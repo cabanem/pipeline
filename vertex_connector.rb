@@ -20,7 +20,7 @@
         hint: 'Include BEGIN/END PRIVATE KEY lines. Used if sa_key_json not provided.' },
 
       { name: 'scope', optional: true, hint: 'OAuth scope(s)', default: 'https://www.googleapis.com/auth/cloud-platform',
-        control_type: 'select', options: [['https://www.googleapis.com/auth/cloud-platform']] }
+        control_type: 'select', options: [['Cloud Platform (all)', 'https://www.googleapis.com/auth/cloud-platform']] }
     ],
 
     authorization: {
@@ -52,9 +52,13 @@
         # Normalize newlines in pasted keys
         key = key.to_s.gsub(/\\n/, "\n")
 
+        # Guard for clock skew
+        iat = Time.now.to_i - 60
+        exp = iat + 3600 # 1 hour validity per Google’s service-account flow
+
         jwt_body = {
           iat: now.to_i,
-          exp: 1.hour.from_now.to_i,
+          exp: exp,
           aud: 'https://oauth2.googleapis.com/token',
           iss: iss,
           scope: (connection['scope'].presence || 'https://www.googleapis.com/auth/cloud-platform')
@@ -64,11 +68,9 @@
 
         assertion = workato.jwt_encode(jwt_body, key, 'RS256')
 
+        # Return the token payload; Workato merges it into `connection`
         post('https://oauth2.googleapis.com/token')
-          .payload(
-            grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-            assertion: assertion
-          )
+          .payload(grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion: assertion)
           .request_format_www_form_urlencoded
       },
 
@@ -85,8 +87,10 @@
     }
   },
 
-  test: ->(_connection) {
-    get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models').params(pageSize: 1)
+  test: ->(connection) {
+    # Protected publisher list that requires auth at project/location scope.
+    get("/v1/projects/#{connection['project_id']}/locations/#{connection['location']}/publishers/google/models")
+      .params(pageSize: 1)
   },
 
   # ====== OBJECT DEFINITIONS ==========================================
