@@ -345,7 +345,8 @@
           { name: 'modified_after',  type: 'date_time' },
           { name: 'modified_before', type: 'date_time' },
           { name: 'mime_type',       label: 'MIME type' },
-          { name: 'exclude_folders', type: 'boolean', control_type: 'checkbox' },
+          { name: 'exclude_folders', type: 'boolean', control_type: 'checkbox', toggle_hint: 'Use custom value',
+            toggle_field: {{name: 'exclude_folders', label: 'Exclude folders', type: 'string', multiline: true}}},
           { name: 'page_token',      label: 'Page token' }
         ]
       end,
@@ -1331,7 +1332,7 @@
               { name: 'id' }, { name: 'name' }, { name: 'mime_type' }
             ] },
           # Preconditions
-          { name: 'if_generation_match', type: 'integer', group: 'Preconditions', hint: 'Use 0 to only create if object does not already exist.' }
+          { name: 'if_generation_match', type: 'integer', group: 'Preconditions', hint: 'Use 0 to only create if object does not already exist.' },
 
           # Options grouping
           { name: 'drive_file_ids', type: 'array', of: 'string', optional: true, hint: 'Drive IDs or URLs', ngIf: 'input.file_input_mode == "manual"', group: 'Source: Drive' },
@@ -1700,6 +1701,34 @@
       msg += "\nRaw: #{body}" if verbose
       msg
     end,
+    
+    normalize_string_list: ->(v) {
+      ary =
+        if v.is_a?(Array)
+          v
+        elsif v.is_a?(String)
+          # split on newlines, commas, or semicolons
+          v.split(/[\n,;]+/)
+        else
+          []
+        end
+
+      ary.map { |s| s.to_s.strip }.reject(&:empty?).uniq
+    },
+
+    # Resolve free text (names/paths) -> IDs if your API needs IDs
+    resolve_folder_ids: ->(connection, items) {
+      items.flat_map { |s|
+        # Example heuristics; swap for your provider:
+        if s =~ /\A[a-zA-Z0-9_\-]{10,}\z/         # looks like an ID
+          s
+        elsif s.start_with?('/')                  # path
+          call(:lookup_folder_by_path, connection, s)   # implement
+        else                                      # name
+          call(:lookup_folder_by_name, connection, s)   # implement
+        end
+      }.compact.uniq
+    },
 
     # ---------------------- Drive helpers ----------------------
     extract_drive_file_id: lambda do |url_or_id|
