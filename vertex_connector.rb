@@ -10,7 +10,7 @@
   # | ----------- | ---------------------------------- | --------------------------------------------------------------------|
   # | AUTH        | not applicable                     | `https:///oauth2.googleapis.com/token``                             |
   # | EMBEDDINGS  | tenant-specific                    | 'aiplatform.googleapis.com' OR '{region}-aiplatform.googleapis.com' |
-  # | GENERATE    | tenant-specific                    | 'aiplatform.googleapis.com' OR '{region}-aiplatform.googleapis.com' |
+  # | GENERATE    | tenantacce-specific                    | 'aiplatform.googleapis.com' OR '{region}-aiplatform.googleapis.com' |
   # | CUSTOM EP   | regional                           | '{region}-aiplatform.googleapis.com'                                |
   # | BATCH PRED  | regional                           | '{region}-aiplatform.googleapis.com'                                |
   # | ----------- | ---------------------------------- | --------------------------------------------------------------------|
@@ -27,8 +27,7 @@
       { name: 'client_email', label: 'Service account client_email', optional: false, extends_schema: true },
       { name: 'private_key',  label: 'Service account private_key',  optional: false, extends_schema: true,
         control_type: 'password', multiline: true, hint: 'Include BEGIN/END PRIVATE KEY lines.' }
-    ]
-    end,
+    ],
 
     authorization: {
       type: 'custom_auth',
@@ -80,12 +79,9 @@
     base_uri: ->(_connection) { 'https://aiplatform.googleapis.com' }
   },
 
-  test: ->(connection) {
-    # Use a regional location for endpoints listing even if caller chose global
-    region = (connection['location'].presence || 'us-east4').to_s.downcase
-    region = 'us-east4' if region == 'global'
-    get(call(:aipl_v1_url, connection, region,
-            "projects/#{connection['project_id']}/locations/#{region}/endpoints"))
+  test: ->(_connection) {
+    get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models')
+      .params(pageSize: 1, view: 'BASIC')
   },
 
   # ====== OBJECT DEFINITIONS ==========================================
@@ -336,6 +332,10 @@
               result['chosen']     = referee['category']
               result['confidence'] = [result['confidence'], referee['confidence']].compact.max
             end
+            if result['confidence'].to_f < min_conf && input['fallback_category'].present?
+              result['chosen'] = input['fallback_category']
+            end
+
           end
 
           result
@@ -458,7 +458,8 @@
 
         # Call endpoint
         loc = (connection['location'].presence || 'global').to_s.downcase
-        post(call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent"))
+        post(call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")).payload(payload)
+
       },
 
       output_fields: ->(object_definitions) { object_definitions['generate_content_output'] },
@@ -518,11 +519,15 @@
 
         tools =
           if input['grounding'] == 'google_search'
-            [ { 'googleSearch' => {} } ]
+            tools = [ { 'googleSearch' => {} } ]
           else
-            ds = input['vertex_ai_search_datastore']
-            error('vertex_ai_search_datastore is required for vertex_ai_search grounding') if ds.blank?
-            [ { 'retrieval' => { 'vertexAiSearch' => { 'datastore' => ds } } } ]
+            ds  = input['vertex_ai_search_datastore'].to_s
+            eng = input['vertex_ai_search_engine'].to_s
+            error('Provide datastore OR engine for vertex_ai_search grounding') if ds.blank? && eng.blank?
+            vas = {}
+            vas['datastore'] = ds unless ds.blank?
+            vas['engine']    = eng unless eng.blank?
+            tools = [ { 'retrieval' => { 'vertexAiSearch' => vas } } ]
           end
 
         gen_cfg = call(:sanitize_generation_config, input['generationConfig'])
@@ -1260,12 +1265,12 @@
     },
 
     sanitize_contents_roles: ->(contents) {
-      call(:safe_array, contents).each_with_object([]) do |c, acc|
-        h = c.is_a?(Hash) ? c.transform_keys { |k| k.to_s } : {}
-        role = (h['role'] || '').to_s.downcase
-        next if role == 'system' # system handled via systemInstruction
-        h['role'] = role if role.present?
-        acc << h
+      call(:safe_array, contents).map do |c|
+        h = c.is_a?(Hash) ? c.transform_keys(&:to_s) : {}
+        role = (h['role'] || 'user').to_s.downcase
+        error("Invalid role: #{role}") unless %w[user model].include?(role)
+        h['role'] = role
+        h
       end
     },
 
@@ -1377,23 +1382,20 @@
     sanitize_generation_config: ->(cfg) {
       return nil if cfg.nil? || (cfg.respond_to?(:empty?) && cfg.empty?)
       g = cfg.dup
-
       # Floats
-      if g.key?('temperature')     then g['temperature']     = call(:safe_float,  g['temperature'])     end
-      if g.key?('topP')            then g['topP']            = call(:safe_float,  g['topP'])            end
-
+      g['temperature']     = call(:safe_float,  g['temperature'])     if g.key?('temperature')
+      g['topP']            = call(:safe_float,  g['topP'])            if g.key?('topP')
       # Integers
-      if g.key?('topK')            then g['topK']            = call(:safe_integer, g['topK'])           end
-      if g.key?('maxOutputTokens') then g['maxOutputTokens'] = call(:safe_integer, g['maxOutputTokens']) end
-      if g.key?('candidateCount')  then g['candidateCount']  = call(:safe_integer, g['candidateCount'])  end
-
+      g['topK']            = call(:safe_integer,g['topK'])            if g.key?('topK')
+      g['maxOutputTokens'] = call(:safe_integer,g['maxOutputTokens']) if g.key?('maxOutputTokens')
+      g['candidateCount']  = call(:safe_integer,g['candidateCount'])  if g.key?('candidateCount')
       # Arrays
-      if g.key?('stopSequences')
-        g['stopSequences'] = call(:safe_array, g['stopSequences']).map(&:to_s)
-      end
-
+      g['stopSequences']   = call(:safe_array, g['stopSequences']).map(&:to_s) if g.key?('stopSequences')
+      # Strip
+      g.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
       g
     }
+
   },
 
   # ====== TRIGGERS ====================================================
