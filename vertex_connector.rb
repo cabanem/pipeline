@@ -55,7 +55,10 @@
       },
 
       apply: ->(connection) {
-        headers('Authorization': "Bearer #{connection['access_token']}")
+        headers(
+          'Authorization': "Bearer #{connection['access_token']}",
+          'X-Goog-User-Project': connection['project_id'].to_s
+        )
       },
 
       # Let Workato trigger re-acquire on auth errors
@@ -667,7 +670,7 @@
       input_fields: ->() {
         [
           { name: 'model', label: 'Embedding model', optional: false,
-            control_type: 'select', pick_list: 'models_embedding', default: 'text-embedding-004',
+            control_type: 'select', pick_list: 'models_embedding', default: 'text-embedding-005',
             hint: 'Pick from list or paste a model ID/path.' },
 
           { name: 'texts', type: 'array', of: 'string', optional: false },
@@ -980,18 +983,11 @@
 
     vector_cosine_similarity: ->(a, b) {
       return 0.0 if a.blank? || b.blank?
-      dot = 0.0
-      sum_a = 0.0
-      sum_b = 0.0
-      len = [a.length, b.length].min
-      i = 0
-      while i < len
-        ai = a[i].to_f
-        bi = b[i].to_f
-        dot   += ai * bi
-        sum_a += ai * ai
-        sum_b += bi * bi
-        i += 1
+      error("Embedding dimensions differ: #{a.length} vs #{b.length}") if a.length != b.length
+      dot = 0.0; sum_a = 0.0; sum_b = 0.0
+      a.each_index do |i|
+        ai = a[i].to_f; bi = b[i].to_f
+        dot += ai * bi; sum_a += ai * ai; sum_b += bi * bi
       end
       denom = Math.sqrt(sum_a) * Math.sqrt(sum_b)
       denom.zero? ? 0.0 : (dot / denom)
@@ -1021,10 +1017,10 @@
       id = model_path_or_id.to_s.split('/').last
       if id.include?('gemini-embedding-001')
         1
-      elsif id.include?('text-embedding-004')
-        100
+      elsif id.include?('text-embedding-')
+        5
       else
-        96
+        5
       end
     },
 
@@ -1111,18 +1107,29 @@
       text   = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s.strip
       parsed = JSON.parse(text) rescue { 'category' => nil, 'confidence' => nil, 'reasoning' => nil, 'distribution' => [] }
 
-      parsed['category'] = allowed.first unless parsed['category'].present? && allowed.include?(parsed['category'])
-      parsed
+      parsed['category'] =
+        if parsed['category'].present? && allowed.include?(parsed['category'])
+          parsed['category']
+        elsif fallback = all_cats.find { |c| c.is_a?(Hash) ? c['name'] == input['fallback_category'] : c == input['fallback_category'] }
+          input['fallback_category']
+        else
+          nil
+        end
+      error('Referee returned no valid category and no fallback is configured') if parsed['category'].nil?
     },
 
     sanitize_contents_roles: ->(contents) {
-      (contents || []).map do |c|
-        dup = c.dup
-        r = dup['role'] || dup[:role]
-        dup['role'] = r.to_s.downcase if r
-        dup
+      (contents || []).each_with_object([]) do |c, acc|
+        role = (c['role'] || c[:role]).to_s.downcase
+        if role == 'system'
+          # drop; system handled separately via systemInstruction
+          next
+        end
+        dup = c.dup; dup['role'] = role if role.present?
+        acc << dup
       end
     },
+
 
     # Accept plain text and produce a proper systemInstruction
     system_instruction_from_text: ->(text) {
