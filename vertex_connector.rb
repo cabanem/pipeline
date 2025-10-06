@@ -217,7 +217,7 @@
 
     # -------------------- Email categorization ------------------------
     gen_categorize_email: {
-      title: 'Generative: Categorize email',
+      title: 'Generative - Categorize email',
       description: 'Classify an email into one of the provided categories using embeddings (default) or a generative referee.',
       retry_on_request: ['GET', 'HEAD', 'POST'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
@@ -225,8 +225,7 @@
 
       input_fields: ->() {
         [
-          { name: 'mode', control_type: 'select', pick_list: 'modes_classification',
-            optional: false, default: 'embedding',
+          { name: 'mode', control_type: 'select', pick_list: 'modes_classification', optional: false, default: 'embedding',
             hint: 'embedding (deterministic), generative (LLM-only), or hybrid (embeddings + LLM referee).' },
 
           { name: 'subject', optional: true },
@@ -393,7 +392,7 @@
 
     # -------------------- Generate content (Gemini) -------------------
     gen_generate_content: {
-      title: 'Generative: Generate content (Gemini)',
+      title: 'Generative - Generate content (Gemini)',
       description: 'POST :generateContent on a publisher model',
       retry_on_request: ['GET', 'HEAD', 'POST'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
@@ -432,13 +431,15 @@
         error('At least one non-system message is required in contents') if contents.blank?
         sys_inst = call(:system_instruction_from_text, input['system_preamble'])
 
+        gen_cfg = call(:sanitize_generation_config, input['generationConfig'])
+
         payload = {
-          'contents'         => contents,
-          'systemInstruction'=> sys_inst,
-          'tools'            => input['tools'],
-          'toolConfig'       => input['toolConfig'],
-          'safetySettings'   => input['safetySettings'],
-          'generationConfig' => input['generationConfig']
+          'contents'          => contents,
+          'systemInstruction' => sys_inst,
+          'tools'             => input['tools'],
+          'toolConfig'        => input['toolConfig'],
+          'safetySettings'    => input['safetySettings'],
+          'generationConfig'  => gen_cfg
         }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
 
         post("/v1/#{model_path}:generateContent").payload(payload)
@@ -462,7 +463,7 @@
 
     # -------------------- Grounded generation -------------------------
     gen_generate_grounded: {
-      title: 'Generative: Generate (grounded)',
+      title: 'Generative - Generate (grounded)',
       description: 'Generate with grounding via Google Search or Vertex AI Search',
       retry_on_request: ['GET', 'HEAD', 'POST'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
@@ -505,13 +506,15 @@
             [ { 'retrieval' => { 'vertexAiSearch' => { 'datastore' => ds } } } ]
           end
 
+        gen_cfg = call(:sanitize_generation_config, input['generationConfig'])
+
         payload = {
           'contents'          => contents,
           'systemInstruction' => sys_inst,
           'tools'             => tools,
           'toolConfig'        => input['toolConfig'],
           'safetySettings'    => input['safetySettings'],
-          'generationConfig'  => input['generationConfig']
+          'generationConfig'  => gen_cfg
         }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
 
         post("/v1/#{model_path}:generateContent").payload(payload)
@@ -533,7 +536,7 @@
 
     # -------------------- New: Query with context chunks --------------
     gen_answer_with_context: {
-      title: 'Generative: Answer with provided context chunks',
+      title: 'Generative - Answer with provided context chunks',
       description: 'Answer a question using caller-supplied context chunks (RAG-lite). Returns structured JSON with citations.',
       retry_on_request: ['GET', 'HEAD', 'POST'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
@@ -577,7 +580,7 @@
 
         # Build a deterministic, schema-ed JSON response
         gen_cfg = {
-          'temperature'       => (input['temperature'].presence || 0),
+          'temperature'      => (input['temperature'].present? ? call(:safe_float, input['temperature']) : 0),
           'maxOutputTokens'   => 1024,
           'responseMimeType'  => 'application/json',
           'responseSchema'    => {
@@ -666,7 +669,7 @@
 
     # -------------------- Embeddings ---------------------------------
     embed_text: {
-      title: 'Embed text',
+      title: 'Embedding - Embed text',
       description: 'POST :predict on a publisher embedding model',
       retry_on_request: ['GET', 'HEAD', 'POST'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
@@ -682,7 +685,7 @@
 
           { name: 'autoTruncate', type: 'boolean', hint: 'Truncate long inputs automatically' },
 
-          { name: 'outputDimensionality', type: 'integer', optional: true,
+          { name: 'outputDimensionality', type: 'integer', optional: true, convert_input: 'integer_conversion',
             hint: 'Optional dimensionality reduction (see model docs).' }
         ]
       },
@@ -694,9 +697,11 @@
           { 'content' => t, 'task_type' => input['task'] }.delete_if { |_k, v| v.nil? }
         }
 
-        params = {}
-        params['autoTruncate']        = true if input['autoTruncate'] == true
-        params['outputDimensionality']= input['outputDimensionality'] if input['outputDimensionality'].present?
+        # Coerce/validate embedding parameters to correct JSON types
+        params = call(:sanitize_embedding_params, {
+          'autoTruncate'         => input['autoTruncate'],
+          'outputDimensionality' => input['outputDimensionality']
+        })
 
         call(:predict_embeddings, model_path, instances, params)
       },
@@ -725,8 +730,7 @@
         [
           { name: 'model', label: 'Model', optional: false, control_type: 'select', pick_list: 'models_generative',
             toggle_hint: 'Use custom value', toggle_field: { name: 'model', label: 'Model', type: 'string', control_type: 'text' } },
-          { name: 'contents', type: 'array', of: 'object',
-            properties: object_definitions['content'], optional: false },
+          { name: 'contents', type: 'array', of: 'object', properties: object_definitions['content'], optional: false },
 
           { name: 'system_preamble', label: 'System preamble (text)', optional: true }
         ]
@@ -1230,7 +1234,72 @@ pick_lists: {
     },
 
     # Like Array#map but safe against nil/false/non-arrays.
-    safe_map: ->(v) { call(:safe_array, v).map { |x| yield(x) } }
+    safe_map: ->(v) { call(:safe_array, v).map { |x| yield(x) } },
+    
+    safe_integer: ->(v) {
+      return nil if v.nil?
+      begin
+        if v.is_a?(String)
+          s = v.strip
+          return nil if s.empty?
+          Integer(s)
+        else
+          Integer(v)
+        end
+      rescue
+        # Last resort: to_i (tolerates "768 " etc.)
+        v.to_i
+      end
+    },
+
+    safe_float: ->(v) {
+      return nil if v.nil?
+      begin
+        if v.is_a?(String)
+          s = v.strip
+          return nil if s.empty?
+          Float(s)
+        else
+          Float(v)
+        end
+      rescue
+        v.to_f
+      end
+    },
+
+    sanitize_embedding_params: ->(raw) {
+      h = {}
+      # Only include autoTruncate when explicitly true (keeps payload minimal)
+      h['autoTruncate'] = true if raw['autoTruncate'] == true
+
+      if raw['outputDimensionality'].present?
+        od = call(:safe_integer, raw['outputDimensionality'])
+        error('outputDimensionality must be a positive integer') if od && od < 1
+        h['outputDimensionality'] = od if od
+      end
+      h
+    },
+  
+    sanitize_generation_config: ->(cfg) {
+      return nil if cfg.nil? || (cfg.respond_to?(:empty?) && cfg.empty?)
+      g = cfg.dup
+
+      # Floats
+      if g.key?('temperature')     then g['temperature']     = call(:safe_float,  g['temperature'])     end
+      if g.key?('topP')            then g['topP']            = call(:safe_float,  g['topP'])            end
+
+      # Integers
+      if g.key?('topK')            then g['topK']            = call(:safe_integer, g['topK'])           end
+      if g.key?('maxOutputTokens') then g['maxOutputTokens'] = call(:safe_integer, g['maxOutputTokens']) end
+      if g.key?('candidateCount')  then g['candidateCount']  = call(:safe_integer, g['candidateCount'])  end
+
+      # Arrays
+      if g.key?('stopSequences')
+        g['stopSequences'] = call(:safe_array, g['stopSequences']).map(&:to_s)
+      end
+
+      g
+    }
   },
 
   # ====== TRIGGERS ====================================================
