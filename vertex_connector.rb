@@ -231,10 +231,8 @@
             ],
             hint: 'At least 2. You can also pass simple strings (names only).' },
 
-          { name: 'embedding_model', label: 'Embedding model',
-            control_type: 'select', pick_list: 'models_embedding', optional: true,
-            default: 'text-embedding-004',
-            hint: 'Used in embedding or hybrid modes.' },
+          { name: 'embedding_model', label: 'Embedding model', control_type: 'select', pick_list: 'models_embedding', optional: true,
+            default: 'text-embedding-005', hint: 'Used in embedding or hybrid modes.' },
 
           { name: 'generative_model', label: 'Generative model',
             control_type: 'select', pick_list: 'models_generative', optional: true,
@@ -277,7 +275,7 @@
 
         # Embedding/hybrid
         if %w[embedding hybrid].include?(mode)
-          emb_model      = (input['embedding_model'].presence || 'text-embedding-004')
+          emb_model      = (input['embedding_model'].presence || 'text-embedding-005')
           emb_model_path = call(:build_embedding_model_path, connection, emb_model)
 
           email_inst = { 'content' => email_text, 'task_type' => 'RETRIEVAL_QUERY' }
@@ -296,7 +294,7 @@
           sims = cat_vecs.each_with_index.map { |v, i| [i, call(:vector_cosine_similarity, email_vec, v)] }
           sims.sort_by! { |(_i, s)| -s }
 
-          scores = sims.map { |(i, s)| { 'category' => cats[i]['name'], 'score' => ((s + 1.0) / 2.0), 'cosine' => s } }
+          scores = sims.map { |(i, s)| { 'category' => cats[i]['name'], 'score' => (((s + 1.0) / 2.0).round(6)), 'cosine' => s.round(6) } }
           top = scores.first
           chosen     = top['category']
           confidence = top['score']
@@ -313,7 +311,7 @@
           if (mode == 'hybrid' || input['return_explanation']) && input['generative_model'].present?
             top_k     = [[(input['top_k'] || 3).to_i, 1].max, cats.length].min
             shortlist = scores.first(top_k).map { |h| h['category'] }
-            referee   = call(:llm_referee, connection, input['generative_model'], email_text, shortlist, cats)
+            referee   = call(:llm_referee, connection, input['generative_model'], email_text, shortlist, cats, input['fallback_category'])
             result['referee'] = referee
 
             if referee['category'].present? && shortlist.include?(referee['category'])
@@ -326,7 +324,7 @@
 
         elsif mode == 'generative'
           error('generative_model is required when mode=generative') if input['generative_model'].blank?
-          referee = call(:llm_referee, connection, input['generative_model'], email_text, cats.map { |c| c['name'] }, cats)
+          referee = call(:llm_referee, connection, input['generative_model'], email_text, cats.map { |c| c['name'] }, cats, input['fallback_category'])
           chosen =
             if referee['confidence'].to_f < min_conf && input['fallback_category'].present?
               input['fallback_category']
@@ -395,10 +393,8 @@
 
       input_fields: ->(object_definitions) {
         [
-          { name: 'model', label: 'Model', optional: false,
-            control_type: 'select', pick_list: 'models_generative',
-            hint: 'Pick from list or paste a model ID/path.' },
-
+          { name: 'model', label: 'Model', optional: false, control_type: 'select', pick_list: 'models_generative', hint: 'Select or use a custom value.',
+            toggle_hint: 'Use custom value', toggle_field: { name: 'model', label: 'Model', type: 'string', control_type: 'text' } },
           { name: 'contents', type: 'array', of: 'object',
             properties: object_definitions['content'], optional: false },
 
@@ -425,6 +421,7 @@
         model_path = call(:build_model_path_with_global_preview, connection, input['model'])
 
         contents = call(:sanitize_contents_roles, input['contents'])
+        error('At least one non-system message is required in contents') if contents.blank?
         sys_inst = call(:system_instruction_from_text, input['system_preamble'])
 
         payload = {
@@ -465,9 +462,8 @@
 
       input_fields: ->(object_definitions) {
         [
-          { name: 'model', label: 'Model', optional: false,
-            control_type: 'select', pick_list: 'models_generative' },
-
+          { name: 'model', label: 'Model', optional: false, control_type: 'select', pick_list: 'models_generative',
+            toggle_hint: 'Use custom value', toggle_field: { name: 'model', label: 'Model', type: 'string', control_type: 'text' } },
           { name: 'grounding', control_type: 'select', pick_list: 'modes_grounding', optional: false },
 
           { name: 'vertex_ai_search_datastore',
@@ -489,6 +485,7 @@
       execute: ->(connection, input) {
         model_path = call(:build_model_path_with_global_preview, connection, input['model'])
         contents   = call(:sanitize_contents_roles, input['contents'])
+        error('At least one non-system message is required in contents') if contents.blank?
         sys_inst   = call(:system_instruction_from_text, input['system_preamble'])
 
         tools =
@@ -536,9 +533,8 @@
 
       input_fields: ->() {
         [
-          { name: 'model', label: 'Model', optional: false,
-            control_type: 'select', pick_list: 'models_generative' },
-
+          { name: 'model', label: 'Model', optional: false, control_type: 'select', pick_list: 'models_generative',
+            toggle_hint: 'Use custom value', toggle_field: { name: 'model', label: 'Model', type: 'string', control_type: 'text' } },
           { name: 'question', optional: false },
 
           { name: 'context_chunks', type: 'array', of: 'object', optional: false, properties: [
@@ -669,10 +665,8 @@
 
       input_fields: ->() {
         [
-          { name: 'model', label: 'Embedding model', optional: false,
-            control_type: 'select', pick_list: 'models_embedding', default: 'text-embedding-005',
-            hint: 'Pick from list or paste a model ID/path.' },
-
+          { name: 'model', label: 'Embedding model', optional: false, control_type: 'select', pick_list: 'models_embedding', default: 'text-embedding-005',
+            hint: 'Select or use a custom value.', toggle_hint: 'Use custom value', toggle_field: { name: 'model', label: 'Embedding model', type: 'string', control_type: 'text' } },
           { name: 'texts', type: 'array', of: 'string', optional: false },
 
           { name: 'task', hint: 'Optional: RETRIEVAL_QUERY or RETRIEVAL_DOCUMENT' },
@@ -720,9 +714,8 @@
 
       input_fields: ->(object_definitions) {
         [
-          { name: 'model', label: 'Model', optional: false,
-            control_type: 'select', pick_list: 'models_generative' },
-
+          { name: 'model', label: 'Model', optional: false, control_type: 'select', pick_list: 'models_generative',
+            toggle_hint: 'Use custom value', toggle_field: { name: 'model', label: 'Model', type: 'string', control_type: 'text' } },
           { name: 'contents', type: 'array', of: 'object',
             properties: object_definitions['content'], optional: false },
 
@@ -733,6 +726,7 @@
       execute: ->(connection, input) {
         model_path = call(:build_model_path_with_global_preview, connection, input['model'])
         contents   = call(:sanitize_contents_roles, input['contents'])
+        error('At least one non-system message is required in contents') if contents.blank?
         sys_inst   = call(:system_instruction_from_text, input['system_preamble'])
 
         post("/v1/#{model_path}:countTokens").payload({
@@ -907,10 +901,11 @@
 
     models_embedding: ->(connection) {
       resp = get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models')
-              .params(pageSize: 2000, listAllVersions: true)
+               .params(pageSize: 1000, listAllVersions: true)
+
       ids = (resp['publisherModels'] || [])
               .map { |m| m['name'].to_s.split('/').last }
-              .select { |id| id.include?('embedding') || id.start_with?('text-embedding') }
+              .select { |id| id.start_with?('text-embedding') || id.start_with?('multimodal-embedding') }
               .uniq.sort
 
       region = call(:embedding_region, connection)
@@ -922,7 +917,7 @@
 
     models_generative: ->(connection) {
       resp = get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models')
-              .params(pageSize: 2000, listAllVersions: true)
+               .params(pageSize: 1000, listAllVersions: true)
       items = (resp['publisherModels'] || [])
                 .map { |m| m['name'].to_s.split('/').last }
                 .select { |id| id.start_with?('gemini-') }
@@ -940,11 +935,18 @@
   methods: {
     # Build model path for publisher models (Gemini/embeddings). Generative defaults to global.
     build_model_path_with_global_preview: ->(connection, model) {
-      m = (model || '').strip
+      m = call(:normalize_model_identifier, model)
       return m if m.start_with?('projects/')
 
-      m = "publishers/#{m}" if m.start_with?('google/models/')
-      loc = 'global'
+      # Accept common short forms
+      if m.start_with?('models/')
+        m = m.split('/', 2).last # drop leading "models/"
+      end
+      if m.start_with?('google/models/')
+        m = "publishers/#{m}"
+      end
+
+      loc = 'global' # generative models live under global
       if m.start_with?('publishers/')
         "projects/#{connection['project_id']}/locations/#{loc}/#{m}"
       else
@@ -953,8 +955,29 @@
     },
 
     build_endpoint_path: ->(connection, endpoint) {
-      ep = (endpoint || '').strip
-      ep.start_with?('projects/') ? ep : "projects/#{connection['project_id']}/locations/#{connection['location']}/endpoints/#{ep}"
+      ep = call(:normalize_endpoint_identifier, endpoint)
+      ep.start_with?('projects/') ? ep :
+        "projects/#{connection['project_id']}/locations/#{connection['location']}/endpoints/#{ep}"
+    },
+
+    build_embedding_model_path: ->(connection, model) {
+      m = call(:normalize_model_identifier, model)
+      return m if m.start_with?('projects/')
+
+      # Accept common short forms
+      if m.start_with?('models/')
+        m = m.split('/', 2).last
+      end
+      if m.start_with?('google/models/')
+        m = "publishers/#{m}"
+      end
+
+      loc = call(:embedding_region, connection)
+      if m.start_with?('publishers/')
+        "projects/#{connection['project_id']}/locations/#{loc}/#{m}"
+      else
+        "projects/#{connection['project_id']}/locations/#{loc}/publishers/google/models/#{m}"
+      end
     },
 
     # Build a single email text body for classification
@@ -999,19 +1022,6 @@
       (loc.present? && loc != 'global') ? loc : 'us-central1'
     },
 
-    build_embedding_model_path: ->(connection, model) {
-      m = (model || '').strip
-      return m if m.start_with?('projects/')
-
-      m = "publishers/#{m}" if m.start_with?('google/models/')
-      loc = call(:embedding_region, connection)
-      if m.start_with?('publishers/')
-        "projects/#{connection['project_id']}/locations/#{loc}/#{m}"
-      else
-        "projects/#{connection['project_id']}/locations/#{loc}/publishers/google/models/#{m}"
-      end
-    },
-
     # Conservative instance limits by model family
     embedding_max_instances: ->(model_path_or_id) {
       id = model_path_or_id.to_s.split('/').last
@@ -1039,11 +1049,12 @@
     },
 
     # Minimal, schema-constrained JSON referee using Gemini
-    llm_referee: ->(connection, model, email_text, shortlist_names, all_cats) {
+    llm_referee: ->(connection, model, email_text, shortlist_names, all_cats, fallback_category = nil) {
       model_path = call(:build_model_path_with_global_preview, connection, model)
 
       cats_norm = all_cats.map { |c| c.is_a?(Hash) ? c : { 'name' => c.to_s } }
-      allowed   = shortlist_names.present? ? shortlist_names : cats_norm.map { |c| c['name'] }
+      allowed   = (shortlist_names.presence || cats_norm.map { |c| c['name'] })
+                    .map { |x| x.is_a?(Hash) ? (x['name'] || x[:name]).to_s : x.to_s }
 
       system_text = <<~SYS
         You are a strict email classifier. Choose exactly one category from the allowed list.
@@ -1107,29 +1118,27 @@
       text   = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s.strip
       parsed = JSON.parse(text) rescue { 'category' => nil, 'confidence' => nil, 'reasoning' => nil, 'distribution' => [] }
 
-      parsed['category'] =
-        if parsed['category'].present? && allowed.include?(parsed['category'])
-          parsed['category']
-        elsif fallback = all_cats.find { |c| c.is_a?(Hash) ? c['name'] == input['fallback_category'] : c == input['fallback_category'] }
-          input['fallback_category']
-        else
-          nil
-        end
-      error('Referee returned no valid category and no fallback is configured') if parsed['category'].nil?
+      # Validate/repair category
+      if parsed['category'].present? && !allowed.include?(parsed['category'])
+        parsed['category'] = nil
+      end
+      if parsed['category'].blank? && fallback_category.present?
+        parsed['category'] = fallback_category
+      end
+      error('Referee returned no valid category and no fallback is configured') if parsed['category'].blank?
+
+      parsed
     },
 
     sanitize_contents_roles: ->(contents) {
       (contents || []).each_with_object([]) do |c, acc|
-        role = (c['role'] || c[:role]).to_s.downcase
-        if role == 'system'
-          # drop; system handled separately via systemInstruction
-          next
-        end
-        dup = c.dup; dup['role'] = role if role.present?
-        acc << dup
+        h = c.is_a?(Hash) ? c.transform_keys { |k| k.to_s } : {}
+        role = (h['role'] || '').to_s.downcase
+        next if role == 'system' # system handled via systemInstruction
+        h['role'] = role if role.present?
+        acc << h
       end
     },
-
 
     # Accept plain text and produce a proper systemInstruction
     system_instruction_from_text: ->(text) {
@@ -1163,7 +1172,37 @@
 
     safe_parse_json: ->(s) {
       JSON.parse(s) rescue { 'answer' => s }
+    },
+    
+    # Normalize a user-provided "model" into a String.
+    # Accepts String or Hash (from datapills/pick lists). Prefers common keys.
+    normalize_model_identifier: ->(raw) {
+      return '' if raw.nil?
+      if raw.is_a?(Hash)
+        v = raw['name'] || raw[:name] ||
+            raw['path'] || raw[:path] ||
+            raw['value'] || raw[:value] ||
+            raw['id'] || raw[:id] ||
+            raw.to_s
+        return v.to_s.strip
+      end
+      raw.to_s.strip
+    },
+
+    # Normalize a user-provided "endpoint" into a String as well.
+    normalize_endpoint_identifier: ->(raw) {
+      return '' if raw.nil?
+      if raw.is_a?(Hash)
+        v = raw['name'] || raw[:name] ||
+            raw['path'] || raw[:path] ||
+            raw['value'] || raw[:value] ||
+            raw['id'] || raw[:id] ||
+            raw.to_s
+        return v.to_s.strip
+      end
+      raw.to_s.strip
     }
+
   },
 
   # ====== TRIGGERS ====================================================
