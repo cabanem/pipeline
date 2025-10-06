@@ -921,34 +921,37 @@
       [%w[Google\ Search google_search], %w[Vertex\ AI\ Search vertex_ai_search]]
     },
 
-    models_embedding: ->(connection) {
+    models_embedding: ->(_connection) {
       begin
-        loc = (connection['location'].presence || 'global').to_s.downcase
-        proj = connection['project_id']
-        resp = get("https://aiplatform.googleapis.com/v1/projects/#{proj}/locations/#{loc}/publishers/google/models")
+        # v1beta1 publishers.models.list — global; no project/location.
+        resp = get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models')
                 .params(pageSize: 200, view: 'BASIC')
-        ids = call(:safe_array, resp && resp['publisherModels'])
-                .map { |m| m['name'].to_s.split('/').last }
-                .select { |id| id.start_with?('text-embedding') || id.start_with?('multimodal-embedding') || id.start_with?('gemini-embedding') }
+
+        ids = call(:safe_array, resp['publisherModels'])
+                .map { |m| m['name'].to_s.split('/').last } # publishers/google/models/<id>
+                .select { |id|
+                  id.start_with?('gemini-embedding') ||
+                  id.start_with?('text-embedding')   ||
+                  id.start_with?('multimodal-embedding')
+                }
                 .uniq.sort
       rescue => _e
-        ids = %w[gemini-embedding-001 text-embedding-005 multimodal-embedding-001]
+        # Don’t inject opinionated fallbacks; let users switch to “Use custom value”.
+        ids = []
       end
       ids.map { |id| [id, id] }
     },
 
     models_generative: ->(connection) {
       begin
-        loc = (connection['location'].presence || 'global').to_s.downcase
-        proj = connection['project_id']
-        resp = get("https://aiplatform.googleapis.com/v1/projects/#{proj}/locations/#{loc}/publishers/google/models")
+        resp = get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models')
                 .params(pageSize: 200, view: 'BASIC')
-        items = call(:safe_array, resp && resp['publisherModels'])
+        items = call(:safe_array, resp['publisherModels'])
                   .map { |m| m['name'].to_s.split('/').last }
                   .select { |id| id.start_with?('gemini-') }
                   .uniq.sort
       rescue => _e
-        items = %w[gemini-2.5-pro gemini-2.5-flash gemini-2.5-flash-lite]
+        items = []
       end
       items.map { |id| [id, id] }
     },
