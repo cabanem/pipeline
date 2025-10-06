@@ -293,7 +293,7 @@
           end
 
           emb_resp = call(:predict_embeddings, emb_model_path, [email_inst] + cat_insts)
-          preds    = (emb_resp['predictions'] || [])
+          preds    = call(:safe_array, emb_resp && emb_resp['predictions'])
           error('Embedding model returned no predictions') if preds.empty?
 
           email_vec = call(:extract_embedding_vector, preds.first)
@@ -570,7 +570,8 @@
         model_path = call(:build_model_path_with_global_preview, connection, input['model'])
 
         max_chunks = call(:clamp_int, (input['max_chunks'] || 20), 1, 100)
-        chunks     = (input['context_chunks'] || [])[0, max_chunks]
+        chunks     = call(:safe_array, input['context_chunks']).first(max_chunks)
+
 
         error('context_chunks must be a non-empty array') if chunks.blank?
 
@@ -927,7 +928,7 @@
       begin
         resp = get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models')
                  .params(pageSize: 200, listAllVersions: true)
-        items = (resp['publisherModels'] || [])
+        items = call(:safe_array, resp && resp['publisherModels'])
                   .map { |m| m['name'].to_s.split('/').last }
                   .select { |id| id.start_with?('gemini-') }
                   .uniq.sort
@@ -1065,9 +1066,12 @@
     llm_referee: ->(connection, model, email_text, shortlist_names, all_cats, fallback_category = nil) {
       model_path = call(:build_model_path_with_global_preview, connection, model)
 
-      cats_norm = all_cats.map { |c| c.is_a?(Hash) ? c : { 'name' => c.to_s } }
-      allowed   = (shortlist_names.presence || cats_norm.map { |c| c['name'] })
-                    .map { |x| x.is_a?(Hash) ? (x['name'] || x[:name]).to_s : x.to_s }
+      cats_norm = call(:safe_array, all_cats).map { |c| c.is_a?(Hash) ? c : { 'name' => c.to_s } }
+      allowed   = if shortlist_names.present?
+                     call(:safe_array, shortlist_names).map { |x| x.is_a?(Hash) ? (x['name'] || x[:name]).to_s : x.to_s }
+                   else
+                     cats_norm.map { |c| c['name'] }
+                   end
 
       system_text = <<~SYS
         You are a strict email classifier. Choose exactly one category from the allowed list.
@@ -1085,7 +1089,7 @@
         Category descriptions (if any):
         #{cats_norm.map { |c|
             desc = c['description']
-            exs  = (c['examples'] || [])
+            exs  = call(:safe_array, (c['examples'] || c[:examples]))
             line = "- #{c['name']}"
             line += ": #{desc}" if desc.present?
             line += " | examples: #{exs.join(' ; ')}" if exs.present?
@@ -1144,7 +1148,7 @@
     },
 
     sanitize_contents_roles: ->(contents) {
-      (contents || []).each_with_object([]) do |c, acc|
+      call(:safe_array, contents).each_with_object([]) do |c, acc|
         h = c.is_a?(Hash) ? c.transform_keys { |k| k.to_s } : {}
         role = (h['role'] || '').to_s.downcase
         next if role == 'system' # system handled via systemInstruction
@@ -1165,7 +1169,7 @@
 
     format_context_chunks: ->(chunks) {
       # Stable, parseable layout the model can learn
-      chunks.each_with_index.map { |c, i|
+      call(:safe_array, chunks).each_with_index.map { |c, i|
         cid  = c['id'] || "chunk-#{i+1}"
         src  = c['source']
         uri  = c['uri']
@@ -1204,7 +1208,7 @@
 
     # Normalize a user-provided "endpoint" into a String as well.
     normalize_endpoint_identifier: ->(raw) {
-      return '' if raw.nil?
+      return '' if raw.nil? || raw == true || raw == false
       if raw.is_a?(Hash)
         v = raw['name'] || raw[:name] ||
             raw['path'] || raw[:path] ||
