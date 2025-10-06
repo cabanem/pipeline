@@ -2,44 +2,42 @@
 
 {
   title: 'Vertex AI Adapter',
-  version: '0.8.0',
-  description: '',
+  version: '0.9.0-draft',
+  description: 'Vertex AI (Gemini + Text Embeddings + Endpoints) via service account JWT',
 
-
-  # ====== CONNECTION ==================================================  
+  # ====== CONNECTION ==================================================
   connection: {
     fields: [
       { name: 'project_id', optional: false, hint: 'GCP project ID' },
-      { name: 'location', optional: false, hint: 'e.g., global, us-east4' },
+      { name: 'location', optional: false, hint: 'e.g., global, us-central1, us-east4' },
 
       { name: 'client_email', label: 'Service account client_email', optional: false },
-      { name: 'private_key', label: 'Service account private_key', optional: false, control_type: 'password', multiline: true,
+      { name: 'private_key',  label: 'Service account private_key',  optional: false,
+        control_type: 'password', multiline: true,
         hint: 'Include BEGIN/END PRIVATE KEY lines.' },
 
-      { name: 'scope', optional: true, hint: 'OAuth scope(s)', default: 'https://www.googleapis.com/auth/cloud-platform',
-        control_type: 'select', options: [['Cloud Platform (all)', 'https://www.googleapis.com/auth/cloud-platform']] }
+      { name: 'scope', optional: true, hint: 'OAuth scope(s)',
+        default: 'https://www.googleapis.com/auth/cloud-platform',
+        control_type: 'select',
+        options: [['Cloud Platform (all)', 'https://www.googleapis.com/auth/cloud-platform']] }
     ],
 
     authorization: {
       type: 'custom_auth',
 
       acquire: ->(connection) {
-        # Parse service account inputs
-        iss = nil
-        key = nil
-
-        iss = connection['client_email']
-        key = connection['private_key']
+        iss = connection['client_email'].to_s.strip
+        key = connection['private_key'].to_s
 
         error('Missing client_email for service account') if iss.blank?
         error('Missing private_key for service account') if key.blank?
 
-        # Normalize newlines in pasted keys
-        key = key.to_s.gsub(/\\n/, "\n")
+        # Normalize pasted keys with literal "\n"
+        key = key.gsub(/\\n/, "\n")
 
         # Guard for clock skew
         iat = Time.now.to_i - 60
-        exp = iat + 3600 # 1 hour validity per Google’s service-account flow
+        exp = iat + 3600 # 1 hour
 
         jwt_body = {
           iat: iat,
@@ -51,29 +49,25 @@
 
         assertion = workato.jwt_encode(jwt_body, key, 'RS256')
 
-        # Return the token payload; Workato merges it into `connection`
         post('https://oauth2.googleapis.com/token')
           .payload(grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion: assertion)
           .request_format_www_form_urlencoded
       },
 
       apply: ->(connection) {
-        bearer = connection['access_token']
-        headers('Authorization': "Bearer #{bearer}")
+        headers('Authorization': "Bearer #{connection['access_token']}")
       },
 
+      # Let Workato trigger re-acquire on auth errors
       refresh_on: [401],
-      detect_on: [/UNAUTHENTICATED/i, /invalid[_-]?token/i, /expired/i]
+      detect_on:  [/UNAUTHENTICATED/i, /invalid[_-]?token/i, /expired/i]
     },
 
-    base_uri: ->(connection) {
-      'https://aiplatform.googleapis.com'
-    }
+    base_uri: ->(_connection) { 'https://aiplatform.googleapis.com' }
   },
 
-  test: ->(_connection) {
-    project_id  = connection['project_id']
-    location    = connection['location']
+  test: ->(connection) {
+    # Lightweight list call validates token + basic access
     get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models').params(pageSize: 1)
   },
 
@@ -91,20 +85,22 @@
               { name: 'mimeType' }, { name: 'fileUri', hint: 'gs://, https://, etc.' }
             ]
           },
-          # Tool interaction fields (optional)
-          { name: 'functionCall', type: 'object' },
-          { name: 'functionResponse', type: 'object' },
-          { name: 'executableCode', type: 'object' },
+          # tool/function scaffolding (pass-through)
+          { name: 'functionCall',        type: 'object' },
+          { name: 'functionResponse',    type: 'object' },
+          { name: 'executableCode',      type: 'object' },
           { name: 'codeExecutionResult', type: 'object' }
         ]
       }
     },
 
+    # Per contract: role ∈ {user, model}
     content: {
       fields: ->(object_definitions) {
         [
           { name: 'role', control_type: 'select', pick_list: 'roles', optional: false },
-          { name: 'parts', type: 'array', of: 'object', properties: object_definitions['content_part'], optional: false }
+          { name: 'parts', type: 'array', of: 'object',
+            properties: object_definitions['content_part'], optional: false }
         ]
       }
     },
@@ -112,42 +108,23 @@
     generation_config: {
       fields: ->() {
         [
-          { name: 'temperature', type: 'number' },
-          { name: 'topP', type: 'number' },
-          { name: 'topK', type: 'integer' },
-          { name: 'maxOutputTokens', type: 'integer' },
-          { name: 'candidateCount', type: 'integer' },
-          { name: 'stopSequences', type: 'array', of: 'string' },
+          { name: 'temperature',       type: 'number'  },
+          { name: 'topP',              type: 'number'  },
+          { name: 'topK',              type: 'integer' },
+          { name: 'maxOutputTokens',   type: 'integer' },
+          { name: 'candidateCount',    type: 'integer' },
+          { name: 'stopSequences',     type: 'array', of: 'string' },
           { name: 'responseMimeType' },
-          { name: 'responseSchema', type: 'object' } # for structured output
+          { name: 'responseSchema',    type: 'object' } # structured output
         ]
       }
     },
 
     safety_setting: {
-      fields: ->() { [
-        { name: 'category' },   # e.g., 'HARM_CATEGORY_UNSPECIFIED'
-        { name: 'threshold' }   # e.g., 'BLOCK_LOW_AND_ABOVE'
-      ] }
-    },
-
-    # Tools for grounding
-    tool_google_search: {
-      fields: ->() { [ { name: 'googleSearch', type: 'object' } ] }
-    },
-    tool_vertex_ai_search: {
       fields: ->() {
         [
-          {
-            name: 'retrieval', type: 'object', properties: [
-              {
-                name: 'vertexAiSearch', type: 'object', properties: [
-                  { name: 'datastore', hint: 'projects/.../locations/.../collections/default_collection/dataStores/...' },
-                  { name: 'servingConfig', hint: 'Optional ServingConfig path' }
-                ]
-              }
-            ]
-          }
+          { name: 'category'  },   # e.g., HARM_CATEGORY_*
+          { name: 'threshold' }    # e.g., BLOCK_LOW_AND_ABOVE
         ]
       }
     },
@@ -158,9 +135,9 @@
           { name: 'responseId' },
           { name: 'modelVersion' },
           { name: 'usageMetadata', type: 'object', properties: [
-              { name: 'promptTokenCount', type: 'integer' },
+              { name: 'promptTokenCount',     type: 'integer' },
               { name: 'candidatesTokenCount', type: 'integer' },
-              { name: 'totalTokenCount', type: 'integer' }
+              { name: 'totalTokenCount',      type: 'integer' }
             ]
           },
           { name: 'candidates', type: 'array', of: 'object', properties: [
@@ -178,15 +155,23 @@
       }
     },
 
+    # Align to contract: embeddings object, not array
     embed_output: {
       fields: ->() {
         [
-          { name: 'predictions', type: 'array', of: 'object',
-            properties: [
-              { name: 'embeddings', type: 'array', of: 'object',
-                properties: [ { name: 'values', type: 'array', of: 'number' } ]
-              }]
-          }]
+          { name: 'predictions', type: 'array', of: 'object', properties: [
+              { name: 'embeddings', type: 'object', properties: [
+                  { name: 'values', type: 'array', of: 'number' },
+                  { name: 'statistics', type: 'object', properties: [
+                      { name: 'truncated',   type: 'boolean' },
+                      { name: 'token_count', type: 'integer' }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
       }
     },
 
@@ -219,27 +204,33 @@
   # ====== ACTIONS =====================================================
   actions: {
 
-    # Generative
+    # -------------------- Email categorization ------------------------
     gen_categorize_email: {
-      title: 'Generative:  Categorize email',
+      title: 'Generative: Categorize email',
       description: 'Classify an email into one of the provided categories using embeddings (default) or a generative referee.',
+      retry_on_request: ['GET', 'HEAD', 'POST'],
+      retry_on_response: [408, 429, 500, 502, 503, 504],
+      max_retries: 3,
+
       input_fields: ->() {
         [
-          { name: 'mode', control_type: 'select', pick_list: 'modes_classification', optional: false, default: 'embedding',
+          { name: 'mode', control_type: 'select', pick_list: 'modes_classification',
+            optional: false, default: 'embedding',
             hint: 'embedding (deterministic), generative (LLM-only), or hybrid (embeddings + LLM referee).' },
 
           { name: 'subject', optional: true },
-          { name: 'body', optional: true },
+          { name: 'body',    optional: true },
 
           { name: 'categories', optional: false, type: 'array', of: 'object', properties: [
-              { name: 'name', optional: false },
+              { name: 'name',      optional: false },
               { name: 'description' },
-              { name: 'examples', type: 'array', of: 'string' }
+              { name: 'examples',  type: 'array', of: 'string' }
             ],
             hint: 'At least 2. You can also pass simple strings (names only).' },
 
           { name: 'embedding_model', label: 'Embedding model',
-            control_type: 'select', pick_list: 'models_embedding', optional: true, default: 'text-embedding-004',
+            control_type: 'select', pick_list: 'models_embedding', optional: true,
+            default: 'text-embedding-004',
             hint: 'Used in embedding or hybrid modes.' },
 
           { name: 'generative_model', label: 'Generative model',
@@ -261,11 +252,11 @@
 
       execute: ->(connection, input) {
         subj = (input['subject'] || '').to_s.strip
-        body = (input['body'] || '').to_s.strip
+        body = (input['body']    || '').to_s.strip
         email_text = call(:build_email_text, subj, body)
         error('Provide subject and/or body') if email_text.blank?
 
-        # Normalize categories (allow strings or objects)
+        # Normalize categories
         raw_cats = input['categories'] || []
         cats = raw_cats.map { |c|
           if c.is_a?(String)
@@ -276,72 +267,60 @@
               'examples' => c['examples'] || c[:examples] || [] }
           end
         }.select { |c| c['name'].present? }
-
         error('At least 2 categories are required') if cats.length < 2
 
-        mode = (input['mode'] || 'embedding').to_s.downcase
-        min_conf = (input['min_confidence'].presence || 0.25).to_f
+        mode      = (input['mode'] || 'embedding').to_s.downcase
+        min_conf  = (input['min_confidence'].presence || 0.25).to_f
 
-        # Embedding/hybrid branch
+        # Embedding/hybrid
         if %w[embedding hybrid].include?(mode)
-          emb_model = (input['embedding_model'].presence || 'gemini-embedding-001')
+          emb_model      = (input['embedding_model'].presence || 'text-embedding-004')
           emb_model_path = call(:build_embedding_model_path, connection, emb_model)
 
-          # Build instances: first = email, rest = category texts
           email_inst = { 'content' => email_text, 'task_type' => 'RETRIEVAL_QUERY' }
-          cat_insts = cats.map do |c|
+          cat_insts  = cats.map do |c|
             txt = [c['name'], c['description'], *(c['examples'] || [])].compact.join("\n")
             { 'content' => txt, 'task_type' => 'RETRIEVAL_DOCUMENT' }
           end
 
           emb_resp = call(:predict_embeddings, emb_model_path, [email_inst] + cat_insts)
-          preds = (emb_resp['predictions'] || [])
+          preds    = (emb_resp['predictions'] || [])
           error('Embedding model returned no predictions') if preds.empty?
 
           email_vec = call(:extract_embedding_vector, preds.first)
-          cat_vecs = preds.drop(1).map { |p| call(:extract_embedding_vector, p) }
+          cat_vecs  = preds.drop(1).map { |p| call(:extract_embedding_vector, p) }
 
           sims = cat_vecs.each_with_index.map { |v, i| [i, call(:vector_cosine_similarity, email_vec, v)] }
           sims.sort_by! { |(_i, s)| -s }
 
-          # Score in [0,1] from cosine [-1,1]
-          scores = sims.map do |(i, s)|
-            { 'category' => cats[i]['name'], 'score' => ((s + 1.0) / 2.0), 'cosine' => s }
-          end
-
+          scores = sims.map { |(i, s)| { 'category' => cats[i]['name'], 'score' => ((s + 1.0) / 2.0), 'cosine' => s } }
           top = scores.first
-          chosen = top['category']
+          chosen     = top['category']
           confidence = top['score']
 
-          # Threshold / fallback
-          if confidence < min_conf && input['fallback_category'].present?
-            chosen = input['fallback_category']
-          end
+          chosen = input['fallback_category'] if confidence < min_conf && input['fallback_category'].present?
 
           result = {
-            'mode' => mode,
-            'chosen' => chosen,
+            'mode'       => mode,
+            'chosen'     => chosen,
             'confidence' => confidence.round(4),
-            'scores' => scores
+            'scores'     => scores
           }
 
-          # Optional LLM referee (hybrid or just explanation flag)
           if (mode == 'hybrid' || input['return_explanation']) && input['generative_model'].present?
-            top_k = [[(input['top_k'] || 3).to_i, 1].max, cats.length].min
+            top_k     = [[(input['top_k'] || 3).to_i, 1].max, cats.length].min
             shortlist = scores.first(top_k).map { |h| h['category'] }
-            referee = call(:llm_referee, connection, input['generative_model'], email_text, shortlist, cats)
+            referee   = call(:llm_referee, connection, input['generative_model'], email_text, shortlist, cats)
             result['referee'] = referee
 
-            # Prefer the referee’s pick if it’s in the shortlist
             if referee['category'].present? && shortlist.include?(referee['category'])
-              result['chosen'] = referee['category']
+              result['chosen']     = referee['category']
               result['confidence'] = [result['confidence'], referee['confidence']].compact.max
             end
           end
 
           result
 
-        # Generative branch
         elsif mode == 'generative'
           error('generative_model is required when mode=generative') if input['generative_model'].blank?
           referee = call(:llm_referee, connection, input['generative_model'], email_text, cats.map { |c| c['name'] }, cats)
@@ -352,12 +331,7 @@
               referee['category']
             end
 
-          {
-            'mode' => mode,
-            'chosen' => chosen,
-            'confidence' => referee['confidence'],
-            'referee' => referee
-          }
+          { 'mode' => mode, 'chosen' => chosen, 'confidence' => referee['confidence'], 'referee' => referee }
 
         else
           error("Unknown mode: #{mode}")
@@ -408,21 +382,29 @@
       }
     },
 
+    # -------------------- Generate content (Gemini) -------------------
     gen_generate_content: {
-      title: 'Generative:  Generate content (Gemini)',
+      title: 'Generative: Generate content (Gemini)',
       description: 'POST :generateContent on a publisher model',
+      retry_on_request: ['GET', 'HEAD', 'POST'],
+      retry_on_response: [408, 429, 500, 502, 503, 504],
+      max_retries: 3,
+
       input_fields: ->(object_definitions) {
         [
           { name: 'model', label: 'Model', optional: false,
             control_type: 'select', pick_list: 'models_generative',
             hint: 'Pick from list or paste a model ID/path.' },
+
           { name: 'contents', type: 'array', of: 'object',
             properties: object_definitions['content'], optional: false },
-          { name: 'systemInstruction', type: 'object',
-            properties: object_definitions['content'] },
+
+          # Contract-friendly: accept plain text; connector will inject a proper systemInstruction
+          { name: 'system_preamble', label: 'System preamble (text)', optional: true, hint: 'Optional system guidance.' },
+
           { name: 'tools', type: 'array', of: 'object', properties: [
               { name: 'googleSearch', type: 'object' },
-              { name: 'retrieval', type: 'object' },
+              { name: 'retrieval',    type: 'object' },
               { name: 'codeExecution', type: 'object' },
               { name: 'functionDeclarations', type: 'array', of: 'object' }
             ]
@@ -430,28 +412,32 @@
           { name: 'toolConfig', type: 'object' },
           { name: 'safetySettings', type: 'array', of: 'object',
             properties: object_definitions['safety_setting'] },
+
           { name: 'generationConfig', type: 'object',
             properties: object_definitions['generation_config'] }
         ]
       },
+
       execute: ->(connection, input) {
         model_path = call(:build_model_path_with_global_preview, connection, input['model'])
 
         contents = call(:sanitize_contents_roles, input['contents'])
-        sys_inst = call(:normalize_system_instruction, input['systemInstruction'])
+        sys_inst = call(:system_instruction_from_text, input['system_preamble'])
 
         payload = {
-          'contents' => contents,
-          'systemInstruction' => sys_inst,
-          'tools' => input['tools'],
-          'toolConfig' => input['toolConfig'],
-          'safetySettings' => input['safetySettings'],
+          'contents'         => contents,
+          'systemInstruction'=> sys_inst,
+          'tools'            => input['tools'],
+          'toolConfig'       => input['toolConfig'],
+          'safetySettings'   => input['safetySettings'],
           'generationConfig' => input['generationConfig']
         }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
 
         post("/v1/#{model_path}:generateContent").payload(payload)
       },
+
       output_fields: ->(object_definitions) { object_definitions['generate_content_output'] },
+
       sample_output: ->() {
         {
           'responseId' => 'resp-123',
@@ -466,27 +452,41 @@
       }
     },
 
+    # -------------------- Grounded generation -------------------------
     gen_generate_grounded: {
-      title: 'Generative:  Generate (grounded)',
+      title: 'Generative: Generate (grounded)',
       description: 'Generate with grounding via Google Search or Vertex AI Search',
+      retry_on_request: ['GET', 'HEAD', 'POST'],
+      retry_on_response: [408, 429, 500, 502, 503, 504],
+      max_retries: 3,
+
       input_fields: ->(object_definitions) {
         [
           { name: 'model', label: 'Model', optional: false,
             control_type: 'select', pick_list: 'models_generative' },
+
           { name: 'grounding', control_type: 'select', pick_list: 'modes_grounding', optional: false },
+
           { name: 'vertex_ai_search_datastore',
             hint: 'Required when grounding=vertex_ai_search: projects/.../locations/.../collections/default_collection/dataStores/...' },
+
           { name: 'contents', type: 'array', of: 'object',
             properties: object_definitions['content'], optional: false },
+
+          { name: 'system_preamble', label: 'System preamble (text)', optional: true },
+
+          { name: 'toolConfig', type: 'object' },
+
           { name: 'generationConfig', type: 'object', properties: object_definitions['generation_config'] },
-          { name: 'safetySettings', type: 'array', of: 'object', properties: object_definitions['safety_setting'] }
+
+          { name: 'safetySettings',  type: 'array', of: 'object', properties: object_definitions['safety_setting'] }
         ]
       },
+
       execute: ->(connection, input) {
         model_path = call(:build_model_path_with_global_preview, connection, input['model'])
-
-        contents = call(:sanitize_contents_roles, input['contents'])
-        sys_inst = call(:normalize_system_instruction, input['systemInstruction'])
+        contents   = call(:sanitize_contents_roles, input['contents'])
+        sys_inst   = call(:system_instruction_from_text, input['system_preamble'])
 
         tools =
           if input['grounding'] == 'google_search'
@@ -497,18 +497,20 @@
             [ { 'retrieval' => { 'vertexAiSearch' => { 'datastore' => ds } } } ]
           end
 
-          payload = {
-            'contents' => contents,
-            'systemInstruction' => sys_inst,
-            'tools' => tools,
-            'toolConfig' => input['toolConfig'],
-            'safetySettings' => input['safetySettings'],
-            'generationConfig' => input['generationConfig']
-          }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
+        payload = {
+          'contents'          => contents,
+          'systemInstruction' => sys_inst,
+          'tools'             => tools,
+          'toolConfig'        => input['toolConfig'],
+          'safetySettings'    => input['safetySettings'],
+          'generationConfig'  => input['generationConfig']
+        }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
 
-          post("/v1/#{model_path}:generateContent").payload(payload)
+        post("/v1/#{model_path}:generateContent").payload(payload)
       },
+
       output_fields: ->(object_definitions) { object_definitions['generate_content_output'] },
+
       sample_output: ->() {
         {
           'responseId' => 'resp-456',
@@ -521,80 +523,221 @@
       }
     },
 
-    # Embedding
+    # -------------------- New: Query with context chunks --------------
+    gen_answer_with_context: {
+      title: 'Generative: Answer with provided context chunks',
+      description: 'Answer a question using caller-supplied context chunks (RAG-lite). Returns structured JSON with citations.',
+      retry_on_request: ['GET', 'HEAD', 'POST'],
+      retry_on_response: [408, 429, 500, 502, 503, 504],
+      max_retries: 3,
+
+      input_fields: ->() {
+        [
+          { name: 'model', label: 'Model', optional: false,
+            control_type: 'select', pick_list: 'models_generative' },
+
+          { name: 'question', optional: false },
+
+          { name: 'context_chunks', type: 'array', of: 'object', optional: false, properties: [
+              { name: 'id' },
+              { name: 'text', optional: false },
+              { name: 'source' },              # e.g., dataset, email, kb
+              { name: 'uri', label: 'URI' },  # link to doc if any
+              { name: 'score', type: 'number' },
+              { name: 'metadata', type: 'object' }
+            ],
+            hint: 'Pass the top-N chunks from your retriever / process.'
+          },
+
+          { name: 'max_chunks', type: 'integer', optional: true, default: 20,
+            hint: 'Hard cap to avoid overlong prompts.' },
+
+          { name: 'system_preamble', optional: true,
+            hint: 'Optional guardrails (e.g., “only answer from context; say I don’t know otherwise”).' },
+
+          { name: 'temperature', type: 'number', optional: true, hint: 'Override temperature (default 0).' }
+        ]
+      },
+
+      execute: ->(connection, input) {
+        model_path = call(:build_model_path_with_global_preview, connection, input['model'])
+
+        max_chunks = call(:clamp_int, (input['max_chunks'] || 20), 1, 100)
+        chunks     = (input['context_chunks'] || [])[0, max_chunks]
+
+        error('context_chunks must be a non-empty array') if chunks.blank?
+
+        # Build a deterministic, schema-ed JSON response
+        gen_cfg = {
+          'temperature'       => (input['temperature'].presence || 0),
+          'maxOutputTokens'   => 1024,
+          'responseMimeType'  => 'application/json',
+          'responseSchema'    => {
+            'type'  => 'object',
+            'additionalProperties' => false,
+            'properties' => {
+              'answer'     => { 'type' => 'string' },
+              'citations'  => {
+                'type'  => 'array',
+                'items' => {
+                  'type' => 'object',
+                  'additionalProperties' => false,
+                  'properties' => {
+                    'chunk_id' => { 'type' => 'string' },
+                    'source'   => { 'type' => 'string' },
+                    'uri'      => { 'type' => 'string' },
+                    'score'    => { 'type' => 'number' }
+                  }
+                }
+              }
+            },
+            'required' => ['answer']
+          }
+        }
+
+        sys_inst = call(:system_instruction_from_text,
+          input['system_preamble'].presence ||
+            'Answer using ONLY the provided context chunks. ' \
+            'If the context is insufficient, reply with “I don’t know.” Keep answers concise and cite chunk IDs.')
+
+        # Format a single USER message containing the question + all chunks
+        context_blob = call(:format_context_chunks, chunks)
+        contents = [
+          { 'role' => 'user', 'parts' => [
+              { 'text' => "Question:\n#{input['question']}\n\nContext:\n#{context_blob}" }
+            ]
+          }
+        ]
+
+        payload = {
+          'contents'          => contents,
+          'systemInstruction' => sys_inst,
+          'generationConfig'  => gen_cfg
+        }
+
+        resp = post("/v1/#{model_path}:generateContent").payload(payload)
+
+        text = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
+        parsed = call(:safe_parse_json, text)
+        {
+          'answer'     => parsed['answer'] || text,
+          'citations'  => parsed['citations'] || [],
+          'responseId' => resp['responseId'],
+          'usage'      => resp['usageMetadata']
+        }
+      },
+
+      output_fields: ->() {
+        [
+          { name: 'answer' },
+          { name: 'citations', type: 'array', of: 'object', properties: [
+              { name: 'chunk_id' }, { name: 'source' }, { name: 'uri' }, { name: 'score', type: 'number' }
+            ]
+          },
+          { name: 'responseId' },
+          { name: 'usage', type: 'object', properties: [
+              { name: 'promptTokenCount', type: 'integer' },
+              { name: 'candidatesTokenCount', type: 'integer' },
+              { name: 'totalTokenCount', type: 'integer' }
+            ]
+          }
+        ]
+      },
+
+      sample_output: ->() {
+        {
+          'answer' => 'The outage began at 09:12 UTC due to a misconfigured firewall rule.',
+          'citations' => [
+            { 'chunk_id' => 'doc-42#p3', 'source' => 'postmortem', 'uri' => 'https://kb/acme/pm-42#p3', 'score' => 0.89 }
+          ],
+          'responseId' => 'resp-789',
+          'usage' => { 'promptTokenCount' => 311, 'candidatesTokenCount' => 187, 'totalTokenCount' => 498 }
+        }
+      }
+    },
+
+    # -------------------- Embeddings ---------------------------------
     embed_text: {
       title: 'Embed text',
       description: 'POST :predict on a publisher embedding model',
       retry_on_request: ['GET', 'HEAD', 'POST'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
+
       input_fields: ->() {
         [
           { name: 'model', label: 'Embedding model', optional: false,
-            control_type: 'select', pick_list: 'models_embedding', default: 'gemini-embedding-001',
-            hint: 'Pick from list or paste a model ID/path (e.g., gemini-embedding-001).' },
+            control_type: 'select', pick_list: 'models_embedding', default: 'text-embedding-004',
+            hint: 'Pick from list or paste a model ID/path.' },
+
           { name: 'texts', type: 'array', of: 'string', optional: false },
+
           { name: 'task', hint: 'Optional: RETRIEVAL_QUERY or RETRIEVAL_DOCUMENT' },
-          { name: 'autoTruncate', type: 'boolean', hint: 'Truncate long inputs automatically' }
+
+          { name: 'autoTruncate', type: 'boolean', hint: 'Truncate long inputs automatically' },
+
+          { name: 'outputDimensionality', type: 'integer', optional: true,
+            hint: 'Optional dimensionality reduction (see model docs).' }
         ]
       },
+
       execute: ->(connection, input) {
-        # Build the model path
         model_path = call(:build_embedding_model_path, connection, input['model'])
-        # Populate instances
+
         instances = (input['texts'] || []).map { |t|
           { 'content' => t, 'task_type' => input['task'] }.delete_if { |_k, v| v.nil? }
         }
-        # Configure params
+
         params = {}
-        params['autoTruncate'] = input['autoTruncate'] unless input['autoTruncate'].nil?
-        # Call endpoint
+        params['autoTruncate']        = true if input['autoTruncate'] == true
+        params['outputDimensionality']= input['outputDimensionality'] if input['outputDimensionality'].present?
+
         call(:predict_embeddings, model_path, instances, params)
       },
+
       output_fields: ->(object_definitions) { object_definitions['embed_output'] },
+
       sample_output: ->() {
-        { 'predictions' => [
-            { 'embeddings' => [ { 'values' => [0.012, -0.034, 0.056] } ] },
-            { 'embeddings' => [ { 'values' => [0.023, -0.045, 0.067] } ] }
-          ] }
+        {
+          'predictions' => [
+            { 'embeddings' => { 'values' => [0.012, -0.034, 0.056], 'statistics' => { 'truncated' => false, 'token_count' => 21 } } },
+            { 'embeddings' => { 'values' => [0.023, -0.045, 0.067], 'statistics' => { 'truncated' => false, 'token_count' => 18 } } }
+          ]
+        }
       }
     },
 
-    # Utility
+    # -------------------- Utility: count tokens -----------------------
     count_tokens: {
-      title: 'Utility:  Count tokens',
+      title: 'Utility: Count tokens',
       description: 'POST :countTokens on a publisher model',
       retry_on_request: ['GET', 'HEAD', 'POST'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
+
       input_fields: ->(object_definitions) {
         [
           { name: 'model', label: 'Model', optional: false,
             control_type: 'select', pick_list: 'models_generative' },
-          { name: 'contents', type: 'array', of: 'object', properties: object_definitions['content'], optional: false },
-          { name: 'systemInstruction', type: 'object', properties: object_definitions['content'] }
+
+          { name: 'contents', type: 'array', of: 'object',
+            properties: object_definitions['content'], optional: false },
+
+          { name: 'system_preamble', label: 'System preamble (text)', optional: true }
         ]
       },
+
       execute: ->(connection, input) {
         model_path = call(:build_model_path_with_global_preview, connection, input['model'])
-        contents = call(:sanitize_contents_roles, input['contents'])
-        sys_inst = call(:normalize_system_instruction, input['systemInstruction'])
-
-        payload = {
-          'contents' => contents,
-          'systemInstruction' => sys_inst,
-          'tools' => input['tools'],
-          'toolConfig' => input['toolConfig'],
-          'safetySettings' => input['safetySettings'],
-          'generationConfig' => input['generationConfig']
-        }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
+        contents   = call(:sanitize_contents_roles, input['contents'])
+        sys_inst   = call(:system_instruction_from_text, input['system_preamble'])
 
         post("/v1/#{model_path}:countTokens").payload({
-          'contents' => contents,
+          'contents'          => contents,
           'systemInstruction' => sys_inst
         }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) })
-
       },
+
       output_fields: ->() {
         [
           { name: 'totalTokens', type: 'integer' },
@@ -602,33 +745,39 @@
           { name: 'promptTokensDetails', type: 'array', of: 'object' }
         ]
       },
+
       sample_output: ->() {
         { 'totalTokens' => 31, 'totalBillableCharacters' => 96,
           'promptTokensDetails' => [ { 'modality' => 'TEXT', 'tokenCount' => 31 } ] }
       }
     },
 
+    # -------------------- GCS simple upload ---------------------------
     upload_to_gcs: {
-      title: 'Utility:  Upload to Cloud Storage (simple upload)',
+      title: 'Utility: Upload to Cloud Storage (simple upload)',
       description: 'Simple media upload to GCS (uploadType=media)',
+
       input_fields: ->() {
         [
-          { name: 'bucket', optional: false },
+          { name: 'bucket',      optional: false },
           { name: 'object_name', optional: false, label: 'Object path/name' },
           { name: 'content_type', optional: false },
           { name: 'file', type: 'file', optional: false }
         ]
       },
+
       execute: ->(_connection, input) {
         post("https://storage.googleapis.com/upload/storage/v1/b/#{CGI.escape(input['bucket'])}/o")
           .params(uploadType: 'media', name: input['object_name'])
           .headers('Content-Type': input['content_type'])
           .request_body(input['file'])
       },
+
       output_fields: ->() {
         [ { name: 'bucket' }, { name: 'name' }, { name: 'generation' },
           { name: 'size' }, { name: 'contentType' }, { name: 'mediaLink' } ]
       },
+
       sample_output: ->() {
         { 'bucket' => 'my-bucket', 'name' => 'docs/foo.pdf', 'generation' => '1728533890000',
           'size' => '123456', 'contentType' => 'application/pdf',
@@ -636,75 +785,79 @@
       }
     },
 
-    # Generic
+    # -------------------- Generic endpoint predict --------------------
     endpoint_predict: {
       title: 'Endpoint predict (custom model)',
       description: 'POST :predict to a Vertex AI Endpoint',
       retry_on_request: ['GET', 'HEAD', 'POST'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
+
       input_fields: ->() {
         [
-          { name: 'endpoint', optional: false, hint: 'Endpoint ID or full resource path' },
-          { name: 'instances', type: 'array', of: 'object', optional: false },
+          { name: 'endpoint',   optional: false, hint: 'Endpoint ID or full resource path' },
+          { name: 'instances',  type: 'array', of: 'object', optional: false },
           { name: 'parameters', type: 'object' }
         ]
       },
+
       execute: ->(connection, input) {
-        # Confirm regional endpoint (UCAIP)
-        call(:ensure_regional_location!) # will throw if connection does not contain required element
-        # Build endpoint path
+        call(:ensure_regional_location!, connection) # require non-global
         endpoint_path = call(:build_endpoint_path, connection, input['endpoint'])
-        # Post
+
         post("/v1/#{endpoint_path}:predict")
           .payload({ 'instances' => input['instances'], 'parameters' => input['parameters'] }.delete_if { |_k, v| v.nil? })
       },
+
       output_fields: ->(object_definitions) { object_definitions['predict_output'] },
+
       sample_output: ->() {
         { 'predictions' => [ { 'score' => 0.92, 'label' => 'positive' } ],
           'deployedModelId' => '1234567890' }
       }
     },
 
-    # Batch
+    # -------------------- Batch --------------------------------------
     batch_prediction_create: {
       title: 'Batch: Create prediction job',
       description: 'Create projects.locations.batchPredictionJobs',
       batch: true,
+
       input_fields: ->() {
         [
           { name: 'displayName', optional: false },
-          { name: 'model', optional: false, hint: 'Full model resource or publisher model' },
+          { name: 'model',       optional: false, hint: 'Full model resource or publisher model' },
           { name: 'gcsInputUris', type: 'array', of: 'string', optional: false },
-          { name: 'instancesFormat', optional: false, hint: 'jsonl,csv,bigquery,tf-record,file-list' },
+          { name: 'instancesFormat',   optional: false, hint: 'jsonl,csv,bigquery,tf-record,file-list' },
           { name: 'predictionsFormat', optional: false, hint: 'jsonl,csv,bigquery' },
           { name: 'gcsOutputUriPrefix', optional: false, hint: 'gs://bucket/path/' },
           { name: 'modelParameters', type: 'object' }
         ]
       },
+
       execute: ->(connection, input) {
-        # Confirm regional endpoint (UCAIP)
-        call(:ensure_regional_location!) # will throw if connection does not contain required element
-        # Build Path
+        call(:ensure_regional_location!, connection)
         path = "/v1/projects/#{connection['project_id']}/locations/#{connection['location']}/batchPredictionJobs"
-        # Build payload
+
         payload = {
-          'displayName' => input['displayName'],
-          'model' => input['model'],
-          'inputConfig' => {
+          'displayName'  => input['displayName'],
+          'model'        => input['model'],
+          'inputConfig'  => {
             'instancesFormat' => input['instancesFormat'],
-            'gcsSource' => { 'uris' => input['gcsInputUris'] }
+            'gcsSource'       => { 'uris' => input['gcsInputUris'] }
           },
           'outputConfig' => {
             'predictionsFormat' => input['predictionsFormat'],
-            'gcsDestination' => { 'outputUriPrefix' => input['gcsOutputUriPrefix'] }
+            'gcsDestination'    => { 'outputUriPrefix' => input['gcsOutputUriPrefix'] }
           },
           'modelParameters' => input['modelParameters']
         }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
-        # Post
+
         post(path).payload(payload)
       },
+
       output_fields: ->(object_definitions) { object_definitions['batch_job'] },
+
       sample_output: ->() {
         { 'name' => 'projects/p/locations/us-central1/batchPredictionJobs/123',
           'displayName' => 'batch-2025-10-06',
@@ -717,18 +870,19 @@
       title: 'Batch: Fetch prediction job (get)',
       description: 'Get a batch prediction job by ID',
       batch: true,
+
       input_fields: ->() { [ { name: 'job_id', optional: false } ] },
+
       execute: ->(connection, input) {
-        # Confirm regional endpoint (UCAIP)
-        call(:ensure_regional_location!) # will throw if connection does not contain required element
-        # Find the job
+        call(:ensure_regional_location!, connection)
         name = input['job_id'].to_s.start_with?('projects/') ?
           input['job_id'] :
           "projects/#{connection['project_id']}/locations/#{connection['location']}/batchPredictionJobs/#{input['job_id']}"
-        # Get
         get("/v1/#{name}")
       },
+
       output_fields: ->(object_definitions) { object_definitions['batch_job'] },
+
       sample_output: ->() {
         { 'name' => 'projects/p/locations/us-central1/batchPredictionJobs/123',
           'displayName' => 'batch-2025-10-06',
@@ -740,13 +894,14 @@
 
   # ====== PICK LISTS ==================================================
   pick_lists: {
-    # --- Modes
     modes_classification: ->() {
       [%w[Embedding embedding], %w[Generative generative], %w[Hybrid hybrid]]
     },
-    modes_grounding: ->() { [%w[Google\ Search google_search], %w[Vertex\ AI\ Search vertex_ai_search]] },
 
-    # --- Models
+    modes_grounding: ->() {
+      [%w[Google\ Search google_search], %w[Vertex\ AI\ Search vertex_ai_search]]
+    },
+
     models_embedding: ->(connection) {
       resp = get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models')
               .params(pageSize: 2000, listAllVersions: true)
@@ -758,43 +913,35 @@
       region = call(:embedding_region, connection)
 
       ids.map { |id|
-        # value is a regional resource; label is the bare id
         [id, "projects/#{connection['project_id']}/locations/#{region}/publishers/google/models/#{id}"]
       }
     },
 
-    # All Gemini-like text/VLM models, with preview 2.5s emitting a GLOBAL-anchored value
     models_generative: ->(connection) {
       resp = get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models')
               .params(pageSize: 2000, listAllVersions: true)
       items = (resp['publisherModels'] || [])
                 .map { |m| m['name'].to_s.split('/').last }
-                .select { |id| id.start_with?('gemini-') }  # exclude imagen
-                .uniq
-                .sort
+                .select { |id| id.start_with?('gemini-') }
+                .uniq.sort
       items.map { |id|
         [id, "projects/#{connection['project_id']}/locations/global/publishers/google/models/#{id}"]
       }
     },
 
-    # --- Roles
-    roles: ->() { [['user','user'], ['model','model'], ['system','system']] }
-
+    # Contract-conformant roles (system handled via system_preamble)
+    roles: ->() { [['user','user'], ['model','model']] }
   },
 
   # ====== METHODS =====================================================
   methods: {
-    # Normalizes a "model" input into a full resource path.
+    # Build model path for publisher models (Gemini/embeddings). Generative defaults to global.
     build_model_path_with_global_preview: ->(connection, model) {
       m = (model || '').strip
-      return m if m.start_with?('projects/')  # full path from picklist => use as-is
+      return m if m.start_with?('projects/')
 
-      # Allow shorthand "google/models/..." -> "publishers/google/models/..."
       m = "publishers/#{m}" if m.start_with?('google/models/')
-
-      # For publisher models (Gemini/embeddings), default to global; it’s the safest superset.
       loc = 'global'
-
       if m.start_with?('publishers/')
         "projects/#{connection['project_id']}/locations/#{loc}/#{m}"
       else
@@ -807,13 +954,13 @@
       ep.start_with?('projects/') ? ep : "projects/#{connection['project_id']}/locations/#{connection['location']}/endpoints/#{ep}"
     },
 
-    # Build a single text for embedding/classification
+    # Build a single email text body for classification
     build_email_text: ->(subject, body) {
       s = subject.to_s.strip
       b = body.to_s.strip
       parts = []
       parts << "Subject: #{s}" if s.present?
-      parts << "Body:\n#{b}" if b.present?
+      parts << "Body:\n#{b}"    if b.present?
       parts.join("\n\n")
     },
 
@@ -821,10 +968,11 @@
       loc = (connection['location'] || '').downcase
       error("This action requires a regional location (e.g., us-central1). Current location is '#{loc}'.") if loc.blank? || loc == 'global'
     },
-    # Extracts a float vector from Vertex embedding prediction shapes
+
+    # Extracts float vector from embedding prediction (both shapes supported)
     extract_embedding_vector: ->(pred) {
-      vec = pred.dig('embeddings', 0, 'values') ||
-            pred.dig('embeddings', 'values') ||
+      vec = pred.dig('embeddings', 'values') ||
+            pred.dig('embeddings', 0, 'values') ||
             pred['values']
       error('Embedding prediction missing values') if vec.blank?
       vec.map(&:to_f)
@@ -832,7 +980,6 @@
 
     vector_cosine_similarity: ->(a, b) {
       return 0.0 if a.blank? || b.blank?
-      # dot(a,b) / (||a|| * ||b||)
       dot = 0.0
       sum_a = 0.0
       sum_b = 0.0
@@ -841,7 +988,7 @@
       while i < len
         ai = a[i].to_f
         bi = b[i].to_f
-        dot += ai * bi
+        dot   += ai * bi
         sum_a += ai * ai
         sum_b += bi * bi
         i += 1
@@ -858,11 +1005,9 @@
 
     build_embedding_model_path: ->(connection, model) {
       m = (model || '').strip
-      return m if m.start_with?('projects/')  # keep full resource path as-is
+      return m if m.start_with?('projects/')
 
-      # Allow "google/models/..." shorthands
       m = "publishers/#{m}" if m.start_with?('google/models/')
-
       loc = call(:embedding_region, connection)
       if m.start_with?('publishers/')
         "projects/#{connection['project_id']}/locations/#{loc}/#{m}"
@@ -871,32 +1016,38 @@
       end
     },
 
+    # Conservative instance limits by model family
     embedding_max_instances: ->(model_path_or_id) {
-      id = model_path_or_id.to_s.split('/').last # handle full path or bare id
-      id.include?('gemini-embedding-001') ? 1 : 250
+      id = model_path_or_id.to_s.split('/').last
+      if id.include?('gemini-embedding-001')
+        1
+      elsif id.include?('text-embedding-004')
+        100
+      else
+        96
+      end
     },
 
     predict_embeddings: ->(model_path, instances, params={}) {
-      max = call(:embedding_max_instances, model_path)
+      max  = call(:embedding_max_instances, model_path)
       preds = []
-      instances.each_slice(max) do |slice|
+      (instances || []).each_slice(max) do |slice|
         resp = post("/v1/#{model_path}:predict")
-                .payload({ 'instances' => slice,
-                            'parameters' => (params.presence || {}) }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) })
+                .payload({
+                  'instances'  => slice,
+                  'parameters' => (params.presence || {})
+                }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) })
         preds.concat(resp['predictions'] || [])
       end
       { 'predictions' => preds }
     },
 
-    # Calls Gemini to choose among categories and explain (structured output)
+    # Minimal, schema-constrained JSON referee using Gemini
     llm_referee: ->(connection, model, email_text, shortlist_names, all_cats) {
       model_path = call(:build_model_path_with_global_preview, connection, model)
 
-      # Build a normalized list (name + optional details) and restrict to shortlist if provided
-      cats_norm = all_cats.map { |c|
-        c.is_a?(Hash) ? c : { 'name' => c.to_s }
-      }
-      allowed = shortlist_names.present? ? shortlist_names : cats_norm.map { |c| c['name'] }
+      cats_norm = all_cats.map { |c| c.is_a?(Hash) ? c : { 'name' => c.to_s } }
+      allowed   = shortlist_names.present? ? shortlist_names : cats_norm.map { |c| c['name'] }
 
       system_text = <<~SYS
         You are a strict email classifier. Choose exactly one category from the allowed list.
@@ -914,7 +1065,7 @@
         Category descriptions (if any):
         #{cats_norm.map { |c|
             desc = c['description']
-            exs = (c['examples'] || [])
+            exs  = (c['examples'] || [])
             line = "- #{c['name']}"
             line += ": #{desc}" if desc.present?
             line += " | examples: #{exs.join(' ; ')}" if exs.present?
@@ -923,29 +1074,29 @@
       USR
 
       payload = {
-        'systemInstruction' => { 'role' => 'SYSTEM', 'parts' => [ { 'text' => system_text } ] },
+        'systemInstruction' => { 'role' => 'system', 'parts' => [ { 'text' => system_text } ] },
         'contents' => [
-          { 'role' => 'USER', 'parts' => [ { 'text' => user_text } ] }
+          { 'role' => 'user', 'parts' => [ { 'text' => user_text } ] }
         ],
         'generationConfig' => {
-          'temperature' => 0,
-          'maxOutputTokens' => 256,
-          'responseMimeType' => 'application/json',
-          'responseSchema' => {
+          'temperature'       => 0,
+          'maxOutputTokens'   => 256,
+          'responseMimeType'  => 'application/json',
+          'responseSchema'    => {
             'type' => 'object',
             'additionalProperties' => false,
             'properties' => {
-              'category' => { 'type' => 'string' },
-              'confidence' => { 'type' => 'number' },
-              'reasoning' => { 'type' => 'string' },
+              'category'     => { 'type' => 'string' },
+              'confidence'   => { 'type' => 'number' },
+              'reasoning'    => { 'type' => 'string' },
               'distribution' => {
-                'type' => 'array',
+                'type'  => 'array',
                 'items' => {
                   'type' => 'object',
                   'additionalProperties' => false,
                   'properties' => {
                     'category' => { 'type' => 'string' },
-                    'prob' => { 'type' => 'number' }
+                    'prob'     => { 'type' => 'number' }
                   },
                   'required' => %w[category prob]
                 }
@@ -954,17 +1105,13 @@
             'required' => %w[category]
           }
         }
-      }.delete_if { |_k, v| v.nil? }
+      }
 
-      resp = post("/v1/#{model_path}:generateContent").payload(payload)
-      text = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s.strip
+      resp   = post("/v1/#{model_path}:generateContent").payload(payload)
+      text   = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s.strip
       parsed = JSON.parse(text) rescue { 'category' => nil, 'confidence' => nil, 'reasoning' => nil, 'distribution' => [] }
 
-      # Ensure category stays within allowed list
-      unless parsed['category'].present? && allowed.include?(parsed['category'])
-        parsed['category'] = allowed.first
-      end
-
+      parsed['category'] = allowed.first unless parsed['category'].present? && allowed.include?(parsed['category'])
       parsed
     },
 
@@ -977,11 +1124,38 @@
       end
     },
 
-    normalize_system_instruction: ->(si) {
-      return nil if si.blank?
-      dup = si.dup
-      dup['role'] = 'system'
-      dup
+    # Accept plain text and produce a proper systemInstruction
+    system_instruction_from_text: ->(text) {
+      return nil if text.blank?
+      { 'role' => 'system', 'parts' => [ { 'text' => text.to_s } ] }
+    },
+
+    clamp_int: ->(n, min, max) {
+      [[n.to_i, min].max, max].min
+    },
+
+    format_context_chunks: ->(chunks) {
+      # Stable, parseable layout the model can learn
+      chunks.each_with_index.map { |c, i|
+        cid  = c['id'] || "chunk-#{i+1}"
+        src  = c['source']
+        uri  = c['uri']
+        sc   = c['score']
+        meta = c['metadata']
+
+        header = ["[#{cid}]",
+                  (src.present? ? "source=#{src}" : nil),
+                  (uri.present? ? "uri=#{uri}"     : nil),
+                  (sc  ? "score=#{sc}"             : nil)].compact.join(' ')
+
+        body = c['text'].to_s
+        meta_str = meta.present? ? "\n(meta: #{meta.to_json})" : ''
+        "#{header}\n#{body}#{meta_str}"
+      }.join("\n\n---\n\n")
+    },
+
+    safe_parse_json: ->(s) {
+      JSON.parse(s) rescue { 'answer' => s }
     }
   },
 
