@@ -1141,7 +1141,6 @@
         body: 'Sequentially uploads each item. Continue-on-error by default. Use multipart if you need custom metadata.'
       },
 
-      # Minimal, consistent config
       config_fields: [
         { name: 'item_input_mode', label: 'Item input', control_type: 'select', default: 'recipe_array',
           sticky: true, extends_schema: true, options: [
@@ -1326,7 +1325,7 @@
         learn_more_text: 'Cloud Storage: objects.insert (upload)',
         body: 'Exports Google Docs/Sheets/Slides to text (or CSV for Sheets) by default, downloads other files, and uploads to the specified GCS bucket using a simple media upload.'
       },
-      # CONFIG
+
       config_fields: [
         { name: 'file_input_mode', label: 'File input', control_type: 'select', default: 'recipe_array',
           sticky: true, extends_schema: true, options: [
@@ -1334,7 +1333,7 @@
             ['Mapped array', 'recipe_array']
           ]}
       ],
-      # INPUT
+
       input_fields: lambda do
         [
           { name: 'bucket', optional: false, group: 'Google Cloud Storage' },
@@ -1362,6 +1361,7 @@
 
         ]
       end,
+
       output_fields: lambda do |object_definitions|
         [
           { name: 'uploaded', type: 'array', of: 'object', properties: [
@@ -1378,7 +1378,7 @@
           { name: 'telemetry', type: 'object', properties: object_definitions['telemetry'] }
         ]
       end,
-      # EXECUTE
+
       execute: lambda do |connection, input|
         action_cid = call('gen_correlation_id')
         started_at = Time.now
@@ -1445,7 +1445,7 @@
               )
               # Only strip URLs for textual exports
               texty = export_mime.to_s.start_with?('text/') || %w[application/json application/xml image/svg+xml].include?(export_mime.to_s)
-              bytes = (strip && texty) ? call('strip_urls_from_text', exp['data'].to_s.force_encoding('UTF-8')) : exp['data']
+              bytes = (strip && texty) ? call('strip_urls_from_text', exp['data']) : exp['data']
               upload_mime = export_mime
             else
               # Don’t try alt=media on Editors files without a mapping; it will 403
@@ -1610,11 +1610,10 @@
   
     sanitize_headers: lambda do |hdrs|
       h = hdrs.is_a?(Hash) ? hdrs : {}
-      # Drop sensitive or noisy headers by name
       h.each_with_object({}) do |(k, v), out|
         key = k.to_s
         next if key =~ /\A(set-cookie|authorization|proxy-authorization)\z/i
-        out[key] = v
+        out[key] = call('safe_utf8', v)
       end
     end,
 
@@ -1711,7 +1710,9 @@
       msg += " — #{message}" if message && message != detail
       msg += " (cid: #{cid})" if cid
       msg += "\nHint: #{hint}"
-      msg += "\nRaw: #{body}" if verbose
+      # Don't print raw binary in verbose errors
+      safe_raw = body.is_a?(String) ? call('safe_utf8', body) : body.to_s
+      msg += "\nRaw: #{safe_raw}" if verbose
       msg
     end,
 
@@ -1772,6 +1773,7 @@
       base = { 'text_content' => '', 'needs_processing' => false, 'fetch_method' => 'skipped', 'export_mime_type' => nil, 'http' => nil }
       return base unless include_content
 
+      # Export path
       export_mime = call('get_export_mime', mime_type)
       if export_mime
         r = call('http_request',
@@ -1784,7 +1786,7 @@
         )
         is_text_export = export_mime.to_s.start_with?('text/') || %w[application/json application/xml image/svg+xml].include?(export_mime.to_s)
         return {
-          'text_content'     => (is_text_export ? r['data'].to_s.force_encoding('UTF-8') : ''),
+          'text_content'     => (is_text_export ? call('safe_utf8', r['data']) : ''),
           'needs_processing' => !is_text_export,
           'fetch_method'     => 'export',
           'export_mime_type' => export_mime,
@@ -1797,6 +1799,7 @@
         return { 'text_content' => '', 'needs_processing' => true, 'fetch_method' => 'export-required', 'export_mime_type' => nil, 'http' => nil }
       end
 
+      # Download path
       r = call('http_request',
         method: :get,
         url: call('build_endpoint_url', :drive, :download, file_id),
@@ -1810,7 +1813,7 @@
       needs_processing = !!(mime_type.to_s.start_with?('application/pdf') || mime_type.to_s.start_with?('image/'))
 
       {
-        'text_content'     => (is_text ? r['data'].to_s.force_encoding('UTF-8') : ''),
+        'text_content'     => (is_text ? call('safe_utf8', r['data']) : ''),
         'needs_processing' => needs_processing,
         'fetch_method'     => 'download',
         'export_mime_type' => nil,
@@ -1918,9 +1921,8 @@
 
     # ---------- Text utilities ----------
     strip_urls_from_text: lambda do |s|
-      t = s.to_s
+      t = call('safe_utf8', s)
       return t if t == ''
-      # Remove http(s):// and bare www. links
       t.gsub(%r{(?:https?://|www\.)\S+}i, '')
     end,
 
@@ -1964,7 +1966,8 @@
         raw_response: true,
         context: { action: 'GCS download (media)', bucket: bucket, object: object_name, correlation_id: cid, verbose_errors: connection['verbose_errors'] }
       )
-      { 'text_content' => r['data'].to_s.force_encoding('UTF-8'), 'needs_processing' => false, 'fetch_method' => 'download' }
+      { 'text_content' => call('safe_utf8', r['data']), 'needs_processing' => false, 'fetch_method' => 'download' }
+
     end,
 
     gcs_get_metadata: lambda do |connection, bucket, object_name, cid|
@@ -1996,6 +1999,22 @@
       key
     end,
 
+    # Fix for binary bytes getting mixed w/ UTF-8 in HTTP calls
+    # Problem looks like exception, "\x... from ASCII-8BIT TO UTF-8"
+    safe_utf8: lambda do |val|
+      s = val.to_s
+      begin
+        # If already UTF-8, scrub invalid sequences; otherwise transcode from bytes.
+        if s.encoding.name == 'UTF-8'
+          s.valid_encoding? ? s : s.scrub
+        else
+          s.encode('UTF-8', 'binary', invalid: :replace, undef: :replace)
+        end
+      rescue
+        s.force_encoding('UTF-8').scrub
+      end
+    end,
+
     choose_export_mime_for_docs: lambda do |mime|
       call('get_export_mime', mime) # reuse your Drive mapping (Docs->text/plain, Sheets->text/csv, Slides->text/plain)
     end,
@@ -2007,13 +2026,17 @@
       meta['metadata'] = cm unless cm.empty?
 
       json_part = JSON.generate(meta)
-      # Build multipart/related body with CRLF delimiters
-      body = []
-      body << "--#{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n#{json_part}\r\n"
-      body << "--#{boundary}\r\nContent-Type: #{meta['contentType']}\r\n\r\n"
-      body << bytes.to_s
-      body << "\r\n--#{boundary}--"
-      multipart_body = body.join
+
+      # Build parts with explicit CRLF and binary encoding
+      part1 = "--#{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n#{json_part}\r\n"
+      part2 = "--#{boundary}\r\nContent-Type: #{meta['contentType']}\r\n\r\n"
+      part3 = "\r\n--#{boundary}--"
+
+      multipart_body = ''.b
+      multipart_body << part1.dup.force_encoding('ASCII-8BIT')
+      multipart_body << part2.dup.force_encoding('ASCII-8BIT')
+      multipart_body << bytes.to_s.b                             # raw payload as bytes
+      multipart_body << part3.dup.force_encoding('ASCII-8BIT')
 
       params = { uploadType: 'multipart' }
       params.merge!(extra_params || {})
@@ -2023,7 +2046,7 @@
         url: call('build_endpoint_url', :storage, :objects_upload_media, bucket),
         params: params,
         headers: {
-          'Content-Type'   => "multipart/related; boundary=#{boundary}",
+          'Content-Type'     => "multipart/related; boundary=#{boundary}",
           'X-Correlation-Id' => cid
         },
         payload: multipart_body, raw_body: true,
