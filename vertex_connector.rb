@@ -22,16 +22,12 @@
       { name: 'location', optional: false, hint: 'e.g., global, us-central1, us-east4' },
       { name: 'scope', optional: true, hint: 'OAuth scope(s)', default: 'https://www.googleapis.com/auth/cloud-platform',
         control_type: 'select', options: [['Cloud Platform (all)', 'https://www.googleapis.com/auth/cloud-platform']] },
-    ],
-    extended_fields: lambda do |connection|
-      if connection['project_id']
-        [
-          { name: 'quota_project_id', label: 'Quota/billing project (optional)', optional: true, extends_schema: true,
-            hint: 'Sets x-goog-user-project for billing/quota. Service account must have roles/serviceusage.serviceUsageConsumer on this project.' },
-          { name: 'client_email', label: 'Service account client_email', optional: false, extends_schema: true },
-          { name: 'private_key',  label: 'Service account private_key',  optional: false, extends_schema: true,
-            control_type: 'password', multiline: true, hint: 'Include BEGIN/END PRIVATE KEY lines.' }
-        ]
+      { name: 'quota_project_id', label: 'Quota/billing project (optional)', optional: true, extends_schema: true,
+        hint: 'Sets x-goog-user-project for billing/quota. Service account must have roles/serviceusage.serviceUsageConsumer on this project.' },
+      { name: 'client_email', label: 'Service account client_email', optional: false, extends_schema: true },
+      { name: 'private_key',  label: 'Service account private_key',  optional: false, extends_schema: true,
+        control_type: 'password', multiline: true, hint: 'Include BEGIN/END PRIVATE KEY lines.' }
+    ]
     end,
 
     authorization: {
