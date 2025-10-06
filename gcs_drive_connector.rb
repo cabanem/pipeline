@@ -346,7 +346,7 @@
           { name: 'modified_before', type: 'date_time' },
           { name: 'mime_type',       label: 'MIME type' },
           { name: 'exclude_folders', type: 'boolean', control_type: 'checkbox', toggle_hint: 'Use custom value',
-            toggle_field: {{name: 'exclude_folders', label: 'Exclude folders', type: 'string', multiline: true}}},
+            toggle_field: {name: 'exclude_folders', label: 'Exclude folders', type: 'string', multiline: true}},
           { name: 'page_token',      label: 'Page token' }
         ]
       end,
