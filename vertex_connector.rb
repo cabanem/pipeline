@@ -13,16 +13,21 @@
       { name: 'location', optional: false, hint: 'e.g., global, us-central1' },
 
       # --- Service account inputs (choose ONE path) ---
-      { name: 'sa_key_json', label: 'Service account key JSON', optional: true, control_type: 'password', multiline: true,
-        hint: 'Paste the full JSON key. If provided, client_email/private_key below are ignored.' },
+      { name: 'auth_option', label: 'Authentication Path', optional: false, control_type: 'select',
+        options: [ ['Full JSON Key', 'key'], ['Individual Fields', 'fields']]},
 
-      { name: 'client_email', label: 'Service account client_email', optional: true, hint: 'Used if sa_key_json not provided' },
+      { name: 'sa_key_json', label: 'Service account key JSON', optional: true, control_type: 'password', multiline: true,
+        ngIf: 'auth_option == "fields"', hint: 'Paste the full JSON key. If provided, client_email/private_key below are ignored.' },
+
+      { name: 'client_email', label: 'Service account client_email', optional: true, hint: 'Used if sa_key_json not provided',
+        ngIf: 'auth_option == "key"'},
       { name: 'private_key', label: 'Service account private_key', optional: true, control_type: 'password', multiline: true,
-        hint: 'Include BEGIN/END PRIVATE KEY lines. Used if sa_key_json not provided.' },
+        ngIf: 'auth_option == "key"', hint: 'Include BEGIN/END PRIVATE KEY lines. Used if sa_key_json not provided.' },
 
       { name: 'subject', optional: true, hint: 'Optional user to impersonate (domain-wide delegation)' },
 
-      { name: 'scope', optional: true, hint: 'OAuth scope(s), space-separated', default: 'https://www.googleapis.com/auth/cloud-platform' }
+      { name: 'scope', optional: true, hint: 'OAuth scope(s)', default: 'https://www.googleapis.com/auth/cloud-platform',
+        control_type: 'multiselect', options: [['https://www.googleapis.com/auth/cloud-platform']] }
     ],
 
     authorization: {
@@ -195,14 +200,12 @@
     embed_output: {
       fields: ->() {
         [
-          { name: 'predictions', type: 'array', of: 'object', properties: [
-              { name: 'embeddings', type: 'array', of: 'object', properties: [
-                  { name: 'values', type: 'array', of: 'number' }
-                ]
-              }
-            ]
-          ]
-        ]
+          { name: 'predictions', type: 'array', of: 'object',
+            properties: [
+              { name: 'embeddings', type: 'array', of: 'object',
+                properties: [ { name: 'values', type: 'array', of: 'number' } ]
+              }]
+          }]
       }
     },
 
