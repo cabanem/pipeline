@@ -42,7 +42,7 @@
         exp = iat + 3600 # 1 hour validity per Google’s service-account flow
 
         jwt_body = {
-          iat: now.to_i,
+          iat: iat,
           exp: exp,
           aud: 'https://oauth2.googleapis.com/token',
           iss: iss,
@@ -66,16 +66,16 @@
     },
 
     base_uri: ->(connection) {
-      loc = (connection['location'] || 'global').downcase
-      loc == 'global' ? 'https://aiplatform.googleapis.com' : "https://#{loc}-aiplatform.googleapis.com"
+      'https://aiplatform.googleapis.com'
     }
   },
 
   test: ->(connection) {
     project_id  = connection['project_id']
     location    = connection['location']
-    # Protected publisher list that requires auth at project/location scope.
-    get("/v1/projects/#{project_id}/locations/#{location}/publishers/google/models")
+    # Protected publisher list that requires auth at project/location scope
+    get("/v1/projects/#{project_id}/locations/#{location}/models")
+      # alt == 'get("/v1/projects/#{project_id}/locations/#{location}/endpoints")'
       .params(pageSize: 1)
   },
 
@@ -221,8 +221,9 @@
   # ====== ACTIONS =====================================================
   actions: {
 
-    text_categorize_email: {
-      title: 'Categorize email',
+    # Generative
+    gen_categorize_email: {
+      title: 'Generative:  Categorize email',
       description: 'Classify an email into one of the provided categories using embeddings (default) or a generative referee.',
       input_fields: ->() {
         [
@@ -407,8 +408,8 @@
       }
     },
 
-    text_generate_content: {
-      title: 'Generate content (Gemini)',
+    gen_generate_content: {
+      title: 'Generative:  Generate content (Gemini)',
       description: 'POST :generateContent on a publisher model',
       input_fields: ->(object_definitions) {
         [
@@ -461,8 +462,8 @@
       }
     },
 
-    text_generate_grounded: {
-      title: 'Generate (grounded)',
+    gen_generate_grounded: {
+      title: 'Generative:  Generate (grounded)',
       description: 'Generate with grounding via Google Search or Vertex AI Search',
       input_fields: ->(object_definitions) {
         [
@@ -511,6 +512,7 @@
       }
     },
 
+    # Embedding
     embed_text: {
       title: 'Embed text',
       description: 'POST :predict on a publisher embedding model',
@@ -542,8 +544,9 @@
       }
     },
 
+    # Utility
     count_tokens: {
-      title: 'Count tokens',
+      title: 'Utility:  Count tokens',
       description: 'POST :countTokens on a publisher model',
       input_fields: ->(object_definitions) {
         [
@@ -574,7 +577,7 @@
     },
 
     upload_to_gcs: {
-      title: 'Upload to Cloud Storage (simple upload)',
+      title: 'Utility:  Upload to Cloud Storage (simple upload)',
       description: 'Simple media upload to GCS (uploadType=media)',
       input_fields: ->() {
         [
@@ -601,6 +604,7 @@
       }
     },
 
+    # Generic
     endpoint_predict: {
       title: 'Endpoint predict (custom model)',
       description: 'POST :predict to a Vertex AI Endpoint',
@@ -623,8 +627,9 @@
       }
     },
 
+    # Batch
     batch_prediction_create: {
-      title: 'Batch prediction (create)',
+      title: 'Batch: Create prediction job',
       description: 'Create projects.locations.batchPredictionJobs',
       batch: true,
       input_fields: ->() {
@@ -666,7 +671,7 @@
     },
 
     batch_prediction_get: {
-      title: 'Batch prediction (get)',
+      title: 'Batch: Fetch prediction job (get)',
       description: 'Get a batch prediction job by ID',
       batch: true,
       input_fields: ->() { [ { name: 'job_id', optional: false } ] },
@@ -752,15 +757,16 @@
       m = (model || '').strip
       return m if m.start_with?('projects/')
 
+      # Allow shorthand "google/models/..." -> "publishers/google/models/..."
+      m = "publishers/#{m}" if m.start_with?('google/models/')
+
       # Determine location to use
       loc = (connection['location'] || 'global').downcase
 
-      # Force global if:
-      #  - model id includes 'gemini-2.5' AND this is a previewy-looking alias (best-effort),
-      #    because per Google, newest 2.5 previews ship only in 'global'.
-      previewy = m =~ /(@|latest|preview|exp)/i
-      force_global = (m.include?('gemini-2.5') && previewy)
-      loc = 'global' if force_global
+      # Many 2.5 models are global-only. Prefer global to avoid regional 404s.
+      if m.include?('gemini-2.5')
+        loc = 'global'
+      end
 
       if m.start_with?('publishers/')
         "projects/#{connection['project_id']}/locations/#{loc}/#{m}"
