@@ -899,49 +899,49 @@
   },
 
   # ====== PICK LISTS ==================================================
-  pick_lists: {
-    modes_classification: ->() {
-      [%w[Embedding embedding], %w[Generative generative], %w[Hybrid hybrid]]
-    },
-
-    modes_grounding: ->() {
-      [%w[Google\ Search google_search], %w[Vertex\ AI\ Search vertex_ai_search]]
-    },
-
-    models_embedding: ->(connection) {
-      begin
-        resp = get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models')
-                 .params(pageSize: 200, listAllVersions: true)
-        ids = call(:safe_array, resp && resp['publisherModels'])
-                .map { |m| m['name'].to_s.split('/').last }
-                .select { |id| id.start_with?('text-embedding') || id.start_with?('multimodal-embedding') }
-                .uniq.sort
-      rescue => _e
-        # Safe fallback, never return boolean false to UI
-        ids = %w[text-embedding-005 multimodal-embedding-001]
-      end
-      region = call(:embedding_region, connection)
-      ids.map { |id| [id, "projects/#{connection['project_id']}/locations/#{region}/publishers/google/models/#{id}"] }
-    },
-
-    models_generative: ->(connection) {
-      begin
-        resp = get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models')
-                 .params(pageSize: 200, listAllVersions: true)
-        items = call(:safe_array, resp && resp['publisherModels'])
-                  .map { |m| m['name'].to_s.split('/').last }
-                  .select { |id| id.start_with?('gemini-') }
-                  .uniq.sort
-      rescue => _e
-        # Safe fallback; include commonly available SKUs so builder remains usable
-        items = %w[gemini-2.5-pro gemini-2.0-flash gemini-1.5-flash]
-      end
-      items.map { |id| [id, "projects/#{connection['project_id']}/locations/global/publishers/google/models/#{id}"] }
-    },
-
-    # Contract-conformant roles (system handled via system_preamble)
-    roles: ->() { [['user','user'], ['model','model']] }
+pick_lists: {
+  modes_classification: ->() {
+    [%w[Embedding embedding], %w[Generative generative], %w[Hybrid hybrid]]
   },
+
+  modes_grounding: ->() {
+    [%w[Google\ Search google_search], %w[Vertex\ AI\ Search vertex_ai_search]]
+  },
+
+  models_embedding: ->(_connection) {
+    begin
+      # Use v1; ask only for basic view. We return short IDs to match defaults.
+      resp = get('https://aiplatform.googleapis.com/v1/publishers/google/models')
+               .params(pageSize: 200, view: 'BASIC')
+      ids = call(:safe_array, resp && resp['publisherModels'])
+              .map { |m| m['name'].to_s.split('/').last }
+              .select { |id| id.start_with?('text-embedding') || id.start_with?('multimodal-embedding') }
+              .uniq.sort
+    rescue => _e
+      # Robust fallback; never yield a boolean to the UI
+      ids = %w[text-embedding-005 multimodal-embedding-001]
+    end
+    # IMPORTANT: value == short ID; runtime builders will construct full path.
+    ids.map { |id| [id, id] }
+  },
+
+  models_generative: ->(_connection) {
+    begin
+      resp = get('https://aiplatform.googleapis.com/v1/publishers/google/models')
+               .params(pageSize: 200, view: 'BASIC')
+      items = call(:safe_array, resp && resp['publisherModels'])
+                .map { |m| m['name'].to_s.split('/').last }
+                .select { |id| id.start_with?('gemini-') }
+                .uniq.sort
+    rescue => _e
+      items = %w[gemini-2.5-pro gemini-2.5-flash gemini-1.5-flash]
+    end
+    items.map { |id| [id, id] }
+  },
+
+  # Contract-conformant roles (system handled via system_preamble)
+  roles: ->() { [['user','user'], ['model','model']] }
+},
 
   # ====== METHODS =====================================================
   methods: {
@@ -1196,10 +1196,10 @@
     normalize_model_identifier: ->(raw) {
       return '' if raw.nil? || raw == true || raw == false
       if raw.is_a?(Hash)
-        v = raw['name'] || raw[:name] ||
-            raw['path'] || raw[:path] ||
-            raw['value'] || raw[:value] ||
-            raw['id'] || raw[:id] ||
+        v = raw['value'] || raw[:value] ||
+            raw['id']    || raw[:id]    ||
+            raw['path']  || raw[:path]  ||
+            raw['name']  || raw[:name]  ||
             raw.to_s
         return v.to_s.strip
       end
@@ -1210,10 +1210,10 @@
     normalize_endpoint_identifier: ->(raw) {
       return '' if raw.nil? || raw == true || raw == false
       if raw.is_a?(Hash)
-        v = raw['name'] || raw[:name] ||
-            raw['path'] || raw[:path] ||
-            raw['value'] || raw[:value] ||
-            raw['id'] || raw[:id] ||
+        v = raw['value'] || raw[:value] ||
+            raw['id']    || raw[:id]    ||
+            raw['path']  || raw[:path]  ||
+            raw['name']  || raw[:name]  ||
             raw.to_s
         return v.to_s.strip
       end
