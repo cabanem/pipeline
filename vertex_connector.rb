@@ -5,24 +5,34 @@
   version: '0.9.0-draft',
   description: 'Vertex AI (Gemini + Text Embeddings + Endpoints) via service account JWT',
 
+  # API Endpoints
+  # | Purpose     | Location                           | Host                                                                |
+  # | ----------- | ---------------------------------- | --------------------------------------------------------------------|
+  # | AUTH        | not applicable                     | `https:///oauth2.googleapis.com/token``                             |
+  # | EMBEDDINGS  | tenant-specific                    | 'aiplatform.googleapis.com' OR '{region}-aiplatform.googleapis.com' |
+  # | GENERATE    | tenant-specific                    | 'aiplatform.googleapis.com' OR '{region}-aiplatform.googleapis.com' |
+  # | CUSTOM EP   | regional                           | '{region}-aiplatform.googleapis.com'                                |
+  # | BATCH PRED  | regional                           | '{region}-aiplatform.googleapis.com'                                |
+  # | ----------- | ---------------------------------- | --------------------------------------------------------------------|
+
   # ====== CONNECTION ==================================================
   connection: {
     fields: [
       { name: 'project_id', optional: false, hint: 'GCP project ID' },
       { name: 'location', optional: false, hint: 'e.g., global, us-central1, us-east4' },
-      { name: 'quota_project_id', label: 'Quota/billing project (optional)', optional: true,
-        hint: 'Sets x-goog-user-project for billing/quota. Service account must have roles/serviceusage.serviceUsageConsumer on this project.' },
-
-      { name: 'client_email', label: 'Service account client_email', optional: false },
-      { name: 'private_key',  label: 'Service account private_key',  optional: false,
-        control_type: 'password', multiline: true,
-        hint: 'Include BEGIN/END PRIVATE KEY lines.' },
-
-      { name: 'scope', optional: true, hint: 'OAuth scope(s)',
-        default: 'https://www.googleapis.com/auth/cloud-platform',
-        control_type: 'select',
-        options: [['Cloud Platform (all)', 'https://www.googleapis.com/auth/cloud-platform']] }
+      { name: 'scope', optional: true, hint: 'OAuth scope(s)', default: 'https://www.googleapis.com/auth/cloud-platform',
+        control_type: 'select', options: [['Cloud Platform (all)', 'https://www.googleapis.com/auth/cloud-platform']] },
     ],
+    extended_fields: lambda do |connection|
+      if connection['project_id']
+        [
+          { name: 'quota_project_id', label: 'Quota/billing project (optional)', optional: true, extends_schema: true,
+            hint: 'Sets x-goog-user-project for billing/quota. Service account must have roles/serviceusage.serviceUsageConsumer on this project.' },
+          { name: 'client_email', label: 'Service account client_email', optional: false, extends_schema: true },
+          { name: 'private_key',  label: 'Service account private_key',  optional: false, extends_schema: true,
+            control_type: 'password', multiline: true, hint: 'Include BEGIN/END PRIVATE KEY lines.' }
+        ]
+    end,
 
     authorization: {
       type: 'custom_auth',
@@ -76,13 +86,10 @@
 
   test: ->(connection) {
     # Use a regional location for endpoints listing even if caller chose global
-    region = (connection['location'].presence || 'us-central1').to_s.downcase
-    region = 'us-central1' if region == 'global'
-    begin
-      get("v1/projects/#{connection['project_id']}/locations/#{region}/endpoints")
-        .params(pageSize: 1)
-    rescue => e
-      region = call(:embedding_region, connection)
+    region = (connection['location'].presence || 'us-east4').to_s.downcase
+    region = 'us-east4' if region == 'global'
+    get(call(:aipl_v1_url, connection, region,
+            "projects/#{connection['project_id']}/locations/#{region}/endpoints"))
   },
 
   # ====== OBJECT DEFINITIONS ==========================================
@@ -178,7 +185,7 @@
                   { name: 'values', type: 'array', of: 'number' },
                   { name: 'statistics', type: 'object', properties: [
                       { name: 'truncated',   type: 'boolean' },
-                      { name: 'token_count', type: 'integer' }
+                      { name: 'token_count', type: 'number' } # sometimes returned as decimal place, e.g., 7.0
                     ]
                   }
                 ]
@@ -299,7 +306,7 @@
             { 'content' => txt, 'task_type' => 'RETRIEVAL_DOCUMENT' }
           end
 
-          emb_resp = call(:predict_embeddings, emb_model_path, [email_inst] + cat_insts)
+          emb_resp = call(:predict_embeddings, connection, emb_model_path, [email_inst] + cat_insts)
           preds    = call(:safe_array, emb_resp && emb_resp['predictions'])
           error('Embedding model returned no predictions') if preds.empty?
 
@@ -399,6 +406,7 @@
     },
 
     # -------------------- Generate content (Gemini) -------------------
+    # --- Gemini
     gen_generate_content: {
       title: 'Generative - Generate content (Gemini)',
       description: 'POST :generateContent on a publisher model',
@@ -433,8 +441,10 @@
       },
 
       execute: ->(connection, input) {
+        # Compute model path
         model_path = call(:build_model_path_with_global_preview, connection, input['model'])
 
+        # Build payload
         contents = call(:sanitize_contents_roles, input['contents'])
         error('At least one non-system message is required in contents') if contents.blank?
         sys_inst = call(:system_instruction_from_text, input['system_preamble'])
@@ -450,7 +460,9 @@
           'generationConfig'  => gen_cfg
         }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
 
-        post("/v1/#{model_path}:generateContent").payload(payload)
+        # Call endpoint
+        loc = (connection['location'].presence || 'global').to_s.downcase
+        post(call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent"))
       },
 
       output_fields: ->(object_definitions) { object_definitions['generate_content_output'] },
@@ -469,7 +481,7 @@
       }
     },
 
-    # -------------------- Grounded generation -------------------------
+    # --- Grounded
     gen_generate_grounded: {
       title: 'Generative - Generate (grounded)',
       description: 'Generate with grounding via Google Search or Vertex AI Search',
@@ -500,7 +512,10 @@
       },
 
       execute: ->(connection, input) {
+        # Compute model path
         model_path = call(:build_model_path_with_global_preview, connection, input['model'])
+
+        # Build payload
         contents   = call(:sanitize_contents_roles, input['contents'])
         error('At least one non-system message is required in contents') if contents.blank?
         sys_inst   = call(:system_instruction_from_text, input['system_preamble'])
@@ -525,7 +540,9 @@
           'generationConfig'  => gen_cfg
         }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
 
-        post("/v1/#{model_path}:generateContent").payload(payload)
+        # Call endpoint
+        loc = (connection['location'].presence || 'global').to_s.downcase
+        post(call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")).payload(payload)
       },
 
       output_fields: ->(object_definitions) { object_definitions['generate_content_output'] },
@@ -542,7 +559,7 @@
       }
     },
 
-    # -------------------- New: Query with context chunks --------------
+    # --- Query with context chunks
     gen_answer_with_context: {
       title: 'Generative - Answer with provided context chunks',
       description: 'Answer a question using caller-supplied context chunks (RAG-lite). Returns structured JSON with citations.',
@@ -634,7 +651,8 @@
           'generationConfig'  => gen_cfg
         }
 
-        resp = post("/v1/#{model_path}:generateContent").payload(payload)
+        loc  = (connection['location'].presence || 'global').to_s.downcase
+        resp = post(call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")).payload(payload)
 
         text = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
         parsed = call(:safe_parse_json, text)
@@ -711,7 +729,7 @@
           'outputDimensionality' => input['outputDimensionality']
         })
 
-        call(:predict_embeddings, model_path, instances, params)
+        call(:predict_embeddings, connection, model_path, instances, params)
       },
 
       output_fields: ->(object_definitions) { object_definitions['embed_output'] },
@@ -729,8 +747,9 @@
       }
 
     },
-
-    # -------------------- Utility: count tokens -----------------------
+ 
+    # -------------------- Utility ------------------------------------
+    # --- Count tokens
     count_tokens: {
       title: 'Utility: Count tokens',
       description: 'POST :countTokens on a publisher model',
@@ -749,12 +768,16 @@
       },
 
       execute: ->(connection, input) {
+        # Compute model path
         model_path = call(:build_model_path_with_global_preview, connection, input['model'])
+
+        # Build payload
         contents   = call(:sanitize_contents_roles, input['contents'])
         error('At least one non-system message is required in contents') if contents.blank?
         sys_inst   = call(:system_instruction_from_text, input['system_preamble'])
 
-        post("/v1/#{model_path}:countTokens").payload({
+        loc = (connection['location'].presence || 'global').to_s.downcase
+        post(call(:aipl_v1_url, connection, loc, "#{model_path}:countTokens")).payload({
           'contents'          => contents,
           'systemInstruction' => sys_inst
         }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) })
@@ -774,7 +797,7 @@
       }
     },
 
-    # -------------------- GCS simple upload ---------------------------
+    # --- GCS simple upload
     upload_to_gcs: {
       title: 'Utility: Upload to Cloud Storage (simple upload)',
       description: 'Simple media upload to GCS (uploadType=media)',
@@ -807,7 +830,8 @@
       }
     },
 
-    # -------------------- Generic endpoint predict --------------------
+    # -------------------- Predict ------------------------------------
+    # --- Generic
     endpoint_predict: {
       title: 'Endpoint predict (custom model)',
       description: 'POST :predict to a Vertex AI Endpoint',
@@ -827,8 +851,10 @@
         call(:ensure_regional_location!, connection) # require non-global
         endpoint_path = call(:build_endpoint_path, connection, input['endpoint'])
 
-        post("/v1/#{endpoint_path}:predict")
+        url = call(:endpoint_predict_url, connection, input['endpoint'])
+        post(url)
           .payload({ 'instances' => input['instances'], 'parameters' => input['parameters'] }.delete_if { |_k, v| v.nil? })
+
       },
 
       output_fields: ->(object_definitions) { object_definitions['predict_output'] },
@@ -839,7 +865,7 @@
       }
     },
 
-    # -------------------- Batch --------------------------------------
+    # --- Batch (create job)
     batch_prediction_create: {
       title: 'Batch: Create prediction job',
       description: 'Create projects.locations.batchPredictionJobs',
@@ -859,7 +885,6 @@
 
       execute: ->(connection, input) {
         call(:ensure_regional_location!, connection)
-        path = "/v1/projects/#{connection['project_id']}/locations/#{connection['location']}/batchPredictionJobs"
 
         payload = {
           'displayName'  => input['displayName'],
@@ -875,7 +900,10 @@
           'modelParameters' => input['modelParameters']
         }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
 
-        post(path).payload(payload)
+        loc  = connection['location']
+        path = "projects/#{connection['project_id']}/locations/#{loc}/batchPredictionJobs"
+
+        post(call(:aipl_v1_url, connection, loc, path)).payload(payload)
       },
 
       output_fields: ->(object_definitions) { object_definitions['batch_job'] },
@@ -888,6 +916,7 @@
       }
     },
 
+    # --- Batch (get job result)
     batch_prediction_get: {
       title: 'Batch: Fetch prediction job (get)',
       description: 'Get a batch prediction job by ID',
@@ -900,7 +929,8 @@
         name = input['job_id'].to_s.start_with?('projects/') ?
           input['job_id'] :
           "projects/#{connection['project_id']}/locations/#{connection['location']}/batchPredictionJobs/#{input['job_id']}"
-        get("/v1/#{name}")
+        loc = connection['location']
+        get(call(:aipl_v1_url, connection, loc, name.sub(%r{^/v1/}, '')))
       },
 
       output_fields: ->(object_definitions) { object_definitions['batch_job'] },
@@ -965,6 +995,40 @@
 
   # ====== METHODS =====================================================
   methods: {
+
+    # -------------------- API endpoint reconciliation -----------------
+    # --- Host and URL
+    # - Regional
+    aipl_service_host: ->(connection, loc=nil) {
+      l = (loc || connection['location']).to_s.downcase
+      (l.blank? || l == 'global') ? 'aiplatform.googleapis.com' : "#{l}-aiplatform.googleapis.com"
+    },
+
+    aipl_v1_url: ->(connection, loc, path) {
+      "https://#{call(:aipl_service_host, connection, loc)}/v1/#{path}"
+    },
+
+    endpoint_predict_url: ->(connection, endpoint) {
+      ep = call(:normalize_endpoint_identifier, endpoint).to_s
+      # Allow caller to pass a full URL (handles dedicatedEndpointDns and private endpoints).
+      return (ep.include?(':predict') ? ep : "#{ep}:predict") if ep.start_with?('http')
+
+      # Prefer region embedded in the resource name; otherwise fallback to connection location.
+      m   = ep.match(%r{^projects/[^/]+/locations/([^/]+)/endpoints/})
+      loc = (m && m[1]) || (connection['location'] || '').to_s.downcase
+      error("This action requires a regional location. Current location is '#{loc}'.") if loc.blank? || loc == 'global'
+
+      host = call(:aipl_service_host, connection, loc)
+      "https://#{host}/v1/#{call(:build_endpoint_path, connection, ep)}:predict"
+    },
+
+    build_endpoint_path: ->(connection, endpoint) {
+      ep = call(:normalize_endpoint_identifier, endpoint)
+      ep.start_with?('projects/') ? ep :
+        "projects/#{connection['project_id']}/locations/#{connection['location']}/endpoints/#{ep}"
+    },
+
+    # --- Model
     build_model_path_with_global_preview: ->(connection, model) {
       m = call(:normalize_model_identifier, model)
       error('Model is required') if m.blank?
@@ -988,12 +1052,6 @@
       end
     },
 
-    build_endpoint_path: ->(connection, endpoint) {
-      ep = call(:normalize_endpoint_identifier, endpoint)
-      ep.start_with?('projects/') ? ep :
-        "projects/#{connection['project_id']}/locations/#{connection['location']}/endpoints/#{ep}"
-    },
-
     build_embedding_model_path: ->(connection, model) {
       m = call(:normalize_model_identifier, model)
       error('Embedding model is required') if m.blank?
@@ -1015,6 +1073,32 @@
       end
     },
 
+    # --- Location or region
+    ensure_regional_location!: ->(connection) {
+      loc = (connection['location'] || '').downcase
+      error("This action requires a regional location (e.g., us-central1). Current location is '#{loc}'.") if loc.blank? || loc == 'global'
+    },
+
+    embedding_region: ->(connection) {
+      loc = (connection['location'] || '').to_s.downcase
+      # Embeddings support global and multi-regional endpoints. Respect caller choice; default to global.
+      loc.present? ? loc : 'global'
+    },
+
+    # Normalize a user-provided "endpoint" into a String as well.
+    normalize_endpoint_identifier: ->(raw) {
+      return '' if raw.nil? || raw == true || raw == false
+      if raw.is_a?(Hash)
+        v = raw['value'] || raw[:value] ||
+            raw['id']    || raw[:id]    ||
+            raw['path']  || raw[:path]  ||
+            raw['name']  || raw[:name]  ||
+            raw.to_s
+        return v.to_s.strip
+      end
+      raw.to_s.strip
+    },
+
     # Build a single email text body for classification
     build_email_text: ->(subject, body) {
       s = subject.to_s.strip
@@ -1023,11 +1107,6 @@
       parts << "Subject: #{s}" if s.present?
       parts << "Body:\n#{b}"    if b.present?
       parts.join("\n\n")
-    },
-
-    ensure_regional_location!: ->(connection) {
-      loc = (connection['location'] || '').downcase
-      error("This action requires a regional location (e.g., us-central1). Current location is '#{loc}'.") if loc.blank? || loc == 'global'
     },
 
     # Extracts float vector from embedding prediction (both shapes supported)
@@ -1051,12 +1130,6 @@
       denom.zero? ? 0.0 : (dot / denom)
     },
 
-    embedding_region: ->(connection) {
-      loc = (connection['location'] || '').to_s.downcase
-      # Embeddings support global and multi-regional endpoints. Respect caller choice; default to global.
-      loc.present? ? loc : 'global'
-    },
-
     # Conservative instance limits by model family
     embedding_max_instances: ->(model_path_or_id) {
       id = model_path_or_id.to_s.split('/').last
@@ -1067,22 +1140,39 @@
       end
     },
 
-    predict_embeddings: ->(model_path, instances, params={}) {
+    predict_embeddings: ->(connection, model_path, instances, params={}) {
       max  = call(:embedding_max_instances, model_path)
       preds = []
       billable = 0
+      # Derive location from the model path (projects/.../locations/{loc}/...)
+      loc = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
+
       (instances || []).each_slice(max) do |slice|
-        resp = post("/v1/#{model_path}:predict")
-                .payload({
-                  'instances'  => slice,
-                  'parameters' => (params.presence || {})
-                }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) })
+        url  = call(:aipl_v1_url, connection, loc, "#{model_path}:predict")
+        resp = post(url).payload({
+                'instances'  => slice,
+                'parameters' => (params.presence || {})
+              }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) })
         preds.concat(resp['predictions'] || [])
         billable += resp.dig('metadata', 'billableCharacterCount').to_i
       end
       out = { 'predictions' => preds }
       out['metadata'] = { 'billableCharacterCount' => billable } if billable > 0
       out
+    },
+
+    endpoint_predict_url: ->(connection, endpoint) {
+      ep = call(:normalize_endpoint_identifier, endpoint).to_s
+      # Allow fully-qualified dedicated endpoint URLs.
+      return (ep.include?(':predict') ? ep : "#{ep}:predict") if ep.start_with?('http')
+
+      # Prefer region from the resource name; fallback to connection.
+      m   = ep.match(%r{^projects/[^/]+/locations/([^/]+)/endpoints/})
+      loc = (m && m[1]) || (connection['location'] || '').to_s.downcase
+      error("This action requires a regional location. Current location is '#{loc}'.") if loc.blank? || loc == 'global'
+
+      host = call(:aipl_service_host, connection, loc)
+      "https://#{host}/v1/#{call(:build_endpoint_path, connection, ep)}:predict"
     },
 
     # Minimal, schema-constrained JSON referee using Gemini
@@ -1154,7 +1244,10 @@
         }
       }
 
-      resp   = post("/v1/#{model_path}:generateContent").payload(payload)
+      loc  = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
+      url  = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
+      resp = post(url).payload(payload)
+
       text   = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s.strip
       parsed = JSON.parse(text) rescue { 'category' => nil, 'confidence' => nil, 'reasoning' => nil, 'distribution' => [] }
 
@@ -1217,20 +1310,6 @@
     # Normalize a user-provided "model" into a String.
     # Accepts String or Hash (from datapills/pick lists). Prefers common keys.
     normalize_model_identifier: ->(raw) {
-      return '' if raw.nil? || raw == true || raw == false
-      if raw.is_a?(Hash)
-        v = raw['value'] || raw[:value] ||
-            raw['id']    || raw[:id]    ||
-            raw['path']  || raw[:path]  ||
-            raw['name']  || raw[:name]  ||
-            raw.to_s
-        return v.to_s.strip
-      end
-      raw.to_s.strip
-    },
-
-    # Normalize a user-provided "endpoint" into a String as well.
-    normalize_endpoint_identifier: ->(raw) {
       return '' if raw.nil? || raw == true || raw == false
       if raw.is_a?(Hash)
         v = raw['value'] || raw[:value] ||
