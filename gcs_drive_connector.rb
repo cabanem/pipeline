@@ -353,6 +353,7 @@
       output_fields: lambda do |object_definitions|
         [
           { name: 'files', type: 'array', of: 'object', properties: object_definitions['drive_file_basic'] },
+          { name: 'file_ids', type: 'array', of: 'string' },
           { name: 'count', type: 'integer' },
           { name: 'has_more', type: 'boolean' },
           { name: 'next_page_token' },
@@ -445,6 +446,7 @@
 
         {
           'files'           => files,
+          'file_ids'        => files.map { |f| f['id'] }, 
           'count'           => files.length,
           'has_more'        => !call('blank?', data['nextPageToken']),
           'next_page_token' => data['nextPageToken'],
@@ -469,10 +471,18 @@
         learn_more_text: 'Google Drive API: files.get',
         body: 'Sequentially fetches IDs with clear success/failure accounting. Continue-on-error is default.'
       },
-      # INPUT
+      config_fields: [
+        { name: 'file_input_mode', label: 'File input', control_type: 'select', default: 'recipe_array', sticky: true, extends_schema: true,
+          options: [['Mapped array', 'recipe_array'], ['Manual', 'manual']] }
+      ],
       input_fields: lambda do
         [
-          { name: 'file_ids', type: 'array', of: 'string', optional: false, hint: 'IDs or URLs' },
+          { name: 'files', label: 'Drive files (from previous step)', type: 'array', of: 'object', optional: true,
+            ngIf: 'input.file_input_mode == "recipe_array"', hint: 'Drop “files” from Drive: List files (or any array with id/file_id).',
+            properties: [
+              { name: 'id' }, { name: 'file_id' }, { name: 'name' }, { name: 'mime_type' }
+            ]},
+          { name: 'file_ids', type: 'array', of: 'string', optional: false, ngIf: 'input.file_input_mode == "manual"', hint: 'IDs or URLs' },
           { name: 'include_content', type: 'boolean', control_type: 'checkbox', default: true },
           { name: 'skip_errors',     type: 'boolean', control_type: 'checkbox', default: true, hint: 'Fail-fast if unchecked' },
           { name: 'strip_urls', type: 'boolean', control_type: 'checkbox', default: false }
@@ -501,7 +511,10 @@
         started_at = Time.now
         local = call('deep_copy', input)
 
-        ids = Array(local['file_ids'] || [])
+        # Unify input shapes
+        ids = call('coerce_drive_ids', local)
+        error('No Drive file IDs provided. Map “file_ids” or “files”.') if ids.empty?
+
         include_content = !!local['include_content']
         skip_errors     = local['skip_errors'] != false
 
@@ -1701,7 +1714,7 @@
       msg += "\nRaw: #{body}" if verbose
       msg
     end,
-    
+
     normalize_string_list: ->(v) {
       ary =
         if v.is_a?(Array)
@@ -2021,12 +2034,14 @@
 
     coerce_drive_ids: lambda do |local|
       ids = []
-      # From array<string>
+      # arrays of strings
       ids += Array(local['drive_file_ids'] || [])
-      # From array<object> with id
-      ids += Array(local['drive_files'] || []).map { |o|
-        o.is_a?(Hash) ? (o['id'] || o['file_id']) : nil
-      }
+      ids += Array(local['file_ids'] || [])
+
+      # arrays of objects with id/file_id
+      ids += Array(local['drive_files'] || []).map { |o| o.is_a?(Hash) ? (o['id'] || o['file_id']) : nil }
+      ids += Array(local['files'] || []).map { |o| o.is_a?(Hash) ? (o['id'] || o['file_id']) : nil }
+
       ids = ids.compact.map { |raw| call('extract_drive_file_id', raw) }
       ids.reject { |s| call('blank?', s) }.uniq
     end,
