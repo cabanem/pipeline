@@ -78,8 +78,11 @@
     # Use a regional location for endpoints listing even if caller chose global
     region = (connection['location'].presence || 'us-central1').to_s.downcase
     region = 'us-central1' if region == 'global'
-    get("https://aiplatform.googleapis.com/v1/projects/#{connection['project_id']}/locations/#{region}/endpoints")
-      .params(pageSize: 1)
+    begin
+      get("v1/projects/#{connection['project_id']}/locations/#{region}/endpoints")
+        .params(pageSize: 1)
+    rescue => e
+      region = call(:embedding_region, connection)
   },
 
   # ====== OBJECT DEFINITIONS ==========================================
