@@ -75,9 +75,9 @@
   },
 
   test: ->(connection) {
-    # Avoid Model Garden gating and quota headers during connection test.
-    # Simple project-scoped list to validate token + IAM + region.
-    region = call(:embedding_region, connection)
+    # Use a regional location for endpoints listing even if caller chose global
+    region = (connection['location'].presence || 'us-central1').to_s.downcase
+    region = 'us-central1' if region == 'global'
     get("https://aiplatform.googleapis.com/v1/projects/#{connection['project_id']}/locations/#{region}/endpoints")
       .params(pageSize: 1)
   },
@@ -180,6 +180,11 @@
                   }
                 ]
               }
+            ]
+          },
+          # NEW: surface billing metadata from the REST response
+          { name: 'metadata', type: 'object', properties: [
+              { name: 'billableCharacterCount', type: 'integer' }
             ]
           }
         ]
@@ -711,11 +716,15 @@
       sample_output: ->() {
         {
           'predictions' => [
-            { 'embeddings' => { 'values' => [0.012, -0.034, 0.056], 'statistics' => { 'truncated' => false, 'token_count' => 21 } } },
-            { 'embeddings' => { 'values' => [0.023, -0.045, 0.067], 'statistics' => { 'truncated' => false, 'token_count' => 18 } } }
-          ]
+            { 'embeddings' => { 'values' => [0.012, -0.034, 0.056],
+              'statistics' => { 'truncated' => false, 'token_count' => 21 } } },
+            { 'embeddings' => { 'values' => [0.023, -0.045, 0.067],
+              'statistics' => { 'truncated' => false, 'token_count' => 18 } } }
+          ],
+          'metadata' => { 'billableCharacterCount' => 230 }
         }
       }
+
     },
 
     # -------------------- Utility: count tokens -----------------------
@@ -903,53 +912,53 @@
   },
 
   # ====== PICK LISTS ==================================================
-pick_lists: {
-  modes_classification: ->() {
-    [%w[Embedding embedding], %w[Generative generative], %w[Hybrid hybrid]]
-  },
+  pick_lists: {
+    modes_classification: ->() {
+      [%w[Embedding embedding], %w[Generative generative], %w[Hybrid hybrid]]
+    },
 
-  modes_grounding: ->() {
-    [%w[Google\ Search google_search], %w[Vertex\ AI\ Search vertex_ai_search]]
-  },
+    modes_grounding: ->() {
+      [%w[Google\ Search google_search], %w[Vertex\ AI\ Search vertex_ai_search]]
+    },
 
-  models_embedding: ->(_connection) {
-    begin
-      # Use v1; ask only for basic view. We return short IDs to match defaults.
-      resp = get('https://aiplatform.googleapis.com/v1/publishers/google/models')
-               .params(pageSize: 200, view: 'BASIC')
-      ids = call(:safe_array, resp && resp['publisherModels'])
-              .map { |m| m['name'].to_s.split('/').last }
-              .select { |id| id.start_with?('text-embedding') || id.start_with?('multimodal-embedding') }
-              .uniq.sort
-    rescue => _e
-      # Robust fallback; never yield a boolean to the UI
-      ids = %w[text-embedding-005 multimodal-embedding-001]
-    end
-    # IMPORTANT: value == short ID; runtime builders will construct full path.
-    ids.map { |id| [id, id] }
-  },
-
-  models_generative: ->(_connection) {
-    begin
-      resp = get('https://aiplatform.googleapis.com/v1/publishers/google/models')
-               .params(pageSize: 200, view: 'BASIC')
-      items = call(:safe_array, resp && resp['publisherModels'])
+    models_embedding: ->(connection) {
+      begin
+        loc = (connection['location'].presence || 'global').to_s.downcase
+        proj = connection['project_id']
+        resp = get("https://aiplatform.googleapis.com/v1/projects/#{proj}/locations/#{loc}/publishers/google/models")
+                .params(pageSize: 200, view: 'BASIC')
+        ids = call(:safe_array, resp && resp['publisherModels'])
                 .map { |m| m['name'].to_s.split('/').last }
-                .select { |id| id.start_with?('gemini-') }
+                .select { |id| id.start_with?('text-embedding') || id.start_with?('multimodal-embedding') || id.start_with?('gemini-embedding') }
                 .uniq.sort
-    rescue => _e
-      items = %w[gemini-2.5-pro gemini-2.5-flash gemini-1.5-flash]
-    end
-    items.map { |id| [id, id] }
-  },
+      rescue => _e
+        ids = %w[gemini-embedding-001 text-embedding-005 multimodal-embedding-001]
+      end
+      ids.map { |id| [id, id] }
+    },
 
-  # Contract-conformant roles (system handled via system_preamble)
-  roles: ->() { [['user','user'], ['model','model']] }
-},
+    models_generative: ->(connection) {
+      begin
+        loc = (connection['location'].presence || 'global').to_s.downcase
+        proj = connection['project_id']
+        resp = get("https://aiplatform.googleapis.com/v1/projects/#{proj}/locations/#{loc}/publishers/google/models")
+                .params(pageSize: 200, view: 'BASIC')
+        items = call(:safe_array, resp && resp['publisherModels'])
+                  .map { |m| m['name'].to_s.split('/').last }
+                  .select { |id| id.start_with?('gemini-') }
+                  .uniq.sort
+      rescue => _e
+        items = %w[gemini-2.5-pro gemini-2.5-flash gemini-2.5-flash-lite]
+      end
+      items.map { |id| [id, id] }
+    },
+
+    # Contract-conformant roles (system handled via system_preamble)
+    roles: ->() { [['user','user'], ['model','model']] }
+  },
 
   # ====== METHODS =====================================================
   methods: {
-    # Build model path for publisher models (Gemini/embeddings). Generative defaults to global.
     build_model_path_with_global_preview: ->(connection, model) {
       m = call(:normalize_model_identifier, model)
       error('Model is required') if m.blank?
@@ -963,7 +972,9 @@ pick_lists: {
         m = "publishers/#{m}"
       end
 
-      loc = 'global' # generative models live under global
+      # Respect caller's location; default to global, which is widely supported for Gemini
+      loc = (connection['location'].presence || 'global').to_s.downcase
+
       if m.start_with?('publishers/')
         "projects/#{connection['project_id']}/locations/#{loc}/#{m}"
       else
@@ -1036,8 +1047,8 @@ pick_lists: {
 
     embedding_region: ->(connection) {
       loc = (connection['location'] || '').to_s.downcase
-      # Embeddings do NOT support global. Default to us-central1 if unset/global.
-      (loc.present? && loc != 'global') ? loc : 'us-central1'
+      # Embeddings support global and multi-regional endpoints. Respect caller choice; default to global.
+      loc.present? ? loc : 'global'
     },
 
     # Conservative instance limits by model family
@@ -1045,16 +1056,15 @@ pick_lists: {
       id = model_path_or_id.to_s.split('/').last
       if id.include?('gemini-embedding-001')
         1
-      elsif id.include?('text-embedding-')
-        5
       else
-        5
+        250
       end
     },
 
     predict_embeddings: ->(model_path, instances, params={}) {
       max  = call(:embedding_max_instances, model_path)
       preds = []
+      billable = 0
       (instances || []).each_slice(max) do |slice|
         resp = post("/v1/#{model_path}:predict")
                 .payload({
@@ -1062,8 +1072,11 @@ pick_lists: {
                   'parameters' => (params.presence || {})
                 }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) })
         preds.concat(resp['predictions'] || [])
+        billable += resp.dig('metadata', 'billableCharacterCount').to_i
       end
-      { 'predictions' => preds }
+      out = { 'predictions' => preds }
+      out['metadata'] = { 'billableCharacterCount' => billable } if billable > 0
+      out
     },
 
     # Minimal, schema-constrained JSON referee using Gemini
