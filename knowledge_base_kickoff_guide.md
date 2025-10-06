@@ -1,91 +1,97 @@
-# Knowledge Base (KB) Kickoff Guide
+# Knowledge Base Kickoff Guide
 
 ### Purpose
 
-We’re building the **Knowledge Base (KB)** that powers our Retrieval-Augmented Generation (RAG) systems — the same architecture used in the Gmail responder project. The KB will handle ingestion, embedding, and retrieval of source materials, forming the foundation for intelligent responses.
-This project reuses existing components to accelerate delivery while maintaining architectural consistency.
+This guide will help you build the **knowledge base (KB)** component for our Retrieval-Augmented Generation (RAG) system. The KB will power embeddings, retrieval, and responses. We’ll reuse core components already built in the Gmail responder project to speed things up.
 
 ---
 
-## 1. Setup & Environment
+## Step 1. Get Your Environment Ready
 
-* Use the shared **development environment** and README from the Gmail responder project.
-* Confirm access to:
+1. **Clone/setup the dev environment** we’ve already standardized (check the README in our repo).
 
-  * **Google Cloud** (Vertex AI + GCS buckets)
-  * **Workato connectors** (Vertex AI connector + Drive utilities)
-  * **Authentication**: GCP service account and OAuth for Drive
+   * Make sure you can run Workato connectors locally with the SDK.
+   * Confirm access to Google Cloud (GCP project + Vertex AI + GCS buckets).
+2. **Auth setup**:
 
-**Goal:** Be able to run connectors locally and execute test actions successfully.
-
----
-
-## 2. Ingestion Pipeline
-
-Start with **Google Drive → GCS**.
-
-Each file should be:
-
-* Normalized to plain text (strip formatting, images, links)
-* Chunked (~1K tokens per section)
-* Enriched with metadata: `doc_id`, `filename`, `updated_at`
-
-**Deliverable:** Recipe that detects new/updated Drive files and stores normalized versions in GCS.
+   * Service account JSON for GCP.
+   * OAuth tokens if accessing Google Drive.
+   * Verify Workato connector authentication works end-to-end.
 
 ---
 
-## 3. Embedding & Storage
+## Step 2. Build the Ingestion Pipeline
 
-* Use the **Vertex AI connector** (`generate_embeddings`) for vectorization.
-* Upsert embeddings into **Vertex Vector Search** under a shared collection (`knowledge_base`).
-* Include metadata for traceability.
+1. **Source**: Start with Google Drive as the data source.
+2. **Destination**: Copy files into Google Cloud Storage (GCS).
+3. **Normalize**: For each file:
 
-**Deliverable:** Recipe that turns normalized text → embeddings → stored vectors.
+   * Extract metadata (doc_id, filename, owner, last_updated).
+   * Convert content to plain text (strip formatting, URLs, images).
+   * Chunk large docs into ~1k tokens.
 
----
-
-## 4. Workato KB Actions
-
-Expose simple, reusable actions:
-
-* **Ingest documents** → Drive/GCS → embeddings → KB
-* **Query KB** → question → top-K relevant results
-
-**Goal:** Recipe builders can access KB functions without custom code.
+➡️ Deliverable: A Workato recipe that takes “New file in Drive” → stores a normalized version in GCS.
 
 ---
 
-## 5. Standards to Follow
+## Step 3. Embed & Store
 
-* **Schema consistency:** use the shared field structure (`doc_id`, `section`, `content`, `updated_at`)
-* **Immutable inputs:** never mutate caller data
-* **Observability:** include success flags, timestamps, and trace IDs in outputs
-* **UI design:** maintain logical grouping of connector fields for clarity
+1. **Connector**: Reuse the Vertex AI connector’s `generate_embeddings` action.
+2. **Chunked text**: For each text chunk, call the embedding API.
+3. **Upsert into Vector Search**:
 
----
+   * Collection: `knowledge_base` (or similar namespace).
+   * Store embeddings + metadata (doc_id, section_id, content, updated_at).
 
-## 6. Documentation & Handoff
-
-* Document setup, authentication, and usage in plain English.
-* Keep a small **change log** for any deviations from the Gmail responder design.
-* Weekly sync with Emily for review and technical alignment.
+➡️ Deliverable: Recipe that takes normalized text chunks → embeddings → inserts into Vertex AI Vector Store.
 
 ---
 
-## 7. Stretch Goals (Post-MVP)
+## Step 4. Expose KB Actions
 
-Once core ingestion and retrieval work:
+Implement actions in Workato so recipe builders can easily use the KB:
 
-* Add new data sources (Confluence, Slack, PDFs, etc.)
-* Implement incremental refresh for updated docs
-* Optimize retrieval quality and latency
+* **Ingest documents**: Input = source (Drive/GCS), Output = confirmation + metadata.
+* **Query KB**: Input = user question, Output = top-k documents/snippets + metadata.
+
+➡️ Deliverable: Connector actions that recipe builders can drag-and-drop without touching code.
+
+---
+
+## Step 5. Maintain Consistency
+
+Follow these principles (already in the Gmail responder project):
+
+* **Schema consistency**: Always use `doc_id`, `section`, `content`, `updated_at`.
+* **No mutation of inputs**: Copy before transforming.
+* **Observability**: Every output includes success flag, timestamp, and trace ID.
+* **UI/UX**: Group connector fields logically for recipe builders.
 
 ---
 
-### Success Criteria
+## Step 6. Document & Share
 
-* End-to-end pipeline: Drive file → GCS → normalized text → embeddings → stored vectors → retrievable chunks
-* Querying returns relevant content with traceable metadata
-* Reusable across multiple RAG-based projects
+* Write down **setup instructions** (auth, env vars, sample recipes).
+* Keep a **change log** of anything that diverges from the email responder pipeline.
+* Schedule a **weekly sync with me** for review and alignment.
 
 ---
+
+## Step 7. Stretch Goal (Later)
+
+Once the basics work, you can:
+
+* Add new sources (Confluence, PDFs in Drive, Slack exports).
+* Add batch ingestion (multiple docs at once).
+* Add refresh logic (detect if a doc has changed, re-ingest only that piece).
+
+---
+
+## Success Criteria
+
+* End-to-end flow works: Drive doc → GCS → normalized text → embeddings → stored in Vector Search.
+* You can query the KB and get relevant chunks back.
+* Recipe builders can use the KB without worrying about internal mechanics.
+
+
+Would you like me to **turn this into a one-pager “handout”** (cleaned up for non-technical eyes, like something you can drop into a Slack message or Confluence page)? That way it doubles as both instructions and managerial visibility.
