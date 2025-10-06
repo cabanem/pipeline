@@ -71,14 +71,10 @@
     }
   },
 
-  test: ->(connection) {
+  test: ->(_connection) {
     project_id  = connection['project_id']
     location    = connection['location']
-    get('/v1/publishers/google/models/gemini-1.5-pro')
-      # Global list of publisher models (beta surface)== 'get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models')'
-      # for custom models API (UCAIP) == 'get("/v1/projects/#{project_id}/locations/#{location}/models")''
-      # alt == 'get("/v1/projects/#{project_id}/locations/#{location}/endpoints")'
-      .params(pageSize: 1)
+    get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models').params(pageSize: 1)
   },
 
   # ====== OBJECT DEFINITIONS ==========================================
@@ -286,18 +282,19 @@
         mode = (input['mode'] || 'embedding').to_s.downcase
         min_conf = (input['min_confidence'].presence || 0.25).to_f
 
+        # Embedding/hybrid branch
         if %w[embedding hybrid].include?(mode)
-          emb_model = (input['embedding_model'].presence || 'text-embedding-004')
-          emb_model_path = call(:build_model_path_with_global_preview, connection, emb_model)
+          emb_model = (input['embedding_model'].presence || 'gemini-embedding-001')
+          emb_model_path = call(:build_embedding_model_path, connection, emb_model)
 
           # Build instances: first = email, rest = category texts
-          email_inst = { 'content' => email_text, 'task' => 'RETRIEVAL_QUERY' }
+          email_inst = { 'content' => email_text, 'task_type' => 'RETRIEVAL_QUERY' }
           cat_insts = cats.map do |c|
             txt = [c['name'], c['description'], *(c['examples'] || [])].compact.join("\n")
-            { 'content' => txt, 'task' => 'RETRIEVAL_DOCUMENT' }
+            { 'content' => txt, 'task_type' => 'RETRIEVAL_DOCUMENT' }
           end
 
-          emb_resp = post("/v1/#{emb_model_path}:predict").payload({ 'instances' => [email_inst] + cat_insts })
+          emb_resp = call(:predict_embeddings, emb_model_path, [email_inst] + cat_insts)
           preds = (emb_resp['predictions'] || [])
           error('Embedding model returned no predictions') if preds.empty?
 
@@ -344,6 +341,7 @@
 
           result
 
+        # Generative branch
         elsif mode == 'generative'
           error('generative_model is required when mode=generative') if input['generative_model'].blank?
           referee = call(:llm_referee, connection, input['generative_model'], email_text, cats.map { |c| c['name'] }, cats)
@@ -533,21 +531,25 @@
       input_fields: ->() {
         [
           { name: 'model', label: 'Embedding model', optional: false,
-            control_type: 'select', pick_list: 'models_embedding',
-            hint: 'Pick from list or paste a model ID/path (e.g., text-embedding-004).' },
+            control_type: 'select', pick_list: 'models_embedding', default: 'gemini-embedding-001',
+            hint: 'Pick from list or paste a model ID/path (e.g., gemini-embedding-001).' },
           { name: 'texts', type: 'array', of: 'string', optional: false },
           { name: 'task', hint: 'Optional: RETRIEVAL_QUERY or RETRIEVAL_DOCUMENT' },
           { name: 'autoTruncate', type: 'boolean', hint: 'Truncate long inputs automatically' }
         ]
       },
       execute: ->(connection, input) {
-        model_path = call(:build_model_path_with_global_preview, connection, input['model'])
-        instances = (input['texts'] || []).map { |t| { 'content' => t, 'task' => input['task'] }.delete_if { |_k, v| v.nil? } }
+        # Build the model path
+        model_path = call(:build_embedding_model_path, connection, input['model'])
+        # Populate instances
+        instances = (input['texts'] || []).map { |t|
+          { 'content' => t, 'task_type' => input['task'] }.delete_if { |_k, v| v.nil? }
+        }
+        # Configure params
         params = {}
         params['autoTruncate'] = input['autoTruncate'] unless input['autoTruncate'].nil?
-
-        post("/v1/#{model_path}:predict")
-          .payload({ 'instances' => instances, 'parameters' => params }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) })
+        # Call endpoint
+        call(:predict_embeddings, model_path, instances, params)
       },
       output_fields: ->(object_definitions) { object_definitions['embed_output'] },
       sample_output: ->() {
@@ -746,16 +748,18 @@
 
     # --- Models
     models_embedding: ->(connection) {
-      # Models for embeddings get the complete global resource path
       resp = get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models')
               .params(pageSize: 2000, listAllVersions: true)
       ids = (resp['publisherModels'] || [])
               .map { |m| m['name'].to_s.split('/').last }
               .select { |id| id.include?('embedding') || id.start_with?('text-embedding') }
-              .uniq
-              .sort
+              .uniq.sort
+
+      region = call(:embedding_region, connection)
+
       ids.map { |id|
-        [id, "projects/#{connection['project_id']}/locations/global/publishers/google/models/#{id}"]
+        # value is a regional resource; label is the bare id
+        [id, "projects/#{connection['project_id']}/locations/#{region}/publishers/google/models/#{id}"]
       }
     },
 
@@ -844,6 +848,44 @@
       end
       denom = Math.sqrt(sum_a) * Math.sqrt(sum_b)
       denom.zero? ? 0.0 : (dot / denom)
+    },
+
+    embedding_region: ->(connection) {
+      loc = (connection['location'] || '').to_s.downcase
+      # Embeddings do NOT support global. Default to us-central1 if unset/global.
+      (loc.present? && loc != 'global') ? loc : 'us-central1'
+    },
+
+    build_embedding_model_path: ->(connection, model) {
+      m = (model || '').strip
+      return m if m.start_with?('projects/')  # keep full resource path as-is
+
+      # Allow "google/models/..." shorthands
+      m = "publishers/#{m}" if m.start_with?('google/models/')
+
+      loc = call(:embedding_region, connection)
+      if m.start_with?('publishers/')
+        "projects/#{connection['project_id']}/locations/#{loc}/#{m}"
+      else
+        "projects/#{connection['project_id']}/locations/#{loc}/publishers/google/models/#{m}"
+      end
+    },
+
+    embedding_max_instances: ->(model_path_or_id) {
+      id = model_path_or_id.to_s.split('/').last # handle full path or bare id
+      id.include?('gemini-embedding-001') ? 1 : 250
+    },
+
+    predict_embeddings: ->(model_path, instances, params={}) {
+      max = call(:embedding_max_instances, model_path)
+      preds = []
+      instances.each_slice(max) do |slice|
+        resp = post("/v1/#{model_path}:predict")
+                .payload({ 'instances' => slice,
+                            'parameters' => (params.presence || {}) }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) })
+        preds.concat(resp['predictions'] || [])
+      end
+      { 'predictions' => preds }
     },
 
     # Calls Gemini to choose among categories and explain (structured output)
