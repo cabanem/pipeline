@@ -10,6 +10,8 @@
     fields: [
       { name: 'project_id', optional: false, hint: 'GCP project ID' },
       { name: 'location', optional: false, hint: 'e.g., global, us-central1, us-east4' },
+      { name: 'quota_project_id', label: 'Quota/billing project (optional)', optional: true,
+        hint: 'Sets x-goog-user-project for billing/quota. Service account must have roles/serviceusage.serviceUsageConsumer on this project.' },
 
       { name: 'client_email', label: 'Service account client_email', optional: false },
       { name: 'private_key',  label: 'Service account private_key',  optional: false,
@@ -55,23 +57,29 @@
       },
 
       apply: ->(connection) {
-        headers(
-          'Authorization': "Bearer #{connection['access_token']}",
-          'X-Goog-User-Project': connection['project_id'].to_s
-        )
+        hdrs = { 'Authorization': "Bearer #{connection['access_token']}" }
+        # Only send X-Goog-User-Project if caller explicitly configured it and has the right IAM.
+        if connection['quota_project_id'].present?
+          hdrs['X-Goog-User-Project'] = connection['quota_project_id'].to_s
+        end
+        headers(hdrs)
+
       },
 
       # Let Workato trigger re-acquire on auth errors
-      refresh_on: [401],
-      detect_on:  [/UNAUTHENTICATED/i, /invalid[_-]?token/i, /expired/i]
+      refresh_on: [401, 403],
+      detect_on:  [/UNAUTHENTICATED/i, /invalid[_-]?token/i, /expired/i, /insufficient/i]
     },
 
     base_uri: ->(_connection) { 'https://aiplatform.googleapis.com' }
   },
 
   test: ->(connection) {
-    # Lightweight list call validates token + basic access
-    get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models').params(pageSize: 1)
+    # Avoid Model Garden gating and quota headers during connection test.
+    # Simple project-scoped list to validate token + IAM + region.
+    region = call(:embedding_region, connection)
+    get("https://aiplatform.googleapis.com/v1/projects/#{connection['project_id']}/locations/#{region}/endpoints")
+      .params(pageSize: 1)
   },
 
   # ====== OBJECT DEFINITIONS ==========================================
@@ -900,31 +908,34 @@
     },
 
     models_embedding: ->(connection) {
-      resp = get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models')
-               .params(pageSize: 1000, listAllVersions: true)
-
-      ids = (resp['publisherModels'] || [])
-              .map { |m| m['name'].to_s.split('/').last }
-              .select { |id| id.start_with?('text-embedding') || id.start_with?('multimodal-embedding') }
-              .uniq.sort
-
+      begin
+        resp = get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models')
+                 .params(pageSize: 200, listAllVersions: true)
+        ids = (resp['publisherModels'] || [])
+                .map { |m| m['name'].to_s.split('/').last }
+                .select { |id| id.start_with?('text-embedding') || id.start_with?('multimodal-embedding') }
+                .uniq.sort
+      rescue => _e
+        # Safe fallback, never return boolean false to UI
+        ids = %w[text-embedding-005 multimodal-embedding-001]
+      end
       region = call(:embedding_region, connection)
-
-      ids.map { |id|
-        [id, "projects/#{connection['project_id']}/locations/#{region}/publishers/google/models/#{id}"]
-      }
+      ids.map { |id| [id, "projects/#{connection['project_id']}/locations/#{region}/publishers/google/models/#{id}"] }
     },
 
     models_generative: ->(connection) {
-      resp = get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models')
-               .params(pageSize: 1000, listAllVersions: true)
-      items = (resp['publisherModels'] || [])
-                .map { |m| m['name'].to_s.split('/').last }
-                .select { |id| id.start_with?('gemini-') }
-                .uniq.sort
-      items.map { |id|
-        [id, "projects/#{connection['project_id']}/locations/global/publishers/google/models/#{id}"]
-      }
+      begin
+        resp = get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models')
+                 .params(pageSize: 200, listAllVersions: true)
+        items = (resp['publisherModels'] || [])
+                  .map { |m| m['name'].to_s.split('/').last }
+                  .select { |id| id.start_with?('gemini-') }
+                  .uniq.sort
+      rescue => _e
+        # Safe fallback; include commonly available SKUs so builder remains usable
+        items = %w[gemini-2.5-pro gemini-2.0-flash gemini-1.5-flash]
+      end
+      items.map { |id| [id, "projects/#{connection['project_id']}/locations/global/publishers/google/models/#{id}"] }
     },
 
     # Contract-conformant roles (system handled via system_preamble)
@@ -936,6 +947,7 @@
     # Build model path for publisher models (Gemini/embeddings). Generative defaults to global.
     build_model_path_with_global_preview: ->(connection, model) {
       m = call(:normalize_model_identifier, model)
+      error('Model is required') if m.blank?
       return m if m.start_with?('projects/')
 
       # Accept common short forms
@@ -962,6 +974,7 @@
 
     build_embedding_model_path: ->(connection, model) {
       m = call(:normalize_model_identifier, model)
+      error('Embedding model is required') if m.blank?
       return m if m.start_with?('projects/')
 
       # Accept common short forms
@@ -1177,7 +1190,7 @@
     # Normalize a user-provided "model" into a String.
     # Accepts String or Hash (from datapills/pick lists). Prefers common keys.
     normalize_model_identifier: ->(raw) {
-      return '' if raw.nil?
+      return '' if raw.nil? || raw == true || raw == false
       if raw.is_a?(Hash)
         v = raw['name'] || raw[:name] ||
             raw['path'] || raw[:path] ||
