@@ -8,7 +8,7 @@
     fields: [
       # -------- Developer options --------
       { name: 'verbose_errors',  label: 'Verbose errors', type: 'boolean', control_type: 'checkbox', hint: 'Include upstream response bodies in normalized error messages (useful in non-prod).' },
-      { name: 'include_trace',   label: 'Include trace in outputs', type: 'boolean', control_type: 'checkbox', default: true, sticky: true },
+      { name: 'include_trace',   label: 'Include trace in outputs', type: 'boolean', control_type: 'checkbox', default: false, sticky: true },
 
       # -------- Authentication selection --------
       { name: 'auth_type', label: 'Authentication type', control_type: 'select', optional: false, default: 'oauth2', extends_schema: true, hint: 'Choose how to authenticate to Google Drive.',
@@ -181,17 +181,13 @@
     )
 
     if connection['enable_gcs'] == true
-      # Ask Google which scopes are on this token
-      ti = call('http_request',
+      # Smoke probe that exercises devstorage scope without assuming a bucket
+      call('http_request',
         method: :get,
-        url: 'https://www.googleapis.com/oauth2/v1/tokeninfo',
-        params: {}, # token inferred from Authorization header
-        context: { action: 'Token info' }
-      )['data']
-
-      scopes = (ti['scope'] || '').split(/\s+/)
-      error('GCS scope missing (devstorage.read_write). Reconnect with “Enable Google Cloud Storage”.') \
-        unless scopes.include?('https://www.googleapis.com/auth/devstorage.read_write')
+        url: 'https://storage.googleapis.com/storage/v1/b/this-bucket-should-not-exist-123456/o',
+        params: { maxResults: 1, fields: 'nextPageToken' },
+        context: { action: 'GCS scope smoke probe' }
+      ) rescue nil  # Only fail test on 401/403; otherwise ignore
     end
 
     true
@@ -345,8 +341,7 @@
           { name: 'modified_after',  type: 'date_time' },
           { name: 'modified_before', type: 'date_time' },
           { name: 'mime_type',       label: 'MIME type' },
-          { name: 'exclude_folders', type: 'boolean', control_type: 'checkbox', toggle_hint: 'Use custom value',
-            toggle_field: {name: 'exclude_folders', label: 'Exclude folders', type: 'string', multiline: true}},
+          { name: 'exclude_folders', type: 'boolean', control_type: 'checkbox', default: false },
           { name: 'page_token',      label: 'Page token' }
         ]
       end,
@@ -422,15 +417,7 @@
         resp = call('http_request',
           method: :get,
           url: call('build_endpoint_url', :drive, :files),
-          params: {
-            q: q,
-            pageSize: page_size,
-            fields: 'nextPageToken,files(id,name,mimeType,size,modifiedTime,md5Checksum,owners)',
-            orderBy: 'modifiedTime desc',
-            pageToken: local['page_token'],
-            supportsAllDrives: true,
-            includeItemsFromAllDrives: true
-          }.reject { |_k, v| v.nil? || v.to_s == '' },
+          params: params,
           headers: { 'X-Correlation-Id' => action_cid },
           context: { action: 'List Drive files', correlation_id: action_cid, verbose_errors: connection['verbose_errors'] }
         )
@@ -444,21 +431,23 @@
           }
         end
 
-        {
+        debug_on = connection['include_trace'] == true
+        out = {
           'files'           => files,
           'file_ids'        => files.map { |f| f['id'] }, 
           'count'           => files.length,
           'has_more'        => !call('blank?', data['nextPageToken']),
           'next_page_token' => data['nextPageToken'],
-          'query_used'      => q,
-          'api'             => resp['http'],
-          'telemetry'       => call('telemetry_envelope',
-                                    true,
-                                    { action: 'list_drive_files', folder_id: folder_id, page_size: page_size },
-                                    started_at,
-                                    action_cid,
-                                    connection['include_trace'])
+          'query_used'      => q
         }
+        out['api'] = resp['http'] if debug_on
+        out['telemetry'] = call('telemetry_envelope',
+                                true,
+                                { action: 'list_drive_files', folder_id: folder_id, page_size: page_size },
+                                started_at,
+                                action_cid,
+                                debug_on) if debug_on
+        out
       end
     },
     batch_fetch_drive_files: {
@@ -543,18 +532,20 @@
 
         succ_ids = successes.map { |rec| rec['id'] }.compact.uniq
 
-        {
+        debug_on = connection['include_trace'] == true
+        out = {
           'successful_files'    => successes,
           'failed_files'        => failures,
-          'successful_file_ids' => succ_ids,                     # <-- new
-          'metrics'             => { 'total_processed' => total, 'success_count' => succ, 'failure_count' => failc, 'success_rate' => rate },
-          'telemetry'           => call('telemetry_envelope',
-                                        failures.empty?,
-                                        { action: 'batch_fetch_drive_files', total: total },
-                                        started_at,
-                                        action_cid,
-                                        connection['include_trace'])
-        }
+          'successful_file_ids' => succ_ids,
+          'metrics'             => { 'total_processed' => total, 'success_count' => succ, 'failure_count' => failc, 'success_rate' => rate }
+         }
+        out['telemetry'] = call('telemetry_envelope',
+                                failures.empty?,
+                                { action: 'batch_fetch_drive_files', total: total },
+                                started_at,
+                                action_cid,
+                                debug_on) if debug_on
+        out
       end
     },
     monitor_drive_changes: {
@@ -625,7 +616,8 @@
             context: { action: 'Get Drive start token', correlation_id: action_cid, verbose_errors: connection['verbose_errors'] }
           )
           # Return initial token
-          return {
+          debug_on = connection['include_trace'] == true
+          out = {
             'changes'         => [],
             'new_page_token'  => (start['data'].is_a?(Hash) ? start['data']['startPageToken'] : nil),
             'files_added'     => [],
@@ -633,14 +625,16 @@
             'files_removed'   => [],
             'summary'         => { 'total_changes' => 0, 'added_count' => 0, 'modified_count' => 0, 'removed_count' => 0, 'has_more' => false },
             'is_initial_token'=> true,
-            'api'             => start['http'],
-            'telemetry'       => call('telemetry_envelope',
-                                      true,
-                                      { action: 'monitor_drive_changes:init' },
-                                      started_at,
-                                      action_cid,
-                                      connection['include_trace'])
-          }
+            # api + telemetry gated below
+           }
+          out['api'] = start['http'] if debug_on
+          out['telemetry'] = call('telemetry_envelope',
+                                  true,
+                                  { action: 'monitor_drive_changes:init' },
+                                  started_at,
+                                  action_cid,
+                                  debug_on) if debug_on
+          out
         end
 
         # Return changes
@@ -696,7 +690,8 @@
         has_more   = !call('blank?', data['nextPageToken'])
 
         # Return changes
-        {
+        debug_on = connection['include_trace'] == true
+        out = {
           'changes'         => all_changes,
           'new_page_token'  => next_token,
           'files_added'     => added,
@@ -710,14 +705,14 @@
             'has_more'      => has_more
           },
           'is_initial_token'=> false,
-          'api'             => chg['http'],
-          'telemetry'       => call('telemetry_envelope',
-                                    true,
-                                    { action: 'monitor_drive_changes', page_size: page_size },
-                                    started_at,
-                                    action_cid,
-                                    connection['include_trace'])
-        }
+        out['api'] = chg['http'] if debug_on
+        out['telemetry'] = call('telemetry_envelope',
+                                true,
+                                { action: 'monitor_drive_changes', page_size: page_size },
+                                started_at,
+                                action_cid,
+                                debug_on) if debug_on
+        out
       end,
 
       sample_output: lambda do
@@ -731,6 +726,7 @@
             'metadata' => { 'action' => 'monitor_drive_changes' },
             'trace'    => { 'correlation_id' => 'cid', 'duration_ms' => 10 } }
         }
+
       end
     },
 
@@ -797,7 +793,8 @@
           }
         end
 
-        {
+        debug_on = connection['include_trace'] == true
+        out = {
           'objects'         => items,
           'count'           => items.length,
           'has_more'        => !call('blank?', data['nextPageToken']),
@@ -805,6 +802,8 @@
           'prefixes'        => data['prefixes'] || [],
           'telemetry'       => call('telemetry_envelope', true, { action: 'gcs_list_objects', bucket: bucket }, started_at, action_cid, connection['include_trace'])
         }
+        out['telemetry'] = call('telemetry_envelope', true, { action: 'gcs_list_objects', bucket: bucket }, started_at, action_cid, debug_on) if debug_on
+        out
       end
     },
     gcs_fetch_object: {
@@ -845,7 +844,8 @@
         text_out = content['text_content']
         text_out = call('strip_urls_from_text', text_out) if local['strip_urls'] == true
 
-        {
+        debug_on = connection['include_trace'] == true
+        out = {
           'bucket'         => meta['bucket'],
           'name'           => meta['name'],
           'size'           => meta['size'],
@@ -860,6 +860,8 @@
           'fetch_method'   => content['fetch_method'],
           'telemetry'      => call('telemetry_envelope', true, { action: 'gcs_fetch_object', bucket: bucket, object: name }, started, cid, connection['include_trace'])
         }
+        out['telemetry'] = call('telemetry_envelope', true, { action: 'gcs_fetch_object', bucket: bucket, object: name }, started, cid, debug_on) if debug_on
+        out
       end
     },
     gcs_batch_fetch_objects: {
@@ -959,25 +961,27 @@
             text = call('strip_urls_from_text', text) if strip_urls
 
             successes << {
-              'bucket'           => meta['bucket'],
-              'name'             => meta['name'],
-              'size'             => meta['size'],
-              'content_type'     => meta['content_type'],
-              'updated'          => meta['updated'],
-              'generation'       => meta['generation'],
-              'md5_hash'         => meta['md5_hash'],
-              'crc32c'           => meta['crc32c'],
-              'metadata'         => meta['metadata'],
-              'text_content'     => text,
-              'needs_processing' => content['needs_processing'],
-              'fetch_method'     => content['fetch_method'],
-              'telemetry'        => call('telemetry_envelope',
-                                        true,
-                                        { action: 'gcs_batch_fetch_objects:item', bucket: bucket, object: name },
-                                        Time.now,
-                                        per_cid,
-                                        true)
-            }
+              item = {
+                'bucket'           => meta['bucket'],
+                'name'             => meta['name'],
+                'size'             => meta['size'],
+                'content_type'     => meta['content_type'],
+                'updated'          => meta['updated'],
+                'generation'       => meta['generation'],
+                'md5_hash'         => meta['md5_hash'],
+                'crc32c'           => meta['crc32c'],
+                'metadata'         => meta['metadata'],
+                'text_content'     => text,
+                'needs_processing' => content['needs_processing'],
+                'fetch_method'     => content['fetch_method']
+             }
+            item['telemetry'] = call('telemetry_envelope',
+                                     true,
+                                     { action: 'gcs_batch_fetch_objects:item', bucket: bucket, object: name },
+                                     Time.now,
+                                     per_cid,
+                                     connection['include_trace'] == true) if connection['include_trace'] == true
+            successes << item
           rescue => e
             failures << {
               'object_name'    => name,
@@ -994,20 +998,21 @@
         failc = failures.length
         rate  = total > 0 ? ((succ.to_f / total) * 100).round(2) : 0.0
 
-        {
+        debug_on = connection['include_trace'] == true
+        out = {
           'successful_objects'     => successes,
           'failed_objects'         => failures,
           'successful_object_names'=> successes.map { |o| o['name'] }.compact.uniq,
           'metrics'                => {
-            'total_processed' => total, 'success_count' => succ, 'failure_count' => failc, 'success_rate' => rate
-          },
-          'telemetry'              => call('telemetry_envelope',
-                                          failures.empty?,
-                                          { action: 'gcs_batch_fetch_objects', bucket: bucket, total: total },
-                                          started_at,
-                                          action_cid,
-                                          connection['include_trace'])
+            'total_processed' => total, 'success_count' => succ, 'failure_count' => failc, 'success_rate' => rate }
         }
+        out['telemetry'] = call('telemetry_envelope',
+                                failures.empty?,
+                                { action: 'gcs_batch_fetch_objects', bucket: bucket, total: total },
+                                started_at,
+                                action_cid,
+                                debug_on) if debug_on
+        out
       end
     },
     gcs_write_object: {
@@ -1118,16 +1123,18 @@
           'metadata'     => up['metadata'] || {}
         }
 
-        {
+        debug_on = connection['include_trace'] == true
+        out = {
           'gcs_object'     => gmd,
           'bytes_uploaded' => bytes.to_s.bytesize,
-          'telemetry'      => call('telemetry_envelope',
-                                  true,
-                                  { action: 'gcs_write_object', bucket: bucket, object: gmd['name'], upload_type: upload },
-                                  started_at,
-                                  action_cid,
-                                  connection['include_trace'])
-        }
+         }
+        out['telemetry'] = call('telemetry_envelope',
+                                true,
+                                { action: 'gcs_write_object', bucket: bucket, object: gmd['name'], upload_type: upload },
+                                started_at,
+                                action_cid,
+                                debug_on) if debug_on
+        out
       end
     },
     gcs_batch_write_objects: {
@@ -1279,12 +1286,13 @@
               'metadata'     => up['metadata'] || {}
             }
 
-            uploaded << {
+            item = {
               'object_name'    => name,
               'gcs_object'     => gmd,
-              'bytes_uploaded' => bytes.to_s.bytesize,
-              'telemetry'      => call('telemetry_envelope', true, { action: 'gcs_batch_write_objects:item', bucket: bucket, object: name }, Time.now, per_cid, true)
+              'bytes_uploaded' => bytes.to_s.bytesize
             }
+            item['telemetry'] = call('telemetry_envelope', true, { action: 'gcs_batch_write_objects:item', bucket: bucket, object: name }, Time.now, per_cid, connection['include_trace'] == true) if connection['include_trace'] == true
+            uploaded << item
           rescue => e
             failed << {
               'object_name'   => (it['object_name'] || ''),
@@ -1301,17 +1309,19 @@
         failc = failed.length
         rate  = total > 0 ? ((succ.to_f / total) * 100).round(2) : 0.0
 
-        {
+        debug_on = connection['include_trace'] == true
+        out = {
           'uploaded'  => uploaded,
           'failed'    => failed,
           'summary'   => { 'total' => total, 'success' => succ, 'failed' => failc, 'success_rate' => rate },
-          'telemetry' => call('telemetry_envelope',
-                              failed.empty?,
-                              { action: 'gcs_batch_write_objects', bucket: bucket, total: total, success: succ, failed: failc, upload_type: upload },
-                              started_at,
-                              action_cid,
-                              connection['include_trace'])
-        }
+         }
+        out['telemetry'] = call('telemetry_envelope',
+                                failed.empty?,
+                                { action: 'gcs_batch_write_objects', bucket: bucket, total: total, success: succ, failed: failc, upload_type: upload },
+                                started_at,
+                                action_cid,
+                                debug_on) if debug_on
+        out
       end
     },
     # COMPOUND
@@ -1488,33 +1498,32 @@
               'metadata' => up['metadata'] || {}
             }
 
-            successes << {
+            item = {
               'drive_file_id' => fid,
               'gcs_object' => gmd,
               'export_mime' => export_mime,
-              'bytes_uploaded' => bytes.to_s.bytesize,
-              'telemetry' => call('telemetry_envelope', true, { action: 'transfer_drive_to_gcs:item', file_id: fid, object: gmd['name'] }, Time.now, per_cid, true)
-            }
+             }
+            item['telemetry'] = call('telemetry_envelope', true, { action: 'transfer_drive_to_gcs:item', file_id: fid, object: gmd['name'] }, Time.now, per_cid, connection['include_trace'] == true) if connection['include_trace'] == true
+            successes << item
           rescue => e
             failures << { 'drive_file_id' => raw, 'error_message' => e.message, 'error_code' => call('infer_error_code', e.message) }
             error("Stopped on #{raw}: #{e.message}") if fail_fast
           end
         end
 
-        {
+        debug_on = connection['include_trace'] == true
+        out = {
           'uploaded' => successes,
           'failed'   => failures,
-          'summary'  => { 'total' => ids.length, 'success' => successes.length, 'failed' => failures.length },
-          'telemetry'=> call('telemetry_envelope',
-                   failures.empty?,
-                   { action: 'transfer_drive_to_gcs',
-                     total: ids.length,
-                     success: successes.length,
-                     failed: failures.length },
-                   started_at,
-                   action_cid,
-                   connection['include_trace'])
-        }
+          'summary'  => { 'total' => ids.length, 'success' => successes.length, 'failed' => failures.length }
+         }
+        out['telemetry'] = call('telemetry_envelope',
+                                failures.empty?,
+                                { action: 'transfer_drive_to_gcs', total: ids.length, success: successes.length, failed: failures.length },
+                                started_at,
+                                action_cid,
+                                debug_on) if debug_on
+        out
       end
     }
   },
@@ -1663,8 +1672,22 @@
       req = req.request_format_raw                 if opts[:raw_body] == true
       req = req.response_format_raw                if opts[:raw_response] == true
 
-      req.after_error_response(/.*/) do |code, body, _hdr, message|
-        error(call('normalize_http_error', code, body, message, ctx.merge(correlation_id: cid)))
+      req.after_error_response(/(429|5\d\d)/) do |code, body, hdrs, message|
+        ra = (hdrs['retry-after'] || hdrs['Retry-After']).to_i
+        retry_after( ra.positive? ? ra : 2 )
+      end
+      # Backoff on throttling/server errors, then normalize remaining errors
+      req.after_error_response(/(429|5\d\d)/) do |code, body, hdrs, message|
+        ra = 0
+        begin
+          ra = (hdrs['retry-after'] || hdrs['Retry-After']).to_i
+        rescue
+          ra = 0
+        end
+        retry_after( ra.positive? ? ra : 2 )
+      end
+      req.after_error_response(/.*/) do |code, body, hdrs, message|
+        error(call('normalize_http_error', code, body, message, ctx.merge(correlation_id: cid, response_headers: hdrs)))
       end
 
       # Always expose status + headers + request info
@@ -1687,6 +1710,7 @@
     normalize_http_error: lambda do |code, body, message, context|
       action = (context || {})[:action] || 'HTTP request'
       cid    = (context || {})[:correlation_id]
+      hdrs   = (context || {})[:response_headers] || {}
       verbose = (context || {})[:verbose_errors] == true
 
       hint =
@@ -1705,11 +1729,12 @@
         parsed && (parsed.dig('error', 'message') || parsed['message'])
       end
 
-      msg = "[#{code}] #{action} failed"
-      msg += " — #{detail}" if detail
-      msg += " — #{message}" if message && message != detail
-      msg += " (cid: #{cid})" if cid
-      msg += "\nHint: #{hint}"
+      req_id = hdrs['x-guploader-uploadid'] || hdrs['x-goog-request-id'] || hdrs['x-request-id']
+      msg = "status=#{code} cid=#{cid} action=#{action}"
+      msg += " request_id=#{req_id}" if req_id
+      msg += " detail=#{detail}" if detail
+      msg += " message=#{message}" if message && message != detail
+      msg += " hint=#{hint}"
       # Don't print raw binary in verbose errors
       safe_raw = body.is_a?(String) ? call('safe_utf8', body) : body.to_s
       msg += "\nRaw: #{safe_raw}" if verbose
@@ -1843,11 +1868,8 @@
     end,
 
     infer_error_code: lambda do |msg|
-      return '401' if msg.include?('[401]')
-      return '403' if msg.include?('[403]')
-      return '404' if msg.include?('[404]')
-      return '429' if msg.include?('[429]')
-      'ERROR'
+      m = msg.match(/status=(\d{3})/)
+      m ? m[1] : 'ERROR'
     end,
 
     # Shared record builder for single/batch
@@ -1874,7 +1896,8 @@
       text    = content['text_content']
       text    = call('strip_urls_from_text', text) if strip_urls
 
-      {
+      debug_on = connection['include_trace'] == true
+      rec = {
         'id'               => mdata['id'],
         'name'             => mdata['name'],
         'mime_type'        => mdata['mimeType'],
@@ -1885,16 +1908,17 @@
         'text_content'     => text,
         'needs_processing' => content['needs_processing'],
         'export_mime_type' => content['export_mime_type'],
-        'fetch_method'     => content['fetch_method'],
-        'api_meta'         => meta['http'],
-        'api_content'      => content['http'],
-        'telemetry'       => call('telemetry_envelope',
-                                   true,
-                                   { action: 'fetch_drive_file', file_id: fid },
-                                   started,
-                                   file_cid,
-                                   true) # always include trace for per-file
+        'fetch_method'     => content['fetch_method']
       }
+      rec['api_meta']    = meta['http']        if debug_on
+      rec['api_content'] = content['http']     if debug_on
+      rec['telemetry']   = call('telemetry_envelope',
+                                true,
+                                { action: 'fetch_drive_file', file_id: fid },
+                                started,
+                                file_cid,
+                                debug_on)     if debug_on
+      rec
     end, 
 
     build_drive_source_metadata: lambda do |drive_meta|
@@ -2072,10 +2096,15 @@
     coerce_gcs_object_names: lambda do |local|
       names = []
       names += Array(local['object_names'] || [])
-      names += Array(local['objects'] || []).map { |o|
-        o.is_a?(Hash) ? (o['name'] || o['object_name']) : nil
-      }
-      names.compact.map(&:to_s).reject { |s| call('blank?', s) }.uniq
+      names += Array(local['objects'] || []).map { |o| o.is_a?(Hash) ? (o['name'] || o['object_name']) : nil }
+      names.compact.map(&:to_s).map { |s|
+        if s.start_with?('gs://')
+          # caller provides bucket separately; keep only the path part
+          s.sub(%r{\Ags://[^/]+/}, '')
+        else
+          s
+        end
+      }.reject { |s| call('blank?', s) }.uniq
     end
 
   }
