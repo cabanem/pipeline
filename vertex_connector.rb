@@ -12,12 +12,9 @@
       { name: 'project_id', optional: false, hint: 'GCP project ID' },
       { name: 'location', optional: false, hint: 'e.g., global, us-east4' },
 
-      { name: 'sa_key_json', label: 'Service account key JSON', optional: true, control_type: 'password', multiline: true,
-        hint: 'Paste the full JSON key. If provided, client_email/private_key below are ignored.' },
-
-      { name: 'client_email', label: 'Service account client_email', optional: true, hint: 'Used if sa_key_json not provided'},
-      { name: 'private_key', label: 'Service account private_key', optional: true, control_type: 'password', multiline: true,
-        hint: 'Include BEGIN/END PRIVATE KEY lines. Used if sa_key_json not provided.' },
+      { name: 'client_email', label: 'Service account client_email', optional: false },
+      { name: 'private_key', label: 'Service account private_key', optional: false, control_type: 'password', multiline: true,
+        hint: 'Include BEGIN/END PRIVATE KEY lines.' },
 
       { name: 'scope', optional: true, hint: 'OAuth scope(s)', default: 'https://www.googleapis.com/auth/cloud-platform',
         control_type: 'select', options: [['Cloud Platform (all)', 'https://www.googleapis.com/auth/cloud-platform']] }
@@ -31,20 +28,8 @@
         iss = nil
         key = nil
 
-        if (json = connection['sa_key_json']).present?
-          begin
-            parsed = JSON.parse(json)
-            iss = parsed['client_email']
-            key = parsed['private_key']
-            # If project_id omitted above, derive it from the SA key (optional)
-            connection['project_id'] = connection['project_id'].presence || parsed['project_id']
-          rescue StandardError => e
-            error("Invalid service account JSON: #{e.message}")
-          end
-        else
-          iss = connection['client_email']
-          key = connection['private_key']
-        end
+        iss = connection['client_email']
+        key = connection['private_key']
 
         error('Missing client_email for service account') if iss.blank?
         error('Missing private_key for service account') if key.blank?
@@ -63,8 +48,6 @@
           iss: iss,
           scope: (connection['scope'].presence || 'https://www.googleapis.com/auth/cloud-platform')
         }
-        # Domain‑wide delegation (optional)
-        jwt_body[:sub] = connection['subject'] if connection['subject'].present?
 
         assertion = workato.jwt_encode(jwt_body, key, 'RS256')
 
@@ -75,7 +58,8 @@
       },
 
       apply: ->(connection) {
-        headers('Authorization': "Bearer #{connection['access_token']}")
+        bearer = connection['access_token']
+        headers('Authorization': "Bearer #{bearer}")
       },
 
       refresh_on: [401, 403]
@@ -88,8 +72,10 @@
   },
 
   test: ->(connection) {
+    project_id  = connection['project_id']
+    location    = connection['location']
     # Protected publisher list that requires auth at project/location scope.
-    get("/v1/projects/#{connection['project_id']}/locations/#{connection['location']}/publishers/google/models")
+    get("/v1/projects/#{project_id}/locations/#{location}/publishers/google/models")
       .params(pageSize: 1)
   },
 
