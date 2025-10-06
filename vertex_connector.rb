@@ -74,8 +74,9 @@
   test: ->(connection) {
     project_id  = connection['project_id']
     location    = connection['location']
-    # Protected publisher list that requires auth at project/location scope
-    get("/v1/projects/#{project_id}/locations/#{location}/models")
+    get('/v1/publishers/google/models/gemini-1.5-pro')
+      # Global list of publisher models (beta surface)== 'get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models')'
+      # for custom models API (UCAIP) == 'get("/v1/projects/#{project_id}/locations/#{location}/models")''
       # alt == 'get("/v1/projects/#{project_id}/locations/#{location}/endpoints")'
       .params(pageSize: 1)
   },
@@ -501,7 +502,7 @@
           payload = {
             'contents' => contents,
             'systemInstruction' => sys_inst,
-            'tools' => input['tools'],
+            'tools' => tools,
             'toolConfig' => input['toolConfig'],
             'safetySettings' => input['safetySettings'],
             'generationConfig' => input['generationConfig']
@@ -586,7 +587,11 @@
           'generationConfig' => input['generationConfig']
         }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
 
-        post("/v1/#{model_path}:generateContent").payload(payload)
+        post("/v1/#{model_path}:countTokens").payload({
+          'contents' => contents,
+          'systemInstruction' => sys_inst
+        }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) })
+
       },
       output_fields: ->() {
         [
@@ -644,7 +649,11 @@
         ]
       },
       execute: ->(connection, input) {
+        # Confirm regional endpoint (UCAIP)
+        call(:ensure_regional_location!) # will throw if connection does not contain required element
+        # Build endpoint path
         endpoint_path = call(:build_endpoint_path, connection, input['endpoint'])
+        # Post
         post("/v1/#{endpoint_path}:predict")
           .payload({ 'instances' => input['instances'], 'parameters' => input['parameters'] }.delete_if { |_k, v| v.nil? })
       },
@@ -672,7 +681,11 @@
         ]
       },
       execute: ->(connection, input) {
+        # Confirm regional endpoint (UCAIP)
+        call(:ensure_regional_location!) # will throw if connection does not contain required element
+        # Build Path
         path = "/v1/projects/#{connection['project_id']}/locations/#{connection['location']}/batchPredictionJobs"
+        # Build payload
         payload = {
           'displayName' => input['displayName'],
           'model' => input['model'],
@@ -686,7 +699,7 @@
           },
           'modelParameters' => input['modelParameters']
         }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
-
+        # Post
         post(path).payload(payload)
       },
       output_fields: ->(object_definitions) { object_definitions['batch_job'] },
@@ -704,9 +717,13 @@
       batch: true,
       input_fields: ->() { [ { name: 'job_id', optional: false } ] },
       execute: ->(connection, input) {
+        # Confirm regional endpoint (UCAIP)
+        call(:ensure_regional_location!) # will throw if connection does not contain required element
+        # Find the job
         name = input['job_id'].to_s.start_with?('projects/') ?
           input['job_id'] :
           "projects/#{connection['project_id']}/locations/#{connection['location']}/batchPredictionJobs/#{input['job_id']}"
+        # Get
         get("/v1/#{name}")
       },
       output_fields: ->(object_definitions) { object_definitions['batch_job'] },
@@ -796,6 +813,10 @@
       parts.join("\n\n")
     },
 
+    ensure_regional_location!: ->(connection) {
+      loc = (connection['location'] || '').downcase
+      error("This action requires a regional location (e.g., us-central1). Current location is '#{loc}'.") if loc.blank? || loc == 'global'
+    },
     # Extracts a float vector from Vertex embedding prediction shapes
     extract_embedding_vector: ->(pred) {
       vec = pred.dig('embeddings', 0, 'values') ||
