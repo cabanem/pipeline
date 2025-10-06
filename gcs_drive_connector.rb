@@ -116,7 +116,9 @@
             { name: 'service_account_email', group: 'Service account', optional: false, hint: 'e.g. my-sa@project.iam.gserviceaccount.com' },
             { name: 'client_id',             group: 'Service account', optional: false, hint: 'Service account client ID (used as JWT kid)' },
             { name: 'private_key_id',        group: 'Service account', optional: false, hint: 'The key’s private_key_id from the JSON' },
-            { name: 'private_key',           group: 'Service account', control_type: 'password', multiline: true, optional: false, hint: 'Paste the PEM private key from the JSON. Newlines may appear as \\n; both forms are handled.' }
+            { name: 'private_key',           group: 'Service account', control_type: 'password', multiline: true, optional: false, hint: 'Paste the PEM private key from the JSON. Newlines may appear as \\n; both forms are handled.' },
+            { name: 'subject_email',         group: 'Service account', optional: true, hint: 'Impersonate this user (domain‑wide delegation required). Optional.' }
+           
           ],
 
           acquire: lambda do |connection|
@@ -138,6 +140,11 @@
               'iat'   => iat,
               'exp'   => exp
             }
+      
+            # Optional user impersonation (domain-wide delegation)
+            if connection['subject_email'].to_s.strip != ''
+              claim['sub'] = connection['subject_email'].to_s.strip
+            end
 
             jwt = workato.jwt_encode(
               claim,
@@ -337,6 +344,7 @@
       input_fields: lambda do
         [
           { name: 'folder_id', label: 'Folder ID or URL', hint: 'Leave empty for My Drive root' },
+          { name: 'drive_id',  label: 'Shared Drive ID', hint: 'Optional: restrict search to a specific shared drive' },
           { name: 'max_results', type: 'integer', default: 100, hint: '1–1000 (default 100)' },
           { name: 'modified_after',  type: 'date_time' },
           { name: 'modified_before', type: 'date_time' },
@@ -373,30 +381,19 @@
 
         page_size = [[(local['max_results'] || 100).to_i, 1].max, 1000].min
         
-        # Safely determine drive/corpora
-        corpora     = 'user'
-        drive_id    = nil
-        use_shared  = false
-
-        if !call('blank?', folder_id)
-          begin
-            fmeta = call('http_request',
-              method: :get,
-              url: call('build_endpoint_url', :drive, :file, folder_id),
-              params: { fields: 'id,mimeType,driveId', supportsAllDrives: true },
-              headers: { 'X-Correlation-Id' => action_cid },
-              context: { action: 'Probe Drive folder', correlation_id: action_cid, verbose_errors: connection['verbose_errors'] }
-            )['data'] || {}
-            if !call('blank?', fmeta['driveId'])
-              corpora    = 'drive'
-              drive_id   = fmeta['driveId']
-              use_shared = true
-            end
-          rescue
-            # Fall back to My Drive if probe fails (keeps listing robust)
-            corpora = 'user'
+        # Drive search strategy:
+        # - If caller gives a drive_id -> restrict to that shared drive (fast/cheapest).
+        # - Else if caller filters by a folder -> search across all drives so shared drive folders work without probing.
+        # - Else -> user's My Drive.
+        drive_id = (local['drive_id'] || '').to_s
+        corpora  =
+          if !call('blank?', drive_id)
+            'drive'
+          elsif !call('blank?', folder_id)
+            'allDrives'
+          else
+            'user'
           end
-        end
 
         params = {
           q: q,
@@ -405,14 +402,13 @@
           orderBy: 'modifiedTime desc',
           pageToken: local['page_token'],
           spaces: 'drive',
-          corpora: corpora
+          corpora: corpora,
+          supportsAllDrives: true,
+          includeItemsFromAllDrives: true
+
         }.reject { |_k, v| v.nil? || v.to_s == '' }
 
-        if use_shared
-          params[:supportsAllDrives]         = true
-          params[:includeItemsFromAllDrives] = true
-          params[:driveId]                   = drive_id
-        end
+        params[:driveId] = drive_id unless call('blank?', drive_id)
 
         resp = call('http_request',
           method: :get,
@@ -440,14 +436,16 @@
           'next_page_token' => data['nextPageToken'],
           'query_used'      => q
         }
-        out['api'] = resp['http'] if debug_on
-        out['telemetry'] = call('telemetry_envelope',
-                                true,
-                                { action: 'list_drive_files', folder_id: folder_id, page_size: page_size },
-                                started_at,
-                                action_cid,
-                                debug_on) if debug_on
-        out
+        if connection['include_trace'] == true
+          out['api'] = resp['http']
+          out['telemetry'] = call('telemetry_envelope',
+                                  true,
+                                  { action: 'list_drive_files', folder_id: folder_id, page_size: page_size, corpora: corpora, drive_id: drive_id },
+                                  started_at,
+                                  action_cid,
+                                  true)
+        end
+         out
       end
     },
     batch_fetch_drive_files: {
@@ -704,7 +702,8 @@
             'removed_count' => removed.length,
             'has_more'      => has_more
           },
-          'is_initial_token'=> false,
+          'is_initial_token'=> false
+        }
         out['api'] = chg['http'] if debug_on
         out['telemetry'] = call('telemetry_envelope',
                                 true,
@@ -960,8 +959,7 @@
             text = content['text_content']
             text = call('strip_urls_from_text', text) if strip_urls
 
-            successes << {
-              item = {
+            item = {
                 'bucket'           => meta['bucket'],
                 'name'             => meta['name'],
                 'size'             => meta['size'],
