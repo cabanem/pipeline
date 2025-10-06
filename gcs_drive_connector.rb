@@ -28,21 +28,22 @@
       end,
 
       identity: lambda do |connection|
-        selected = connection['auth_type'] || 'custom'
-        if selected == 'oauth'
+        selected = (connection['auth_type'] || 'custom').to_s
+        if selected == 'oauth2'
           begin
-            info = call('http_request', connection,
-              method: 'GET',
+            info = call('http_request',
+              method: :get,
               url: 'https://openidconnect.googleapis.com/v1/userinfo',
-              headers: {}, # @note auth comes from apply
-              retry_config: { max_attempts: 2, backoff: 0.5, retry_on: [429,500,502,503,504] }
-            )
+              headers: {}, # auth applied by 'apply'
+              context: { action: 'OIDC userinfo' }
+            )['data'] || {}
             email = info['email'] || '(no email)'
             name  = info['name']
             sub   = info['sub']
             [name, email, sub].compact.join(' / ')
           rescue
             'OAuth2 (Google) - identity unavailable'
+          end
         else
           connection['service_account_email']
         end
@@ -374,6 +375,47 @@
         })
 
         page_size = [[(local['max_results'] || 100).to_i, 1].max, 1000].min
+        
+        # Safely determine drive/corpora
+        corpora     = 'user'
+        drive_id    = nil
+        use_shared  = false
+
+        if !call('blank?', folder_id)
+          begin
+            fmeta = call('http_request',
+              method: :get,
+              url: call('build_endpoint_url', :drive, :file, folder_id),
+              params: { fields: 'id,mimeType,driveId', supportsAllDrives: true },
+              headers: { 'X-Correlation-Id' => action_cid },
+              context: { action: 'Probe Drive folder', correlation_id: action_cid, verbose_errors: connection['verbose_errors'] }
+            )['data'] || {}
+            if !call('blank?', fmeta['driveId'])
+              corpora    = 'drive'
+              drive_id   = fmeta['driveId']
+              use_shared = true
+            end
+          rescue
+            # Fall back to My Drive if probe fails (keeps listing robust)
+            corpora = 'user'
+          end
+        end
+
+        params = {
+          q: q,
+          pageSize: page_size,
+          fields: 'nextPageToken,files(id,name,mimeType,size,modifiedTime,md5Checksum,owners)',
+          orderBy: 'modifiedTime desc',
+          pageToken: local['page_token'],
+          spaces: 'drive',
+          corpora: corpora
+        }.reject { |_k, v| v.nil? || v.to_s == '' }
+
+        if use_shared
+          params[:supportsAllDrives]         = true
+          params[:includeItemsFromAllDrives] = true
+          params[:driveId]                   = drive_id
+        end
 
         resp = call('http_request',
           method: :get,
