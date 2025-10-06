@@ -266,14 +266,14 @@
         error('Provide subject and/or body') if email_text.blank?
 
         # Normalize categories
-        raw_cats = input['categories'] || []
-        cats = raw_cats.map { |c|
+        raw_cats = input['categories']
+        cats = call(:safe_array, raw_cats).map { |c|
           if c.is_a?(String)
             { 'name' => c, 'description' => nil, 'examples' => [] }
           else
             { 'name' => c['name'] || c[:name],
               'description' => c['description'] || c[:description],
-              'examples' => c['examples'] || c[:examples] || [] }
+              'examples' => call(:safe_array, (c['examples'] || c[:examples])) }
           end
         }.select { |c| c['name'].present? }
         error('At least 2 categories are required') if cats.length < 2
@@ -689,7 +689,7 @@
       execute: ->(connection, input) {
         model_path = call(:build_embedding_model_path, connection, input['model'])
 
-        instances = (input['texts'] || []).map { |t|
+        instances = call(:safe_array, input['texts']).map { |t|
           { 'content' => t, 'task_type' => input['task'] }.delete_if { |_k, v| v.nil? }
         }
 
@@ -911,7 +911,7 @@
       begin
         resp = get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models')
                  .params(pageSize: 200, listAllVersions: true)
-        ids = (resp['publisherModels'] || [])
+        ids = call(:safe_array, resp && resp['publisherModels'])
                 .map { |m| m['name'].to_s.split('/').last }
                 .select { |id| id.start_with?('text-embedding') || id.start_with?('multimodal-embedding') }
                 .uniq.sort
@@ -1214,8 +1214,19 @@
         return v.to_s.strip
       end
       raw.to_s.strip
-    }
+    },
 
+    # Coerce anything into a safe array for mapping.
+    safe_array: ->(v) {
+      return [] if v.nil? || v == false
+      return v  if v.is_a?(Array)
+      # Avoid surprising Hash#to_a (which returns [[:k, v], ...]).
+      # For Hash, we usually want a single element collection containing it.
+      [v]
+    },
+
+    # Like Array#map but safe against nil/false/non-arrays.
+    safe_map: ->(v) { call(:safe_array, v).map { |x| yield(x) } }
   },
 
   # ====== TRIGGERS ====================================================
