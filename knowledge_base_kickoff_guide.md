@@ -93,5 +93,3 @@ Once the basics work, you can:
 * You can query the KB and get relevant chunks back.
 * Recipe builders can use the KB without worrying about internal mechanics.
 
-
-Would you like me to **turn this into a one-pager “handout”** (cleaned up for non-technical eyes, like something you can drop into a Slack message or Confluence page)? That way it doubles as both instructions and managerial visibility.
