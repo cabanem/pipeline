@@ -436,9 +436,13 @@
       },
       execute: ->(connection, input) {
         model_path = call(:build_model_path_with_global_preview, connection, input['model'])
+
+        contents = call(:sanitize_contents_roles, input['contents'])
+        sys_inst = call(:normalize_system_instruction, input['systemInstruction'])
+
         payload = {
-          'contents' => input['contents'],
-          'systemInstruction' => input['systemInstruction'],
+          'contents' => contents,
+          'systemInstruction' => sys_inst,
           'tools' => input['tools'],
           'toolConfig' => input['toolConfig'],
           'safetySettings' => input['safetySettings'],
@@ -481,6 +485,9 @@
       execute: ->(connection, input) {
         model_path = call(:build_model_path_with_global_preview, connection, input['model'])
 
+        contents = call(:sanitize_contents_roles, input['contents'])
+        sys_inst = call(:normalize_system_instruction, input['systemInstruction'])
+
         tools =
           if input['grounding'] == 'google_search'
             [ { 'googleSearch' => {} } ]
@@ -490,14 +497,16 @@
             [ { 'retrieval' => { 'vertexAiSearch' => { 'datastore' => ds } } } ]
           end
 
-        payload = {
-          'contents' => input['contents'],
-          'tools' => tools,
-          'generationConfig' => input['generationConfig'],
-          'safetySettings' => input['safetySettings']
-        }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
+          payload = {
+            'contents' => contents,
+            'systemInstruction' => sys_inst,
+            'tools' => input['tools'],
+            'toolConfig' => input['toolConfig'],
+            'safetySettings' => input['safetySettings'],
+            'generationConfig' => input['generationConfig']
+          }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
 
-        post("/v1/#{model_path}:generateContent").payload(payload)
+          post("/v1/#{model_path}:generateContent").payload(payload)
       },
       output_fields: ->(object_definitions) { object_definitions['generate_content_output'] },
       sample_output: ->() {
@@ -558,10 +567,19 @@
       },
       execute: ->(connection, input) {
         model_path = call(:build_model_path_with_global_preview, connection, input['model'])
-        payload = { 'contents' => input['contents'], 'systemInstruction' => input['systemInstruction'] }
-          .delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
+        contents = call(:sanitize_contents_roles, input['contents'])
+        sys_inst = call(:normalize_system_instruction, input['systemInstruction'])
 
-        post("/v1/#{model_path}:countTokens").payload(payload)
+        payload = {
+          'contents' => contents,
+          'systemInstruction' => sys_inst,
+          'tools' => input['tools'],
+          'toolConfig' => input['toolConfig'],
+          'safetySettings' => input['safetySettings'],
+          'generationConfig' => input['generationConfig']
+        }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
+
+        post("/v1/#{model_path}:generateContent").payload(payload)
       },
       output_fields: ->() {
         [
@@ -700,73 +718,51 @@
     modes_grounding: ->() { [%w[Google\ Search google_search], %w[Vertex\ AI\ Search vertex_ai_search]] },
 
     # --- Models
-    models_embedding: ->(_connection) {
+    models_embedding: ->(connection) {
+      # Models for embeddings get the complete global resource path
       resp = get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models')
-               .params(pageSize: 2000, listAllVersions: true)
-      (resp['publisherModels'] || [])
-        .map { |m| m['name'].to_s.split('/').last }
-        .select { |id| id.include?('embedding') || id.start_with?('text-embedding') }
-        .uniq
-        .sort
-        .map { |id| [id, id] }
+              .params(pageSize: 2000, listAllVersions: true)
+      ids = (resp['publisherModels'] || [])
+              .map { |m| m['name'].to_s.split('/').last }
+              .select { |id| id.include?('embedding') || id.start_with?('text-embedding') }
+              .uniq
+              .sort
+      ids.map { |id|
+        [id, "projects/#{connection['project_id']}/locations/global/publishers/google/models/#{id}"]
+      }
     },
 
     # All Gemini-like text/VLM models, with preview 2.5s emitting a GLOBAL-anchored value
     models_generative: ->(connection) {
       resp = get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models')
-               .params(pageSize: 2000, listAllVersions: true)
+              .params(pageSize: 2000, listAllVersions: true)
       items = (resp['publisherModels'] || [])
-                .map do |m|
-                  id = m['name'].to_s.split('/').last # e.g., "gemini-2.5-pro"
-                  stage = (m['launchStage'] || 'UNSPECIFIED')
-                  label = "#{id} (#{stage})"
-
-                  # If this is a Gemini 2.5 preview, force location=global in the pick value.
-                  is_25 = id.include?('gemini-2.5')
-                  is_preview = %w[EXPERIMENTAL PRIVATE_PREVIEW PUBLIC_PREVIEW].include?(stage)
-                  value =
-                    if is_25 && is_preview
-                      # Return full resource with global to bypass regional base_uri
-                      "projects/#{connection['project_id']}/locations/global/publishers/google/models/#{id}"
-                    else
-                      # Keep compact; build_model_path will inject the user location
-                      id
-                    end
-                  [label, value]
-                end
-
-      # Keep only Gemini & Imagen family for generative usage (exclude embeddings here)
-      items
-        .select { |(label, _v)| label.start_with?('gemini-') || label.start_with?('imagen') }
-        .sort_by { |(label, _v)| label }
+                .map { |m| m['name'].to_s.split('/').last }
+                .select { |id| id.start_with?('gemini-') }  # exclude imagen
+                .uniq
+                .sort
+      items.map { |id|
+        [id, "projects/#{connection['project_id']}/locations/global/publishers/google/models/#{id}"]
+      }
     },
 
     # --- Roles
-    roles: ->() { [%w[USER USER], %w[MODEL MODEL], %w[SYSTEM SYSTEM]] }
+    roles: ->() { [['user','user'], ['model','model'], ['system','system']] }
 
   },
 
   # ====== METHODS =====================================================
   methods: {
     # Normalizes a "model" input into a full resource path.
-    # If you passed a full path (projects/...), it's used as-is.
-    # If you passed a publisher path (publishers/...), we prefix project/location.
-    # If you passed a bare ID (gemini-2.5-pro), we build the path — and if that looks
-    # like a Gemini 2.5 preview but the connection location isn't global, we override to global.
     build_model_path_with_global_preview: ->(connection, model) {
       m = (model || '').strip
-      return m if m.start_with?('projects/')
+      return m if m.start_with?('projects/')  # full path from picklist => use as-is
 
       # Allow shorthand "google/models/..." -> "publishers/google/models/..."
       m = "publishers/#{m}" if m.start_with?('google/models/')
 
-      # Determine location to use
-      loc = (connection['location'] || 'global').downcase
-
-      # Many 2.5 models are global-only. Prefer global to avoid regional 404s.
-      if m.include?('gemini-2.5')
-        loc = 'global'
-      end
+      # For publisher models (Gemini/embeddings), default to global; it’s the safest superset.
+      loc = 'global'
 
       if m.start_with?('publishers/')
         "projects/#{connection['project_id']}/locations/#{loc}/#{m}"
@@ -898,7 +894,24 @@
 
       parsed
     },
+
+    sanitize_contents_roles: ->(contents) {
+      (contents || []).map do |c|
+        dup = c.dup
+        r = dup['role'] || dup[:role]
+        dup['role'] = r.to_s.downcase if r
+        dup
+      end
+    },
+
+    normalize_system_instruction: ->(si) {
+      return nil if si.blank?
+      dup = si.dup
+      dup['role'] = 'system'
+      dup
+    }
   },
+
   # ====== TRIGGERS ====================================================
   triggers: {},
 
