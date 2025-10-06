@@ -62,7 +62,8 @@
         headers('Authorization': "Bearer #{bearer}")
       },
 
-      refresh_on: [401, 403]
+      refresh_on: [401],
+      detect_on: [/UNAUTHENTICATED/i, /invalid[_-]?token/i, /expired/i]
     },
 
     base_uri: ->(connection) {
@@ -525,6 +526,9 @@
     embed_text: {
       title: 'Embed text',
       description: 'POST :predict on a publisher embedding model',
+      retry_on_request: ['GET', 'HEAD', 'POST'],
+      retry_on_response: [408, 429, 500, 502, 503, 504],
+      max_retries: 3,
       input_fields: ->() {
         [
           { name: 'model', label: 'Embedding model', optional: false,
@@ -557,6 +561,9 @@
     count_tokens: {
       title: 'Utility:  Count tokens',
       description: 'POST :countTokens on a publisher model',
+      retry_on_request: ['GET', 'HEAD', 'POST'],
+      retry_on_response: [408, 429, 500, 502, 503, 504],
+      max_retries: 3,
       input_fields: ->(object_definitions) {
         [
           { name: 'model', label: 'Model', optional: false,
@@ -626,6 +633,9 @@
     endpoint_predict: {
       title: 'Endpoint predict (custom model)',
       description: 'POST :predict to a Vertex AI Endpoint',
+      retry_on_request: ['GET', 'HEAD', 'POST'],
+      retry_on_response: [408, 429, 500, 502, 503, 504],
+      max_retries: 3,
       input_fields: ->() {
         [
           { name: 'endpoint', optional: false, hint: 'Endpoint ID or full resource path' },
