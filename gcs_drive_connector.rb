@@ -1,7 +1,7 @@
 {
   title: 'Drive Utilities',
-  description: 'Google Drive utilities with enterprise resilience, telemetry, and multi-auth',
-  version: "0.2.1",
+  description: 'Google Drive utilities with resilience, telemetry, and multi-auth',
+  version: "0.3.0",
   custom_action: false,
 
   connection: {
@@ -24,7 +24,7 @@
       type: 'multi',
 
       selected: lambda do |connection|
-        (connection['auth_type'] || 'oauth2').to_s
+        (connection['auth_type'] || 'custom').to_s
       end,
 
       identity: lambda do |connection|
@@ -290,7 +290,11 @@
           { name: 'files', type: 'array', of: 'object', properties: object_definitions['drive_file'] },
           { name: 'count', type: 'integer' },
           { name: 'has_more', type: 'boolean' },
-          { name: 'next_page_token' }
+          { name: 'next_page_token' },
+          { name: 'trace', type: 'array', of: 'object', properties: [
+              { name: 'action' }, { name: 'correlation_id' },
+              { name: 'status', type: 'integer' }, { name: 'url' }, { name: 'dur_ms', type: 'integer' }
+          ]}
         ]
       end,
       sample_output: lambda do
@@ -331,8 +335,12 @@
             'user'
           end
 
+        include_trace = connection['include_trace'] == true
+        traces = []
+
         # 4. HTTP request 
         action_cid = call('gen_correlation_id')
+        files_endpoint = call('build_endpoint_url', :drive, :files)
         params = {
           q: q,
           pageSize: page_size,
@@ -350,15 +358,20 @@
 
         resp = call('http_request',
           method: :get,
-          url:    call('build_endpoint_url', :drive, :files),
+          url:    files_endpoint,
           params: params,
           headers: { 'X-Correlation-Id' => action_cid },
           context: {
             action: 'Drive: List files (simplified)',
             correlation_id: action_cid,
+            url: files_endpoint,
             verbose_errors: connection['verbose_errors'] # harmless if not present
           }
         )
+        traces << call('trace_pack',
+          { action: 'Drive: List files (simplified)', correlation_id: action_cid, url: files_endpoint },
+          resp
+        ) if include_trace
 
         # 5. Map output to canonical shape 
         data  = resp['data'].is_a?(Hash) ? resp['data'] : {}
@@ -376,12 +389,14 @@
           }
         end
 
-        {
+        out = {
           'files'           => files,
           'count'           => files.length,
           'has_more'        => !call('blank?', data['nextPageToken']),
           'next_page_token' => data['nextPageToken']
         }
+        out['trace'] = traces if include_trace
+        out
       end
     },
 
@@ -742,9 +757,14 @@
           { name: 'count', type: 'integer' },
           { name: 'has_more', type: 'boolean' },
           { name: 'next_page_token' },
-          { name: 'prefixes', type: 'array', of: 'string' }
+          { name: 'prefixes', type: 'array', of: 'string' },
+          { name: 'trace', type: 'array', of: 'object', properties: [
+              { name: 'action' }, { name: 'correlation_id' },
+              { name: 'status', type: 'integer' }, { name: 'url' }, { name: 'dur_ms', type: 'integer' }
+          ]}
         ]
       end,
+
       sample_output: lambda do
         {
           'objects' => [
@@ -755,8 +775,9 @@
           'count' => 1, 'has_more' => false, 'next_page_token' => nil, 'prefixes' => []
         }
       end,
+
       execute: lambda do |connection, input|
-        # ---------- Normalize inputs ----------
+        # 1.  Normalize inputs
         local     = call('deep_copy', input)
         bucket_in = (local['bucket'] || '').to_s.strip
         prefix    = (local['prefix'] || '').to_s
@@ -783,8 +804,12 @@
 
         error('Bucket is required') if call('blank?', bucket)
 
-        # ---------- Build request ----------
+        # 2. Build request
+        include_trace = connection['include_trace'] == true
+        traces = []
+
         action_cid = call('gen_correlation_id')
+        list_endpoint = call('build_endpoint_url', :storage, :objects_list, bucket)
         params = {
           prefix:      (prefix == '' ? nil : prefix),
           delimiter:   (delimiter == '' ? nil : delimiter),
@@ -794,20 +819,25 @@
           fields:      'items(bucket,name,size,contentType,updated,generation,md5Hash,crc32c,metadata),nextPageToken,prefixes'
         }.reject { |_k, v| v.nil? || v.to_s == '' }
 
-        # ---------- HTTP: GCS objects.list ----------
+        # 3. HTTP: GCS objects.list
         resp = call('http_request',
           method:  :get,
-          url:     call('build_endpoint_url', :storage, :objects_list, bucket),
+          url:     list_endpoint,
           params:  params,
           headers: { 'X-Correlation-Id' => action_cid },
           context: {
             action: 'GCS: List objects (simplified)',
             correlation_id: action_cid,
-            verbose_errors: connection['verbose_errors'] # harmless if unset
+            url: list_endpoint,
+            verbose_errors: connection['verbose_errors']
           }
         )
+        traces << call('trace_pack',
+          { action: 'GCS: List objects (simplified)', correlation_id: action_cid, url: list_endpoint },
+          resp
+        ) if include_trace
 
-        # ---------- Map output ----------
+        # 4. Map output
         data  = resp['data'].is_a?(Hash) ? resp['data'] : {}
         items = Array(data['items']).map do |o|
           {
@@ -824,13 +854,15 @@
         end
 
         next_token = data['nextPageToken']
-        {
+        out = {
           'objects'         => items,
           'count'           => items.length,
           'has_more'        => !call('blank?', next_token),
           'next_page_token' => next_token,
           'prefixes'        => Array(data['prefixes'] || [])
         }
+        out['trace'] = traces if include_trace
+        out
       end
     },
 
@@ -1247,15 +1279,26 @@
       title: 'Transfer: Drive → GCS',
       subtitle: 'Export/download from Drive and upload to GCS',
       batch: true,
+
       input_fields: lambda do
         [
           { name: 'bucket', optional: false },
           { name: 'gcs_prefix', hint: 'e.g., exports/2025-09-30' },
           { name: 'drive_file_ids', type: 'array', of: 'string', optional: false, hint: 'IDs or URLs' },
           { name: 'content_mode_for_editors', control_type: 'select', default: 'text',
-            options: [['Text (export)', 'text'], ['Skip editors', 'skip']], hint: 'Editors cannot produce raw bytes.' }
+            options: [['Text (export)', 'text'], ['Skip editors', 'skip']],
+            hint: 'Editors cannot produce raw bytes.' },
+          { name: 'naming_template', hint: 'Optional. Tokens: {name}, {ext}, {id}, {uuid}, {modified:yyyyMMdd-HHmmssZ}. Example: {name}-{id}-{modified:yyyyMMdd}.csv' },
+          { name: 'prevent_overwrite', type: 'boolean', control_type: 'checkbox', default: false,
+            hint: 'Sets ifGenerationMatch=0 so upload fails if object already exists.' },
+          { name: 'preconditions', type: 'object', properties: [
+              { name: 'if_generation_match', type: 'integer' },
+              { name: 'if_metageneration_match', type: 'integer' }
+            ],
+            hint: 'Advanced: overrides prevent_overwrite when set.' }
         ]
       end,
+
       output_fields: lambda do |object_definitions|
         [
           { name: 'uploaded', type: 'array', of: 'object', properties: [
@@ -1270,6 +1313,7 @@
           ]}
         ]
       end,
+
       sample_output: lambda do
         {
           'uploaded' => [
@@ -1285,10 +1329,11 @@
           'summary' => { 'total' => 1, 'success' => 1, 'failed' => 0 }
         }
       end,
+      
       execute: lambda do |connection, input|
         local  = call('deep_copy', input)
 
-        # ---- Normalize input ----
+        # Normalize input
         bucket = (local['bucket'] || '').to_s.strip
         error('Bucket is required') if call('blank?', bucket)
 
@@ -1302,10 +1347,14 @@
         editors_mode = (local['content_mode_for_editors'] || 'text').to_s
         error('content_mode_for_editors must be "text" or "skip"') unless %w[text skip].include?(editors_mode)
 
-        # ---- Helper: upload to GCS (multipart with metadata) ----
-        upload_with_meta = lambda do |bytes, content_type, object_name, provenance, cid|
+        # Overwrite protection / preconditions
+        explicit_pre = local['preconditions'].is_a?(Hash) ? local['preconditions'] : {}
+        extra_params = call('build_gcs_preconditions', explicit_pre, local['prevent_overwrite'] == true)
+
+        # Upload wrapper now accepts extra_params
+        upload_with_meta = lambda do |bytes, content_type, object_name, provenance, cid, params_extra|
           meta_hash = call('sanitize_metadata_hash', provenance)
-          call('gcs_multipart_upload', connection, bucket, object_name, bytes, content_type, meta_hash, cid, {})
+          call('gcs_multipart_upload', connection, bucket, object_name, bytes, content_type, meta_hash, cid, (params_extra || {}))
         end
 
         uploaded, failed = [], []
@@ -1313,7 +1362,7 @@
         ids.each do |raw_id|
           per_cid = call('gen_correlation_id')
           begin
-            # --- 1) Get Drive metadata (resolve shortcuts once) ---
+            # 1. Get Drive metadata (resolve shortcuts once)
             fid = raw_id
             meta = call('http_request',
               method: :get,
@@ -1338,8 +1387,9 @@
 
             mime = (fm['mimeType'] || '').to_s
             name = (fm['name'] || '').to_s
+            modified_iso = fm['modifiedTime'].to_s
 
-            # --- 2) Acquire content (export Editors, download others) ---
+            # 2. Acquire content (export Editors, download others)
             bytes = nil
             upload_mime = nil
 
@@ -1374,20 +1424,22 @@
               upload_mime = (mime == '' ? 'application/octet-stream' : mime)
             end
 
-            # --- 3) Choose GCS object name (prefix + sanitized filename) ---
-            object_name = call('safe_object_name', prefix, name)
+            # 3. Choose GCS object name (prefix + naming_template or default)
+            export_ext = call('mime_ext_for_mime', upload_mime)
+            template   = (local['naming_template'] || '').to_s
+            object_name = call('render_naming_template', prefix, name, fid, modified_iso, export_ext, template)
 
-            # --- 4) Provenance metadata (always attach) ---
+            # 4. Provenance metadata (always attach)
             provenance = {
-              'src_drive_id'       => fm['id'].to_s,
+              'src_drive_id'       => (fm['id'] || fid).to_s,
               'src_drive_mime'     => mime,
-              'src_drive_modified' => fm['modifiedTime'].to_s
+              'src_drive_modified' => modified_iso
             }
 
-            # --- 5) Upload to GCS (multipart) ---
-            up = upload_with_meta.call(bytes, upload_mime, object_name, provenance, per_cid)
+            # 5. Upload to GCS (multipart) with overwrite/preconditions
+            up = upload_with_meta.call(bytes, upload_mime, object_name, provenance, per_cid, extra_params)
 
-            # --- 6) Map success ---
+            # 6 Map success
             gmd = {
               'bucket'       => up['bucket']      || bucket,
               'name'         => up['name']        || object_name,
@@ -1739,6 +1791,83 @@
 
     blank?: lambda do |v|
       v.nil? || (v.respond_to?(:empty?) && v.empty?) || v.to_s.strip == ''
+    end,
+
+    # --- Naming + overwrite helpers ---
+
+    mime_ext_for_mime: lambda do |m|
+      case (m || '')
+      when 'text/plain'    then 'txt'
+      when 'text/csv'      then 'csv'
+      when 'image/svg+xml' then 'svg'
+      else nil
+      end
+    end,
+
+    format_modified_for_pattern: lambda do |modified_iso, pattern|
+      t0  = (Time.parse(modified_iso.to_s) rescue (Time.iso8601(modified_iso.to_s) rescue Time.now)).utc
+      fmt = pattern.to_s
+                  .gsub('yyyy', '%Y')
+                  .gsub('MM',   '%m')
+                  .gsub('dd',   '%d')
+                  .gsub('HH',   '%H')
+                  .gsub('mm',   '%M')
+                  .gsub('ss',   '%S')
+                  .gsub('Z',    'Z')
+      t0.strftime(fmt)
+    end,
+
+    render_naming_template: lambda do |prefix_in, orig_name, fid, modified_iso, ext_override, tmpl|
+      base = (orig_name || '').to_s
+      if (idx = base.rindex('.'))
+        name_noext = base[0...idx]
+        orig_ext   = base[(idx + 1)..-1]
+      else
+        name_noext = base
+        orig_ext   = ''
+      end
+      ext = (ext_override || orig_ext || '').to_s
+
+      # Default path if no template: keep/append extension
+      if tmpl.to_s.strip == ''
+        fname =
+          if ext != '' && (orig_ext == '' || orig_ext.downcase != ext.downcase)
+            "#{name_noext}.#{ext}"
+          elsif orig_ext != ''
+            "#{name_noext}.#{orig_ext}"
+          else
+            name_noext
+          end
+        return call('safe_object_name', prefix_in, fname)
+      end
+
+      t = tmpl.to_s.dup
+      # {modified:pattern}
+      t = t.gsub(/\{modified:([^}]+)\}/) { call('format_modified_for_pattern', modified_iso, Regexp.last_match(1)) }
+
+      uuid = (SecureRandom.uuid rescue call('gen_correlation_id'))
+      t = t.gsub('{name}', name_noext)
+          .gsub('{ext}',  ext)
+          .gsub('{id}',   fid.to_s)
+          .gsub('{uuid}', uuid.to_s)
+
+      # Tidy slashes and edges; keep internal folders from template
+      t = t.gsub(%r{/{2,}}, '/').gsub(%r{\A/+|/+\z}, '')
+      whole = prefix_in.to_s == '' ? t : "#{prefix_in.to_s.gsub(%r{\A/+|/+\z}, '')}/#{t}"
+      call('safe_object_name', '', whole)
+    end,
+
+    build_gcs_preconditions: lambda do |explicit_pre, prevent_overwrite|
+      if explicit_pre.is_a?(Hash) && !explicit_pre.empty?
+        {
+          ifGenerationMatch:     explicit_pre['if_generation_match'],
+          ifMetagenerationMatch: explicit_pre['if_metageneration_match']
+        }.reject { |_k, v| v.nil? || v.to_s == '' }
+      elsif prevent_overwrite == true
+        { ifGenerationMatch: 0 }
+      else
+        {}
+      end
     end,
 
     # ---------- Drive helpers ----------
