@@ -1161,6 +1161,487 @@
       end
     }
   },
-  methods: {}
+  
+  methods: {
+
+    # ---------- URL + endpoint helpers ----------
+
+    build_endpoint_url: lambda do |service, op, *args|
+      s = service.to_s
+      o = op.to_s
+
+      case s
+      when 'oauth2'
+        case o
+        when 'authorize' then 'https://accounts.google.com/o/oauth2/v2/auth'
+        when 'token'     then 'https://oauth2.googleapis.com/token'
+        else
+          error("Unknown oauth2 op=#{o}")
+        end
+
+      when 'drive'
+        base = 'https://www.googleapis.com/drive/v3'
+        case o
+        when 'about'    then "#{base}/about"
+        when 'files'    then "#{base}/files"
+        when 'file'
+          fid = (args[0] || '').to_s
+          error('fileId required') if fid == ''
+          "#{base}/files/#{fid}"
+        when 'download'
+          # Intentionally include alt=media here (callers often omit it for Drive)
+          fid = (args[0] || '').to_s
+          error('fileId required') if fid == ''
+          "#{base}/files/#{fid}?alt=media"
+        when 'export'
+          fid = (args[0] || '').to_s
+          error('fileId required') if fid == ''
+          "#{base}/files/#{fid}/export"
+        else
+          error("Unknown drive op=#{o}")
+        end
+
+      when 'storage'
+        # NOTE: For object path params we must percent-encode the whole name INCLUDING slashes as %2F.
+        api_base   = 'https://storage.googleapis.com/storage/v1'
+        upload_base = 'https://www.googleapis.com/upload/storage/v1'
+        case o
+        when 'objects_list'
+          bucket = (args[0] || '').to_s
+          error('bucket required') if bucket == ''
+          "#{api_base}/b/#{bucket}/o"
+        when 'object', 'download'
+          bucket = (args[0] || '').to_s
+          object = (args[1] || '').to_s
+          error('bucket required') if bucket == ''
+          error('object required') if object == ''
+          enc = call('encode_gcs_object', object)
+          # For storage downloads, callers already pass alt=media explicitly.
+          "#{api_base}/b/#{bucket}/o/#{enc}"
+        when 'objects_upload_media'
+          bucket = (args[0] || '').to_s
+          error('bucket required') if bucket == ''
+          "#{upload_base}/b/#{bucket}/o"
+        else
+          error("Unknown storage op=#{o}")
+        end
+
+      else
+        error("Unknown service=#{s}")
+      end
+    end,
+
+    build_query_string: lambda do |params|
+      h = params.is_a?(Hash) ? params : {}
+      pairs = h.each_with_object([]) do |(k, v), acc|
+        next if k.nil? || v.nil?
+        acc << "#{k}=#{call('url_encode_component', v.to_s)}"
+      end
+      pairs.join('&')
+    end,
+
+    url_encode_component: lambda do |str|
+      begin
+        # Prefer stdlib if present
+        URI.encode_www_form_component(str.to_s)
+      rescue
+        # Minimal fallback
+        str.to_s.gsub(/[^A-Za-z0-9\-\._~]/) { |m| '%%%02X' % m.ord }
+      end
+    end,
+
+    encode_gcs_object: lambda do |name|
+      # Encode entire object name as a single path segment (slashes included)
+      call('url_encode_component', name.to_s)
+    end,
+
+    # ---------- HTTP wrapper with retries, JSON-error normalization ----------
+
+    http_request: lambda do |opts|
+      method            = (opts[:method] || opts['method'] || :get).to_sym
+      url               = (opts[:url] || opts['url']).to_s
+      params_in         = (opts[:params] || opts['params'] || {})
+      headers_in        = (opts[:headers] || opts['headers'] || {})
+      payload_in        = opts[:payload].nil? ? opts['payload'] : opts[:payload]
+      raw_response      = !!(opts[:raw_response] || opts['raw_response'])
+      raw_body          = !!(opts[:raw_body] || opts['raw_body'])
+      www_form_urlenc   = !!(opts[:www_form_urlencoded] || opts['www_form_urlencoded'])
+      context           = (opts[:context] || opts['context'] || {}) # { action, correlation_id, verbose_errors }
+
+      # Build request
+      max_retries = 5
+      attempt = 0
+
+      begin
+        attempt += 1
+        started = Time.now
+
+        req =
+          case method
+          when :get    then get(url)
+          when :post   then post(url)
+          when :put    then put(url)
+          when :patch  then patch(url)
+          when :delete then delete(url)
+          else
+            error("Unsupported HTTP method=#{method}")
+          end
+
+        # Query params (remove blanks)
+        params = (params_in || {}).reject { |_k, v| v.nil? || v.to_s == '' }
+        req = req.params(params) unless params.empty?
+
+        # Headers
+        hdrs = {}
+        headers_in.each { |k, v| hdrs[k] = v } if headers_in.is_a?(Hash)
+        req = req.headers(hdrs) unless hdrs.empty?
+
+        # Request body
+        if [:post, :put, :patch].include?(method) || (method == :delete && !raw_body.nil? && !payload_in.nil?)
+          if raw_body
+            # Send bytes/string as-is
+            req = req.payload(payload_in.to_s)
+          elsif www_form_urlenc
+            body = call('build_query_string', payload_in || {})
+            req = req.headers('Content-Type' => 'application/x-www-form-urlencoded')
+            req = req.payload(body)
+          else
+            # Default: JSON (Workato handles JSON serialization for hashes)
+            req = req.payload(payload_in) unless payload_in.nil?
+          end
+        end
+
+        req = req.response_format_raw if raw_response
+
+        # Normalize errors; we’ll raise and possibly retry.
+        req = req.after_error_response(/.*/) do |code, body, resp_headers, message|
+          norm = call('normalize_http_error', code, body, resp_headers, url, context)
+          error(norm) # raises
+        end
+
+        # Success path → capture code/body/headers
+        result = req.after_response do |code, body, resp_headers|
+          dur_ms = ((Time.now - started) * 1000.0).round
+          { 'data' => body, 'status' => code.to_i, 'headers' => resp_headers, 'duration' => dur_ms }
+        end
+
+        result
+
+      rescue => e
+        retryable, wait_s = call('should_retry?', e.message, attempt, max_retries)
+        if retryable
+          Kernel.sleep(wait_s)
+          retry
+        end
+        error(e.message) # give up with normalized message
+      end
+    end,
+
+    should_retry?: lambda do |message, attempt, max_retries|
+      # Google-style and HTTP-level retry signals
+      msg = message.to_s
+      retry_signals = (
+        msg.include?('HTTP 429') ||
+        msg.include?('userRateLimitExceeded') ||
+        msg.include?('rateLimitExceeded') ||
+        msg.include?('backendError') ||
+        msg.include?('internalError') ||
+        msg.include?('HTTP 5')
+      )
+      return [false, 0] unless retry_signals && attempt < max_retries
+
+      base = 0.5 # seconds
+      cap  = 16.0
+      wait = [base * (2 ** (attempt - 1)), cap].min
+      # Full jitter (0.5x–1.5x)
+      jitter = 0.5 + rand
+      [true, (wait * jitter)]
+    end,
+
+    normalize_http_error: lambda do |code, body, headers, url, context|
+      status_i = code.to_i
+      status_s = call('status_text', status_i)
+
+      # Try to extract Google JSON error info
+      gerr = {}
+      if body.is_a?(Hash) && body['error'].is_a?(Hash)
+        gerr = body['error']
+      elsif body.is_a?(String) && body.lstrip.start_with?('{')
+        begin
+          parsed = JSON.parse(body) rescue {}
+          gerr = parsed['error'] if parsed.is_a?(Hash) && parsed['error'].is_a?(Hash)
+        rescue
+          # ignore parser failure
+        end
+      end
+
+      reason  = (gerr['errors'] && gerr['errors'].is_a?(Array) && gerr['errors'][0].is_a?(Hash)) ? gerr['errors'][0]['reason'] : nil
+      statusN = (gerr['status'] || '').to_s
+      msg     = (gerr['message'] || '').to_s
+
+      action  = (context[:action] || context['action']).to_s
+      cid     = (context[:correlation_id] || context['correlation_id'] || headers['X-Correlation-Id'] || headers['x-correlation-id']).to_s
+      verbose = !!(context[:verbose_errors] || context['verbose_errors'])
+
+      pieces = []
+      pieces << "HTTP #{status_i} #{status_s}"
+      pieces << statusN unless statusN.empty?
+      pieces << reason  unless reason.to_s.empty?
+      lead   = pieces.join(' – ')
+      lead   = "HTTP #{status_i} #{status_s}" if lead.strip.empty?
+
+      tail   = []
+      tail << "action=#{action}" unless action.empty?
+      tail << "cid=#{cid}" unless cid.empty?
+      tail << "url=#{url}"
+
+      # Only include concise upstream body snippet when verbose
+      if verbose
+        snippet =
+          if body.is_a?(String)
+            body[0, 512]
+          elsif body.is_a?(Hash)
+            JSON.generate(body)[0, 512]
+          else
+            body.to_s[0, 512]
+          end
+        tail << "upstream=#{snippet}"
+      end
+
+      [lead, msg].reject(&:empty?).join(': ') + " (#{tail.join(' | ')})"
+    end,
+
+    status_text: lambda do |code|
+      {
+        200 => 'OK', 201 => 'Created', 202 => 'Accepted', 204 => 'No Content',
+        304 => 'Not Modified',
+        400 => 'Bad Request', 401 => 'Unauthorized', 403 => 'Forbidden',
+        404 => 'Not Found', 409 => 'Conflict', 412 => 'Precondition Failed',
+        413 => 'Payload Too Large', 415 => 'Unsupported Media Type',
+        429 => 'Too Many Requests',
+        500 => 'Internal Server Error', 502 => 'Bad Gateway',
+        503 => 'Service Unavailable', 504 => 'Gateway Timeout'
+      }[code.to_i] || ''
+    end,
+
+    # ---------- Correlation/trace ----------
+
+    gen_correlation_id: lambda do
+      begin
+        SecureRandom.uuid
+      rescue
+        t = (Time.now.to_f * 1000).to_i
+        r = (rand * 1_000_000_000).to_i
+        "wrkto-#{t}-#{r}"
+      end
+    end,
+
+    # Optional trace pack for future use (attach to outputs if include_trace=true)
+    trace_pack: lambda do |context, http_result|
+      {
+        'action'         => (context[:action] || context['action']).to_s,
+        'correlation_id' => (context[:correlation_id] || context['correlation_id']).to_s,
+        'status'         => http_result['status'].to_i,
+        'url'            => (context[:url] || context['url']).to_s,
+        'dur_ms'         => (http_result['duration'] || 0).to_i
+      }
+    end,
+
+    # ---------- Type/format utilities ----------
+
+    to_iso8601: lambda do |dt|
+      return nil if dt.nil? || dt.to_s.strip == ''
+      t =
+        case dt
+        when Integer then Time.at(dt)
+        when Float   then Time.at(dt)
+        when String  then Time.parse(dt) rescue nil
+        else
+          dt.respond_to?(:to_time) ? dt.to_time : nil
+        end
+      (t || Time.now).utc.iso8601
+    end,
+
+    safe_utf8: lambda do |bytes|
+      s = bytes.to_s
+      s.encode('UTF-8', invalid: :replace, undef: :replace, replace: '�')
+    end,
+
+    strip_urls_from_text: lambda do |text|
+      t = text.to_s
+      # Remove http/https/ftp and bare www.* URLs.
+      # Preserve emails and filesystem paths.
+      t.gsub(%r{(?<!@)\b((?:https?|ftp)://[^\s<>"')]+|www\.[^\s<>"')]+)}i, '')
+    end,
+
+    deep_copy: lambda do |obj|
+      JSON.parse(JSON.generate(obj)) rescue obj
+    end,
+
+    blank?: lambda do |v|
+      v.nil? || (v.respond_to?(:empty?) && v.empty?) || v.to_s.strip == ''
+    end,
+
+    # ---------- Drive helpers ----------
+
+    extract_drive_file_id: lambda do |raw|
+      s = raw.to_s.strip
+      return nil if s == ''
+      return s unless s.include?('/') || s.include?('?')
+
+      # Common patterns: /file/d/{id}, /document/d/{id}, /spreadsheets/d/{id}, /presentation/d/{id}, /uc?id={id}, ?id={id}
+      patterns = [
+        %r{/d/([a-zA-Z0-9_-]{10,})},               # /.../d/{id}
+        %r{[?&]id=([a-zA-Z0-9_-]{10,})},           # ?id={id}
+        %r{/file/u/\d+/d/([a-zA-Z0-9_-]{10,})}     # /file/u/x/d/{id}
+      ]
+      patterns.each do |rx|
+        m = s.match(rx)
+        return m[1] if m && m[1]
+      end
+      nil
+    end,
+
+    extract_drive_folder_id: lambda do |raw|
+      s = raw.to_s.strip
+      return nil if s == ''
+      return s unless s.include?('/') || s.include?('?')
+
+      # Patterns: /folders/{id}, ?id={id}
+      patterns = [
+        %r{/folders/([a-zA-Z0-9_-]{10,})},
+        %r{[?&]id=([a-zA-Z0-9_-]{10,})}
+      ]
+      patterns.each do |rx|
+        m = s.match(rx)
+        return m[1] if m && m[1]
+      end
+      nil
+    end,
+
+    maybe_extract_id: lambda do |raw|
+      s = raw.to_s.strip
+      return '' if s == ''
+      call('extract_drive_file_id', s) || call('extract_drive_folder_id', s) || s
+    end,
+
+    build_drive_query: lambda do |opts|
+      o = opts || {}
+      clauses = ["trashed=false"]
+
+      if (fid = o[:folder_id] || o['folder_id']).to_s.strip != ''
+        clauses << "'#{fid}' in parents"
+      end
+
+      if (aft = o[:modified_after] || o['modified_after']).to_s.strip != ''
+        clauses << "modifiedTime >= '#{aft}'"
+      end
+      if (bef = o[:modified_before] || o['modified_before']).to_s.strip != ''
+        clauses << "modifiedTime <= '#{bef}'"
+      end
+
+      if (mt = o[:mime_type] || o['mime_type']).to_s.strip != ''
+        safe = mt.gsub("'", "\\\\'")
+        clauses << "mimeType = '#{safe}'"
+      end
+
+      exclude_folders = !!(o[:exclude_folders] || o['exclude_folders'])
+      if exclude_folders
+        clauses << "mimeType != 'application/vnd.google-apps.folder'"
+      end
+
+      clauses.join(' and ')
+    end,
+
+    get_export_mime: lambda do |editors_mime|
+      case (editors_mime || '').to_s
+      when 'application/vnd.google-apps.document'   then 'text/plain'
+      when 'application/vnd.google-apps.spreadsheet' then 'text/csv'
+      when 'application/vnd.google-apps.presentation' then 'text/plain'
+      when 'application/vnd.google-apps.drawing'    then 'image/svg+xml'
+      else
+        nil
+      end
+    end,
+
+    # ---------- GCS helpers ----------
+
+    sanitize_metadata_hash: lambda do |h|
+      out = {}
+      (h.is_a?(Hash) ? h : {}).each do |k, v|
+        next if k.nil?
+        out[k.to_s] = v.nil? ? '' : v.to_s
+      end
+      out
+    end,
+
+    safe_object_name: lambda do |prefix, filename|
+      p = (prefix || '').to_s.gsub(%r{\A/+|/+\z}, '')
+      fn = (filename || '').to_s
+      # Remove control chars, collapse whitespace, strip leading ./ and spaces
+      fn = fn.gsub(/[\u0000-\u001F]/, '').gsub(/\s+/, ' ').gsub(/\A[\.\/\s]+/, '')
+      # Fall back if empty
+      fn = 'unnamed' if fn == ''
+      parts = []
+      parts << p unless p == ''
+      parts << fn
+      parts.join('/')
+    end,
+
+    gcs_multipart_upload: lambda do |connection, bucket, object_name, bytes, content_type, metadata_hash, correlation_id, extra_params|
+      boundary  = "wrkto-#{(call('gen_correlation_id') || '').gsub('-', '')}"
+      meta_json = JSON.generate({
+        'name'        => object_name,
+        'contentType' => content_type,
+        'metadata'    => (metadata_hash || {})
+      })
+
+      part1 = "--#{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n#{meta_json}\r\n"
+      part2 = "--#{boundary}\r\nContent-Type: #{content_type}\r\n\r\n"
+      part3 = "\r\n--#{boundary}--"
+
+      body = ''.b
+      body << part1.dup.force_encoding('ASCII-8BIT')
+      body << part2.dup.force_encoding('ASCII-8BIT')
+      body << bytes.to_s.b
+      body << part3.dup.force_encoding('ASCII-8BIT')
+
+      params = { uploadType: 'multipart' }.merge(extra_params || {})
+
+      resp = call('http_request',
+        method:  :post,
+        url:     call('build_endpoint_url', :storage, :objects_upload_media, bucket),
+        params:  params,
+        headers: {
+          'Content-Type'     => "multipart/related; boundary=#{boundary}",
+          'X-Correlation-Id' => correlation_id
+        },
+        payload: body,
+        raw_body: true,
+        context: { action: 'GCS upload (multipart)', correlation_id: correlation_id, verbose_errors: connection['verbose_errors'] }
+      )
+
+      resp['data'].is_a?(Hash) ? resp['data'] : {}
+    end,
+
+    # ---------- Error code mapping (for batch summaries etc.) ----------
+
+    infer_error_code: lambda do |msg|
+      m = msg.to_s
+      return 'UNAUTHORIZED'        if m =~ /\b401\b|unauth/i
+      return 'FORBIDDEN'           if m =~ /\b403\b|forbidden/i
+      return 'NOT_FOUND'           if m =~ /\b404\b|not found/i
+      return 'CONFLICT'            if m =~ /\b409\b|conflict/i
+      return 'PRECONDITION_FAILED' if m =~ /\b412\b|precondition/i
+      return 'PAYLOAD_TOO_LARGE'   if m =~ /\b413\b|payload too large/i
+      return 'UNSUPPORTED_MEDIA'   if m =~ /\b415\b|unsupported media/i
+      return 'RATE_LIMITED'        if m =~ /\b429\b|rateLimitExceeded|userRateLimitExceeded/i
+      return 'INTERNAL'            if m =~ /\b5\d\d\b|internalError|backendError/i
+      return 'BAD_REQUEST'         if m =~ /\b400\b|bad request/i
+      nil
+    end
+
+  }
+
 }
 
