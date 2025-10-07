@@ -9,182 +9,103 @@
       #  Developer options 
       { name: 'verbose_errors',  label: 'Verbose errors', type: 'boolean', control_type: 'checkbox', hint: 'Include upstream response bodies in normalized error messages (useful in non-prod).' },
       { name: 'include_trace',   label: 'Include trace in outputs', type: 'boolean', control_type: 'checkbox', default: false, sticky: true },
+      
+      # Service account details
+      { name: 'service_account_email', group: 'Service account', optional: false, hint: 'e.g. my-sa@project.iam.gserviceaccount.com' },
+      { name: 'client_id',             group: 'Service account', optional: false, hint: 'Service account client ID (used as JWT kid)' },
+      { name: 'private_key_id',        group: 'Service account', optional: false, hint: 'The key’s private_key_id from the JSON' },
+      { name: 'private_key',           group: 'Service account', control_type: 'password', multiline: true, optional: false,
+        hint: 'Paste the PEM private key from the JSON. Newlines may appear as \\n; both forms are handled.' },
 
-      #  Authentication selection 
-      { name: 'auth_type', label: 'Authentication type', control_type: 'select', optional: false, default: 'custom', extends_schema: true, hint: 'Choose how to authenticate to Google Drive.',
-        options: [
-          ['OAuth 2.0 (user delegated)', 'oauth2'],
-          ['Service account (JWT)',      'custom']
-        ] },
+      # Enable GCS
       { name: 'enable_gcs', label: 'Enable Google Cloud Storage', type: 'boolean', control_type: 'checkbox',
         default: true, sticky: true, hint: 'Adds Cloud Storage scopes for listing/uploading objects (requires reconnect).' }
     ],
 
     authorization: {
-      type: 'multi',
+      type: 'custom_auth',
 
-      selected: lambda do |connection|
-        (connection['auth_type'] || 'custom').to_s
+      acquire: lambda do |connection|
+        iss = connection['service_account_email']
+        iat = Time.now.to_i
+        exp = iat + 3600
+
+        # Normalize + validate key material
+        private_key = connection['private_key'].to_s.strip
+        private_key = private_key.gsub(/\\n/, "\n").gsub(/\r\n?/, "\n")
+        error('Invalid private key: missing BEGIN/END markers') unless private_key.include?('BEGIN PRIVATE KEY')
+
+        aud = call('build_endpoint_url', :oauth2, :token)
+        scopes = ['https://www.googleapis.com/auth/drive.readonly']
+        scopes << 'https://www.googleapis.com/auth/devstorage.read_write' if connection['enable_gcs'] == true
+        claim = {
+          'iss'   => iss,
+          'scope' => scopes.join(' '), # space-separated per Google
+          'aud'   => aud,
+          'iat'   => iat,
+          'exp'   => exp
+        }
+
+        jwt = workato.jwt_encode(
+          claim,
+          private_key,
+          'RS256',
+          kid: connection['private_key_id'] # must be the key's private_key_id, not client_id
+        )
+
+        # HTTP call
+        resp = call('http_request',
+          method: :post,
+          url: aud,
+          payload: {
+            grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+            assertion: jwt
+          },
+          www_form_urlencoded: true,
+          context: { action: 'Service account JWT exchange' }
+        )
+
+        # Package the response
+        {
+          access_token: resp['data']['access_token'],
+          expires_at:  (Time.now + resp['data']['expires_in'].to_i).iso8601
+        }
       end,
 
       identity: lambda do |connection|
-        selected = (connection['auth_type'] || 'custom').to_s
-        if selected == 'oauth2'
-          begin
-            info = call('http_request',
-              method: :get,
-              url: 'https://openidconnect.googleapis.com/v1/userinfo',
-              headers: {}, # auth applied by 'apply'
-              context: { action: 'OIDC userinfo' }
-            )['data'] || {}
-            email = info['email'] || '(no email)'
-            name  = info['name']
-            sub   = info['sub']
-            [name, email, sub].compact.join(' / ')
-          rescue
-            'OAuth2 (Google) - identity unavailable'
-          end
-        else
-          connection['service_account_email']
-        end
+        connection['service_account_email']
       end,
 
-      options: {
-        oauth2: {
-          type: 'oauth2',
-          fields: [
-            { name: 'client_id',     group: 'OAuth 2.0 (user delegated)', optional: false, hint: 'Google Cloud OAuth2 client ID' },
-            { name: 'client_secret', group: 'OAuth 2.0 (user delegated)', optional: false, control_type: 'password', hint: 'Google Cloud OAuth2 client secret' }],
+      apply: lambda do |connection|
+        headers(Authorization: "Bearer #{connection['access_token']}")
+      end,
 
-          authorization_url: lambda do |connection|
-            scopes = ['https://www.googleapis.com/auth/drive.readonly']
-            # If GCS enabled, append
-            scopes << 'https://www.googleapis.com/auth/devstorage.read_write' if connection['enable_gcs'] == true
-            q = call('build_query_string', {
-              client_id:  connection['client_id'],
-              response_type: 'code',
-              scope: scopes.join(' '),
-              access_type: 'offline',
-              include_granted_scopes: 'true',
-              prompt: 'consent',
-              redirect_uri: 'https://www.workato.com/oauth/callback'
-            })
-            "#{call('build_endpoint_url', :oauth2, :authorize)}?#{q}"
-          end,
+      refresh_on: [401, 403],
+      detect_on: [/UNAUTHENTICATED/i, /invalid[_-]?token/i, /expired/i, /insufficient/i]
+    },
 
-          acquire: lambda do |connection, auth_code|
-            resp = call('http_request',
-              method: :post,
-              url: call('build_endpoint_url', :oauth2, :token),
-              payload: {
-                client_id:     connection['client_id'],
-                client_secret: connection['client_secret'],
-                grant_type:    'authorization_code',
-                code:          auth_code,
-                redirect_uri:  'https://www.workato.com/oauth/callback'
-              },
-              www_form_urlencoded: true,
-              context: { action: 'OAuth token exchange', verbose_errors: connection['verbose_errors'] }
-            )
-            resp['data']
-          end,
-
-          refresh: lambda do |connection, refresh_token|
-            resp = call('http_request',
-              method: :post,
-              url: call('build_endpoint_url', :oauth2, :token),
-              payload: {
-                client_id:     connection['client_id'],
-                client_secret: connection['client_secret'],
-                grant_type:    'refresh_token',
-                refresh_token: refresh_token
-              },
-              www_form_urlencoded: true,
-              context: { action: 'OAuth token refresh', verbose_errors: connection['verbose_errors'] }
-            )
-            resp['data']
-          end,
-
-          apply: lambda do |_connection, access_token|
-            headers(Authorization: "Bearer #{access_token}")
-          end
-        },
-
-        custom: {
-          type: 'custom_auth',
-          fields: [
-            { name: 'service_account_email', group: 'Service account', optional: false, hint: 'e.g. my-sa@project.iam.gserviceaccount.com' },
-            { name: 'client_id',             group: 'Service account', optional: false, hint: 'Service account client ID (used as JWT kid)' },
-            { name: 'private_key_id',        group: 'Service account', optional: false, hint: 'The key’s private_key_id from the JSON' },
-            { name: 'private_key',           group: 'Service account', control_type: 'password', multiline: true, optional: false, hint: 'Paste the PEM private key from the JSON. Newlines may appear as \\n; both forms are handled.' },
-            { name: 'subject_email',         group: 'Service account', optional: true, hint: 'Impersonate this user (domain‑wide delegation required). Optional.' }  
-          ],
-
-          acquire: lambda do |connection|
-            iat = Time.now.to_i
-            exp = iat + 3600
-
-            # Normalize + validate key material
-            private_key = connection['private_key'].to_s.strip
-            private_key = private_key.gsub(/\\n/, "\n").gsub(/\r\n?/, "\n")
-            error('Invalid private key: missing BEGIN/END markers') unless private_key.include?('BEGIN PRIVATE KEY')
-
-            aud = call('build_endpoint_url', :oauth2, :token)
-            scopes = ['https://www.googleapis.com/auth/drive.readonly']
-            scopes << 'https://www.googleapis.com/auth/devstorage.read_write' if connection['enable_gcs'] == true
-            claim = {
-              'iss'   => connection['service_account_email'],
-              'scope' => scopes.join(' '), # space-separated per Google
-              'aud'   => aud,
-              'iat'   => iat,
-              'exp'   => exp
-            }
-      
-            # Optional user impersonation (domain-wide delegation)
-            if connection['subject_email'].to_s.strip != ''
-              claim['sub'] = connection['subject_email'].to_s.strip
-            end
-
-            jwt = workato.jwt_encode(
-              claim,
-              private_key,
-              'RS256',
-              kid: connection['private_key_id'] # must be the key's private_key_id, not client_id
-            )
-
-            resp = call('http_request',
-              method: :post,
-              url: aud,
-              payload: {
-                grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-                assertion: jwt
-              },
-              www_form_urlencoded: true,
-              context: { action: 'Service account JWT exchange' }
-            )
-
-          {
-            access_token: resp['data']['access_token'],
-            expires_at:  (Time.now + resp['data']['expires_in'].to_i).iso8601
-          }
-          end,
-          apply: lambda do |connection|
-            headers(Authorization: "Bearer #{connection['access_token']}")
-          end,
-          refresh_on: [401]
-        }
-      }
-    }
+    base_uri: -> (_connection) { 'https://www.googleapis.com/auth' }
   },
 
   test: lambda do |connection|
     # Drive probe
-    call('http_request',
-      method: :get,
-      url:    call('build_endpoint_url', :drive, :about),
-      params: { fields: 'user,storageQuota' },
-      context: { action: 'Drive about' }
-    )
+    begin
+        call('http_request',
+        method: :get,
+        url:    call('build_endpoint_url', :drive, :about),
+        params: { fields: 'user,storageQuota' },
+        context: { action: 'Drive about' }
+      )
+    rescue => e
+      msg = e.message.to_s
+      if msg =~ /unregistered callers|without established identity|Please use API key/i
+        error('Authentication not applied: your connection does not have an OAuth/Service Account identity. ' \
+              'Fix: open the connection, set **Authentication type** correctly (OAuth2 or Service account), ' \
+              'complete the handshake (OAuth consent or SA JWT), then reconnect.')
+      else
+        raise
+      end
+    end
 
     if connection['enable_gcs'] == true
       begin
@@ -1717,6 +1638,13 @@
             body.to_s[0, 512]
           end
         tail << "upstream=#{snippet}"
+      end
+
+      # Helpful hint for the "unregistered callers" class of failures
+      raw = (body.is_a?(String) ? body : (body.to_s rescue ''))
+      upstream_text = [msg, raw].join(' ')
+      if upstream_text =~ /unregistered callers|without established identity|Please use API key/i
+        tail << "hint=Auth header missing. Verify connection auth_type and reconnect (OAuth2: complete consent; Service Account: service_account_email/private_key [+ subject_email for DWD])."
       end
 
       [lead, msg].reject(&:empty?).join(': ') + " (#{tail.join(' | ')})"
