@@ -40,7 +40,7 @@
         scopes << 'https://www.googleapis.com/auth/devstorage.read_write' if connection['enable_gcs'] == true
         claim = {
           'iss'   => iss,
-          'scope' => scopes.join(' '), # space-separated per Google
+          'scope' => scopes.join(' '),
           'aud'   => aud,
           'iat'   => iat,
           'exp'   => exp
@@ -50,25 +50,26 @@
           claim,
           private_key,
           'RS256',
-          kid: connection['private_key_id'] # must be the key's private_key_id, not client_id
+          kid: connection['private_key_id']
         )
 
-        # HTTP call
-        resp = call('http_request',
-          method: :post,
-          url: aud,
-          payload: {
-            grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-            assertion: jwt
-          },
-          www_form_urlencoded: true,
-          context: { action: 'Service account JWT exchange' }
-        )
+        # Direct HTTP (no custom wrapper)
+        resp = post(aud)
+                .payload(
+                  grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+                  assertion:  jwt
+                )
+                .request_format_www_form_urlencoded
+                .after_error_response(/.*/) do |code, body, headers, _message|
+                  norm = call('normalize_http_error', code, body, headers, aud,
+                              { action: 'Service account JWT exchange',
+                                verbose_errors: connection['verbose_errors'] })
+                  error(norm)
+                end
 
-        # Package the response
         {
-          access_token: resp['data']['access_token'],
-          expires_at:  (Time.now + resp['data']['expires_in'].to_i).iso8601
+          access_token: resp['access_token'],
+          expires_at:   (Time.now + (resp['expires_in'] || 3600).to_i).iso8601
         }
       end,
 
@@ -84,18 +85,14 @@
       detect_on: [/UNAUTHENTICATED/i, /invalid[_-]?token/i, /expired/i, /insufficient/i]
     },
 
-    base_uri: -> (_connection) { 'https://www.googleapis.com/auth' }
+    base_uri: -> (_connection) { 'https://www.googleapis.com/' }
   },
 
   test: lambda do |connection|
     # Drive probe
     begin
-        call('http_request',
-        method: :get,
-        url:    call('build_endpoint_url', :drive, :about),
-        params: { fields: 'user,storageQuota' },
-        context: { action: 'Drive about' }
-      )
+      get(call('build_endpoint_url', :drive, :about))
+        .params(fields: 'user,storageQuota')
     rescue => e
       msg = e.message.to_s
       if msg =~ /unregistered callers|without established identity|Please use API key/i
@@ -110,12 +107,8 @@
     if connection['enable_gcs'] == true
       begin
         # Exercise devstorage scope without assuming a bucket
-        call('http_request',
-          method: :get,
-          url: 'https://storage.googleapis.com/storage/v1/b/this-bucket-should-not-exist-123456/o',
-          params: { maxResults: 1, fields: 'nextPageToken' },
-          context: { action: 'GCS scope smoke probe' }
-        )
+        get('https://storage.googleapis.com/storage/v1/b/this-bucket-should-not-exist-123456/o')
+          .params(maxResults: 1, fields: 'nextPageToken')
       rescue => e
         msg = e.message.to_s
         # Only fail connection on 401/403 (bad/insufficient creds or missing scope)
