@@ -302,21 +302,18 @@
           pageSize: page_size,
           includeRemoved: input['include_removed'] == true,
           supportsAllDrives: true,
+          # Include Shared drive items when not polling a specific drive.
+          # Aligns w/ Drive v3 changes.list param semantics; when 
+          # drive_id is '' (user corpus), prevents silent omission of Shared drive changes
+          includeItemsFromAllDrives: (drive_id == ''),
           fields: fields
         }
         params_c[:driveId] = drive_id unless drive_id == ''
         body = get(url_chg)
-          .params(
-            pageToken: token,
-            pageSize: page_size,
-            includeRemoved: input['include_removed'] == true,
-            supportsAllDrives: true,
-            fields: fields
-          )
           .params(params_c)
           .headers('X-Correlation-Id' => cid)
-          .after_error_response(/.*/) do |code, resp_body, headers, _msg|
-            norm = call('normalize_http_error', code, resp_body, headers, url_chg,
+          .after_error_response(/.*/) do |c, resp_body, headers, _msg|
+            norm = call('normalize_http_error', c, resp_body, headers, url_chg,
                         { action: 'Drive changes.list', correlation_id: cid, verbose_errors: connection['verbose_errors'] })
             error(norm)
           end
@@ -362,6 +359,7 @@
         out['trace'] = traces if include_trace
         out
       end
+
     },
 
     # DRIVE: LIST
@@ -533,115 +531,34 @@
       end,
 
       execute: lambda do |connection, input|
-        # 1. Normalize inputs
         local         = call('deep_copy', input)
         mode          = (local['content_mode'] || 'text').to_s
         strip         = !!(local.dig('postprocess', 'strip_urls') == true)
         include_trace = connection['include_trace'] == true
         traces        = []
 
-        fid = call('extract_drive_file_id', local['file_id'])
-        error('No Drive file ID provided.') if call('blank?', fid)
+        fid_in, rk_in = call('extract_drive_id_and_key', local['file_id'])
+        error('No Drive file ID provided.') if call('blank?', fid_in)
 
-        # Construct metadata
-        per_cid  = call('gen_correlation_id')
+        per_cid = call('gen_correlation_id')
+        started = Time.now
+        fid, mdata, eff_rk = call('drive_fetch_meta_resolved', fid_in, per_cid,
+                                   'id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress),shortcutDetails(targetId,targetMimeType,targetResourceKey),resourceKey',
+                                   connection['verbose_errors'] == true, rk_in)
+        traces << { 'action' => 'Drive get (meta+resolve)', 'correlation_id' => per_cid, 'status' => 200,
+                    'url' => '(files.get -> shortcut resolve)', 'dur_ms' => ((Time.now - started) * 1000.0).round } if include_trace
 
-        started  = Time.now
-        fid, mdata = call('drive_fetch_meta_resolved', fid, per_cid,
-                          'id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress),shortcutDetails(targetId,targetMimeType)',
-                          connection['verbose_errors'] == true)
-        traces << { 'action' => 'Drive get (meta+resolve)', 'correlation_id' => per_cid,
-                    'status' => 200, 'url' => "(files.get -> shortcut resolve)", 'dur_ms' => ((Time.now - started) * 1000.0).round } if include_trace
+        out   = call('drive_map_output_from_meta', mdata)
+        rk_hdr = call('build_rk_header', fid, eff_rk)
 
-
-        mime = (mdata['mimeType'] || '').to_s
-        out = {
-          'id'            => mdata['id'],
-          'name'          => mdata['name'],
-          'mime_type'     => mime,
-          'size'          => (mdata['size'] || 0).to_i,
-          'modified_time' => mdata['modifiedTime'],
-          'checksum'      => mdata['md5Checksum'],
-          'owners'        => Array(mdata['owners']).map { |o| { 'displayName' => o['displayName'], 'emailAddress' => o['emailAddress'] } }
-        }
-
-        # 3. Content (per mode)
-        case mode
-        when 'none'
-          # metadata only
-        when 'text'
-          if mime.start_with?('application/vnd.google-apps.')
-            export_mime = call('get_export_mime', mime)
-            error("Export required for Editors type #{mime} but not supported.") if export_mime.nil?
-
-            url_exp = call('build_endpoint_url', :drive, :export, fid)
-            started3 = Time.now
-            code3    = nil
-            exp_body = get(url_exp)
-              .params(mimeType: export_mime)
-              .headers('X-Correlation-Id' => per_cid)
-              .response_format_raw
-              .after_error_response(/.*/) do |c, b, h, _|
-                error(call('normalize_http_error', c, b, h, url_exp,
-                          { action: 'Drive export (text)', correlation_id: per_cid, verbose_errors: connection['verbose_errors'] }))
-              end
-              .after_response { |c, b, _| code3 = c.to_i; b }
-            traces << { 'action' => 'Drive export (text)', 'correlation_id' => per_cid, 'status' => code3,
-                        'url' => url_exp, 'dur_ms' => ((Time.now - started3) * 1000.0).round } if include_trace
-
-            txt = call('safe_utf8', exp_body)
-            txt = call('strip_urls_from_text', txt) if strip
-            out['text_content'] = txt
-            out['exported_as']  = export_mime
-
-          else
-            error("Non-text file (#{mime}); use content_mode=bytes or none.") unless call('textual_mime?', mime)
-
-            url_dl = call('build_endpoint_url', :drive, :download, fid)
-            started4 = Time.now
-            code4    = nil
-            dl_body = get(url_dl)
-              .params(supportsAllDrives: true, acknowledgeAbuse: (local['acknowledge_abuse'] == true))
-              .headers('X-Correlation-Id' => per_cid)
-              .response_format_raw
-              .after_error_response(/.*/) do |c, b, h, _|
-                error(call('normalize_http_error', c, b, h, url_dl,
-                          { action: 'Drive download (text)', correlation_id: per_cid, verbose_errors: connection['verbose_errors'] }))
-              end
-              .after_response { |c, b, _| code4 = c.to_i; b }
-            traces << { 'action' => 'Drive download (text)', 'correlation_id' => per_cid, 'status' => code4,
-                        'url' => url_dl, 'dur_ms' => ((Time.now - started4) * 1000.0).round } if include_trace
-
-            txt = call('safe_utf8', dl_body)
-            txt = call('strip_urls_from_text', txt) if strip
-            out['text_content'] = txt
-          end
-
-        when 'bytes'
-          error('Editors files require content_mode=text (export).') if mime.start_with?('application/vnd.google-apps.')
-          url_dl = call('build_endpoint_url', :drive, :download, fid)
-          started5 = Time.now
-          code5    = nil
-          dl_body = get(url_dl)
-            .params(supportsAllDrives: true, acknowledgeAbuse: (local['acknowledge_abuse'] == true))
-            .headers('X-Correlation-Id' => per_cid)
-            .response_format_raw
-            .after_error_response(/.*/) do |c, b, h, _|
-              error(call('normalize_http_error', c, b, h, url_dl,
-                        { action: 'Drive download (bytes)', correlation_id: per_cid, verbose_errors: connection['verbose_errors'] }))
-            end
-            .after_response { |c, b, _| code5 = c.to_i; b }
-          traces << { 'action' => 'Drive download (bytes)', 'correlation_id' => per_cid, 'status' => code5,
-                      'url' => url_dl, 'dur_ms' => ((Time.now - started5) * 1000.0).round } if include_trace
-
-          out['content_bytes'] = [dl_body.to_s].pack('m0')
-
-        else
-          error("Unsupported content_mode=#{mode}. Use none|text|bytes.")
-        end
+        content_fields, c_traces = call('drive_fetch_content_fields', connection, fid, out['mime_type'], mode,
+                                        (local['acknowledge_abuse'] == true), strip, rk_hdr, per_cid)
+        out.merge!(content_fields)
+        traces.concat(c_traces) if include_trace
 
         out['trace'] = traces if include_trace
         out
+       end
       end
     },
 
@@ -697,136 +614,59 @@
       end,
 
       execute: lambda do |connection, input|
-        # 1. Normalize inputs
         local         = call('deep_copy', input)
         mode          = (local['content_mode'] || 'text').to_s
         strip         = !!(local.dig('postprocess', 'strip_urls') == true)
         include_trace = connection['include_trace'] == true
         traces        = []
 
-        # Collect IDs from { file_ids[], files[].id|file_id }
-        ids = []
-        ids += Array(local['file_ids'] || [])
-        ids += Array(local['files'] || []).map { |o| o.is_a?(Hash) ? (o['id'] || o['file_id']) : nil }
-        ids = ids.compact.map { |raw| call('extract_drive_file_id', raw) }
-                .reject { |s| call('blank?', s) }.uniq
-        error('No Drive file IDs provided. Map "file_ids" or "files".') if ids.empty?
+        pairs = []
+        pairs += Array(local['file_ids'] || []).map { |raw| call('extract_drive_id_and_key', raw) }
+        pairs += Array(local['files']    || []).map { |o|
+          call('extract_drive_id_and_key', (o.is_a?(Hash) ? (o['id'] || o['file_id']) : o))
+        }
+        pairs = pairs.select { |id, _| !call('blank?', id) }.uniq
+        error('No Drive file IDs provided. Map "file_ids" or "files".') if pairs.empty?
 
         successes, failures = [], []
 
-        ids.each do |raw_id|
+        pairs.each do |fid_in, rk_in|
           per_cid = call('gen_correlation_id')
           begin
-            # 2. Metadata (resolve shortcut once via helper)
-            fid = raw_id
             started_m = Time.now
-            fid, mdata = call('drive_fetch_meta_resolved', fid, per_cid,
-                              'id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress),shortcutDetails(targetId,targetMimeType)',
-                              connection['verbose_errors'] == true)
+            fid, mdata, eff_rk = call('drive_fetch_meta_resolved', fid_in, per_cid,
+                                      'id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress),shortcutDetails(targetId,targetMimeType,targetResourceKey),resourceKey',
+                                      connection['verbose_errors'] == true, rk_in)
             traces << { 'action' => 'Drive get (meta+resolve)', 'correlation_id' => per_cid, 'status' => 200,
                         'url' => '(files.get -> shortcut resolve)', 'dur_ms' => ((Time.now - started_m) * 1000.0).round } if include_trace
+            out    = call('drive_map_output_from_meta', mdata)
+            rk_hdr = call('build_rk_header', fid, eff_rk)
 
-
-            mime = (mdata['mimeType'] || '').to_s
-            out = {
-              'id'            => mdata['id'],
-              'name'          => mdata['name'],
-              'mime_type'     => mime,
-              'size'          => (mdata['size'] || 0).to_i,
-              'modified_time' => mdata['modifiedTime'],
-              'checksum'      => mdata['md5Checksum'],
-              'owners'        => Array(mdata['owners']).map { |o| { 'displayName' => o['displayName'], 'emailAddress' => o['emailAddress'] } }
-            }
-
-            # 3. Content (per mode)
-            case mode
-            when 'none'
-              # no content
-
-            when 'text'
-              if mime.start_with?('application/vnd.google-apps.')
-                export_mime = call('get_export_mime', mime)
-                error("Export mapping not defined for Editors type #{mime}.") if export_mime.nil?
-                url_exp = call('build_endpoint_url', :drive, :export, fid)
-                started_e = Time.now
-                code_e    = nil
-                exp_body = get(url_exp)
-                  .params(mimeType: export_mime)
-                  .headers('X-Correlation-Id' => per_cid)
-                  .response_format_raw
-                  .after_error_response(/.*/) do |c, b, h, _|
-                    error(call('normalize_http_error', c, b, h, url_exp,
-                               { action: 'Drive export (text)', correlation_id: per_cid, verbose_errors: connection['verbose_errors'] }))
-                  end
-                  .after_response { |c, b, _| code_e = c.to_i; b }
-                traces << { 'action' => 'Drive export (text)', 'correlation_id' => per_cid, 'status' => code_e, 'url' => url_exp, 'dur_ms' => ((Time.now - started_e) * 1000.0).round } if include_trace
-                txt = call('safe_utf8', exp_body)
-
-                txt = call('strip_urls_from_text', txt) if strip
-                out['text_content'] = txt
-                out['exported_as']  = export_mime
-
-              else
-                error("Non-text file (#{mime}); use content_mode=bytes or none.") unless call('textual_mime?', mime)
-                url_dl = call('build_endpoint_url', :drive, :download, fid)
-                started_d = Time.now
-                code_d    = nil
-                dl_body = get(url_dl)
-                  .params(supportsAllDrives: true, acknowledgeAbuse: (local['acknowledge_abuse'] == true))
-                  .headers('X-Correlation-Id' => per_cid)
-                  .response_format_raw
-                  .after_error_response(/.*/) do |c, b, h, _|
-                    error(call('normalize_http_error', c, b, h, url_dl,
-                               { action: 'Drive download (text)', correlation_id: per_cid, verbose_errors: connection['verbose_errors'] }))
-                  end
-                  .after_response { |c, b, _| code_d = c.to_i; b }
-                traces << { 'action' => 'Drive download (text)', 'correlation_id' => per_cid, 'status' => code_d, 'url' => url_dl, 'dur_ms' => ((Time.now - started_d) * 1000.0).round } if include_trace
-                txt = call('safe_utf8', dl_body)
-                txt = call('strip_urls_from_text', txt) if strip
-                out['text_content'] = txt
-              end
-
-            when 'bytes'
-              error('Editors files require content_mode=text (export).') if mime.start_with?('application/vnd.google-apps.')
-              url_dl = call('build_endpoint_url', :drive, :download, fid)
-              started_db = Time.now
-              code_db    = nil
-              dl_body = get(url_dl)
-                .params(supportsAllDrives: true, acknowledgeAbuse: (local['acknowledge_abuse'] == true))
-                .headers('X-Correlation-Id' => per_cid)
-                .response_format_raw
-                .after_error_response(/.*/) do |c, b, h, _|
-                  error(call('normalize_http_error', c, b, h, url_dl,
-                             { action: 'Drive download (bytes)', correlation_id: per_cid, verbose_errors: connection['verbose_errors'] }))
-                end
-                .after_response { |c, b, _| code_db = c.to_i; b }
-              traces << { 'action' => 'Drive download (bytes)', 'correlation_id' => per_cid, 'status' => code_db, 'url' => url_dl, 'dur_ms' => ((Time.now - started_db) * 1000.0).round } if include_trace
-              out['content_bytes'] = [dl_body.to_s].pack('m0')
-
-            else
-              error("Unsupported content_mode=#{mode}. Use none|text|bytes.")
-            end
+            content_fields, c_traces = call('drive_fetch_content_fields', connection, fid, out['mime_type'], mode,
+                                            (local['acknowledge_abuse'] == true), strip, rk_hdr, per_cid)
+            out.merge!(content_fields)
+            traces.concat(c_traces) if include_trace
 
             successes << out
-
           rescue => e
             failures << {
-              'file_id'       => raw_id,
+              'file_id'       => fid_in,
               'error_message' => e.message,
               'error_code'    => call('infer_error_code', e.message)
             }
-            next
           end
         end
 
         out = {
           'files'   => successes,
           'failed'  => failures,
-          'summary' => { 'total' => ids.length, 'success' => successes.length, 'failed' => failures.length }
+          'summary' => { 'total' => pairs.length, 'success' => successes.length, 'failed' => failures.length }
         }
         out['trace'] = traces if include_trace
         out
+
       end
+
     },
 
     # GCS: LIST
@@ -1113,7 +953,7 @@
           { name: 'content_mode', control_type: 'select', optional: false, default: 'text',
             options: [['Text', 'text'], ['Bytes', 'bytes']] },
           { name: 'text_content', optional: true, ngIf: 'input.content_mode == "text"', control_type: 'text', multiline: true },
-          { name: 'content_bytes', optional: true, ngIf: 'input.content_mode == "bytes"', hint: 'Base64 string or bytes from prior step' },
+          { name: 'content_bytes', optional: true, ngIf: 'input.content_mode == "bytes"', hint: 'Base64 string (e.g., from a prior step\'s content_bytes)' },
           { name: 'content_type', optional: true, hint: 'Defaults: text/plain; charset=UTF-8 (text), application/octet-stream (bytes)' },
           { name: 'custom_metadata', type: 'object', optional: true },
           { name: 'preconditions', type: 'object', properties: [
@@ -1183,7 +1023,6 @@
             error('text_content is required when content_mode=text') if txt == ''
             txt = call('strip_urls_from_text', txt) if strip
             txt # UTF-8 string is fine; request sets raw_body
-          when 'bytes'
           when 'bytes'
             b64 = (local['content_bytes'] || '').to_s
             error('content_bytes (base64) is required when content_mode=bytes') if b64 == ''
@@ -1454,25 +1293,22 @@
       execute: lambda do |connection, input|
         local  = call('deep_copy', input)
 
-        # Normalize input
         bucket = (local['bucket'] || '').to_s.strip
         error('Bucket is required') if call('blank?', bucket)
 
-        prefix = (local['gcs_prefix'] || '').to_s.gsub(%r{^/+|/+$}, '') # allow empty
+        prefix = (local['gcs_prefix'] || '').to_s.gsub(%r{^/+|/+$}, '')
 
-        ids = Array(local['drive_file_ids'] || [])
-                .map { |raw| call('extract_drive_file_id', raw) }
-                .reject { |s| call('blank?', s) }
-        error('No Drive file IDs provided. Map "drive_file_ids".') if ids.empty?
+        pairs = Array(local['drive_file_ids'] || [])
+                  .map { |raw| call('extract_drive_id_and_key', raw) }
+                  .select { |id, _| !call('blank?', id) }
+        error('No Drive file IDs provided. Map "drive_file_ids".') if pairs.empty?
 
         editors_mode = (local['content_mode_for_editors'] || 'text').to_s
         error('content_mode_for_editors must be "text" or "skip"') unless %w[text skip].include?(editors_mode)
 
-        # Overwrite protection / preconditions
         explicit_pre = local['preconditions'].is_a?(Hash) ? local['preconditions'] : {}
         extra_params = call('build_gcs_preconditions', explicit_pre, local['prevent_overwrite'] == true)
 
-        # Upload wrapper now accepts extra_params
         upload_with_meta = lambda do |bytes, content_type, object_name, provenance, cid, params_extra|
           meta_hash = call('sanitize_metadata_hash', provenance)
           call('gcs_multipart_upload', connection, bucket, object_name, bytes, content_type, meta_hash, cid, (params_extra || {}))
@@ -1483,17 +1319,17 @@
 
         uploaded, failed = [], []
 
-        ids.each do |raw_id|
+        pairs.each do |fid_in, rk_in|
           per_cid = call('gen_correlation_id')
           begin
-            fid = raw_id
-            # 1. Get Drive metadata (resolve shortcuts once via helper)
+            # 1. Get Drive metadata (resolve shortcuts)
             started_m = Time.now
-            fid, fm = call('drive_fetch_meta_resolved', fid, per_cid,
-                           'id,name,mimeType,modifiedTime,md5Checksum,shortcutDetails(targetId,targetMimeType)',
-                           connection['verbose_errors'] == true)
+            fid, fm, eff_rk = call('drive_fetch_meta_resolved', fid_in, per_cid,
+                                  'id,name,mimeType,modifiedTime,md5Checksum,shortcutDetails(targetId,targetMimeType,targetResourceKey),resourceKey',
+                                  connection['verbose_errors'] == true, rk_in)
             traces << { 'action' => 'Transfer: Get Drive meta+resolve', 'correlation_id' => per_cid, 'status' => 200,
                         'url' => '(files.get -> shortcut resolve)', 'dur_ms' => ((Time.now - started_m) * 1000.0).round } if include_trace
+            rk_hdr = call('build_rk_header', fid, eff_rk)
 
             mime = (fm['mimeType'] || '').to_s
             name = (fm['name'] || '').to_s
@@ -1505,45 +1341,47 @@
 
             if mime.start_with?('application/vnd.google-apps.')
               if editors_mode == 'skip'
-                failed << { 'drive_file_id' => raw_id, 'error_message' => "Skipped Editors file type #{mime} by configuration.", 'error_code' => 'SKIPPED' }
+                failed << { 'drive_file_id' => fid_in, 'error_message' => "Skipped Editors file type #{mime} by configuration.", 'error_code' => 'SKIPPED' }
                 next
               end
               export_mime = call('get_export_mime', mime)
               error("Export mapping not defined for Editors type #{mime}.") if export_mime.nil?
 
               url_exp = call('build_endpoint_url', :drive, :export, fid)
-              exp_body = get(url_exp)
-                .params(mimeType: export_mime)
-                .headers('X-Correlation-Id' => per_cid)
-                .response_format_raw
-                .after_error_response(/.*/) do |c,b,h,_|
-                  error(call('normalize_http_error', c, b, h, url_exp,
-                             { action: 'Transfer: Export Drive file', correlation_id: per_cid, verbose_errors: connection['verbose_errors'] }))
-                end
-                .after_response { |_c,b,_| b }
+              req = get(url_exp)
+                      .params(mimeType: export_mime)
+                      .headers('X-Correlation-Id' => per_cid)
+              req = req.headers('X-Goog-Drive-Resource-Keys' => rk_hdr) if rk_hdr
+              exp_body = req.response_format_raw
+                          .after_error_response(/.*/) do |c,b,h,_|
+                            error(call('normalize_http_error', c, b, h, url_exp,
+                                      { action: 'Transfer: Export Drive file', correlation_id: per_cid, verbose_errors: connection['verbose_errors'] }))
+                          end
+                          .after_response { |_c,b,_| b }
               bytes = exp_body
               upload_mime = export_mime
             else
               url_dl = call('build_endpoint_url', :drive, :download, fid)
-              dl_body = get(url_dl)
-                .params(supportsAllDrives: true, acknowledgeAbuse: (local['acknowledge_abuse'] == true))
-                .headers('X-Correlation-Id' => per_cid)
-                .response_format_raw
-                .after_error_response(/.*/) do |c,b,h,_|
-                  error(call('normalize_http_error', c, b, h, url_dl,
-                             { action: 'Transfer: Download Drive file', correlation_id: per_cid, verbose_errors: connection['verbose_errors'] }))
-                end
-                .after_response { |_c,b,_| b }
+              req = get(url_dl)
+                      .params(supportsAllDrives: true, acknowledgeAbuse: (local['acknowledge_abuse'] == true))
+                      .headers('X-Correlation-Id' => per_cid)
+              req = req.headers('X-Goog-Drive-Resource-Keys' => rk_hdr) if rk_hdr
+              dl_body = req.response_format_raw
+                        .after_error_response(/.*/) do |c,b,h,_|
+                          error(call('normalize_http_error', c, b, h, url_dl,
+                                    { action: 'Transfer: Download Drive file', correlation_id: per_cid, verbose_errors: connection['verbose_errors'] }))
+                        end
+                        .after_response { |_c,b,_| b }
               bytes = dl_body
               upload_mime = (mime == '' ? 'application/octet-stream' : mime)
             end
 
-            # 3. Choose GCS object name (prefix + naming_template or default)
+            # 3. Choose GCS object name (prefix + optional template)
             export_ext = call('mime_ext_for_mime', upload_mime)
             template   = (local['naming_template'] || '').to_s
             object_name = call('render_naming_template', prefix, name, fid, modified_iso, export_ext, template)
 
-            # 4. Provenance metadata (always attach)
+            # 4. Provenance metadata
             provenance = {
               'src_drive_id'       => (fm['id'] || fid).to_s,
               'src_drive_mime'     => mime,
@@ -1553,7 +1391,7 @@
             # 5. Upload to GCS (multipart) with overwrite/preconditions
             up = upload_with_meta.call(bytes, upload_mime, object_name, provenance, per_cid, extra_params)
 
-            # 6 Map success
+            # 6. Map success
             gmd = {
               'bucket'       => up['bucket']      || bucket,
               'name'         => up['name']        || object_name,
@@ -1567,10 +1405,9 @@
             }
 
             uploaded << { 'drive_file_id' => fid, 'gcs_object' => gmd }
-
           rescue => e
             failed << {
-              'drive_file_id' => raw_id,
+              'drive_file_id' => fid_in,
               'error_message' => e.message,
               'error_code'    => call('infer_error_code', e.message)
             }
@@ -1581,11 +1418,12 @@
         out = {
           'uploaded' => uploaded,
           'failed'   => failed,
-          'summary'  => { 'total' => ids.length, 'success' => uploaded.length, 'failed' => failed.length }
+          'summary'  => { 'total' => pairs.length, 'success' => uploaded.length, 'failed' => failed.length }
         }
         out['trace'] = traces if include_trace
         out
       end
+
     },
 
     devtools_http_migration_smoke: {
@@ -1693,10 +1531,10 @@
           error('fileId required') if fid == ''
           "#{base}/files/#{fid}"
         when 'download'
-          # Intentionally include alt=media here (callers often omit it for Drive)
+          # Caller will pass alt=media via .params(alt: 'media') for consistency
           fid = (args[0] || '').to_s
           error('fileId required') if fid == ''
-          "#{base}/files/#{fid}?alt=media"
+          "#{base}/files/#{fid}"
         when 'export'
           fid = (args[0] || '').to_s
           error('fileId required') if fid == ''
@@ -1710,7 +1548,7 @@
       when 'storage'
         # NOTE: For object path params we must percent-encode the whole name INCLUDING slashes as %2F.
         api_base   = 'https://storage.googleapis.com/storage/v1'
-        upload_base = 'https://www.googleapis.com/upload/storage/v1'
+        upload_base = 'https://www.storage.googleapis.com/upload/storage/v1'
         case o
         when 'objects_list'
           bucket = (args[0] || '').to_s
@@ -1747,20 +1585,15 @@
     end,
 
     url_encode_component: lambda do |str|
-      begin
-        # Prefer stdlib if present
-        URI.encode_www_form_component(str.to_s)
-      rescue
-        # Fallback, percent-encode UTF-8 bytes, keep unreserved [A-Za-z0-9-._~]
-        s = str.to_s.encode('UTF-8', invalid: :replace, undef: :replace, replace: '')
-        s.bytes.map { |b|
-          if (b >= 0x30 && b <= 0x39) || (b >= 0x41 && b <= 0x5A) || (b >= 0x61 && b <= 0x7A) || [0x2D,0x2E,0x5F,0x7E].include?(b)
-            b.chr
-          else
-            '%%%02X' % b
-          end
-        }.join
-      end
+      # Percent-encode for **path segments** (RFC 3986 unreserved only).
+      s = str.to_s.encode('UTF-8', invalid: :replace, undef: :replace, replace: '')
+      s.bytes.map { |b|
+        if (b >= 0x30 && b <= 0x39) || (b >= 0x41 && b <= 0x5A) || (b >= 0x61 && b <= 0x7A) || [0x2D,0x2E,0x5F,0x7E].include?(b)
+          b.chr
+        else
+          '%%%02X' % b
+        end
+      }.join
     end,
 
     encode_gcs_object: lambda do |name|
@@ -1792,7 +1625,8 @@
       msg     = (gerr['message'] || '').to_s
 
       action  = (context[:action] || context['action']).to_s
-      cid     = (context[:correlation_id] || context['correlation_id'] || headers['X-Correlation-Id'] || headers['x-correlation-id']).to_s
+      h       = headers.is_a?(Hash) ? headers : {}
+      cid     = (context[:correlation_id] || context['correlation_id'] || h['X-Correlation-Id'] || h['x-correlation-id']).to_s
       verbose = !!(context[:verbose_errors] || context['verbose_errors'])
 
       pieces = []
@@ -1820,20 +1654,23 @@
         tail << "upstream=#{snippet}"
       end
 
-      # Helpful hint for the "unregistered callers" class of failures
+      # Helpful hints
       raw = (body.is_a?(String) ? body : (body.to_s rescue ''))
       upstream_text = [msg, raw].join(' ')
       if upstream_text =~ /unregistered callers|without established identity|Please use API key/i
         tail << "hint=Auth header missing. Verify connection auth_type and reconnect (OAuth2: complete consent; Service Account: service_account_email/private_key [+ subject_email for DWD])."
       end
-
-      # Requester pays buckets
       if upstream_text =~ /userProjectMissing|requester[\s-]?pays/i
         tail << "hint=GCS requester-pays: set **GCS billing project (userProject)** on the connection."
       end
-      # Export size cap (10 MB)
       if upstream_text =~ /exportSizeLimitExceeded/i
         tail << "hint=Drive files.export max is 10 MB. Reduce size, split sheets, or export a different format."
+      end
+      if upstream_text =~ /cannotDownloadAbusiveFile/i
+        tail << "hint=File flagged as abusive. Set 'acknowledge_abuse=true' to proceed."
+      end
+      if upstream_text =~ /downloadQuotaExceeded/i
+        tail << "hint=Drive download quota exceeded for this file. Try later or copy the file to reset quotas."
       end
 
       [lead, msg].reject(&:empty?).join(': ') + " (#{tail.join(' | ')})"
@@ -1998,31 +1835,43 @@
 
     # ---------- Drive helpers ----------
 
-    drive_fetch_meta_resolved: lambda do |fid_in, correlation_id, fields, verbose_errors=false|
+    drive_fetch_meta_resolved: lambda do |fid_in, correlation_id, fields, verbose_errors=false, resource_key=nil|
       fid = (fid_in || '').to_s
-      base_fields = fields || 'id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress),shortcutDetails(targetId,targetMimeType)'
+      base_fields = (fields || 'id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress),shortcutDetails(targetId,targetMimeType,targetResourceKey),resourceKey')
+
+      # Initial metadata (may require a resourceKey)
+      hdr = call('build_rk_header', fid, resource_key)
       url_meta = call('build_endpoint_url', :drive, :file, fid)
-      meta = get(url_meta)
-               .params(fields: base_fields, supportsAllDrives: true)
-               .headers('X-Correlation-Id' => correlation_id)
-               .after_error_response(/.*/) do |c,b,h,_|
-                 error(call('normalize_http_error', c, b, h, url_meta,
-                            { action: 'Drive get (meta)', correlation_id: correlation_id, verbose_errors: verbose }))
-               end
+      req = get(url_meta)
+              .params(fields: base_fields, supportsAllDrives: true)
+              .headers('X-Correlation-Id' => correlation_id)
+      req = req.headers('X-Goog-Drive-Resource-Keys' => hdr) if hdr
+      meta = req.after_error_response(/.*/) do |c,b,h,_|
+              error(call('normalize_http_error', c, b, h, url_meta,
+                          { action: 'Drive get (meta)', correlation_id: correlation_id, verbose_errors: verbose_errors }))
+            end
+
       m = meta.is_a?(Hash) ? meta : {}
+      # Resolve shortcuts; target can have its own resourceKey
       if m['mimeType'] == 'application/vnd.google-apps.shortcut' && m.dig('shortcutDetails','targetId')
-        fid2 = m.dig('shortcutDetails','targetId').to_s
-        url2 = call('build_endpoint_url', :drive, :file, fid2)
-        meta2 = get(url2)
-                  .params(fields: base_fields.sub(/,?shortcutDetails\([^)]*\)/, ''), supportsAllDrives: true)
-                  .headers('X-Correlation-Id' => correlation_id)
-                  .after_error_response(/.*/) do |c,b,h,_|
-                    error(call('normalize_http_error', c, b, h, url2,
-                               { action: 'Drive get (target meta)', correlation_id: correlation_id, verbose_errors: verbose }))
-                  end
-        return [fid2, (meta2.is_a?(Hash) ? meta2 : {})]
+        fid2  = m.dig('shortcutDetails','targetId').to_s
+        rk2   = m.dig('shortcutDetails','targetResourceKey') || resource_key
+        hdr2  = call('build_rk_header', fid2, rk2)
+        url2  = call('build_endpoint_url', :drive, :file, fid2)
+
+        req2 = get(url2)
+                .params(fields: base_fields.sub(/,?shortcutDetails\([^)]*\)/, ''), supportsAllDrives: true)
+                .headers('X-Correlation-Id' => correlation_id)
+        req2 = req2.headers('X-Goog-Drive-Resource-Keys' => hdr2) if hdr2
+
+        meta2 = req2.after_error_response(/.*/) do |c,b,h,_|
+                  error(call('normalize_http_error', c, b, h, url2,
+                            { action: 'Drive get (target meta)', correlation_id: correlation_id, verbose_errors: verbose_errors }))
+                end
+        return [fid2, (meta2.is_a?(Hash) ? meta2 : {}), rk2]
       end
-      [fid, m]
+
+      [fid, m, (m['resourceKey'] || resource_key)]
     end,
 
     extract_drive_file_id: lambda do |raw|
@@ -2060,6 +1909,14 @@
       nil
     end,
 
+    extract_drive_id_and_key: lambda do |raw|
+      s = raw.to_s.strip
+      return [nil, nil] if s == ''
+      id = call('extract_drive_file_id', s) || s
+      m  = s.match(/[?&](?:resourcekey|resourceKey)=([^&]+)/)
+      [id, (m && m[1])]
+    end,
+
     maybe_extract_id: lambda do |raw|
       s = raw.to_s.strip
       return '' if s == ''
@@ -2094,6 +1951,13 @@
       clauses.join(' and ')
     end,
 
+    build_rk_header: lambda do |file_id, rk|
+      fid = file_id.to_s.strip
+      key = rk.to_s.strip
+      return nil if fid.empty? || key.empty?
+      "#{fid}/#{key}"
+    end,
+
     get_export_mime: lambda do |editors_mime|
       case (editors_mime || '').to_s
       when 'application/vnd.google-apps.document'   then 'text/plain'
@@ -2102,6 +1966,136 @@
       when 'application/vnd.google-apps.drawing'    then 'image/svg+xml'
       else
         nil
+      end
+    end,
+
+    # ---------- HTTP + Drive content helpers (new) ----------
+
+    drive_build_headers: lambda do |cid, rk_hdr=nil|
+      h = { 'X-Correlation-Id' => cid }
+      h['X-Goog-Drive-Resource-Keys'] = rk_hdr if rk_hdr
+      h
+    end,
+
+    http_get_raw_with_trace: lambda do |url, params, headers, action, verbose|
+      started = Time.now
+      status  = nil
+      body = get(url)
+               .params(params || {})
+               .headers(headers || {})
+               .response_format_raw
+               .after_error_response(/.*/) do |c, b, h, _|
+                 error(call('normalize_http_error', c, b, h, url,
+                            { action: action, correlation_id: (headers || {})['X-Correlation-Id'], verbose_errors: verbose }))
+               end
+               .after_response { |c, b, _| status = c.to_i; b }
+      trace = {
+        'action' => action,
+        'correlation_id' => (headers || {})['X-Correlation-Id'],
+        'status' => status,
+        'url' => url,
+        'dur_ms' => ((Time.now - started) * 1000.0).round
+      }
+      [body, trace]
+    end,
+
+    drive_export_text_with_trace: lambda do |connection, fid, export_mime, cid, rk_hdr|
+      url     = call('build_endpoint_url', :drive, :export, fid)
+      params  = { mimeType: export_mime }
+      headers = call('drive_build_headers', cid, rk_hdr)
+      raw, tr = call('http_get_raw_with_trace', url, params, headers, 'Drive export (text)', connection['verbose_errors'] == true)
+      [call('safe_utf8', raw), tr]
+    end,
+
+    drive_export_raw_with_trace: lambda do |connection, fid, export_mime, cid, rk_hdr|
+      url     = call('build_endpoint_url', :drive, :export, fid)
+      params  = { mimeType: export_mime }
+      headers = call('drive_build_headers', cid, rk_hdr)
+      raw, tr = call('http_get_raw_with_trace', url, params, headers, 'Drive export (bytes)', connection['verbose_errors'] == true)
+      [raw, export_mime, tr]
+    end,
+
+    drive_download_blob_with_trace: lambda do |connection, fid, ack, cid, rk_hdr, action|
+      # Use files.get with alt=media, not a hard-coded ?alt=media URL
+      url     = call('build_endpoint_url', :drive, :file, fid)
+      params  = { alt: 'media', supportsAllDrives: true, acknowledgeAbuse: !!ack }
+      headers = call('drive_build_headers', cid, rk_hdr)
+      call('http_get_raw_with_trace', url, params, headers, action, connection['verbose_errors'] == true)
+    end,
+
+    drive_map_output_from_meta: lambda do |mdata|
+      {
+        'id'            => mdata['id'],
+        'name'          => mdata['name'],
+        'mime_type'     => mdata['mimeType'],
+        'size'          => (mdata['size'] || 0).to_i,
+        'modified_time' => mdata['modifiedTime'],
+        'checksum'      => mdata['md5Checksum'],
+        'owners'        => Array(mdata['owners']).map { |o|
+                            { 'displayName' => o['displayName'], 'emailAddress' => o['emailAddress'] }
+                          }
+      }
+    end,
+
+    # Returns [fields_hash, traces_array]
+    drive_fetch_content_fields: lambda do |connection, fid, mime, mode, ack, strip, rk_hdr, cid|
+      traces = []
+      out = {}
+      case mode.to_s
+      when 'none'
+        return [out, traces]
+      when 'bytes'
+        if mime.to_s.start_with?('application/vnd.google-apps.')
+          error('Editors files require content_mode=text (export).')
+        end
+        raw, tr = call('drive_download_blob_with_trace', connection, fid, ack, cid, rk_hdr, 'Drive download (bytes)')
+        traces << tr
+        out['content_bytes'] = [raw.to_s].pack('m0')
+        return [out, traces]
+      else # 'text'
+        if mime.to_s.start_with?('application/vnd.google-apps.')
+          export_mime = call('get_export_mime', mime)
+          error("Export mapping not defined for Editors type #{mime}.") if export_mime.nil?
+          txt, tr = call('drive_export_text_with_trace', connection, fid, export_mime, cid, rk_hdr)
+          traces << tr
+          txt = call('strip_urls_from_text', txt) if strip
+          out['text_content'] = txt
+          out['exported_as']  = export_mime
+          return [out, traces]
+        end
+        if call('textual_mime?', mime)
+          raw, tr = call('drive_download_blob_with_trace', connection, fid, ack, cid, rk_hdr, 'Drive download (text)')
+          traces << tr
+          txt = call('safe_utf8', raw)
+          txt = call('strip_urls_from_text', txt) if strip
+          out['text_content'] = txt
+          return [out, traces]
+        else
+          raw, tr = call('drive_download_blob_with_trace', connection, fid, ack, cid, rk_hdr, 'Drive download (auto-bytes)')
+          traces << tr
+          out['content_bytes'] = [raw.to_s].pack('m0')
+          return [out, traces]
+        end
+      end
+    end,
+
+    # For transfer: return raw bytes + content type + trace(s)
+    drive_fetch_bytes_for_transfer: lambda do |connection, fid, mime, editors_mode, ack, rk_hdr, cid|
+      traces = []
+      if mime.to_s.start_with?('application/vnd.google-apps.')
+        if editors_mode.to_s == 'skip'
+          return [nil, nil, traces, :skipped]
+        end
+        export_mime = call('get_export_mime', mime)
+        error("Export mapping not defined for Editors type #{mime}.") if export_mime.nil?
+        raw, upload_mime, tr = call('drive_export_raw_with_trace', connection, fid, export_mime, cid, rk_hdr)
+        traces << tr
+        return [raw, upload_mime, traces, nil]
+      else
+        raw, tr = call('drive_download_blob_with_trace', connection, fid, ack, cid, rk_hdr, 'Transfer: Download Drive file')
+        traces << tr
+        upload_mime = (mime.to_s == '' ? 'application/octet-stream' : mime)
+        return [raw, upload_mime, traces, nil]
       end
     end,
 
@@ -2166,6 +2160,24 @@
         .after_response { |c, b, _| code = c.to_i; b }
 
       resp_body.is_a?(Hash) ? resp_body : (JSON.parse(resp_body) rescue {})
+    end,
+
+    gcs_normalize_bucket_and_name: lambda do |bucket_in, name_in|
+      bucket = (bucket_in || '').to_s.strip
+      name   = (name_in || '').to_s
+      if bucket.start_with?('gs://')
+        rest  = bucket.sub(/\Ags:\/\//, '')
+        parts = rest.split('/', 2)
+        bucket = parts[0]
+        name   = parts[1] if name.to_s == '' && parts[1]
+      end
+      if name.start_with?('gs://')
+        rest  = name.sub(/\Ags:\/\//, '')
+        parts = rest.split('/', 2)
+        bucket = parts[0] if bucket.to_s == ''
+        name   = (parts[1] || '')
+      end
+      [bucket, name]
     end,
 
     # ---------- Error code mapping (for batch summaries etc.) ----------
