@@ -20,14 +20,14 @@
       "DriveSupportsAllDrives": {
         "name": "supportsAllDrives",
         "in": "query",
-        "required": true,
-        "schema": { "type": "boolean", "default": true }
+        "required": false,
+        "schema": { "type": "boolean", "default": false }
       },
       "DriveIncludeItemsFromAllDrives": {
         "name": "includeItemsFromAllDrives",
         "in": "query",
         "required": false,
-        "schema": { "type": "boolean", "default": true }
+        "schema": { "type": "boolean", "default": false }
       },
       "DriveFields": {
         "name": "fields",
@@ -46,7 +46,19 @@
             "properties": {
               "code": { "type": "integer" },
               "message": { "type": "string" },
-              "status": { "type": "string" }
+              "status": { "type": "string" },
+              "errors": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "reason": { "type": "string" },
+                    "message": { "type": "string" },
+                    "location": { "type": "string" },
+                    "locationType": { "type": "string" }
+                  }
+                }
+              }
             },
             "required": ["code", "message"]
           }
@@ -86,7 +98,9 @@
         "type": "object",
         "properties": {
           "files": { "type": "array", "items": { "$ref": "#/components/schemas/DriveFile" } },
-          "nextPageToken": { "type": "string" }
+          "nextPageToken": { "type": "string" },
+          "kind": { "type": "string" },
+          "incompleteSearch": { "type": "boolean" }
         },
         "required": ["files"]
       },
@@ -106,13 +120,17 @@
         "properties": {
           "changes": { "type": "array", "items": { "$ref": "#/components/schemas/DriveChange" } },
           "nextPageToken": { "type": "string" },
-          "newStartPageToken": { "type": "string" }
+          "newStartPageToken": { "type": "string" },
+          "kind": { "type": "string" }
         },
         "required": ["changes"]
       },
       "DriveStartPageToken": {
         "type": "object",
-        "properties": { "startPageToken": { "type": "string" } },
+        "properties": {
+          "startPageToken": { "type": "string" },
+          "kind": { "type": "string" }
+        },
         "required": ["startPageToken"]
       },
       "GcsObject": {
@@ -135,7 +153,8 @@
         "properties": {
           "items": { "type": "array", "items": { "$ref": "#/components/schemas/GcsObject" } },
           "nextPageToken": { "type": "string" },
-          "prefixes": { "type": "array", "items": { "type": "string" } }
+          "prefixes": { "type": "array", "items": { "type": "string" } },
+          "kind": { "type": "string" }
         }
       },
       "OAuthTokenResponse": {
@@ -159,6 +178,14 @@
         },
         "required": ["sub"]
       },
+      "StreamingPredictResponse": {
+        "type": "object",
+        "properties": {
+          "outputs": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+          "parameters": { "type": "object", "additionalProperties": true }
+        },
+        "additionalProperties": true
+      },
       "UploadMultipartMetadata": {
         "type": "object",
         "properties": {
@@ -167,7 +194,13 @@
           "metadata": { "type": "object", "additionalProperties": { "type": "string" } }
         },
         "required": ["name"]
-      }
+      },
+      "Content": { "type": "object", "additionalProperties": true },
+      "Tool": { "type": "object", "additionalProperties": true },
+      "SafetySetting": { "type": "object", "additionalProperties": true },
+      "GenerationConfig": { "type": "object", "additionalProperties": true },
+      "GenerateContentResponse": { "type": "object", "additionalProperties": true }
+
     }
   },
   "paths": {
@@ -209,15 +242,24 @@
         "parameters": [
           { "name": "q", "in": "query", "required": false, "schema": { "type": "string" }, "description": "Query built by build_drive_query()" },
           { "name": "pageSize", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 1000 } },
-          { "name": "orderBy", "in": "query", "schema": { "type": "string", "enum": ["modifiedTime desc"] } },
+          {
+            "name": "orderBy",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "description": "Comma-separated sort keys. Valid: createdTime, folder, modifiedByMeTime, modifiedTime, name, name_natural, quotaBytesUsed, recency, sharedWithMeTime, starred, viewedByMeTime; each key may be suffixed with ' desc'."
+            }
+          },
           { "name": "pageToken", "in": "query", "schema": { "type": "string" } },
-          { "name": "spaces", "in": "query", "schema": { "type": "string", "enum": ["drive"] } },
-          { "name": "corpora", "in": "query", "schema": { "type": "string", "enum": ["user", "drive", "allDrives"] } },
+          { "name": "spaces", "in": "query", "schema": { "type": "string", "enum": ["drive", "appDataFolder"] } },
+          { "name": "corpora", "in": "query", "schema": { "type": "string", "enum": ["user", "domain", "drive", "allDrives"] } },
           { "name": "driveId", "in": "query", "schema": { "type": "string" } },
           { "$ref": "#/components/parameters/DriveSupportsAllDrives" },
           { "$ref": "#/components/parameters/DriveIncludeItemsFromAllDrives" },
           { "$ref": "#/components/parameters/DriveFields" },
-          { "$ref": "#/components/parameters/XCorrelationId" }
+          { "$ref": "#/components/parameters/XCorrelationId" },
+          { "name": "includePermissionsForView", "in": "query", "required": false, "schema": { "type": "string", "enum": ["published"] } },
+          { "name": "includeLabels", "in": "query", "required": false, "schema": { "type": "string" } }
         ],
         "responses": {
           "200": { "description": "Drive file list", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DriveListResponse" } } } },
@@ -237,7 +279,10 @@
           { "$ref": "#/components/parameters/DriveSupportsAllDrives" },
           { "$ref": "#/components/parameters/DriveFields" },
           { "name": "alt", "in": "query", "required": false, "schema": { "type": "string", "enum": ["json", "media"] }, "description": "media = download bytes" },
-          { "$ref": "#/components/parameters/XCorrelationId" }
+          { "$ref": "#/components/parameters/XCorrelationId" },
+          { "name": "acknowledgeAbuse", "in": "query", "required": false, "schema": { "type": "boolean", "default": false }, "description": "Acknowledge risk to download abusive content when alt=media." },
+          { "name": "includePermissionsForView", "in": "query", "required": false, "schema": { "type": "string", "enum": ["published"] } },
+          { "name": "includeLabels", "in": "query", "required": false, "schema": { "type": "string" } }
         ],
         "responses": {
           "200": {
@@ -260,17 +305,24 @@
         "security": [{ "bearerAuth": [] }],
         "parameters": [
           { "name": "fileId", "in": "path", "required": true, "schema": { "type": "string" } },
-          { "name": "mimeType", "in": "query", "required": true, "schema": { "type": "string", "enum": ["text/plain", "text/csv", "image/svg+xml"] } },
+          {
+            "name": "mimeType",
+            "in": "query",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "Required. Export MIME type. See Google’s export matrix. (Export responses are limited to ~10MB.)"
+          },
           { "$ref": "#/components/parameters/DriveSupportsAllDrives" },
           { "$ref": "#/components/parameters/XCorrelationId" }
         ],
         "responses": {
           "200": {
-            "description": "Exported file bytes (text/plain, text/csv, image/svg+xml)",
+            "description": "Exported file bytes (type depends on mimeType)",
             "content": {
               "text/plain": { "schema": { "type": "string" } },
               "text/csv": { "schema": { "type": "string" } },
-              "image/svg+xml": { "schema": { "type": "string" } }
+              "image/svg+xml": { "schema": { "type": "string" } },
+              "*/*": { "schema": { "type": "string" } }
             }
           },
           "default": { "description": "Error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GoogleJsonError" } } } }
@@ -290,7 +342,14 @@
           { "name": "includeRemoved", "in": "query", "schema": { "type": "boolean", "default": false } },
           { "$ref": "#/components/parameters/DriveSupportsAllDrives" },
           { "name": "fields", "in": "query", "schema": { "type": "string", "example": "nextPageToken,newStartPageToken,changes(changeType,time,removed,fileId,file(id,name,mimeType,modifiedTime,size,md5Checksum,trashed,parents))" } },
-          { "$ref": "#/components/parameters/XCorrelationId" }
+          { "$ref": "#/components/parameters/XCorrelationId" },
+          { "name": "driveId", "in": "query", "required": false, "schema": { "type": "string" } },
+          { "name": "includeCorpusRemovals", "in": "query", "required": false, "schema": { "type": "boolean", "default": false } },
+          { "name": "includeItemsFromAllDrives", "in": "query", "required": false, "schema": { "type": "boolean", "default": false } },
+          { "name": "restrictToMyDrive", "in": "query", "required": false, "schema": { "type": "boolean", "default": false } },
+          { "name": "spaces", "in": "query", "required": false, "schema": { "type": "string", "enum": ["drive", "appDataFolder"] } },
+          { "name": "includePermissionsForView", "in": "query", "required": false, "schema": { "type": "string", "enum": ["published"] } },
+          { "name": "includeLabels", "in": "query", "required": false, "schema": { "type": "string" } }
         ],
         "responses": {
           "200": { "description": "Changes page", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DriveChangesResponse" } } } },
@@ -307,7 +366,8 @@
         "security": [{ "bearerAuth": [] }],
         "parameters": [
           { "$ref": "#/components/parameters/DriveSupportsAllDrives" },
-          { "$ref": "#/components/parameters/XCorrelationId" }
+          { "$ref": "#/components/parameters/XCorrelationId" },
+          { "name": "driveId", "in": "query", "required": false, "schema": { "type": "string" } }
         ],
         "responses": {
           "200": { "description": "Start page token", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DriveStartPageToken" } } } },
@@ -330,7 +390,14 @@
           { "name": "maxResults", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000 } },
           { "name": "versions", "in": "query", "schema": { "type": "boolean", "default": false } },
           { "name": "fields", "in": "query", "schema": { "type": "string", "example": "items(bucket,name,size,contentType,updated,generation,md5Hash,crc32c,metadata),nextPageToken,prefixes" } },
-          { "$ref": "#/components/parameters/XCorrelationId" }
+          { "$ref": "#/components/parameters/XCorrelationId" },
+          { "name": "startOffset", "in": "query", "schema": { "type": "string" } },
+          { "name": "endOffset", "in": "query", "schema": { "type": "string" } },
+          { "name": "includeTrailingDelimiter", "in": "query", "schema": { "type": "boolean", "default": false } },
+          { "name": "matchGlob", "in": "query", "schema": { "type": "string" }, "description": "Glob filter (requires delimiter='/' when listing prefixes)." },
+          { "name": "includeFoldersAsPrefixes", "in": "query", "schema": { "type": "boolean", "default": false }, "description": "Return empty folders and managed folders as prefixes (requires delimiter='/')." },
+          { "name": "projection", "in": "query", "schema": { "type": "string", "enum": ["full", "noAcl"] } },
+          { "name": "softDeleted", "in": "query", "schema": { "type": "boolean", "default": false }, "description": "List only soft-deleted objects (requires bucket with soft delete policy; mutually exclusive with versions=true)." }
         ],
         "responses": {
           "200": { "description": "Object list", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GcsListResponse" } } } },
@@ -349,7 +416,15 @@
           { "name": "bucket", "in": "path", "required": true, "schema": { "type": "string" } },
           { "name": "object", "in": "path", "required": true, "schema": { "type": "string" } },
           { "name": "alt", "in": "query", "required": false, "schema": { "type": "string", "enum": ["json", "media"] } },
-          { "$ref": "#/components/parameters/XCorrelationId" }
+          { "$ref": "#/components/parameters/XCorrelationId" },
+          { "name": "generation", "in": "query", "schema": { "type": ["integer", "string"] }, "description": "Select a specific object generation." },
+          { "name": "ifGenerationMatch", "in": "query", "schema": { "type": ["integer", "string"] } },
+          { "name": "ifGenerationNotMatch", "in": "query", "schema": { "type": ["integer", "string"] } },
+          { "name": "ifMetagenerationMatch", "in": "query", "schema": { "type": ["integer", "string"] } },
+          { "name": "ifMetagenerationNotMatch", "in": "query", "schema": { "type": ["integer", "string"] } },
+          { "name": "projection", "in": "query", "schema": { "type": "string", "enum": ["full", "noAcl"] } },
+          { "name": "softDeleted", "in": "query", "schema": { "type": "boolean", "default": false }, "description": "Get metadata for a soft-deleted object (requires generation; alt=media not supported when softDeleted=true)." },
+          { "name": "restoreToken", "in": "query", "schema": { "type": "string" }, "description": "Disambiguate soft-deleted objects when name+generation do not uniquely identify." }
         ],
         "responses": {
           "200": {
@@ -366,20 +441,26 @@
     },
 
     "/upload/storage/v1/b/{bucket}/o": {
-      "servers": [{ "url": "https://www.googleapis.com" }],
+      "servers": [
+        { "url": "https://www.googleapis.com" },
+        { "url": "https://storage.googleapis.com" }
+      ],
       "post": {
         "operationId": "storage.objects.insert",
         "security": [{ "bearerAuth": [] }],
         "parameters": [
           { "name": "bucket", "in": "path", "required": true, "schema": { "type": "string" } },
-          { "name": "uploadType", "in": "query", "required": true, "schema": { "type": "string", "enum": ["media", "multipart"] } },
+          { "name": "uploadType", "in": "query", "required": true, "schema": { "type": "string", "enum": ["media", "multipart", "resumable"] } },
           { "name": "name", "in": "query", "required": false, "schema": { "type": "string" }, "description": "Required for uploadType=media" },
           { "name": "ifGenerationMatch", "in": "query", "schema": { "type": ["integer", "string"] } },
           { "name": "ifMetagenerationMatch", "in": "query", "schema": { "type": ["integer", "string"] } },
-          { "$ref": "#/components/parameters/XCorrelationId" }
+          { "$ref": "#/components/parameters/XCorrelationId" },
+          { "name": "X-Upload-Content-Type", "in": "header", "required": false, "schema": { "type": "string" }, "description": "Resumable uploads: content type of the object being uploaded." },
+          { "name": "X-Upload-Content-Length", "in": "header", "required": false, "schema": { "type": ["integer", "string"] }, "description": "Resumable uploads: size in bytes of the object being uploaded." }
         ],
         "requestBody": {
           "required": true,
+          "description": "For uploadType=media: raw bytes required (application/octet-stream) and 'name' query param required. For uploadType=multipart: multipart/related with JSON metadata + media. For uploadType=resumable: this POST initiates a session; body may be a JSON metadata object or empty; use the 'Location' session URI for subsequent PUTs.",
           "content": {
             "application/octet-stream": {
               "schema": { "type": "string", "description": "Raw bytes", "format": "binary" }
@@ -393,6 +474,9 @@
                 },
                 "required": ["metadata", "media"]
               }
+            },
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/UploadMultipartMetadata" }
             }
           }
         },
@@ -489,6 +573,109 @@
           "default": { "description": "Error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GoogleJsonError" } } } }
         },
         "x-used-by": ["connection.authorization.identity (OAuth2 mode)"]
+      }
+    },
+
+    "/v1/{endpoint}:serverStreamingPredict": {
+      "servers": [{ "url": "https://aiplatform.googleapis.com" }],
+      "post": {
+        "operationId": "aiplatform.endpoints.serverStreamingPredict",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "endpoint",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "projects/{project}/locations/{location}/endpoints/{endpointId}"
+          },
+          { "$ref": "#/components/parameters/XCorrelationId" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "inputs": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+                  "parameters": { "type": "object", "additionalProperties": true }
+                },
+                "required": ["inputs"],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Server streams multiple StreamingPredictResponse JSON objects.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/StreamingPredictResponse" }
+              }
+            }
+          },
+          "default": {
+            "description": "Error",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GoogleJsonError" } } }
+          }
+        },
+        "x-used-by": ["vertex.endpoints.server_streaming_predict"]
+      }
+    },
+
+    "/v1/{model}:streamGenerateContent": {
+      "servers": [{ "url": "https://aiplatform.googleapis.com" }],
+      "post": {
+        "operationId": "aiplatform.models.streamGenerateContent",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "model",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "Publisher model or tuned endpoint. E.g. projects/{project}/locations/{location}/publishers/google/models/{modelId} OR projects/{project}/locations/{location}/endpoints/{endpointId}"
+          },
+          { "$ref": "#/components/parameters/XCorrelationId" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "contents": { "type": "array", "items": { "$ref": "#/components/schemas/Content" } },
+                  "systemInstruction": { "$ref": "#/components/schemas/Content" },
+                  "tools": { "type": "array", "items": { "$ref": "#/components/schemas/Tool" } },
+                  "toolConfig": { "type": "object", "additionalProperties": true },
+                  "safetySettings": { "type": "array", "items": { "$ref": "#/components/schemas/SafetySetting" } },
+                  "generationConfig": { "$ref": "#/components/schemas/GenerationConfig" },
+                  "cachedContent": { "type": "string" }
+                },
+                "required": ["contents"],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Server streams multiple GenerateContentResponse JSON objects.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/GenerateContentResponse" }
+              }
+            }
+          },
+          "default": {
+            "description": "Error",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GoogleJsonError" } } }
+          }
+        },
+        "x-used-by": ["vertex.generate_content.stream"]
       }
     }
   }
