@@ -41,9 +41,12 @@
         token_url = (key['token_uri'].presence || 'https://oauth2.googleapis.com/token')
         now = Time.now.to_i
 
+        scopes = ['https://www.googleapis.com/auth/cloud-platform', 'https://www.googleapis.com/auth/drive.readonly', 'https://www.googleapis.com/auth/devstorage.read_write']
+        scopes = scopes.strip
+
         payload = {
           iss: key['client_email'],
-          scope: (connection['scopes'] || '').strip,
+          scope: scopes,
           aud: token_url,
           iat: now,
           exp: now + 3600 # max 1 hour
@@ -518,7 +521,10 @@
         user_project = connection['user_project']
         uploaded = []
         failed = []
-        drive_files = (input['drive_file_ids'] || []).csv
+
+        raw_input = input['drive_file_ids'].to_s
+        drive_files = raw_input.split(/[\s,]+/).map(&:strip).reject(&:blank?)
+
         drive_files.each do |raw|
           begin
             file_id = call(:extract_drive_id, raw.strip)
