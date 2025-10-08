@@ -12,6 +12,12 @@
         hint: 'Paste the full JSON from Google Cloud (includes client_email, private_key, token_uri).'
       },
       {
+        name: 'user_project',
+        label: 'User project for requester-pays (optional)',
+        hint: 'Project ID for billing (userProject)',
+        optional: true
+      },
+      {
         name: 'scopes',
         control_type: 'text',
         optional: true,
@@ -198,8 +204,8 @@
         ]
       end,
       output_fields: lambda do |object_definitions|
-        object_definitions['list_page_meta'][:fields] + [
-          { name: 'files', type: 'array', of: 'object', properties: object_definitions['drive_file_min'][:fields] }
+        object_definitions['list_page_meta'] + [
+          { name: 'files', type: 'array', of: 'object', properties: object_definitions['drive_file_min'] }
         ]
       end,
       execute: lambda do |_connection, input|
@@ -305,7 +311,7 @@
             export_mime = call(:editors_export_mime, meta['mimeType'])
             bytes = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}/export")
                     .params(mimeType: export_mime, supportsAllDrives: true)
-                    .request_format_raw # <-- treat response as raw
+                    .response_format_raw # <-- treat response as raw
             text = call(:force_utf8, bytes.to_s)
             text = call(:strip_urls, text) if strip
             result.merge(exported_as: export_mime, text_content: text)
@@ -313,7 +319,7 @@
             if call(:is_textual_mime?, meta['mimeType'])
               bytes = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}")
                       .params(alt: 'media', supportsAllDrives: true)
-                      .request_format_raw
+                      .response_format_raw
               text = call(:force_utf8, bytes.to_s)
               text = call(:strip_urls, text) if strip
               result.merge(text_content: text)
@@ -327,7 +333,7 @@
           end
           bytes = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}")
                   .params(alt: 'media', supportsAllDrives: true, acknowledgeAbuse: false)
-                  .request_format_raw
+                  .response_format_raw
           result.merge(content_bytes: Base64.strict_encode64(bytes.to_s))
         else
           raise "400 Bad Request - Unknown content_mode: #{mode}"
@@ -350,7 +356,7 @@
         ]
       end,
       output_fields: lambda do |object_definitions|
-        object_definitions['gcs_list_page'][:fields]
+        object_definitions['gcs_list_page']
       end,
       execute: lambda do |_connection, input|
         page_size = [[(input['max_results'] || 1000).to_i, 1].max, 1000].min
@@ -361,7 +367,8 @@
                 pageToken: input['page_token'],
                 maxResults: page_size,
                 versions: !!input['include_versions'],
-                fields: 'items(bucket,name,size,contentType,updated,generation,md5Hash,crc32c,metadata),nextPageToken,prefixes'
+                fields: 'items(bucket,name,size,contentType,updated,generation,md5Hash,crc32c,metadata),nextPageToken,prefixes',
+                userProject: connection['user_project']
               )
 
         items = (res['items'] || []).map do |o|
@@ -402,7 +409,7 @@
         ]
       end,
       output_fields: lambda do |object_definitions|
-        object_definitions['gcs_object'][:fields] + [
+        object_definitions['gcs_object']+ [
           { name: 'text_content', type: 'string' },
           { name: 'content_bytes', type: 'string', hint: 'Base64' }
         ]
@@ -437,14 +444,14 @@
           end
           bytes = get("https://storage.googleapis.com/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o/#{ERB::Util.url_encode(name)}")
                   .params(alt: 'media')
-                  .request_format_raw
+                  .response_format_raw
           text = call(:force_utf8, bytes.to_s)
           text = call(:strip_urls, text) if strip
           base.merge(text_content: text)
         elsif mode == 'bytes'
           bytes = get("https://storage.googleapis.com/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o/#{ERB::Util.url_encode(name)}")
                   .params(alt: 'media')
-                  .request_format_raw
+                  .response_format_raw
           base.merge(content_bytes: Base64.strict_encode64(bytes.to_s))
         else
           raise "400 Bad Request - Unknown content_mode: #{mode}"
@@ -478,14 +485,14 @@
         ]
       end,
       output_fields: lambda do |object_definitions|
-        object_definitions['gcs_object'][:fields] + [{ name: 'bytes_uploaded', type: 'integer' }]
+        object_definitions['gcs_object']+ [{ name: 'bytes_uploaded', type: 'integer' }]
       end,
       execute: lambda do |_connection, input|
         bucket = input['bucket']
         name = input['object_name']
         mode = input['content_mode']
         strip = input.dig('postprocess', 'strip_urls') ? true : false
-        meta = input['custom_metadata'] || {}
+        meta = meta.transform_values { |v| v.nil? ? nil : v.to_s } if meta.present?
 
         body_bytes, ctype =
           if mode == 'text'
@@ -568,7 +575,7 @@
         ]
       end,
       output_fields: lambda do |object_definitions|
-        object_definitions['transfer_result'][:fields]
+        object_definitions['transfer_result']
       end,
       execute: lambda do |_connection, input|
         bucket = input['bucket']
@@ -594,7 +601,7 @@
               export_mime = call(:editors_export_mime, meta['mimeType'])
               bytes = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}/export")
                       .params(mimeType: export_mime, supportsAllDrives: true)
-                      .request_format_raw
+                      .response_format_raw
               body = bytes.to_s
               created = post("https://www.googleapis.com/upload/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o")
                         .params(uploadType: 'media', name: object_name)
@@ -613,7 +620,7 @@
               ctype = meta['mimeType']
               bytes = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}")
                       .params(alt: 'media', supportsAllDrives: true)
-                      .request_format_raw
+                      .response_format_raw
               body = bytes.to_s
               created = post("https://www.googleapis.com/upload/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o")
                         .params(uploadType: 'media', name: object_name)
