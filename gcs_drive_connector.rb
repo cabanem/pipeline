@@ -34,8 +34,10 @@
         token_url = (key['token_uri'].presence || 'https://oauth2.googleapis.com/token')
         now = Time.now.to_i
 
-        scopes = ['https://www.googleapis.com/auth/cloud-platform', 'https://www.googleapis.com/auth/drive.readonly', 'https://www.googleapis.com/auth/devstorage.read_write']
-        scopes = scopes.strip
+        scopes = [
+          'https://www.googleapis.com/auth/cloud-platform',
+          'https://www.googleapis.com/auth/drive.readonly'
+        ].join(' ')
 
         payload = {
           iss: key['client_email'],
@@ -69,8 +71,10 @@
 
       # URL: authorization
       authorization_url: lambda do |connection|
-        scopes = ['https://www.googleapis.com/auth/cloud-platform', 'https://www.googleapis.com/auth/drive.readonly', 'https://www.googleapis.com/auth/devstorage.read_write']
-        scopes = scopes.strip
+        scopes = [
+          'https://www.googleapis.com/auth/cloud-platform',
+          'https://www.googleapis.com/auth/drive.readonly'
+        ].join(' ')
         "https://accounts.google.com/o/oauth2/v2/auth?response_type=code&access_type=offline&include_granted_scopes=true&scope=#{CGI.escape(scopes)}"
       end,
 
