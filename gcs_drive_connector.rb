@@ -18,7 +18,9 @@
 
       # Enable GCS
       { name: 'enable_gcs', label: 'Enable Google Cloud Storage', type: 'boolean', control_type: 'checkbox',
-        default: true, sticky: true, hint: 'Adds Cloud Storage scopes for listing/uploading objects (requires reconnect).' }
+        default: true, sticky: true, hint: 'Adds Cloud Storage scopes for listing/uploading objects (requires reconnect).' },
+      { name: 'gcs_user_project', label: 'GCS billing project (userProject)', optional: true, sticky: true,
+        hint: 'Required for Requester Pays buckets.' }
     ],
 
     authorization: {
@@ -201,6 +203,7 @@
 
       input_fields: lambda do
         [
+          { name: 'drive_id', label: 'Shared Drive ID', hint: 'Poll a specific Shared Drive. Leave blank for My Drive.' },
           { name: 'page_token', label: 'Page token', hint: 'Use the prior next_page_token to continue.' },
           { name: 'start_page_token', hint: 'Used only when page_token is blank; the action auto-fetches one if this is blank too.' },
           { name: 'page_size', type: 'integer', default: 100, hint: '1–1000' },
@@ -257,6 +260,7 @@
         if token == ''
           token = (input['start_page_token'].to_s.strip)
         end
+        drive_id = (input['drive_id'] || '').to_s.strip
 
         # Auto-get startPageToken when neither provided
         if token == ''
@@ -264,8 +268,10 @@
           started_t = Time.now
           code_t    = nil
 
+          params_t = { supportsAllDrives: true }
+          params_t[:driveId] = drive_id unless drive_id == ''
           tok_body = get(url_tok)
-            .params(supportsAllDrives: true)
+            .params(params_t)
             .headers('X-Correlation-Id' => cid)
             .after_error_response(/.*/) do |code, body, headers, _msg|
               norm = call('normalize_http_error', code, body, headers, url_tok,
@@ -291,6 +297,14 @@
 
         fields = 'nextPageToken,newStartPageToken,changes(changeType,time,removed,fileId,file(id,name,mimeType,modifiedTime,size,md5Checksum,owners(displayName,emailAddress)))'
 
+        params_c = {
+          pageToken: token,
+          pageSize: page_size,
+          includeRemoved: input['include_removed'] == true,
+          supportsAllDrives: true,
+          fields: fields
+        }
+        params_c[:driveId] = drive_id unless drive_id == ''
         body = get(url_chg)
           .params(
             pageToken: token,
@@ -299,6 +313,7 @@
             supportsAllDrives: true,
             fields: fields
           )
+          .params(params_c)
           .headers('X-Correlation-Id' => cid)
           .after_error_response(/.*/) do |code, resp_body, headers, _msg|
             norm = call('normalize_http_error', code, resp_body, headers, url_chg,
@@ -490,6 +505,8 @@
           { name: 'content_mode', control_type: 'select', optional: false, default: 'text',
             options: [['None', 'none'], ['Text', 'text'], ['Bytes', 'bytes']],
             hint: 'Editors: bytes not supported; use text (export).'},
+          { name: 'acknowledge_abuse', type: 'boolean', control_type: 'checkbox', default: false,
+            hint: 'Required to download some flagged files.' },
           { name: 'postprocess', type: 'object', properties: [
               { name: 'strip_urls', type: 'boolean', control_type: 'checkbox', default: false }
           ]}
@@ -561,7 +578,7 @@
             started3 = Time.now
             code3    = nil
             exp_body = get(url_exp)
-              .params(mimeType: export_mime, supportsAllDrives: true)
+              .params(mimeType: export_mime)
               .headers('X-Correlation-Id' => per_cid)
               .response_format_raw
               .after_error_response(/.*/) do |c, b, h, _|
@@ -584,7 +601,7 @@
             started4 = Time.now
             code4    = nil
             dl_body = get(url_dl)
-              .params(supportsAllDrives: true)
+              .params(supportsAllDrives: true, acknowledgeAbuse: (local['acknowledge_abuse'] == true))
               .headers('X-Correlation-Id' => per_cid)
               .response_format_raw
               .after_error_response(/.*/) do |c, b, h, _|
@@ -606,7 +623,7 @@
           started5 = Time.now
           code5    = nil
           dl_body = get(url_dl)
-            .params(supportsAllDrives: true)
+            .params(supportsAllDrives: true, acknowledgeAbuse: (local['acknowledge_abuse'] == true))
             .headers('X-Correlation-Id' => per_cid)
             .response_format_raw
             .after_error_response(/.*/) do |c, b, h, _|
@@ -642,6 +659,8 @@
           { name: 'content_mode', control_type: 'select', optional: false, default: 'text',
             options: [['None', 'none'], ['Text', 'text'], ['Bytes', 'bytes']],
             hint: 'Editors: bytes not supported; use text (export).'},
+          { name: 'acknowledge_abuse', type: 'boolean', control_type: 'checkbox', default: false,
+            hint: 'Required to download some flagged files.' },
           { name: 'postprocess', type: 'object', properties: [
               { name: 'strip_urls', type: 'boolean', control_type: 'checkbox', default: false }
           ]}
@@ -732,7 +751,7 @@
                 started_e = Time.now
                 code_e    = nil
                 exp_body = get(url_exp)
-                  .params(mimeType: export_mime, supportsAllDrives: true)
+                  .params(mimeType: export_mime)
                   .headers('X-Correlation-Id' => per_cid)
                   .response_format_raw
                   .after_error_response(/.*/) do |c, b, h, _|
@@ -753,7 +772,7 @@
                 started_d = Time.now
                 code_d    = nil
                 dl_body = get(url_dl)
-                  .params(supportsAllDrives: true)
+                  .params(supportsAllDrives: true, acknowledgeAbuse: (local['acknowledge_abuse'] == true))
                   .headers('X-Correlation-Id' => per_cid)
                   .response_format_raw
                   .after_error_response(/.*/) do |c, b, h, _|
@@ -773,7 +792,7 @@
               started_db = Time.now
               code_db    = nil
               dl_body = get(url_dl)
-                .params(supportsAllDrives: true)
+                .params(supportsAllDrives: true, acknowledgeAbuse: (local['acknowledge_abuse'] == true))
                 .headers('X-Correlation-Id' => per_cid)
                 .response_format_raw
                 .after_error_response(/.*/) do |c, b, h, _|
@@ -886,6 +905,8 @@
           versions:    versions,
           fields:      'items(bucket,name,size,contentType,updated,generation,md5Hash,crc32c,metadata),nextPageToken,prefixes'
         }.reject { |_k, v| v.nil? || v.to_s == '' }
+        up = connection['gcs_user_project'].to_s
+        params[:userProject] = up unless up == ''
 
         started = Time.now
         code    = nil
@@ -994,7 +1015,11 @@
         url_meta = call('build_endpoint_url', :storage, :object, bucket, name)
         started1 = Time.now
         code1    = nil
+        params_m = {}
+        up = connection['gcs_user_project'].to_s
+        params_m[:userProject] = up unless up == ''
         meta_body = get(url_meta)
+          .params(params_m)
           .headers('X-Correlation-Id' => cid)
           .after_error_response(/.*/) do |c, b, h, _|
             error(call('normalize_http_error', c, b, h, url_meta,
@@ -1029,8 +1054,10 @@
           url_dl = call('build_endpoint_url', :storage, :download, bucket, name)
           started2 = Time.now
           code2    = nil
+          p_dl = { alt: 'media' }
+          p_dl[:userProject] = up unless up == ''
           dl_body = get(url_dl)
-            .params(alt: 'media')
+            .params(p_dl)
             .headers('X-Correlation-Id' => cid)
             .response_format_raw
             .after_error_response(/.*/) do |c, b, h, _|
@@ -1050,8 +1077,10 @@
           url_dl = call('build_endpoint_url', :storage, :download, bucket, name)
           started3 = Time.now
           code3    = nil
+          p_db = { alt: 'media' }
+          p_db[:userProject] = up unless up == ''
           dl_body = get(url_dl)
-            .params(alt: 'media')
+            .params(p_db)
             .headers('X-Correlation-Id' => cid)
             .response_format_raw
             .after_error_response(/.*/) do |c, b, h, _|
@@ -1155,12 +1184,13 @@
             txt = call('strip_urls_from_text', txt) if strip
             txt # UTF-8 string is fine; request sets raw_body
           when 'bytes'
+          when 'bytes'
             b64 = (local['content_bytes'] || '').to_s
             error('content_bytes (base64) is required when content_mode=bytes') if b64 == ''
-            # Decode base64 (strict) without stdlib Base64
-            b   = b64.to_s.unpack('m0').first.to_s
-            error('Failed to decode content_bytes (base64)') if b == ''
-            b
+            arr = b64.to_s.unpack('m0')
+            decoded = arr && arr[0]
+            error('Failed to decode content_bytes (base64)') if decoded.nil?
+            decoded
           else
             error("Unsupported content_mode=#{mode}. Use text|bytes.")
           end
@@ -1208,6 +1238,8 @@
           body << part3.dup.force_encoding('ASCII-8BIT')
 
           params = { uploadType: 'multipart' }.merge(extra_params)
+          up = connection['gcs_user_project'].to_s
+          params[:userProject] = up unless up == ''
 
           url_up   = call('build_endpoint_url', :storage, :objects_upload_media, bucket)
           started  = Time.now
@@ -1216,6 +1248,7 @@
             .params(params)
             .headers('Content-Type' => "multipart/related; boundary=#{boundary}", 'X-Correlation-Id' => cid)
             .payload(body)
+            .request_format_raw
             .after_error_response(/.*/) do |c, b, h, _|
               error(call('normalize_http_error', c, b, h, url_up,
                         { action: 'GCS upload (multipart)', correlation_id: cid, verbose_errors: connection['verbose_errors'] }))
@@ -1226,6 +1259,8 @@
         else
           # Media upload (content only)
           params = { uploadType: 'media', name: name }.merge(extra_params)
+          up = connection['gcs_user_project'].to_s
+          params[:userProject] = up unless up == ''
           url_up  = call('build_endpoint_url', :storage, :objects_upload_media, bucket)
           started = Time.now
           code    = nil
@@ -1233,6 +1268,7 @@
             .params(params)
             .headers('Content-Type' => mime, 'X-Correlation-Id' => cid)
             .payload(raw_bytes)
+            .request_format_raw
             .after_error_response(/.*/) do |c, b, h, _|
               error(call('normalize_http_error', c, b, h, url_up,
                         { action: 'GCS upload (media)', correlation_id: cid, verbose_errors: connection['verbose_errors'] }))
@@ -1319,6 +1355,8 @@
           ifGenerationMatch:     pre['if_generation_match'],
           ifMetagenerationMatch: pre['if_metageneration_match']
         }.reject { |_k, v| v.nil? || v.to_s == '' }
+        up = connection['gcs_user_project'].to_s
+        params[:userProject] = up unless up == ''
 
         cid           = call('gen_correlation_id')
         include_trace = connection['include_trace'] == true
@@ -1364,6 +1402,8 @@
           { name: 'content_mode_for_editors', control_type: 'select', default: 'text',
             options: [['Text (export)', 'text'], ['Skip editors', 'skip']],
             hint: 'Editors cannot produce raw bytes.' },
+          { name: 'acknowledge_abuse', type: 'boolean', control_type: 'checkbox', default: false,
+            hint: 'Required for some binary downloads.' },
           { name: 'naming_template', hint: 'Optional. Tokens: {name}, {ext}, {id}, {uuid}, {modified:yyyyMMdd-HHmmssZ}. Example: {name}-{id}-{modified:yyyyMMdd}.csv' },
           { name: 'prevent_overwrite', type: 'boolean', control_type: 'checkbox', default: false,
             hint: 'Sets ifGenerationMatch=0 so upload fails if object already exists.' },
@@ -1473,7 +1513,7 @@
 
               url_exp = call('build_endpoint_url', :drive, :export, fid)
               exp_body = get(url_exp)
-                .params(mimeType: export_mime, supportsAllDrives: true)
+                .params(mimeType: export_mime)
                 .headers('X-Correlation-Id' => per_cid)
                 .response_format_raw
                 .after_error_response(/.*/) do |c,b,h,_|
@@ -1486,7 +1526,7 @@
             else
               url_dl = call('build_endpoint_url', :drive, :download, fid)
               dl_body = get(url_dl)
-                .params(supportsAllDrives: true)
+                .params(supportsAllDrives: true, acknowledgeAbuse: (local['acknowledge_abuse'] == true))
                 .headers('X-Correlation-Id' => per_cid)
                 .response_format_raw
                 .after_error_response(/.*/) do |c,b,h,_|
@@ -1787,6 +1827,15 @@
         tail << "hint=Auth header missing. Verify connection auth_type and reconnect (OAuth2: complete consent; Service Account: service_account_email/private_key [+ subject_email for DWD])."
       end
 
+      # Requester pays buckets
+      if upstream_text =~ /userProjectMissing|requester[\s-]?pays/i
+        tail << "hint=GCS requester-pays: set **GCS billing project (userProject)** on the connection."
+      end
+      # Export size cap (10 MB)
+      if upstream_text =~ /exportSizeLimitExceeded/i
+        tail << "hint=Drive files.export max is 10 MB. Reduce size, split sheets, or export a different format."
+      end
+
       [lead, msg].reject(&:empty?).join(': ') + " (#{tail.join(' | ')})"
     end,
 
@@ -1949,7 +1998,7 @@
 
     # ---------- Drive helpers ----------
 
-    drive_fetch_meta_resolved: lambda do |fid_in, correlation_id, fields|
+    drive_fetch_meta_resolved: lambda do |fid_in, correlation_id, fields, verbose_errors=false|
       fid = (fid_in || '').to_s
       base_fields = fields || 'id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress),shortcutDetails(targetId,targetMimeType)'
       url_meta = call('build_endpoint_url', :drive, :file, fid)
@@ -1958,7 +2007,7 @@
                .headers('X-Correlation-Id' => correlation_id)
                .after_error_response(/.*/) do |c,b,h,_|
                  error(call('normalize_http_error', c, b, h, url_meta,
-                            { action: 'Drive get (meta)', correlation_id: correlation_id, verbose_errors: verbose_errors }))
+                            { action: 'Drive get (meta)', correlation_id: correlation_id, verbose_errors: verbose }))
                end
       m = meta.is_a?(Hash) ? meta : {}
       if m['mimeType'] == 'application/vnd.google-apps.shortcut' && m.dig('shortcutDetails','targetId')
@@ -1969,7 +2018,7 @@
                   .headers('X-Correlation-Id' => correlation_id)
                   .after_error_response(/.*/) do |c,b,h,_|
                     error(call('normalize_http_error', c, b, h, url2,
-                               { action: 'Drive get (target meta)', correlation_id: correlation_id, verbose_errors: verbose_errors }))
+                               { action: 'Drive get (target meta)', correlation_id: correlation_id, verbose_errors: verbose }))
                   end
         return [fid2, (meta2.is_a?(Hash) ? meta2 : {})]
       end
@@ -2100,6 +2149,8 @@
 
       url = call('build_endpoint_url', :storage, :objects_upload_media, bucket)
       params = { uploadType: 'multipart' }.merge(extra_params || {})
+      up = connection['gcs_user_project'].to_s rescue ''
+      params[:userProject] = up unless up == ''
 
       started = Time.now
       code    = nil
@@ -2107,6 +2158,7 @@
         .params(params)
         .headers('Content-Type' => "multipart/related; boundary=#{boundary}", 'X-Correlation-Id' => correlation_id)
         .payload(body)
+        .request_format_raw
         .after_error_response(/.*/) do |c, b, h, _|
           error(call('normalize_http_error', c, b, h, url,
                     { action: 'GCS upload (multipart)', correlation_id: correlation_id, verbose_errors: connection['verbose_errors'] }))
