@@ -1,781 +1,770 @@
 {
-  title: "Google Drive & GCS Connector",
-  
+  title: 'Google Drive + GCS Utilities',
+
+  # --------- CONNECTION --------------------------------------------------
   connection: {
     fields: [
       {
-        name: "service_account_json",
-        label: "Service Account JSON",
+        name: 'service_account_key_json',
+        label: 'Service account JSON key',
+        control_type: 'text-area',
         optional: false,
-        control_type: "text-area",
-        hint: "Paste the entire service account JSON key file contents"
+        hint: 'Paste the full JSON from Google Cloud (includes client_email, private_key, token_uri).'
+      },
+      {
+        name: 'scopes',
+        control_type: 'text',
+        optional: true,
+        hint: 'Space-separated scopes. Default covers Drive read + GCS read/write.',
+        default: 'https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/devstorage.read_write openid email profile'
       }
     ],
-    
+
     authorization: {
-      type: "custom_auth",
-      
+      # Custom JWT-bearer --> OAuth access token exchange
+      type: 'custom',
+
+      # Attach the access token to every request
+      apply: lambda do |connection|
+        headers('Authorization': "Bearer #{connection['access_token']}")
+      end,
+
+      # Obtain/refresh the access token
       acquire: lambda do |connection|
-        # Parse service account JSON
-        service_account = JSON.parse(connection["service_account_json"])
-        
-        # JWT header
-        header = {
-          alg: "RS256",
-          typ: "JWT"
-        }
-        
-        # JWT claims
+        key = JSON.parse(connection['service_account_key_json'].to_s)
+        token_url = (key['token_uri'].presence || 'https://oauth2.googleapis.com/token')
         now = Time.now.to_i
-        claims = {
-          iss: service_account["client_email"],
-          scope: [
-            "https://www.googleapis.com/auth/drive.readonly",
-            "https://www.googleapis.com/auth/devstorage.read_write"
-          ].join(" "),
-          aud: "https://oauth2.googleapis.com/token",
-          exp: now + 3600,  # 1 hour expiry
-          iat: now
+
+        payload = {
+          iss: key['client_email'],
+          scope: (connection['scopes'] || '').strip,
+          aud: token_url,
+          iat: now,
+          exp: now + 3600 # max 1 hour
         }
-        
-        # Create JWT
-        header_encoded = header.to_json.encode_base64.gsub("=", "").gsub("+", "-").gsub("/", "_")
-        claims_encoded = claims.to_json.encode_base64.gsub("=", "").gsub("+", "-").gsub("/", "_")
-        
-        # Sign JWT with private key
-        private_key = OpenSSL::PKey::RSA.new(service_account["private_key"])
-        signature_input = "#{header_encoded}.#{claims_encoded}"
-        signature = private_key.sign(OpenSSL::Digest::SHA256.new, signature_input)
-        signature_encoded = signature.encode_base64.gsub("=", "").gsub("+", "-").gsub("/", "_")
-        
-        jwt = "#{header_encoded}.#{claims_encoded}.#{signature_encoded}"
-        
-        # Exchange JWT for access token
-        response = post("https://oauth2.googleapis.com/token").
-          payload(
-            grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
-            assertion: jwt
-          ).
-          request_format_www_form_urlencoded
-        
+
+        assertion = call(:jwt_sign_rs256, payload, key['private_key'])
+
+        res = post(token_url)
+                .payload(
+                  grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+                  assertion: assertion
+                )
+                .request_format_www_form_urlencoded
+
         {
-          access_token: response["access_token"],
-          expires_in: response["expires_in"]
+          access_token: res['access_token'],
+          token_type: res['token_type'],
+          expires_in: res['expires_in'],
+          # cushion refresh by 60s
+          expires_at: (Time.now + res['expires_in'].to_i - 60).utc.iso8601
         }
       end,
-      
-      refresh: lambda do |connection, authorization|
-        # Service accounts don't use refresh tokens
-        # Just acquire a new token using the same JWT process
-        call(:acquire, connection)
+
+      # URL: base
+      #base_uri: lambda do |connection|
+      #end,
+
+      # URL: authorization
+      authorization_url: lambda do |connection|
+        scopes = (connection['scopes'] || '').strip
+        "https://accounts.google.com/o/oauth2/v2/auth?response_type=code&access_type=offline&include_granted_scopes=true&scope=#{CGI.escape(scopes)}"
       end,
+
+      # URL: token
+      token_url: 'https://oauth2.googleapis.com/token',
       
-      detect_on: [401],
-      
-      apply: lambda do |connection, access_token|
-        headers("Authorization": "Bearer #{access_token}")
-      end
+      # Refresh rules
+      refresh_on: [401, 403],
+
+      detect_on: [/UNAUTHENTICATED/i, /invalid[_-]?token/i, /expired/i, /insufficient/i]
     }
   },
-  
-  test: lambda do |connection|
-    get("https://www.googleapis.com/drive/v3/about").
-      params(fields: "user")
+
+  # --------- CONNECTION TEST ---------------------------------------------
+  test: lambda do |_connection|
+    get('https://www.googleapis.com/drive/v3/about')
+      .params(fields: 'user,storageQuota')
   end,
-  
+
+  # --------- OBJECT DEFINITIONS ------------------------------------------
+  object_definitions: {
+    drive_owner: {
+      fields: [
+        { name: 'display_name', type: 'string' },
+        { name: 'email', type: 'string' }
+      ]
+    },
+    drive_file_min: {
+      fields: [
+        { name: 'id', type: 'string' },
+        { name: 'name', type: 'string' },
+        { name: 'mime_type', type: 'string' },
+        { name: 'size', type: 'integer' },
+        { name: 'modified_time', type: 'date_time' },
+        { name: 'checksum', type: 'string' },
+        { name: 'owners', type: 'array', of: 'object', properties: [{ name: 'display_name' }, { name: 'email' }] }
+      ]
+    },
+    drive_file_full: {
+      fields: [
+        { name: 'id', type: 'string' },
+        { name: 'name', type: 'string' },
+        { name: 'mime_type', type: 'string' },
+        { name: 'size', type: 'integer' },
+        { name: 'modified_time', type: 'date_time' },
+        { name: 'checksum', type: 'string' },
+        { name: 'owners', type: 'array', of: 'object', properties: [{ name: 'display_name' }, { name: 'email' }] },
+        { name: 'exported_as', type: 'string' },
+        { name: 'text_content', type: 'string' },
+        { name: 'content_bytes', type: 'string', hint: 'Base64' }
+      ]
+    },
+    list_page_meta: {
+      fields: [
+        { name: 'count', type: 'integer' },
+        { name: 'has_more', type: 'boolean' },
+        { name: 'next_page_token', type: 'string' }
+      ]
+    },
+    gcs_object: {
+      fields: [
+        { name: 'bucket', type: 'string' },
+        { name: 'name', type: 'string' },
+        { name: 'size', type: 'integer' },
+        { name: 'content_type', type: 'string' },
+        { name: 'updated', type: 'date_time' },
+        { name: 'generation', type: 'string' },
+        { name: 'md5_hash', type: 'string' },
+        { name: 'crc32c', type: 'string' },
+        { name: 'metadata', type: 'object' }
+      ]
+    },
+    gcs_list_page: {
+      fields: [
+        { name: 'objects', type: 'array', of: 'object', properties: [{ name: 'bucket' }, { name: 'name' }, { name: 'size', type: 'integer' }, { name: 'content_type' }, { name: 'updated', type: 'date_time' }, { name: 'generation' }, { name: 'md5_hash' }, { name: 'crc32c' }, { name: 'metadata', type: 'object' }] },
+        { name: 'prefixes', type: 'array', of: 'string' },
+        { name: 'count', type: 'integer' },
+        { name: 'has_more', type: 'boolean' },
+        { name: 'next_page_token', type: 'string' }
+      ]
+    },
+    transfer_result: {
+      fields: [
+        { name: 'uploaded', type: 'array', of: 'object', properties: [
+          { name: 'drive_file_id' }, { name: 'drive_name' }, { name: 'bucket' }, { name: 'gcs_object_name' }, { name: 'bytes_uploaded', type: 'integer' }, { name: 'content_type' }
+        ]},
+        { name: 'failed', type: 'array', of: 'object', properties: [
+          { name: 'drive_file_id' }, { name: 'error_message' }, { name: 'error_code' }
+        ]},
+        { name: 'summary', type: 'object', properties: [
+          { name: 'total', type: 'integer' }, { name: 'success', type: 'integer' }, { name: 'failed', type: 'integer' }
+        ]}
+      ]
+    }
+  },
+
+  # --------- ACTIONS -----------------------------------------------------
   actions: {
+
+    # 1) drive_list_files
     drive_list_files: {
-      title: "List Drive files",
-      subtitle: "List files from Google Drive with optional filtering",
-      
-      input_fields: lambda do
+      title: 'Drive: List files',
+      description: 'Return a page of Drive files with minimal metadata (newest first).',
+      input_fields: lambda do |_|
         [
-          { name: "folder_id", optional: true, hint: "Folder ID or URL to list files from" },
-          { name: "max_results", type: "integer", default: 100, hint: "1-1000" },
-          { name: "page_token", optional: true },
-          { name: "modified_after", type: "datetime", optional: true },
-          { name: "modified_before", type: "datetime", optional: true },
-          { name: "mime_type", optional: true, hint: "Filter by MIME type" },
-          { name: "exclude_folders", type: "boolean", default: false },
-          { name: "drive_id", optional: true, hint: "Shared drive ID" }
+          { name: 'folder_id_or_url', label: 'Folder ID or URL', optional: true },
+          { name: 'drive_id', label: 'Shared drive ID', optional: true },
+          { name: 'modified_after', type: 'date_time', optional: true },
+          { name: 'modified_before', type: 'date_time', optional: true },
+          { name: 'mime_types', type: 'array', of: 'string', optional: true, hint: "Exact mimeType matches; any of these (OR)." },
+          { name: 'exclude_folders', type: 'boolean', optional: true, default: false },
+          { name: 'max_results', type: 'integer', optional: true, hint: '1-1000, default 100' },
+          { name: 'page_token', type: 'string', optional: true }
         ]
       end,
-      
-      execute: lambda do |connection, input|
-        # Extract folder ID from URL if needed
-        folder_id = input["folder_id"]
-        if folder_id&.include?("/")
-          folder_id = folder_id[/\/d\/([^\/\?]+)/, 1] || folder_id[/[?&]id=([^&]+)/, 1] || folder_id
+      output_fields: lambda do |object_definitions|
+        object_definitions['list_page_meta'][:fields] + [
+          { name: 'files', type: 'array', of: 'object', properties: object_definitions['drive_file_min'][:fields] }
+        ]
+      end,
+      execute: lambda do |_connection, input|
+        folder_id = call(:extract_drive_id, input['folder_id_or_url'])
+        page_size = [[(input['max_results'] || 100).to_i, 1].max, 1000].min
+        q = ["trashed=false"]
+
+        # Date filtering → ISO-8601 UTC
+        if input['modified_after'].present?
+          q << "modifiedTime >= '#{call(:to_iso8601_utc, input['modified_after'])}'"
         end
-        
-        # Build query
-        query_parts = ["trashed=false"]
-        query_parts << "'#{folder_id}' in parents" if folder_id.present?
-        
-        if input["modified_after"].present?
-          query_parts << "modifiedTime >= '#{input["modified_after"].to_time.iso8601}'"
+        if input['modified_before'].present?
+          q << "modifiedTime <= '#{call(:to_iso8601_utc, input['modified_before'])}'"
         end
-        
-        if input["modified_before"].present?
-          query_parts << "modifiedTime <= '#{input["modified_before"].to_time.iso8601}'"
+
+        # MIME filters
+        if input['mime_types'].present?
+          ors = input['mime_types'].map { |mt| "mimeType='#{mt}'" }.join(' or ')
+          q << "(#{ors})"
         end
-        
-        if input["mime_type"].present?
-          query_parts << "mimeType = '#{input["mime_type"]}'"
+
+        # Exclude folders
+        if input['exclude_folders']
+          q << "mimeType != 'application/vnd.google-apps.folder'"
         end
-        
-        if input["exclude_folders"] == true
-          query_parts << "mimeType != 'application/vnd.google-apps.folder'"
+
+        # Folder filter
+        if folder_id.present?
+          q << "'#{folder_id}' in parents"
         end
-        
-        # Setup corpus and drive params
-        params = {
-          q: query_parts.join(" and "),
-          pageSize: [1, [input["max_results"] || 100, 1000].min].max,
-          orderBy: "modifiedTime desc",
-          spaces: "drive",
-          supportsAllDrives: true,
-          includeItemsFromAllDrives: true,
-          fields: "files(id,name,mimeType,size,modifiedTime,md5Checksum,owners),nextPageToken"
-        }
-        
-        params[:pageToken] = input["page_token"] if input["page_token"].present?
-        
-        if input["drive_id"].present?
-          params[:corpora] = "drive"
-          params[:driveId] = input["drive_id"]
-        elsif folder_id.present?
-          params[:corpora] = "allDrives"
-        else
-          params[:corpora] = "user"
+
+        corpora, drive_id = if input['drive_id'].present?
+                              ['drive', input['drive_id']]
+                            elsif folder_id.present?
+                              ['allDrives', nil]
+                            else
+                              ['user', nil]
+                            end
+
+        res = get('https://www.googleapis.com/drive/v3/files')
+              .params(
+                q: q.join(' and '),
+                pageSize: page_size,
+                pageToken: input['page_token'],
+                orderBy: 'modifiedTime desc',
+                spaces: 'drive',
+                corpora: corpora,
+                driveId: drive_id,
+                supportsAllDrives: true,
+                includeItemsFromAllDrives: true,
+                fields: 'files(id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress)),nextPageToken'
+              )
+
+        files = (res['files'] || []).map do |f|
+          {
+            id: f['id'],
+            name: f['name'],
+            mime_type: f['mimeType'],
+            size: call(:to_int_or_nil, f['size']),
+            modified_time: f['modifiedTime'],
+            checksum: f['md5Checksum'],
+            owners: (f['owners'] || []).map { |o| { display_name: o['displayName'], email: o['emailAddress'] } }
+          }
         end
-        
-        response = get("https://www.googleapis.com/drive/v3/files").
-          params(params)
-        
+
+        next_token = res['nextPageToken']
         {
-          files: response["files"]&.map do |file|
-            {
-              id: file["id"],
-              name: file["name"],
-              mime_type: file["mimeType"],
-              size: file["size"]&.to_i,
-              modified_time: file["modifiedTime"],
-              checksum: file["md5Checksum"],
-              owners: file["owners"]
-            }
-          end || [],
-          count: response["files"]&.size || 0,
-          has_more: response["nextPageToken"].present?,
-          next_page_token: response["nextPageToken"]
+          files: files,
+          count: files.length,
+          has_more: next_token.present?,
+          next_page_token: next_token
         }
-      end,
-      
-      output_fields: lambda do
-        [
-          { name: "files", type: "array", of: "object", properties: [
-            { name: "id" },
-            { name: "name" },
-            { name: "mime_type" },
-            { name: "size", type: "integer" },
-            { name: "modified_time" },
-            { name: "checksum" },
-            { name: "owners", type: "array", of: "object", properties: [
-              { name: "displayName" },
-              { name: "emailAddress" }
-            ]}
-          ]},
-          { name: "count", type: "integer" },
-          { name: "has_more", type: "boolean" },
-          { name: "next_page_token" }
-        ]
       end
     },
-    
+
+    # 2) drive_get_file
     drive_get_file: {
-      title: "Get Drive file",
-      subtitle: "Get file metadata and optionally content",
-      
-      input_fields: lambda do
+      title: 'Drive: Get file (meta + optional content)',
+      description: 'Fetch Drive file metadata and optionally content (text or bytes). Shortcuts are resolved once.',
+      input_fields: lambda do |_|
         [
-          { name: "file_id", optional: false, hint: "File ID or URL" },
-          { name: "content_mode", control_type: "select", 
-            pick_list: [["None", "none"], ["Text", "text"], ["Bytes", "bytes"]],
-            default: "none" },
-          { name: "postprocess", type: "object", properties: [
-            { name: "strip_urls", type: "boolean", default: false }
-          ]}
+          { name: 'file_id_or_url', optional: false },
+          { name: 'content_mode', control_type: 'select', pick_list: 'content_modes', optional: false, default: 'none' },
+          { name: 'postprocess', type: 'object', properties: [{ name: 'strip_urls', type: 'boolean', default: false }], optional: true }
         ]
       end,
-      
-      execute: lambda do |connection, input|
-        # Extract file ID from URL if needed
-        file_id = input["file_id"]
-        if file_id&.include?("/")
-          file_id = file_id[/\/d\/([^\/\?]+)/, 1] || file_id[/[?&]id=([^&]+)/, 1] || file_id
-        end
-        
-        # Get metadata
-        metadata = get("https://www.googleapis.com/drive/v3/files/#{file_id}").
-          params(
-            supportsAllDrives: true,
-            fields: "id,name,mimeType,size,modifiedTime,md5Checksum,owners,shortcutDetails"
-          )
-        
-        # Follow shortcut if needed
-        if metadata["shortcutDetails"].present?
-          file_id = metadata["shortcutDetails"]["targetId"]
-          metadata = get("https://www.googleapis.com/drive/v3/files/#{file_id}").
-            params(
-              supportsAllDrives: true,
-              fields: "id,name,mimeType,size,modifiedTime,md5Checksum,owners"
-            )
-        end
-        
-        result = {
-          id: metadata["id"],
-          name: metadata["name"],
-          mime_type: metadata["mimeType"],
-          size: metadata["size"]&.to_i,
-          modified_time: metadata["modifiedTime"],
-          checksum: metadata["md5Checksum"],
-          owners: metadata["owners"]
-        }
-        
-        # Handle content modes
-        case input["content_mode"]
-        when "text"
-          if metadata["mimeType"]&.start_with?("application/vnd.google-apps.")
-            # Google Editors - export
-            export_map = {
-              "application/vnd.google-apps.document" => "text/plain",
-              "application/vnd.google-apps.spreadsheet" => "text/csv",
-              "application/vnd.google-apps.presentation" => "text/plain",
-              "application/vnd.google-apps.drawing" => "image/svg+xml"
-            }
-            
-            export_mime = export_map[metadata["mimeType"]]
-            if export_mime.nil?
-              error("Unsupported Google Editors type for export")
-            end
-            
-            content = get("https://www.googleapis.com/drive/v3/files/#{file_id}/export").
-              params(
-                mimeType: export_mime,
-                supportsAllDrives: true
-              ).response_format_raw
-            
-            result[:text_content] = content
-            result[:exported_as] = export_mime
-            
-          elsif ["text/", "application/json", "application/xml", "text/csv", "image/svg+xml"].
-                any? { |t| metadata["mimeType"]&.include?(t) }
-            # Textual non-Editors
-            content = get("https://www.googleapis.com/drive/v3/files/#{file_id}").
-              params(
-                alt: "media",
-                supportsAllDrives: true
-              ).response_format_raw
-            
-            result[:text_content] = content
-            
+      output_fields: lambda do |object_definitions|
+        object_definitions['drive_file_full'][:fields]
+      end,
+      execute: lambda do |_connection, input|
+        file_id = call(:extract_drive_id, input['file_id_or_url'])
+        meta = call(:drive_get_meta_resolving_shortcut, file_id)
+
+        result = call(:map_drive_meta, meta)
+
+        mode = (input['content_mode'] || 'none').to_s
+        strip = input.dig('postprocess', 'strip_urls') ? true : false
+
+        if mode == 'none'
+          result
+        elsif mode == 'text'
+          if call(:is_google_editors_mime?, meta['mimeType'])
+            export_mime = call(:editors_export_mime, meta['mimeType'])
+            bytes = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}/export")
+                    .params(mimeType: export_mime, supportsAllDrives: true)
+                    .request_format_raw # <-- treat response as raw
+            text = call(:force_utf8, bytes.to_s)
+            text = call(:strip_urls, text) if strip
+            result.merge(exported_as: export_mime, text_content: text)
           else
-            error("Non-text file; use content_mode=bytes or none")
-          end
-          
-          # Strip URLs if requested
-          if input.dig("postprocess", "strip_urls") && result[:text_content]
-            result[:text_content] = result[:text_content].gsub(/https?:\/\/[^\s]+/, "")
-          end
-          
-        when "bytes"
-          if metadata["mimeType"]&.start_with?("application/vnd.google-apps.")
-            error("Google Editors files require content_mode=text (export)")
-          end
-          
-          content = get("https://www.googleapis.com/drive/v3/files/#{file_id}").
-            params(
-              alt: "media",
-              supportsAllDrives: true
-            ).response_format_raw
-          
-          result[:content_bytes] = content.encode_base64
-        end
-        
-        result
-      end,
-      
-      output_fields: lambda do
-        [
-          { name: "id" },
-          { name: "name" },
-          { name: "mime_type" },
-          { name: "size", type: "integer" },
-          { name: "modified_time" },
-          { name: "checksum" },
-          { name: "owners", type: "array", of: "object", properties: [
-            { name: "displayName" },
-            { name: "emailAddress" }
-          ]},
-          { name: "text_content" },
-          { name: "content_bytes" },
-          { name: "exported_as" }
-        ]
-      end
-    },
-    
-    gcs_list_objects: {
-      title: "List GCS objects",
-      subtitle: "List objects in a Google Cloud Storage bucket",
-      
-      input_fields: lambda do
-        [
-          { name: "bucket", optional: false },
-          { name: "prefix", optional: true },
-          { name: "delimiter", optional: true, hint: "Use '/' to emulate folders" },
-          { name: "max_results", type: "integer", default: 1000, hint: "1-1000" },
-          { name: "page_token", optional: true },
-          { name: "include_versions", type: "boolean", default: false }
-        ]
-      end,
-      
-      execute: lambda do |connection, input|
-        params = {
-          maxResults: [1, [input["max_results"] || 1000, 1000].min].max,
-          fields: "items(bucket,name,size,contentType,updated,generation,md5Hash,crc32c,metadata),nextPageToken,prefixes"
-        }
-        
-        params[:prefix] = input["prefix"] if input["prefix"].present?
-        params[:delimiter] = input["delimiter"] if input["delimiter"].present?
-        params[:pageToken] = input["page_token"] if input["page_token"].present?
-        params[:versions] = input["include_versions"] if input["include_versions"] == true
-        
-        response = get("https://storage.googleapis.com/storage/v1/b/#{input["bucket"]}/o").
-          params(params)
-        
-        {
-          objects: response["items"]&.map do |item|
-            {
-              bucket: item["bucket"],
-              name: item["name"],
-              size: item["size"]&.to_i,
-              content_type: item["contentType"],
-              updated: item["updated"],
-              generation: item["generation"],
-              md5_hash: item["md5Hash"],
-              crc32c: item["crc32c"],
-              metadata: item["metadata"]
-            }
-          end || [],
-          prefixes: response["prefixes"] || [],
-          count: response["items"]&.size || 0,
-          has_more: response["nextPageToken"].present?,
-          next_page_token: response["nextPageToken"]
-        }
-      end,
-      
-      output_fields: lambda do
-        [
-          { name: "objects", type: "array", of: "object", properties: [
-            { name: "bucket" },
-            { name: "name" },
-            { name: "size", type: "integer" },
-            { name: "content_type" },
-            { name: "updated" },
-            { name: "generation" },
-            { name: "md5_hash" },
-            { name: "crc32c" },
-            { name: "metadata", type: "object" }
-          ]},
-          { name: "prefixes", type: "array", of: "string" },
-          { name: "count", type: "integer" },
-          { name: "has_more", type: "boolean" },
-          { name: "next_page_token" }
-        ]
-      end
-    },
-    
-    gcs_get_object: {
-      title: "Get GCS object",
-      subtitle: "Get object metadata and optionally content",
-      
-      input_fields: lambda do
-        [
-          { name: "bucket", optional: false },
-          { name: "object_name", optional: false },
-          { name: "content_mode", control_type: "select",
-            pick_list: [["None", "none"], ["Text", "text"], ["Bytes", "bytes"]],
-            default: "none" },
-          { name: "postprocess", type: "object", properties: [
-            { name: "strip_urls", type: "boolean", default: false }
-          ]}
-        ]
-      end,
-      
-      execute: lambda do |connection, input|
-        # Get metadata
-        metadata = get("https://storage.googleapis.com/storage/v1/b/#{input["bucket"]}/o/#{input["object_name"].encode_url}")
-        
-        result = {
-          bucket: metadata["bucket"],
-          name: metadata["name"],
-          size: metadata["size"]&.to_i,
-          content_type: metadata["contentType"],
-          updated: metadata["updated"],
-          generation: metadata["generation"],
-          md5_hash: metadata["md5Hash"],
-          crc32c: metadata["crc32c"],
-          metadata: metadata["metadata"]
-        }
-        
-        # Handle content modes
-        case input["content_mode"]
-        when "text"
-          if ["text/", "application/json", "application/xml", "text/csv", "image/svg+xml"].
-             any? { |t| metadata["contentType"]&.include?(t) }
-            content = get("https://storage.googleapis.com/storage/v1/b/#{input["bucket"]}/o/#{input["object_name"].encode_url}").
-              params(alt: "media").
-              response_format_raw
-            
-            result[:text_content] = content
-            
-            # Strip URLs if requested
-            if input.dig("postprocess", "strip_urls")
-              result[:text_content] = result[:text_content].gsub(/https?:\/\/[^\s]+/, "")
+            if call(:is_textual_mime?, meta['mimeType'])
+              bytes = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}")
+                      .params(alt: 'media', supportsAllDrives: true)
+                      .request_format_raw
+              text = call(:force_utf8, bytes.to_s)
+              text = call(:strip_urls, text) if strip
+              result.merge(text_content: text)
+            else
+              raise '415 Unsupported Media Type - Non-text file; use content_mode=bytes or none.'
             end
-          else
-            error("Non-text object; use content_mode=bytes or none")
           end
-          
-        when "bytes"
-          content = get("https://storage.googleapis.com/storage/v1/b/#{input["bucket"]}/o/#{input["object_name"].encode_url}").
-            params(alt: "media").
-            response_format_raw
-          
-          result[:content_bytes] = content.encode_base64
-        end
-        
-        result
-      end,
-      
-      output_fields: lambda do
-        [
-          { name: "bucket" },
-          { name: "name" },
-          { name: "size", type: "integer" },
-          { name: "content_type" },
-          { name: "updated" },
-          { name: "generation" },
-          { name: "md5_hash" },
-          { name: "crc32c" },
-          { name: "metadata", type: "object" },
-          { name: "text_content" },
-          { name: "content_bytes" }
-        ]
-      end
-    },
-    
-    gcs_put_object: {
-      title: "Upload to GCS",
-      subtitle: "Upload content to Google Cloud Storage",
-      
-      input_fields: lambda do
-        [
-          { name: "bucket", optional: false },
-          { name: "object_name", optional: false },
-          { name: "content_mode", control_type: "select",
-            pick_list: [["Text", "text"], ["Bytes", "bytes"]],
-            optional: false },
-          { name: "text_content", optional: true, hint: "Required when content_mode=text" },
-          { name: "content_bytes", optional: true, hint: "Base64 encoded. Required when content_mode=bytes" },
-          { name: "content_type", optional: true, hint: "MIME type" },
-          { name: "custom_metadata", type: "object", optional: true },
-          { name: "preconditions", type: "object", properties: [
-            { name: "if_generation_match" },
-            { name: "if_metageneration_match" }
-          ], optional: true },
-          { name: "postprocess", type: "object", properties: [
-            { name: "strip_urls", type: "boolean", default: false }
-          ]}
-        ]
-      end,
-      
-      execute: lambda do |connection, input|
-        # Validate inputs
-        if input["content_mode"] == "text" && input["text_content"].blank?
-          error("text_content is required when content_mode=text")
-        elsif input["content_mode"] == "bytes" && input["content_bytes"].blank?
-          error("content_bytes is required when content_mode=bytes")
-        end
-        
-        # Prepare content and determine upload method
-        if input["content_mode"] == "text"
-          content = input["text_content"]
-          
-          # Strip URLs if requested
-          if input.dig("postprocess", "strip_urls")
-            content = content.gsub(/https?:\/\/[^\s]+/, "")
+        elsif mode == 'bytes'
+          if call(:is_google_editors_mime?, meta['mimeType'])
+            raise '400 Bad Request - Editors files require content_mode=text (export).'
           end
-          
-          mime_type = input["content_type"] || "text/plain; charset=UTF-8"
-          payload_bytes = content
-          
-        else # bytes
-          content = input["content_bytes"].decode_base64
-          mime_type = input["content_type"] || "application/octet-stream"
-          payload_bytes = content
-        end
-        
-        # Build request
-        url = "https://storage.googleapis.com/upload/storage/v1/b/#{input["bucket"]}/o"
-        params = {}
-        
-        # Add preconditions
-        if input.dig("preconditions", "if_generation_match").present?
-          params[:ifGenerationMatch] = input["preconditions"]["if_generation_match"]
-        end
-        if input.dig("preconditions", "if_metageneration_match").present?
-          params[:ifMetagenerationMatch] = input["preconditions"]["if_metageneration_match"]
-        end
-        
-        # Upload based on whether we have custom metadata
-        if input["custom_metadata"].present?
-          # Multipart upload
-          params[:uploadType] = "multipart"
-          
-          boundary = "==boundary=="
-          metadata_json = {
-            name: input["object_name"],
-            contentType: mime_type,
-            metadata: input["custom_metadata"]
-          }.to_json
-          
-          multipart_body = [
-            "--#{boundary}",
-            "Content-Type: application/json; charset=UTF-8",
-            "",
-            metadata_json,
-            "--#{boundary}",
-            "Content-Type: #{mime_type}",
-            "",
-            payload_bytes,
-            "--#{boundary}--"
-          ].join("\r\n")
-          
-          response = post(url).
-            params(params).
-            headers("Content-Type": "multipart/related; boundary=#{boundary}").
-            request_body(multipart_body)
-            
+          bytes = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}")
+                  .params(alt: 'media', supportsAllDrives: true, acknowledgeAbuse: false)
+                  .request_format_raw
+          result.merge(content_bytes: Base64.strict_encode64(bytes.to_s))
         else
-          # Simple media upload
-          params[:uploadType] = "media"
-          params[:name] = input["object_name"]
-          
-          response = post(url).
-            params(params).
-            headers("Content-Type": mime_type).
-            request_body(payload_bytes)
+          raise "400 Bad Request - Unknown content_mode: #{mode}"
         end
-        
-        {
-          gcs_object: {
-            bucket: response["bucket"],
-            name: response["name"],
-            size: response["size"]&.to_i,
-            content_type: response["contentType"],
-            updated: response["updated"],
-            generation: response["generation"],
-            md5_hash: response["md5Hash"],
-            crc32c: response["crc32c"],
-            metadata: response["metadata"]
-          },
-          bytes_uploaded: payload_bytes.bytesize
-        }
-      end,
-      
-      output_fields: lambda do
-        [
-          { name: "gcs_object", type: "object", properties: [
-            { name: "bucket" },
-            { name: "name" },
-            { name: "size", type: "integer" },
-            { name: "content_type" },
-            { name: "updated" },
-            { name: "generation" },
-            { name: "md5_hash" },
-            { name: "crc32c" },
-            { name: "metadata", type: "object" }
-          ]},
-          { name: "bytes_uploaded", type: "integer" }
-        ]
       end
     },
-    
-    transfer_drive_to_gcs: {
-      title: "Transfer Drive files to GCS",
-      subtitle: "Copy multiple files from Drive to Cloud Storage",
-      
-      input_fields: lambda do
+
+    # 3) gcs_list_objects
+    gcs_list_objects: {
+      title: 'GCS: List objects',
+      description: 'List objects in a bucket, optionally using prefix and delimiter.',
+      input_fields: lambda do |_|
         [
-          { name: "bucket", optional: false },
-          { name: "gcs_prefix", optional: true, hint: "Prefix for GCS object names" },
-          { name: "drive_file_ids", type: "array", of: "string", optional: false,
-            hint: "Array of Drive file IDs or URLs" },
-          { name: "content_mode_for_editors", control_type: "select",
-            pick_list: [["Export as text", "text"], ["Skip", "skip"]],
-            default: "text" }
+          { name: 'bucket', optional: false },
+          { name: 'prefix', optional: true },
+          { name: 'delimiter', optional: true, hint: 'Use "/" to emulate folders' },
+          { name: 'include_versions', type: 'boolean', optional: true, default: false },
+          { name: 'max_results', type: 'integer', optional: true, hint: '1–1000, default 1000' },
+          { name: 'page_token', optional: true }
         ]
       end,
-      
-      execute: lambda do |connection, input|
+      output_fields: lambda do |object_definitions|
+        object_definitions['gcs_list_page'][:fields]
+      end,
+      execute: lambda do |_connection, input|
+        page_size = [[(input['max_results'] || 1000).to_i, 1].max, 1000].min
+        res = get("https://storage.googleapis.com/storage/v1/b/#{URI.encode_www_form_component(input['bucket'])}/o")
+              .params(
+                prefix: input['prefix'],
+                delimiter: input['delimiter'],
+                pageToken: input['page_token'],
+                maxResults: page_size,
+                versions: !!input['include_versions'],
+                fields: 'items(bucket,name,size,contentType,updated,generation,md5Hash,crc32c,metadata),nextPageToken,prefixes'
+              )
+
+        items = (res['items'] || []).map do |o|
+          {
+            bucket: o['bucket'],
+            name: o['name'],
+            size: call(:to_int_or_nil, o['size']),
+            content_type: o['contentType'],
+            updated: o['updated'],
+            generation: o['generation'],
+            md5_hash: o['md5Hash'],
+            crc32c: o['crc32c'],
+            metadata: o['metadata']
+          }
+        end
+
+        next_token = res['nextPageToken']
+        {
+          objects: items,
+          prefixes: res['prefixes'] || [],
+          count: items.length,
+          has_more: next_token.present?,
+          next_page_token: next_token
+        }
+      end
+    },
+
+    # 4) gcs_get_object
+    gcs_get_object: {
+      title: 'GCS: Get object (meta + optional content)',
+      description: 'Fetch GCS object metadata and optionally content (text or bytes).',
+      input_fields: lambda do |_|
+        [
+          { name: 'bucket', optional: false },
+          { name: 'object_name', optional: false },
+          { name: 'content_mode', control_type: 'select', pick_list: 'content_modes', optional: false, default: 'none' },
+          { name: 'postprocess', type: 'object', properties: [{ name: 'strip_urls', type: 'boolean', default: false }], optional: true }
+        ]
+      end,
+      output_fields: lambda do |object_definitions|
+        object_definitions['gcs_object'][:fields] + [
+          { name: 'text_content', type: 'string' },
+          { name: 'content_bytes', type: 'string', hint: 'Base64' }
+        ]
+      end,
+      execute: lambda do |_connection, input|
+        bucket = input['bucket']
+        name = input['object_name']
+        meta = get("https://storage.googleapis.com/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o/#{ERB::Util.url_encode(name)}")
+               .params(alt: 'json')
+
+        base = {
+          bucket: meta['bucket'],
+          name: meta['name'],
+          size: call(:to_int_or_nil, meta['size']),
+          content_type: meta['contentType'],
+          updated: meta['updated'],
+          generation: meta['generation'],
+          md5_hash: meta['md5Hash'],
+          crc32c: meta['crc32c'],
+          metadata: meta['metadata']
+        }
+
+        mode = (input['content_mode'] || 'none').to_s
+        strip = input.dig('postprocess', 'strip_urls') ? true : false
+        ctype = meta['contentType']
+
+        if mode == 'none'
+          base
+        elsif mode == 'text'
+          unless call(:is_textual_mime?, ctype)
+            raise '415 Unsupported Media Type - Non-text object; use content_mode=bytes or none.'
+          end
+          bytes = get("https://storage.googleapis.com/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o/#{ERB::Util.url_encode(name)}")
+                  .params(alt: 'media')
+                  .request_format_raw
+          text = call(:force_utf8, bytes.to_s)
+          text = call(:strip_urls, text) if strip
+          base.merge(text_content: text)
+        elsif mode == 'bytes'
+          bytes = get("https://storage.googleapis.com/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o/#{ERB::Util.url_encode(name)}")
+                  .params(alt: 'media')
+                  .request_format_raw
+          base.merge(content_bytes: Base64.strict_encode64(bytes.to_s))
+        else
+          raise "400 Bad Request - Unknown content_mode: #{mode}"
+        end
+      end
+    },
+
+    # 5) gcs_put_object
+    gcs_put_object: {
+      title: 'GCS: Put object',
+      description: 'Upload text or bytes to GCS. Returns created object metadata and bytes_uploaded.',
+      input_fields: lambda do |_|
+        [
+          { name: 'bucket', optional: false },
+          { name: 'object_name', optional: false },
+          { name: 'content_mode', control_type: 'select', pick_list: 'content_modes_write', optional: false, default: 'text' },
+          { name: 'text_content', optional: true, hint: 'Required when content_mode=text' },
+          { name: 'content_bytes', optional: true, hint: 'Base64; required when content_mode=bytes' },
+          { name: 'content_type', optional: true, hint: 'Default text/plain; charset=UTF-8 for text, application/octet-stream for bytes' },
+          { name: 'custom_metadata', type: 'object', optional: true },
+          {
+            name: 'preconditions',
+            type: 'object',
+            optional: true,
+            properties: [
+              { name: 'if_generation_match', optional: true },
+              { name: 'if_metageneration_match', optional: true }
+            ]
+          },
+          { name: 'postprocess', type: 'object', properties: [{ name: 'strip_urls', type: 'boolean', default: false }], optional: true }
+        ]
+      end,
+      output_fields: lambda do |object_definitions|
+        object_definitions['gcs_object'][:fields] + [{ name: 'bytes_uploaded', type: 'integer' }]
+      end,
+      execute: lambda do |_connection, input|
+        bucket = input['bucket']
+        name = input['object_name']
+        mode = input['content_mode']
+        strip = input.dig('postprocess', 'strip_urls') ? true : false
+        meta = input['custom_metadata'] || {}
+
+        body_bytes, ctype =
+          if mode == 'text'
+            text = input['text_content']
+            raise '400 Bad Request - text_content is required when content_mode=text.' if text.nil?
+            text = call(:strip_urls, text) if strip
+            [text.to_s.dup.force_encoding('UTF-8'), (input['content_type'].presence || 'text/plain; charset=UTF-8')]
+          elsif mode == 'bytes'
+            b64 = input['content_bytes']
+            raise '400 Bad Request - content_bytes is required when content_mode=bytes.' if b64.nil?
+            [Base64.decode64(b64.to_s), (input['content_type'].presence || 'application/octet-stream')]
+          else
+            raise "400 Bad Request - Unknown content_mode: #{mode}"
+          end
+
+        bytes_uploaded = body_bytes.bytesize
+
+        q = {
+          ifGenerationMatch: input.dig('preconditions', 'if_generation_match'),
+          ifMetagenerationMatch: input.dig('preconditions', 'if_metageneration_match')
+        }.compact
+
+        if meta.present?
+          # Multipart upload (metadata + media)
+          boundary = "workato-multipart-#{SecureRandom.hex(8)}"
+          meta_json = { name: name, contentType: ctype, metadata: meta }.to_json
+          multipart =
+            "--#{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n#{meta_json}\r\n" \
+            "--#{boundary}\r\nContent-Type: #{ctype}\r\nContent-Transfer-Encoding: binary\r\n\r\n#{body_bytes}\r\n" \
+            "--#{boundary}--\r\n"
+
+          created = post("https://www.googleapis.com/upload/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o")
+                    .params(q.merge(uploadType: 'multipart'))
+                    .headers('Content-Type': "multipart/related; boundary=#{boundary}")
+                    .request_body(multipart)
+          {
+            bucket: created['bucket'],
+            name: created['name'],
+            size: call(:to_int_or_nil, created['size']),
+            content_type: created['contentType'],
+            updated: created['updated'],
+            generation: created['generation'],
+            md5_hash: created['md5Hash'],
+            crc32c: created['crc32c'],
+            metadata: created['metadata'],
+            bytes_uploaded: bytes_uploaded
+          }
+        else
+          # Media upload (content only)
+          created = post("https://www.googleapis.com/upload/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o")
+                    .params(q.merge(uploadType: 'media', name: name))
+                    .headers('Content-Type': ctype)
+                    .request_body(body_bytes)
+          {
+            bucket: created['bucket'],
+            name: created['name'],
+            size: call(:to_int_or_nil, created['size']),
+            content_type: created['contentType'],
+            updated: created['updated'],
+            generation: created['generation'],
+            md5_hash: created['md5Hash'],
+            crc32c: created['crc32c'],
+            metadata: created['metadata'],
+            bytes_uploaded: bytes_uploaded
+          }
+        end
+      end
+    },
+
+    # 6) transfer_drive_to_gcs
+    transfer_drive_to_gcs: {
+      title: 'Transfer: Drive → GCS',
+      description: 'For each Drive file ID, fetch content (export Editors to text if selected) and upload to GCS under a prefix.',
+      input_fields: lambda do |_|
+        [
+          { name: 'bucket', optional: false },
+          { name: 'gcs_prefix', optional: true, hint: 'E.g. "ingest/". No file ID is added; collisions are possible by design.' },
+          { name: 'drive_file_ids', type: 'array', of: 'string', optional: false, hint: 'IDs or URLs' },
+          { name: 'content_mode_for_editors', control_type: 'select', pick_list: 'editors_modes', optional: true, default: 'text' }
+        ]
+      end,
+      output_fields: lambda do |object_definitions|
+        object_definitions['transfer_result'][:fields]
+      end,
+      execute: lambda do |_connection, input|
+        bucket = input['bucket']
+        prefix = (input['gcs_prefix'] || '').to_s
+        prefix = "#{prefix}/" unless prefix.empty? || prefix.end_with?('/')
+        editors_mode = (input['content_mode_for_editors'] || 'text').to_s
+
         uploaded = []
         failed = []
-        
-        input["drive_file_ids"].each do |file_id_or_url|
+
+        (input['drive_file_ids'] || []).each do |raw|
           begin
-            # Extract file ID
-            file_id = file_id_or_url
-            if file_id&.include?("/")
-              file_id = file_id[/\/d\/([^\/\?]+)/, 1] || file_id[/[?&]id=([^&]+)/, 1] || file_id
-            end
-            
-            # Get metadata
-            metadata = get("https://www.googleapis.com/drive/v3/files/#{file_id}").
-              params(
-                supportsAllDrives: true,
-                fields: "id,name,mimeType,size,shortcutDetails"
-              )
-            
-            # Follow shortcut if needed
-            if metadata["shortcutDetails"].present?
-              file_id = metadata["shortcutDetails"]["targetId"]
-              metadata = get("https://www.googleapis.com/drive/v3/files/#{file_id}").
-                params(
-                  supportsAllDrives: true,
-                  fields: "id,name,mimeType,size"
-                )
-            end
-            
-            # Determine how to get content
-            if metadata["mimeType"]&.start_with?("application/vnd.google-apps.")
-              # Google Editors file
-              if input["content_mode_for_editors"] == "skip"
-                next # Skip this file
-              end
-              
-              # Export to text format
-              export_map = {
-                "application/vnd.google-apps.document" => "text/plain",
-                "application/vnd.google-apps.spreadsheet" => "text/csv", 
-                "application/vnd.google-apps.presentation" => "text/plain",
-                "application/vnd.google-apps.drawing" => "image/svg+xml"
-              }
-              
-              export_mime = export_map[metadata["mimeType"]]
-              if export_mime.nil?
-                failed << {
-                  drive_file_id: file_id,
-                  error_message: "Unsupported Google Editors type",
-                  error_code: 400
-                }
+            file_id = call(:extract_drive_id, raw)
+            meta = call(:drive_get_meta_resolving_shortcut, file_id)
+            fname = meta['name'].to_s
+            object_name = "#{prefix}#{fname}"
+
+            if call(:is_google_editors_mime?, meta['mimeType'])
+              if editors_mode == 'skip'
+                failed << { drive_file_id: file_id, error_message: 'Skipped Editors file (set content_mode_for_editors=text to export).', error_code: 'SKIPPED' }
                 next
               end
-              
-              content = get("https://www.googleapis.com/drive/v3/files/#{file_id}/export").
-                params(
-                  mimeType: export_mime,
-                  supportsAllDrives: true
-                ).response_format_raw
-              
-              # Determine file extension for exported file
-              ext_map = {
-                "text/plain" => ".txt",
-                "text/csv" => ".csv",
-                "image/svg+xml" => ".svg"
+              export_mime = call(:editors_export_mime, meta['mimeType'])
+              bytes = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}/export")
+                      .params(mimeType: export_mime, supportsAllDrives: true)
+                      .request_format_raw
+              body = bytes.to_s
+              created = post("https://www.googleapis.com/upload/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o")
+                        .params(uploadType: 'media', name: object_name)
+                        .headers('Content-Type': export_mime)
+                        .request_body(body)
+              uploaded << {
+                drive_file_id: file_id,
+                drive_name: fname,
+                bucket: created['bucket'],
+                gcs_object_name: created['name'],
+                bytes_uploaded: body.bytesize,
+                content_type: export_mime
               }
-              file_name = metadata["name"] + ext_map[export_mime]
-              content_type = export_mime
-              
             else
-              # Regular file - download as-is
-              content = get("https://www.googleapis.com/drive/v3/files/#{file_id}").
-                params(
-                  alt: "media",
-                  supportsAllDrives: true
-                ).response_format_raw
-              
-              file_name = metadata["name"]
-              content_type = metadata["mimeType"]
-            end
-            
-            # Build GCS object name
-            gcs_name = input["gcs_prefix"].present? ? 
-              "#{input["gcs_prefix"]}#{file_name}" : file_name
-            
-            # Upload to GCS
-            response = post("https://storage.googleapis.com/upload/storage/v1/b/#{input["bucket"]}/o").
-              params(
-                uploadType: "media",
-                name: gcs_name
-              ).
-              headers("Content-Type": content_type).
-              request_body(content)
-            
-            uploaded << {
-              drive_file_id: file_id,
-              gcs_object: {
-                bucket: response["bucket"],
-                name: response["name"],
-                size: response["size"]&.to_i,
-                content_type: response["contentType"]
+              # Non-Editors → raw download, keep mime
+              ctype = meta['mimeType']
+              bytes = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}")
+                      .params(alt: 'media', supportsAllDrives: true)
+                      .request_format_raw
+              body = bytes.to_s
+              created = post("https://www.googleapis.com/upload/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o")
+                        .params(uploadType: 'media', name: object_name)
+                        .headers('Content-Type': ctype)
+                        .request_body(body)
+              uploaded << {
+                drive_file_id: file_id,
+                drive_name: fname,
+                bucket: created['bucket'],
+                gcs_object_name: created['name'],
+                bytes_uploaded: body.bytesize,
+                content_type: ctype
               }
-            }
-            
+            end
           rescue => e
-            error_code = e.respond_to?(:code) ? e.code : 500
-            failed << {
-              drive_file_id: file_id_or_url,
-              error_message: e.message,
-              error_code: error_code
-            }
+            code = (e.to_s[/\b(\d{3})\b/, 1] || 'ERROR')
+            failed << { drive_file_id: raw, error_message: e.to_s, error_code: code }
           end
         end
-        
+
         {
           uploaded: uploaded,
           failed: failed,
           summary: {
-            total: input["drive_file_ids"].size,
-            success: uploaded.size,
-            failed: failed.size
+            total: (uploaded.length + failed.length),
+            success: uploaded.length,
+            failed: failed.length
           }
         }
-      end,
-      
-      output_fields: lambda do
-        [
-          { name: "uploaded", type: "array", of: "object", properties: [
-            { name: "drive_file_id" },
-            { name: "gcs_object", type: "object", properties: [
-              { name: "bucket" },
-              { name: "name" },
-              { name: "size", type: "integer" },
-              { name: "content_type" }
-            ]}
-          ]},
-          { name: "failed", type: "array", of: "object", properties: [
-            { name: "drive_file_id" },
-            { name: "error_message" },
-            { name: "error_code", type: "integer" }
-          ]},
-          { name: "summary", type: "object", properties: [
-            { name: "total", type: "integer" },
-            { name: "success", type: "integer" },
-            { name: "failed", type: "integer" }
-          ]}
-        ]
       end
     }
+  },
+
+  # --------- PICK LISTS --------------------------------------------------
+  pick_lists: {
+    content_modes: lambda do |_|
+      [
+        %w[none none],
+        %w[text text],
+        %w[bytes bytes]
+      ]
+    end,
+    content_modes_write: lambda do |_|
+      [
+        %w[text text],
+        %w[bytes bytes]
+      ]
+    end,
+    editors_modes: lambda do |_|
+      [
+        ['text (export Editors to plain/csv/svg per mapping)', 'text'],
+        ['skip (do not transfer Editors files)', 'skip']
+      ]
+    end
+  },
+
+  # --------- METHODS -----------------------------------------------------
+  methods: {
+    # --- Shared rules ---
+    extract_drive_id: lambda do |str|
+      s = (str || '').to_s.strip
+      return nil if s.empty?
+      # /d/{id}
+      m = s.match(%r{/d/([^/]+)})
+      return m[1] if m
+      # /folders/{id}
+      m = s.match(%r{/folders/([^/]+)})
+      return m[1] if m
+      # ?id={id}
+      m = s.match(/[?&]id=([^&]+)/)
+      return CGI.unescape(m[1]) if m
+      # else assume raw ID
+      s
+    end,
+
+    to_iso8601_utc: lambda do |t|
+      Time.parse(t.to_s).utc.iso8601
+    rescue
+      t
+    end,
+
+    to_int_or_nil: lambda do |val|
+      v = val.to_s
+      v.empty? ? nil : v.to_i
+    end,
+
+    is_textual_mime?: lambda do |mime|
+      m = (mime || '').downcase
+      return true if m.start_with?('text/')
+      %w[application/json application/xml text/csv image/svg+xml].include?(m)
+    end,
+
+    is_google_editors_mime?: lambda do |mime|
+      (mime || '').start_with?('application/vnd.google-apps.')
+    end,
+
+    editors_export_mime: lambda do |mime|
+      case mime
+      when 'application/vnd.google-apps.document'     then 'text/plain'
+      when 'application/vnd.google-apps.spreadsheet'  then 'text/csv'
+      when 'application/vnd.google-apps.presentation' then 'text/plain'
+      when 'application/vnd.google-apps.drawing'      then 'image/svg+xml'
+      else
+        # Defensive default; Google will 400 for unsupported combos anyway.
+        'text/plain'
+      end
+    end,
+
+    strip_urls: lambda do |text|
+      text.to_s.gsub(%r{https?://\S+|www\.\S+}, '')
+    end,
+
+    force_utf8: lambda do |bytes|
+      s = bytes.to_s
+      s.force_encoding('UTF-8')
+      s.valid_encoding? ? s : s.encode('UTF-8', invalid: :replace, undef: :replace, replace: '')
+    end,
+
+    map_drive_meta: lambda do |f|
+      {
+        id: f['id'],
+        name: f['name'],
+        mime_type: f['mimeType'],
+        size: call(:to_int_or_nil, f['size']),
+        modified_time: f['modifiedTime'],
+        checksum: f['md5Checksum'],
+        owners: (f['owners'] || []).map { |o| { display_name: o['displayName'], email: o['emailAddress'] } }
+      }
+    end,
+
+    drive_get_meta_resolving_shortcut: lambda do |file_id|
+      meta = get("https://www.googleapis.com/drive/v3/files/#{file_id}")
+             .params(
+               supportsAllDrives: true,
+               fields: 'id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress),shortcutDetails'
+             )
+      target = meta.dig('shortcutDetails', 'targetId')
+      if target.present?
+        get("https://www.googleapis.com/drive/v3/files/#{target}")
+          .params(
+            supportsAllDrives: true,
+            fields: 'id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress)'
+          )
+      else
+        meta
+      end
+    end,
+
+    # Base64url without padding
+    b64url: lambda do |bytes|
+      Base64.urlsafe_encode64(bytes).gsub(/=+$/, '')
+    end,
+
+    # Sign a JWT (RS256) using the service account private key
+    jwt_sign_rs256: lambda do |claims, private_key_pem|
+      header = { alg: 'RS256', typ: 'JWT' }
+
+      encoded_header  = call(:b64url, header.to_json)
+      encoded_payload = call(:b64url, claims.to_json)
+      signing_input   = "#{encoded_header}.#{encoded_payload}"
+
+      rsa = OpenSSL::PKey::RSA.new(private_key_pem.to_s)
+      signature = rsa.sign(OpenSSL::Digest::SHA256.new, signing_input)
+
+      "#{signing_input}.#{call(:b64url, signature)}"
+    end
   }
 }
