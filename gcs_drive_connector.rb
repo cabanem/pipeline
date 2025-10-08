@@ -90,45 +90,54 @@
   # --------- OBJECT DEFINITIONS ------------------------------------------
   object_definitions: {
     drive_owner: {
-      fields: [
-        { name: 'display_name', type: 'string' },
-        { name: 'email', type: 'string' }
-      ]
+      fields: lambda do |connection|
+        [
+          { name: 'display_name', type: 'string' },
+          { name: 'email', type: 'string' }
+        ]
+      end
     },
     drive_file_min: {
-      fields: [
-        { name: 'id', type: 'string' },
-        { name: 'name', type: 'string' },
-        { name: 'mime_type', type: 'string' },
-        { name: 'size', type: 'integer' },
-        { name: 'modified_time', type: 'date_time' },
-        { name: 'checksum', type: 'string' },
-        { name: 'owners', type: 'array', of: 'object', properties: [{ name: 'display_name' }, { name: 'email' }] }
-      ]
+      fields: lambda do |connection|
+        [
+          { name: 'id', type: 'string' },
+          { name: 'name', type: 'string' },
+          { name: 'mime_type', type: 'string' },
+          { name: 'size', type: 'integer' },
+          { name: 'modified_time', type: 'date_time' },
+          { name: 'checksum', type: 'string' },
+          { name: 'owners', type: 'array', of: 'object', properties: [{ name: 'display_name' }, { name: 'email' }] }
+        ]
+      end
     },
     drive_file_full: {
-      fields: [
-        { name: 'id', type: 'string' },
-        { name: 'name', type: 'string' },
-        { name: 'mime_type', type: 'string' },
-        { name: 'size', type: 'integer' },
-        { name: 'modified_time', type: 'date_time' },
-        { name: 'checksum', type: 'string' },
-        { name: 'owners', type: 'array', of: 'object', properties: [{ name: 'display_name' }, { name: 'email' }] },
-        { name: 'exported_as', type: 'string' },
-        { name: 'text_content', type: 'string' },
-        { name: 'content_bytes', type: 'string', hint: 'Base64' }
-      ]
+      fields: lambda do |connection|
+        [
+          { name: 'id', type: 'string' },
+          { name: 'name', type: 'string' },
+          { name: 'mime_type', type: 'string' },
+          { name: 'size', type: 'integer' },
+          { name: 'modified_time', type: 'date_time' },
+          { name: 'checksum', type: 'string' },
+          { name: 'owners', type: 'array', of: 'object', properties: [{ name: 'display_name' }, { name: 'email' }] },
+          { name: 'exported_as', type: 'string' },
+          { name: 'text_content', type: 'string' },
+          { name: 'content_bytes', type: 'string', hint: 'Base64' }
+        ]
+      end
     },
     list_page_meta: {
-      fields: [
-        { name: 'count', type: 'integer' },
-        { name: 'has_more', type: 'boolean' },
-        { name: 'next_page_token', type: 'string' }
-      ]
+      fields: lambda do |connection|
+        [
+          { name: 'count', type: 'integer' },
+          { name: 'has_more', type: 'boolean' },
+          { name: 'next_page_token', type: 'string' }
+        ]
+      end
     },
     gcs_object: {
-      fields: [
+      fields: lambda do |connection|
+      [
         { name: 'bucket', type: 'string' },
         { name: 'name', type: 'string' },
         { name: 'size', type: 'integer' },
@@ -139,28 +148,33 @@
         { name: 'crc32c', type: 'string' },
         { name: 'metadata', type: 'object' }
       ]
+    end
     },
     gcs_list_page: {
-      fields: [
-        { name: 'objects', type: 'array', of: 'object', properties: [{ name: 'bucket' }, { name: 'name' }, { name: 'size', type: 'integer' }, { name: 'content_type' }, { name: 'updated', type: 'date_time' }, { name: 'generation' }, { name: 'md5_hash' }, { name: 'crc32c' }, { name: 'metadata', type: 'object' }] },
-        { name: 'prefixes', type: 'array', of: 'string' },
-        { name: 'count', type: 'integer' },
-        { name: 'has_more', type: 'boolean' },
-        { name: 'next_page_token', type: 'string' }
-      ]
+      fields: lambda do |connection|
+        [
+          { name: 'objects', type: 'array', of: 'object', properties: [{ name: 'bucket' }, { name: 'name' }, { name: 'size', type: 'integer' }, { name: 'content_type' }, { name: 'updated', type: 'date_time' }, { name: 'generation' }, { name: 'md5_hash' }, { name: 'crc32c' }, { name: 'metadata', type: 'object' }] },
+          { name: 'prefixes', type: 'array', of: 'string' },
+          { name: 'count', type: 'integer' },
+          { name: 'has_more', type: 'boolean' },
+          { name: 'next_page_token', type: 'string' }
+        ]
+      end
     },
     transfer_result: {
-      fields: [
-        { name: 'uploaded', type: 'array', of: 'object', properties: [
-          { name: 'drive_file_id' }, { name: 'drive_name' }, { name: 'bucket' }, { name: 'gcs_object_name' }, { name: 'bytes_uploaded', type: 'integer' }, { name: 'content_type' }
-        ]},
-        { name: 'failed', type: 'array', of: 'object', properties: [
-          { name: 'drive_file_id' }, { name: 'error_message' }, { name: 'error_code' }
-        ]},
-        { name: 'summary', type: 'object', properties: [
-          { name: 'total', type: 'integer' }, { name: 'success', type: 'integer' }, { name: 'failed', type: 'integer' }
-        ]}
-      ]
+      fields: lambda do |connection|
+        [
+          { name: 'uploaded', type: 'array', of: 'object', properties: [
+            { name: 'drive_file_id' }, { name: 'drive_name' }, { name: 'bucket' }, { name: 'gcs_object_name' }, { name: 'bytes_uploaded', type: 'integer' }, { name: 'content_type' }
+          ]},
+          { name: 'failed', type: 'array', of: 'object', properties: [
+            { name: 'drive_file_id' }, { name: 'error_message' }, { name: 'error_code' }
+          ]},
+          { name: 'summary', type: 'object', properties: [
+            { name: 'total', type: 'integer' }, { name: 'success', type: 'integer' }, { name: 'failed', type: 'integer' }
+          ]}
+        ]
+      end
     }
   },
 
