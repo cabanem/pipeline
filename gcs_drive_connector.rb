@@ -420,7 +420,10 @@
         include_trace = connection['include_trace'] == true
         traces = []
 
-        # 4. HTTP request 
+        # 4) HTTP request (no wrapper)
+        include_trace = connection['include_trace'] == true
+        traces = []
+
         action_cid = call('gen_correlation_id')
         files_endpoint = call('build_endpoint_url', :drive, :files)
         params = {
@@ -432,31 +435,26 @@
           corpora: corpora,
           supportsAllDrives: true,
           includeItemsFromAllDrives: true,
-          # Only request what we map
           fields: 'nextPageToken,files(id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress))'
         }.reject { |_k, v| v.nil? || v.to_s == '' }
-
         params[:driveId] = drive_id unless call('blank?', drive_id)
 
-        resp = call('http_request',
-          method: :get,
-          url:    files_endpoint,
-          params: params,
-          headers: { 'X-Correlation-Id' => action_cid },
-          context: {
-            action: 'Drive: List files (simplified)',
-            correlation_id: action_cid,
-            url: files_endpoint,
-            verbose_errors: connection['verbose_errors'] # harmless if not present
-          }
-        )
-        traces << call('trace_pack',
-          { action: 'Drive: List files (simplified)', correlation_id: action_cid, url: files_endpoint },
-          resp
-        ) if include_trace
+        started = Time.now
+        code = nil
+        body = get(files_endpoint)
+          .params(params)
+          .headers('X-Correlation-Id' => action_cid)
+          .after_error_response(/.*/) do |c, b, h, _|
+            error(call('normalize_http_error', c, b, h, files_endpoint,
+                      { action: 'Drive: List files (simplified)', correlation_id: action_cid, verbose_errors: connection['verbose_errors'] }))
+          end
+          .after_response { |c, b, _h| code = c.to_i; b }
 
-        # 5. Map output to canonical shape 
-        data  = resp['data'].is_a?(Hash) ? resp['data'] : {}
+        traces << { 'action' => 'Drive: List files (simplified)', 'correlation_id' => action_cid,
+                    'status' => code, 'url' => files_endpoint, 'dur_ms' => ((Time.now - started) * 1000.0).round } if include_trace
+
+        # 5) Map output to canonical shape
+        data  = body.is_a?(Hash) ? body : {}
         files = Array(data['files']).map do |f|
           {
             'id'            => f['id'],
@@ -535,30 +533,44 @@
           m.start_with?('text/') || %w[application/json application/xml text/csv image/svg+xml].include?(m)
         end
 
-        per_cid = call('gen_correlation_id')
+        # Construct metadata
+        per_cid  = call('gen_correlation_id')
+        include_trace = connection['include_trace'] == true
+        traces  = []
 
-        # 2. Metadata (resolve one level of shortcut)
         url_meta = call('build_endpoint_url', :drive, :file, fid)
-        meta = call('http_request',
-          method: :get, url: url_meta,
-          params: { fields: 'id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress),shortcutDetails(targetId,targetMimeType)', supportsAllDrives: true },
-          headers: { 'X-Correlation-Id' => per_cid },
-          context: { action: 'Drive get (meta)', correlation_id: per_cid, url: url_meta, verbose_errors: connection['verbose_errors'] }
-        )
-        traces << call('trace_pack', { action: 'Drive get (meta)', correlation_id: per_cid, url: url_meta }, meta) if include_trace
-        mdata = meta['data'].is_a?(Hash) ? meta['data'] : {}
+        started  = Time.now
+        code     = nil
+        meta_body = get(url_meta)
+          .params(fields: 'id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress),shortcutDetails(targetId,targetMimeType)',
+                  supportsAllDrives: true)
+          .headers('X-Correlation-Id' => per_cid)
+          .after_error_response(/.*/) do |c, b, h, _|
+            error(call('normalize_http_error', c, b, h, url_meta,
+                      { action: 'Drive get (meta)', correlation_id: per_cid, verbose_errors: connection['verbose_errors'] }))
+          end
+          .after_response { |c, b, _| code = c.to_i; b }
+        traces << { 'action' => 'Drive get (meta)', 'correlation_id' => per_cid, 'status' => code,
+                    'url' => url_meta, 'dur_ms' => ((Time.now - started) * 1000.0).round } if include_trace
 
-        if mdata['mimeType'] == 'application/vnd.google-apps.shortcut' && mdata.dig('shortcutDetails', 'targetId')
-          fid = mdata.dig('shortcutDetails', 'targetId')
+        mdata = meta_body.is_a?(Hash) ? meta_body : {}
+
+        if mdata['mimeType'] == 'application/vnd.google-apps.shortcut' && mdata.dig('shortcutDetails','targetId')
+          fid = mdata.dig('shortcutDetails','targetId')
           url_meta2 = call('build_endpoint_url', :drive, :file, fid)
-          meta = call('http_request',
-            method: :get, url: url_meta2,
-            params: { fields: 'id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress)', supportsAllDrives: true },
-            headers: { 'X-Correlation-Id' => per_cid },
-            context: { action: 'Drive get (target meta)', correlation_id: per_cid, url: url_meta2, verbose_errors: connection['verbose_errors'] }
-          )
-          traces << call('trace_pack', { action: 'Drive get (target meta)', correlation_id: per_cid, url: url_meta2 }, meta) if include_trace
-          mdata = meta['data'].is_a?(Hash) ? meta['data'] : {}
+          started2 = Time.now
+          code2    = nil
+          meta_body = get(url_meta2)
+            .params(fields: 'id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress)', supportsAllDrives: true)
+            .headers('X-Correlation-Id' => per_cid)
+            .after_error_response(/.*/) do |c, b, h, _|
+              error(call('normalize_http_error', c, b, h, url_meta2,
+                        { action: 'Drive get (target meta)', correlation_id: per_cid, verbose_errors: connection['verbose_errors'] }))
+            end
+            .after_response { |c, b, _| code2 = c.to_i; b }
+          traces << { 'action' => 'Drive get (target meta)', 'correlation_id' => per_cid, 'status' => code2,
+                      'url' => url_meta2, 'dur_ms' => ((Time.now - started2) * 1000.0).round } if include_trace
+          mdata = meta_body.is_a?(Hash) ? meta_body : {}
         end
 
         mime = (mdata['mimeType'] || '').to_s
@@ -576,37 +588,52 @@
         case mode
         when 'none'
           # metadata only
-
         when 'text'
           if mime.start_with?('application/vnd.google-apps.')
             export_mime = call('get_export_mime', mime)
             error("Export required for Editors type #{mime} but not supported.") if export_mime.nil?
+
             url_exp = call('build_endpoint_url', :drive, :export, fid)
-            exp = call('http_request',
-              method: :get, url: url_exp,
-              params: { mimeType: export_mime, supportsAllDrives: true },
-              headers: { 'X-Correlation-Id' => per_cid },
-              raw_response: true,
-              context: { action: 'Drive export (text)', correlation_id: per_cid, url: url_exp, verbose_errors: connection['verbose_errors'] }
-            )
-            traces << call('trace_pack', { action: 'Drive export (text)', correlation_id: per_cid, url: url_exp }, exp) if include_trace
-            txt = call('safe_utf8', exp['data'])
+            started3 = Time.now
+            code3    = nil
+            exp_body = get(url_exp)
+              .params(mimeType: export_mime, supportsAllDrives: true)
+              .headers('X-Correlation-Id' => per_cid)
+              .response_format_raw
+              .after_error_response(/.*/) do |c, b, h, _|
+                error(call('normalize_http_error', c, b, h, url_exp,
+                          { action: 'Drive export (text)', correlation_id: per_cid, verbose_errors: connection['verbose_errors'] }))
+              end
+              .after_response { |c, b, _| code3 = c.to_i; b }
+            traces << { 'action' => 'Drive export (text)', 'correlation_id' => per_cid, 'status' => code3,
+                        'url' => url_exp, 'dur_ms' => ((Time.now - started3) * 1000.0).round } if include_trace
+
+            txt = call('safe_utf8', exp_body)
             txt = call('strip_urls_from_text', txt) if strip
             out['text_content'] = txt
             out['exported_as']  = export_mime
 
           else
-            error("Non-text file (#{mime}); use content_mode=bytes or none.") unless is_textual.call(mime)
-            url_dl = call('build_endpoint_url', :drive, :download, fid)
-            dl = call('http_request',
-              method: :get, url: url_dl,
-              params: { supportsAllDrives: true },
-              headers: { 'X-Correlation-Id' => per_cid },
-              raw_response: true,
-              context: { action: 'Drive download (text)', correlation_id: per_cid, url: url_dl, verbose_errors: connection['verbose_errors'] }
+            error("Non-text file (#{mime}); use content_mode=bytes or none.") unless (
+              mime.start_with?('text/') || %w[application/json application/xml text/csv image/svg+xml].include?(mime)
             )
-            traces << call('trace_pack', { action: 'Drive download (text)', correlation_id: per_cid, url: url_dl }, dl) if include_trace
-            txt = call('safe_utf8', dl['data'])
+
+            url_dl = call('build_endpoint_url', :drive, :download, fid)
+            started4 = Time.now
+            code4    = nil
+            dl_body = get(url_dl)
+              .params(supportsAllDrives: true)
+              .headers('X-Correlation-Id' => per_cid)
+              .response_format_raw
+              .after_error_response(/.*/) do |c, b, h, _|
+                error(call('normalize_http_error', c, b, h, url_dl,
+                          { action: 'Drive download (text)', correlation_id: per_cid, verbose_errors: connection['verbose_errors'] }))
+              end
+              .after_response { |c, b, _| code4 = c.to_i; b }
+            traces << { 'action' => 'Drive download (text)', 'correlation_id' => per_cid, 'status' => code4,
+                        'url' => url_dl, 'dur_ms' => ((Time.now - started4) * 1000.0).round } if include_trace
+
+            txt = call('safe_utf8', dl_body)
             txt = call('strip_urls_from_text', txt) if strip
             out['text_content'] = txt
           end
@@ -614,15 +641,21 @@
         when 'bytes'
           error('Editors files require content_mode=text (export).') if mime.start_with?('application/vnd.google-apps.')
           url_dl = call('build_endpoint_url', :drive, :download, fid)
-          dl = call('http_request',
-            method: :get, url: url_dl,
-            params: { supportsAllDrives: true },
-            headers: { 'X-Correlation-Id' => per_cid },
-            raw_response: true,
-            context: { action: 'Drive download (bytes)', correlation_id: per_cid, url: url_dl, verbose_errors: connection['verbose_errors'] }
-          )
-          traces << call('trace_pack', { action: 'Drive download (bytes)', correlation_id: per_cid, url: url_dl }, dl) if include_trace
-          out['content_bytes'] = [dl['data'].to_s].pack('m0')
+          started5 = Time.now
+          code5    = nil
+          dl_body = get(url_dl)
+            .params(supportsAllDrives: true)
+            .headers('X-Correlation-Id' => per_cid)
+            .response_format_raw
+            .after_error_response(/.*/) do |c, b, h, _|
+              error(call('normalize_http_error', c, b, h, url_dl,
+                        { action: 'Drive download (bytes)', correlation_id: per_cid, verbose_errors: connection['verbose_errors'] }))
+            end
+            .after_response { |c, b, _| code5 = c.to_i; b }
+          traces << { 'action' => 'Drive download (bytes)', 'correlation_id' => per_cid, 'status' => code5,
+                      'url' => url_dl, 'dur_ms' => ((Time.now - started5) * 1000.0).round } if include_trace
+
+          out['content_bytes'] = [dl_body.to_s].pack('m0')
 
         else
           error("Unsupported content_mode=#{mode}. Use none|text|bytes.")
@@ -846,7 +879,6 @@
           ]}
         ]
       end,
-
       sample_output: lambda do
         {
           'objects' => [
@@ -857,7 +889,6 @@
           'count' => 1, 'has_more' => false, 'next_page_token' => nil, 'prefixes' => []
         }
       end,
-
       execute: lambda do |connection, input|
         # 1.  Normalize inputs
         local     = call('deep_copy', input)
@@ -901,26 +932,22 @@
           fields:      'items(bucket,name,size,contentType,updated,generation,md5Hash,crc32c,metadata),nextPageToken,prefixes'
         }.reject { |_k, v| v.nil? || v.to_s == '' }
 
-        # 3. HTTP: GCS objects.list
-        resp = call('http_request',
-          method:  :get,
-          url:     list_endpoint,
-          params:  params,
-          headers: { 'X-Correlation-Id' => action_cid },
-          context: {
-            action: 'GCS: List objects (simplified)',
-            correlation_id: action_cid,
-            url: list_endpoint,
-            verbose_errors: connection['verbose_errors']
-          }
-        )
-        traces << call('trace_pack',
-          { action: 'GCS: List objects (simplified)', correlation_id: action_cid, url: list_endpoint },
-          resp
-        ) if include_trace
+        started = Time.now
+        code    = nil
+        body = get(list_endpoint)
+          .params(params)
+          .headers('X-Correlation-Id' => action_cid)
+          .after_error_response(/.*/) do |c, b, h, _|
+            error(call('normalize_http_error', c, b, h, list_endpoint,
+                      { action: 'GCS: List objects (simplified)', correlation_id: action_cid, verbose_errors: connection['verbose_errors'] }))
+          end
+          .after_response { |c, b, _| code = c.to_i; b }
+
+        traces << { 'action' => 'GCS: List objects (simplified)', 'correlation_id' => action_cid,
+                    'status' => code, 'url' => list_endpoint, 'dur_ms' => ((Time.now - started) * 1000.0).round } if include_trace
 
         # 4. Map output
-        data  = resp['data'].is_a?(Hash) ? resp['data'] : {}
+        data  = body.is_a?(Hash) ? body : {}
         items = Array(data['items']).map do |o|
           {
             'bucket'       => o['bucket'],
@@ -1006,19 +1033,19 @@
           m.start_with?('text/') || %w[application/json application/xml text/csv image/svg+xml].include?(m)
         end
 
-        # ---------- Fetch metadata ----------
+        # Fetch metadata
         cid  = call('gen_correlation_id')
-        meta = call('http_request',
-          method:  :get,
-          url:     call('build_endpoint_url', :storage, :object, bucket, name),
-          headers: { 'X-Correlation-Id' => cid },
-          context: {
-            action: 'GCS get object (meta)',
-            bucket: bucket, object: name, correlation_id: cid,
-            verbose_errors: connection['verbose_errors']
-          }
-        )
-        md = meta['data'].is_a?(Hash) ? meta['data'] : {}
+        url_meta = call('build_endpoint_url', :storage, :object, bucket, name)
+        started1 = Time.now
+        code1    = nil
+        meta_body = get(url_meta)
+          .headers('X-Correlation-Id' => cid)
+          .after_error_response(/.*/) do |c, b, h, _|
+            error(call('normalize_http_error', c, b, h, url_meta,
+                      { action: 'GCS get object (meta)', correlation_id: cid, verbose_errors: connection['verbose_errors'] }))
+          end
+          .after_response { |c, b, _| code1 = c.to_i; b }
+        md = meta_body.is_a?(Hash) ? meta_body : {}
 
         out = {
           'bucket'       => md['bucket'] || bucket,
@@ -1034,43 +1061,46 @@
 
         case mode
         when 'none'
-          # metadata only
+          # nothing
 
         when 'text'
           ct = (out['content_type'] || '').to_s
-          error("status=415 Non-text object (#{ct}); use content_mode=bytes or none.") unless is_textual.call(ct)
-
-          dl = call('http_request',
-            method:  :get,
-            url:     call('build_endpoint_url', :storage, :download, bucket, name),
-            params:  { alt: 'media' },
-            headers: { 'X-Correlation-Id' => cid },
-            raw_response: true,
-            context: {
-              action: 'GCS download (text)',
-              bucket: bucket, object: name, correlation_id: cid,
-              verbose_errors: connection['verbose_errors']
-            }
+          error("status=415 Non-text object (#{ct}); use content_mode=bytes or none.") unless (
+            ct.start_with?('text/') || %w[application/json application/xml text/csv image/svg+xml].include?(ct)
           )
-          txt = call('safe_utf8', dl['data'])
+
+          url_dl = call('build_endpoint_url', :storage, :download, bucket, name)
+          started2 = Time.now
+          code2    = nil
+          dl_body = get(url_dl)
+            .params(alt: 'media')
+            .headers('X-Correlation-Id' => cid)
+            .response_format_raw
+            .after_error_response(/.*/) do |c, b, h, _|
+              error(call('normalize_http_error', c, b, h, url_dl,
+                        { action: 'GCS download (text)', correlation_id: cid, verbose_errors: connection['verbose_errors'] }))
+            end
+            .after_response { |c, b, _| code2 = c.to_i; b }
+
+          txt = call('safe_utf8', dl_body)
           txt = call('strip_urls_from_text', txt) if strip
           out['text_content'] = txt
 
         when 'bytes'
-          dl = call('http_request',
-            method:  :get,
-            url:     call('build_endpoint_url', :storage, :download, bucket, name),
-            params:  { alt: 'media' },
-            headers: { 'X-Correlation-Id' => cid },
-            raw_response: true,
-            context: {
-              action: 'GCS download (bytes)',
-              bucket: bucket, object: name, correlation_id: cid,
-              verbose_errors: connection['verbose_errors']
-            }
-          )
-          # Base64 (strict) without requiring stdlib Base64
-          out['content_bytes'] = [dl['data'].to_s].pack('m0')
+          url_dl = call('build_endpoint_url', :storage, :download, bucket, name)
+          started3 = Time.now
+          code3    = nil
+          dl_body = get(url_dl)
+            .params(alt: 'media')
+            .headers('X-Correlation-Id' => cid)
+            .response_format_raw
+            .after_error_response(/.*/) do |c, b, h, _|
+              error(call('normalize_http_error', c, b, h, url_dl,
+                        { action: 'GCS download (bytes)', correlation_id: cid, verbose_errors: connection['verbose_errors'] }))
+            end
+            .after_response { |c, b, _| code3 = c.to_i; b }
+
+          out['content_bytes'] = [dl_body.to_s].pack('m0')
 
         else
           error("Unsupported content_mode=#{mode}. Use none|text|bytes.")
@@ -1145,7 +1175,7 @@
         error('Bucket is required')      if call('blank?', bucket)
         error('Object name is required') if call('blank?', name)
 
-        # -------- Payload prep --------
+        # Payload prep
         mime  =
           if local['content_type'].to_s != ''
             local['content_type'].to_s
@@ -1173,7 +1203,7 @@
 
         bytes_len = raw_bytes.to_s.bytesize
 
-        # -------- Upload mode selection --------
+        # Upload mode selection
         cm_in = local['custom_metadata']
         has_meta = cm_in.is_a?(Hash) && !cm_in.empty?
 
@@ -1199,13 +1229,9 @@
         cid = call('gen_correlation_id')
 
         if has_meta
-          # -------- Multipart upload (metadata + media) --------
-          boundary = "wrkto-#{call('gen_correlation_id').gsub('-', '')}"
-          meta_json = JSON.generate({
-            'name'        => name,
-            'contentType' => mime,
-            'metadata'    => custom_meta
-          })
+          # Multipart upload (metadata + media)
+          boundary  = "wrkto-#{call('gen_correlation_id').gsub('-', '')}"
+          meta_json = JSON.generate({ 'name' => name, 'contentType' => mime, 'metadata' => custom_meta })
 
           part1 = "--#{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n#{meta_json}\r\n"
           part2 = "--#{boundary}\r\nContent-Type: #{mime}\r\n\r\n"
@@ -1219,41 +1245,43 @@
 
           params = { uploadType: 'multipart' }.merge(extra_params)
 
-          resp = call('http_request',
-            method:  :post,
-            url:     call('build_endpoint_url', :storage, :objects_upload_media, bucket),
-            params:  params,
-            headers: { 'Content-Type' => "multipart/related; boundary=#{boundary}", 'X-Correlation-Id' => cid },
-            payload: body,
-            raw_body: true,
-            context: {
-              action: 'GCS upload (multipart)',
-              bucket: bucket, object: name, correlation_id: cid,
-              verbose_errors: connection['verbose_errors']
-            }
-          )
-        else
-          # -------- Media upload (content only) --------
-          params = { uploadType: 'media', name: name }.merge(extra_params)
+          url_up   = call('build_endpoint_url', :storage, :objects_upload_media, bucket)
+          started  = Time.now
+          code     = nil
+          up_body = post(url_up)
+            .params(params)
+            .headers('Content-Type' => "multipart/related; boundary=#{boundary}", 'X-Correlation-Id' => cid)
+            .payload(body)
+            .after_error_response(/.*/) do |c, b, h, _|
+              error(call('normalize_http_error', c, b, h, url_up,
+                        { action: 'GCS upload (multipart)', correlation_id: cid, verbose_errors: connection['verbose_errors'] }))
+            end
+            .after_response { |c, b, _| code = c.to_i; b }
 
-          resp = call('http_request',
-            method:  :post,
-            url:     call('build_endpoint_url', :storage, :objects_upload_media, bucket),
-            params:  params,
-            headers: { 'Content-Type' => mime, 'X-Correlation-Id' => cid },
-            payload: raw_bytes,
-            raw_body: true,
-            context: {
-              action: 'GCS upload (media)',
-              bucket: bucket, object: name, correlation_id: cid,
-              verbose_errors: connection['verbose_errors']
-            }
-          )
+          up = up_body.is_a?(Hash) ? up_body : (JSON.parse(up_body) rescue {})
+        else
+          # Media upload (content only)
+          params = { uploadType: 'media', name: name }.merge(extra_params)
+          url_up  = call('build_endpoint_url', :storage, :objects_upload_media, bucket)
+          started = Time.now
+          code    = nil
+          up_body = post(url_up)
+            .params(params)
+            .headers('Content-Type' => mime, 'X-Correlation-Id' => cid)
+            .payload(raw_bytes)
+            .after_error_response(/.*/) do |c, b, h, _|
+              error(call('normalize_http_error', c, b, h, url_up,
+                        { action: 'GCS upload (media)', correlation_id: cid, verbose_errors: connection['verbose_errors'] }))
+            end
+            .after_response { |c, b, _| code = c.to_i; b }
+
+          up = up_body.is_a?(Hash) ? up_body : (JSON.parse(up_body) rescue {})
+
         end
 
         up = resp['data'].is_a?(Hash) ? resp['data'] : {}
 
-        # -------- Map output --------
+        # Map output
         gmd = {
           'bucket'       => up['bucket']       || bucket,
           'name'         => up['name']         || name,
@@ -1289,7 +1317,6 @@
           ]}
         ]
       end,
-
       output_fields: lambda do
         [
           { name: 'deleted', type: 'boolean' },
@@ -1300,11 +1327,9 @@
           ]}
         ]
       end,
-
       sample_output: lambda do
         { 'deleted' => true, 'generation' => '1700000000000000' }
       end,
-
       execute: lambda do |connection, input|
         local  = call('deep_copy', input)
         bucket = (local['bucket'] || '').to_s.strip
@@ -1338,18 +1363,25 @@
         traces        = []
 
         url  = call('build_endpoint_url', :storage, :object, bucket, name)
-        resp = call('http_request',
-          method:  :delete,
-          url:     url,
-          params:  params,
-          headers: { 'X-Correlation-Id' => cid },
-          context: { action: 'GCS delete object', correlation_id: cid, url: url, verbose_errors: connection['verbose_errors'] }
-        )
-        traces << call('trace_pack', { action: 'GCS delete object', correlation_id: cid, url: url }, resp) if include_trace
+        started = Time.now
+        code    = nil
+        resp_headers = {}
+        delete(url)
+          .params(params)
+          .headers('X-Correlation-Id' => cid)
+          .after_error_response(/.*/) do |c, b, h, _|
+            error(call('normalize_http_error', c, b, h, url,
+                      { action: 'GCS delete object', correlation_id: cid, verbose_errors: connection['verbose_errors'] }))
+          end
+          .after_response do |c, _b, h|
+            code = c.to_i
+            resp_headers = h || {}
+          end
 
-        hdrs = resp['headers'] || {}
-        gen  = hdrs['x-goog-generation'] || hdrs['X-Goog-Generation']
+        traces << { 'action' => 'GCS delete object', 'correlation_id' => cid, 'status' => code,
+                    'url' => url, 'dur_ms' => ((Time.now - started) * 1000.0).round } if include_trace
 
+        gen  = resp_headers['x-goog-generation'] || resp_headers['X-Goog-Generation']
         out = { 'deleted' => true, 'generation' => gen }
         out['trace'] = traces if include_trace
         out
@@ -1554,140 +1586,82 @@
       end
     },
 
-    devtools_drive_changes_smoke: {
-      title: 'DEV: Drive changes smoke',
-      subtitle: 'Fetch start token and walk N pages to validate paging/tokens',
-      help: { body: 'Development-only helper. Keep max_pages small in shared orgs.' },
-
+    devtools_http_migration_smoke: {
+      title: 'DEV: HTTP migration smoke',
+      subtitle: 'One-page sanity for list/get/download & GCS list',
       input_fields: lambda do
         [
-          { name: 'start_page_token', hint: 'Optional. If blank, fetched automatically.' },
-          { name: 'max_pages', type: 'integer', default: 1 },
-          { name: 'page_size', type: 'integer', default: 50 },
-          { name: 'include_removed', type: 'boolean', control_type: 'checkbox', default: false }
+          { name: 'any_drive_file_id', hint: 'Optional: a small text file id to test download' },
+          { name: 'gcs_bucket', hint: 'Optional: will call storage.objects.list' }
         ]
       end,
-
       output_fields: lambda do
         [
-          { name: 'pages_fetched', type: 'integer' },
-          { name: 'total_changes', type: 'integer' },
-          { name: 'removed_count', type: 'integer' },
-          { name: 'next_page_token' },
-          { name: 'new_start_page_token' },
-          { name: 'page_tokens', type: 'array', of: 'string' },
-          { name: 'sample_changes', type: 'array', of: 'object', properties: [
-              { name: 'change_type' }, { name: 'time' }, { name: 'removed', type: 'boolean' }, { name: 'file_id' }, { name: 'file_name' }
-          ]},
+          { name: 'drive_list_status', type: 'integer' },
+          { name: 'drive_get_status', type: 'integer' },
+          { name: 'gcs_list_status', type: 'integer' },
+          { name: 'sample_name' },
           { name: 'trace', type: 'array', of: 'object', properties: [
-              { name: 'action' }, { name: 'correlation_id' },
-              { name: 'status', type: 'integer' }, { name: 'url' }, { name: 'dur_ms', type: 'integer' }
+              { name: 'action' }, { name: 'status', type: 'integer' }, { name: 'url' }, { name: 'dur_ms', type: 'integer' }
           ]}
         ]
       end,
-
-      sample_output: lambda do
-        {
-          'pages_fetched' => 1,
-          'total_changes' => 3,
-          'removed_count' => 1,
-          'next_page_token' => 'p2',
-          'new_start_page_token' => nil,
-          'page_tokens' => ['p1'],
-          'sample_changes' => [
-            { 'change_type' => 'file', 'time' => '2025-09-30T12:00:00Z', 'removed' => false, 'file_id' => '1a2b3c', 'file_name' => 'Report.txt' }
-          ]
-        }
-      end,
-
       execute: lambda do |connection, input|
-        include_trace = connection['include_trace'] == true
-        traces        = []
-        cid           = call('gen_correlation_id')
+        traces = []
 
-        url_tok = call('build_endpoint_url', :drive, :changes_start_token)
-        url_chg = call('build_endpoint_url', :drive, :changes)
-
-        # Acquire or use provided start token
-        token = (input['start_page_token'].to_s.strip)
-        if token == ''
-          started = Time.now
-          code    = nil
-          tbody = get(url_tok)
-            .params(supportsAllDrives: true)
-            .after_error_response(/.*/) do |c, b, h, _|
-              error(call('normalize_http_error', c, b, h, url_tok, { action: 'Drive getStartPageToken', correlation_id: cid, verbose_errors: connection['verbose_errors'] }))
-            end
-            .after_response { |c, b, _| code = c.to_i; b }
-          dur = ((Time.now - started) * 1000.0).round
-          traces << { 'action' => 'Drive getStartPageToken', 'correlation_id' => cid, 'status' => code, 'url' => url_tok, 'dur_ms' => dur } if include_trace
-          token = (tbody['startPageToken'] || '').to_s
-          error('Failed to acquire startPageToken') if token == ''
-        end
-
-        max_pages  = [[(input['max_pages'] || 1).to_i, 1].max, 20].min
-        page_size  = [[(input['page_size'] || 50).to_i, 1].max, 1000].min
-        include_removed = input['include_removed'] == true
-
-        fields = 'nextPageToken,newStartPageToken,changes(changeType,time,removed,fileId,file(id,name))'
-
-        pages   = 0
-        total   = 0
-        removed = 0
-        tokens  = []
-        last_next = nil
-        last_new  = nil
-        samples   = []
-
-        while pages < max_pages && token && token != ''
-          started = Time.now
-          code    = nil
-          body = get(url_chg)
-            .params(pageToken: token, pageSize: page_size, includeRemoved: include_removed, supportsAllDrives: true, fields: fields)
-            .after_error_response(/.*/) do |c, b, h, _|
-              error(call('normalize_http_error', c, b, h, url_chg, { action: 'Drive changes.list', correlation_id: cid, verbose_errors: connection['verbose_errors'] }))
-            end
-            .after_response { |c, b, _| code = c.to_i; b }
-          dur = ((Time.now - started) * 1000.0).round
-          traces << { 'action' => 'Drive changes.list', 'correlation_id' => cid, 'status' => code, 'url' => url_chg, 'dur_ms' => dur } if include_trace
-
-          tokens << token
-          arr = Array(body['changes'])
-          total += arr.length
-          removed += arr.count { |c| c['removed'] }
-
-          # keep a tiny sample for visual inspection
-          arr.first(3 - samples.length).each do |c|
-            samples << {
-              'change_type' => c['changeType'],
-              'time'        => c['time'],
-              'removed'     => !!c['removed'],
-              'file_id'     => c['fileId'],
-              'file_name'   => (c.dig('file', 'name') || '')
-            }
+        # Drive files.list (status only)
+        url_list = call('build_endpoint_url', :drive, :files)
+        started  = Time.now
+        code     = nil
+        body = get(url_list)
+          .params(pageSize: 1, orderBy: 'modifiedTime desc', spaces: 'drive', corpora: 'user',
+                  supportsAllDrives: true, includeItemsFromAllDrives: true,
+                  fields: 'files(id,name)')
+          .after_error_response(/.*/) do |c, b, h, _|
+            error(call('normalize_http_error', c, b, h, url_list, { action: 'drive.files.list', verbose_errors: connection['verbose_errors'] }))
           end
+          .after_response { |c, b, _| code = c.to_i; b }
+        traces << { 'action' => 'drive.files.list', 'status' => code, 'url' => url_list, 'dur_ms' => ((Time.now - started) * 1000.0).round }
+        name = Array(body['files']).dig(0, 'name')
 
-          last_next = body['nextPageToken']
-          last_new  = body['newStartPageToken']
-          token     = last_next # advance
-          pages    += 1
-          break if token.nil? || token == ''
+        # Optional: Drive files.get alt=media for a tiny text
+        get_status = nil
+        if (fid = input['any_drive_file_id'].to_s.strip) != ''
+          url_get = call('build_endpoint_url', :drive, :download, fid)
+          started = Time.now
+          get(url_get)
+            .params(supportsAllDrives: true)
+            .response_format_raw
+            .after_error_response(/.*/) do |c, b, h, _|
+              error(call('normalize_http_error', c, b, h, url_get, { action: 'drive.files.get(media)' }))
+            end
+            .after_response { |c, _b, _| get_status = c.to_i }
+          traces << { 'action' => 'drive.files.get(media)', 'status' => get_status, 'url' => url_get, 'dur_ms' => ((Time.now - started) * 1000.0).round }
         end
 
-        out = {
-          'pages_fetched'        => pages,
-          'total_changes'        => total,
-          'removed_count'        => removed,
-          'next_page_token'      => last_next,
-          'new_start_page_token' => last_new,
-          'page_tokens'          => tokens,
-          'sample_changes'       => samples
+        # Optional: storage.objects.list
+        gcs_status = nil
+        if (bk = input['gcs_bucket'].to_s.strip) != ''
+          url_gcs = call('build_endpoint_url', :storage, :objects_list, bk)
+          started = Time.now
+          get(url_gcs)
+            .params(maxResults: 1, fields: 'items(name)')
+            .after_error_response(/.*/) do |c, b, h, _|
+              error(call('normalize_http_error', c, b, h, url_gcs, { action: 'storage.objects.list' }))
+            end
+            .after_response { |c, _b, _| gcs_status = c.to_i }
+          traces << { 'action' => 'storage.objects.list', 'status' => gcs_status, 'url' => url_gcs, 'dur_ms' => ((Time.now - started) * 1000.0).round }
+        end
+
+        {
+          'drive_list_status' => code,
+          'drive_get_status'  => get_status,
+          'gcs_list_status'   => gcs_status,
+          'sample_name'       => name,
+          'trace'             => traces
         }
-        out['trace'] = traces if include_trace
-        out
       end
     }
-
   },
 
   methods: {
@@ -2220,22 +2194,22 @@
       body << bytes.to_s.b
       body << part3.dup.force_encoding('ASCII-8BIT')
 
+      url = call('build_endpoint_url', :storage, :objects_upload_media, bucket)
       params = { uploadType: 'multipart' }.merge(extra_params || {})
 
-      resp = call('http_request',
-        method:  :post,
-        url:     call('build_endpoint_url', :storage, :objects_upload_media, bucket),
-        params:  params,
-        headers: {
-          'Content-Type'     => "multipart/related; boundary=#{boundary}",
-          'X-Correlation-Id' => correlation_id
-        },
-        payload: body,
-        raw_body: true,
-        context: { action: 'GCS upload (multipart)', correlation_id: correlation_id, verbose_errors: connection['verbose_errors'] }
-      )
+      started = Time.now
+      code    = nil
+      resp_body = post(url)
+        .params(params)
+        .headers('Content-Type' => "multipart/related; boundary=#{boundary}", 'X-Correlation-Id' => correlation_id)
+        .payload(body)
+        .after_error_response(/.*/) do |c, b, h, _|
+          error(call('normalize_http_error', c, b, h, url,
+                    { action: 'GCS upload (multipart)', correlation_id: correlation_id, verbose_errors: connection['verbose_errors'] }))
+        end
+        .after_response { |c, b, _| code = c.to_i; b }
 
-      resp['data'].is_a?(Hash) ? resp['data'] : {}
+      resp_body.is_a?(Hash) ? resp_body : (JSON.parse(resp_body) rescue {})
     end,
 
     # ---------- Error code mapping (for batch summaries etc.) ----------
