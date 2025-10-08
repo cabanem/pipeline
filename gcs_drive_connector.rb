@@ -16,13 +16,6 @@
         label: 'User project for requester-pays (optional)',
         hint: 'Project ID for billing (userProject)',
         optional: true
-      },
-      {
-        name: 'scopes',
-        control_type: 'text',
-        optional: true,
-        hint: 'Space-separated scopes. Default covers Drive read + GCS read/write.',
-        default: 'https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/devstorage.read_write openid email profile'
       }
     ],
 
@@ -76,7 +69,8 @@
 
       # URL: authorization
       authorization_url: lambda do |connection|
-        scopes = (connection['scopes'] || '').strip
+        scopes = ['https://www.googleapis.com/auth/cloud-platform', 'https://www.googleapis.com/auth/drive.readonly', 'https://www.googleapis.com/auth/devstorage.read_write']
+        scopes = scopes.strip
         "https://accounts.google.com/o/oauth2/v2/auth?response_type=code&access_type=offline&include_granted_scopes=true&scope=#{CGI.escape(scopes)}"
       end,
 
