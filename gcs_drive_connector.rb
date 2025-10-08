@@ -1,6 +1,6 @@
 {
-  title: 'Drive Utilities',
-  description: 'Google Drive utilities with resilience, telemetry, and multi-auth',
+  title: 'GCS and Google Drive Utilities',
+  description: 'Google Drive utilities with resilience, telemetry.',
   version: "0.4.0",
   custom_action: false,
 
@@ -12,7 +12,6 @@
       
       # Service account details
       { name: 'service_account_email', group: 'Service account', optional: false, hint: 'e.g. my-sa@project.iam.gserviceaccount.com' },
-      { name: 'client_id',             group: 'Service account', optional: false, hint: 'Service account client ID (used as JWT kid)' },
       { name: 'private_key_id',        group: 'Service account', optional: false, hint: 'The key’s private_key_id from the JSON' },
       { name: 'private_key',           group: 'Service account', control_type: 'password', multiline: true, optional: false,
         hint: 'Paste the PEM private key from the JSON. Newlines may appear as \\n; both forms are handled.' },
@@ -81,8 +80,8 @@
         headers(Authorization: "Bearer #{connection['access_token']}")
       end,
 
-      refresh_on: [401, 403],
-      detect_on: [/UNAUTHENTICATED/i, /invalid[_-]?token/i, /expired/i, /insufficient/i]
+      refresh_on: [401],
+      detect_on: [/UNAUTHENTICATED/i, /invalid[_-]?token/i, /token.*expired/i, /auth.*expired/i]
     },
 
     base_uri: -> (_connection) { 'https://www.googleapis.com/' }
@@ -433,7 +432,7 @@
           spaces: 'drive',
           corpora: corpora,
           supportsAllDrives: true,
-          includeItemsFromAllDrives: true,
+          includeItemsFromAllDrives: (corpora != 'user'),
           fields: 'nextPageToken,files(id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress))'
         }.reject { |_k, v| v.nil? || v.to_s == '' }
         params[:driveId] = drive_id unless call('blank?', drive_id)
@@ -527,50 +526,16 @@
         fid = call('extract_drive_file_id', local['file_id'])
         error('No Drive file ID provided.') if call('blank?', fid)
 
-        is_textual = lambda do |mime|
-          m = (mime || '').to_s
-          m.start_with?('text/') || %w[application/json application/xml text/csv image/svg+xml].include?(m)
-        end
-
         # Construct metadata
         per_cid  = call('gen_correlation_id')
-        include_trace = connection['include_trace'] == true
-        traces  = []
 
-        url_meta = call('build_endpoint_url', :drive, :file, fid)
         started  = Time.now
-        code     = nil
-        meta_body = get(url_meta)
-          .params(fields: 'id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress),shortcutDetails(targetId,targetMimeType)',
-                  supportsAllDrives: true)
-          .headers('X-Correlation-Id' => per_cid)
-          .after_error_response(/.*/) do |c, b, h, _|
-            error(call('normalize_http_error', c, b, h, url_meta,
-                      { action: 'Drive get (meta)', correlation_id: per_cid, verbose_errors: connection['verbose_errors'] }))
-          end
-          .after_response { |c, b, _| code = c.to_i; b }
-        traces << { 'action' => 'Drive get (meta)', 'correlation_id' => per_cid, 'status' => code,
-                    'url' => url_meta, 'dur_ms' => ((Time.now - started) * 1000.0).round } if include_trace
+        fid, mdata = call('drive_fetch_meta_resolved', fid, per_cid,
+                          'id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress),shortcutDetails(targetId,targetMimeType)',
+                          connection['verbose_errors'] == true)
+        traces << { 'action' => 'Drive get (meta+resolve)', 'correlation_id' => per_cid,
+                    'status' => 200, 'url' => "(files.get -> shortcut resolve)", 'dur_ms' => ((Time.now - started) * 1000.0).round } if include_trace
 
-        mdata = meta_body.is_a?(Hash) ? meta_body : {}
-
-        if mdata['mimeType'] == 'application/vnd.google-apps.shortcut' && mdata.dig('shortcutDetails','targetId')
-          fid = mdata.dig('shortcutDetails','targetId')
-          url_meta2 = call('build_endpoint_url', :drive, :file, fid)
-          started2 = Time.now
-          code2    = nil
-          meta_body = get(url_meta2)
-            .params(fields: 'id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress)', supportsAllDrives: true)
-            .headers('X-Correlation-Id' => per_cid)
-            .after_error_response(/.*/) do |c, b, h, _|
-              error(call('normalize_http_error', c, b, h, url_meta2,
-                        { action: 'Drive get (target meta)', correlation_id: per_cid, verbose_errors: connection['verbose_errors'] }))
-            end
-            .after_response { |c, b, _| code2 = c.to_i; b }
-          traces << { 'action' => 'Drive get (target meta)', 'correlation_id' => per_cid, 'status' => code2,
-                      'url' => url_meta2, 'dur_ms' => ((Time.now - started2) * 1000.0).round } if include_trace
-          mdata = meta_body.is_a?(Hash) ? meta_body : {}
-        end
 
         mime = (mdata['mimeType'] || '').to_s
         out = {
@@ -613,9 +578,7 @@
             out['exported_as']  = export_mime
 
           else
-            error("Non-text file (#{mime}); use content_mode=bytes or none.") unless (
-              mime.start_with?('text/') || %w[application/json application/xml text/csv image/svg+xml].include?(mime)
-            )
+            error("Non-text file (#{mime}); use content_mode=bytes or none.") unless call('textual_mime?', mime)
 
             url_dl = call('build_endpoint_url', :drive, :download, fid)
             started4 = Time.now
@@ -730,48 +693,19 @@
                 .reject { |s| call('blank?', s) }.uniq
         error('No Drive file IDs provided. Map "file_ids" or "files".') if ids.empty?
 
-        is_textual = lambda do |mime|
-          m = (mime || '').to_s
-          m.start_with?('text/') || %w[application/json application/xml text/csv image/svg+xml].include?(m)
-        end
-
         successes, failures = [], []
 
         ids.each do |raw_id|
           per_cid = call('gen_correlation_id')
           begin
-            # 2. Metadata (resolve shortcut once)
+            # 2. Metadata (resolve shortcut once via helper)
             fid = raw_id
-            url_meta = call('build_endpoint_url', :drive, :file, fid)
             started_m = Time.now
-            code_m    = nil
-            meta_body = get(url_meta)
-              .params(fields: 'id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress),shortcutDetails(targetId,targetMimeType)', supportsAllDrives: true)
-              .headers('X-Correlation-Id' => per_cid)
-              .after_error_response(/.*/) do |c, b, h, _|
-                error(call('normalize_http_error', c, b, h, url_meta,
-                           { action: 'Drive get (meta)', correlation_id: per_cid, verbose_errors: connection['verbose_errors'] }))
-              end
-              .after_response { |c, b, _| code_m = c.to_i; b }
-            traces << { 'action' => 'Drive get (meta)', 'correlation_id' => per_cid, 'status' => code_m, 'url' => url_meta, 'dur_ms' => ((Time.now - started_m) * 1000.0).round } if include_trace
-            mdata = meta_body.is_a?(Hash) ? meta_body : {}
-
-            if mdata['mimeType'] == 'application/vnd.google-apps.shortcut' && mdata.dig('shortcutDetails', 'targetId')
-              fid = mdata.dig('shortcutDetails', 'targetId')
-              url_meta2 = call('build_endpoint_url', :drive, :file, fid)
-              started_m2 = Time.now
-              code_m2    = nil
-              meta_body = get(url_meta2)
-                .params(fields: 'id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress)', supportsAllDrives: true)
-                .headers('X-Correlation-Id' => per_cid)
-                .after_error_response(/.*/) do |c, b, h, _|
-                  error(call('normalize_http_error', c, b, h, url_meta2,
-                             { action: 'Drive get (target meta)', correlation_id: per_cid, verbose_errors: connection['verbose_errors'] }))
-                end
-                .after_response { |c, b, _| code_m2 = c.to_i; b }
-              traces << { 'action' => 'Drive get (target meta)', 'correlation_id' => per_cid, 'status' => code_m2, 'url' => url_meta2, 'dur_ms' => ((Time.now - started_m2) * 1000.0).round } if include_trace
-              mdata = meta_body.is_a?(Hash) ? meta_body : {}
-            end
+            fid, mdata = call('drive_fetch_meta_resolved', fid, per_cid,
+                              'id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress),shortcutDetails(targetId,targetMimeType)',
+                              connection['verbose_errors'] == true)
+            traces << { 'action' => 'Drive get (meta+resolve)', 'correlation_id' => per_cid, 'status' => 200,
+                        'url' => '(files.get -> shortcut resolve)', 'dur_ms' => ((Time.now - started_m) * 1000.0).round } if include_trace
 
 
             mime = (mdata['mimeType'] || '').to_s
@@ -814,7 +748,7 @@
                 out['exported_as']  = export_mime
 
               else
-                error("Non-text file (#{mime}); use content_mode=bytes or none.") unless is_textual.call(mime)
+                error("Non-text file (#{mime}); use content_mode=bytes or none.") unless call('textual_mime?', mime)
                 url_dl = call('build_endpoint_url', :drive, :download, fid)
                 started_d = Time.now
                 code_d    = nil
@@ -1012,7 +946,12 @@
         ]
       end,
       output_fields: lambda do |object_definitions|
-        object_definitions['gcs_object_with_content']
+        object_definitions['gcs_object_with_content'] + [
+          { name: 'trace', type: 'array', of: 'object', properties: [
+              { name: 'action' }, { name: 'correlation_id' },
+              { name: 'status', type: 'integer' }, { name: 'url' }, { name: 'dur_ms', type: 'integer' }
+          ]}
+        ]
       end,
       sample_output: lambda do
         {
@@ -1024,6 +963,8 @@
       end,
       execute: lambda do |connection, input|
         local  = call('deep_copy', input)
+        include_trace = connection['include_trace'] == true
+        traces        = []
         mode   = (local['content_mode'] || 'text').to_s
         strip  = !!(local.dig('postprocess', 'strip_urls') == true)
 
@@ -1048,12 +989,6 @@
         error('Bucket is required') if call('blank?', bucket)
         error('Object name is required') if call('blank?', name)
 
-        # Helper: textual mime?
-        is_textual = lambda do |mime|
-          m = (mime || '').to_s
-          m.start_with?('text/') || %w[application/json application/xml text/csv image/svg+xml].include?(m)
-        end
-
         # Fetch metadata
         cid  = call('gen_correlation_id')
         url_meta = call('build_endpoint_url', :storage, :object, bucket, name)
@@ -1066,6 +1001,9 @@
                       { action: 'GCS get object (meta)', correlation_id: cid, verbose_errors: connection['verbose_errors'] }))
           end
           .after_response { |c, b, _| code1 = c.to_i; b }
+
+        traces << { 'action' => 'GCS get object (meta)', 'correlation_id' => cid, 'status' => code1,
+                    'url' => url_meta, 'dur_ms' => ((Time.now - started1) * 1000.0).round } if include_trace
         md = meta_body.is_a?(Hash) ? meta_body : {}
 
         out = {
@@ -1086,9 +1024,7 @@
 
         when 'text'
           ct = (out['content_type'] || '').to_s
-          error("status=415 Non-text object (#{ct}); use content_mode=bytes or none.") unless (
-            ct.start_with?('text/') || %w[application/json application/xml text/csv image/svg+xml].include?(ct)
-          )
+          error("status=415 Non-text object (#{ct}); use content_mode=bytes or none.") unless call('textual_mime?', ct)
 
           url_dl = call('build_endpoint_url', :storage, :download, bucket, name)
           started2 = Time.now
@@ -1102,6 +1038,9 @@
                         { action: 'GCS download (text)', correlation_id: cid, verbose_errors: connection['verbose_errors'] }))
             end
             .after_response { |c, b, _| code2 = c.to_i; b }
+
+          traces << { 'action' => 'GCS download (text)', 'correlation_id' => cid, 'status' => code2,
+                      'url' => url_dl, 'dur_ms' => ((Time.now - started2) * 1000.0).round } if include_trace
 
           txt = call('safe_utf8', dl_body)
           txt = call('strip_urls_from_text', txt) if strip
@@ -1121,12 +1060,16 @@
             end
             .after_response { |c, b, _| code3 = c.to_i; b }
 
+          traces << { 'action' => 'GCS download (bytes)', 'correlation_id' => cid, 'status' => code3,
+                      'url' => url_dl, 'dur_ms' => ((Time.now - started3) * 1000.0).round } if include_trace
+
           out['content_bytes'] = [dl_body.to_s].pack('m0')
 
         else
           error("Unsupported content_mode=#{mode}. Use none|text|bytes.")
         end
 
+        out['trace'] = traces if include_trace
         out
       end
     },
@@ -1443,7 +1386,12 @@
           ]},
           { name: 'summary', type: 'object', properties: [
               { name: 'total', type: 'integer' }, { name: 'success', type: 'integer' }, { name: 'failed', type: 'integer' }
+          ]},
+          { name: 'trace', type: 'array', of: 'object', properties: [
+              { name: 'action' }, { name: 'correlation_id' },
+              { name: 'status', type: 'integer' }, { name: 'url' }, { name: 'dur_ms', type: 'integer' }
           ]}
+
         ]
       end,
 
@@ -1490,38 +1438,22 @@
           call('gcs_multipart_upload', connection, bucket, object_name, bytes, content_type, meta_hash, cid, (params_extra || {}))
         end
 
+        include_trace = connection['include_trace'] == true
+        traces        = []
+
         uploaded, failed = [], []
 
         ids.each do |raw_id|
           per_cid = call('gen_correlation_id')
           begin
-            # 1. Get Drive metadata (resolve shortcuts once)
-            url_meta = call('build_endpoint_url', :drive, :file, fid)
+            fid = raw_id
+            # 1. Get Drive metadata (resolve shortcuts once via helper)
             started_m = Time.now
-            code_m    = nil
-            meta_body = get(url_meta)
-              .params(fields: 'id,name,mimeType,modifiedTime,md5Checksum,shortcutDetails(targetId,targetMimeType)', supportsAllDrives: true)
-              .headers('X-Correlation-Id' => per_cid)
-              .after_error_response(/.*/) do |c,b,h,_|
-                error(call('normalize_http_error', c, b, h, url_meta,
-                           { action: 'Transfer: Get Drive file', correlation_id: per_cid, verbose_errors: connection['verbose_errors'] }))
-              end
-              .after_response { |c,b,_| code_m = c.to_i; b }
-            fm = meta_body.is_a?(Hash) ? meta_body : {}
-
-            if fm['mimeType'] == 'application/vnd.google-apps.shortcut' && fm.dig('shortcutDetails', 'targetId')
-              fid = fm.dig('shortcutDetails', 'targetId')
-              url_meta2 = call('build_endpoint_url', :drive, :file, fid)
-              meta_body = get(url_meta2)
-                .params(fields: 'id,name,mimeType,modifiedTime,md5Checksum', supportsAllDrives: true)
-                .headers('X-Correlation-Id' => per_cid)
-                .after_error_response(/.*/) do |c,b,h,_|
-                  error(call('normalize_http_error', c, b, h, url_meta2,
-                             { action: 'Transfer: Get target file', correlation_id: per_cid, verbose_errors: connection['verbose_errors'] }))
-                end
-                .after_response { |_c,b,_| b }
-              fm = meta_body.is_a?(Hash) ? meta_body : {}
-            end
+            fid, fm = call('drive_fetch_meta_resolved', fid, per_cid,
+                           'id,name,mimeType,modifiedTime,md5Checksum,shortcutDetails(targetId,targetMimeType)',
+                           connection['verbose_errors'] == true)
+            traces << { 'action' => 'Transfer: Get Drive meta+resolve', 'correlation_id' => per_cid, 'status' => 200,
+                        'url' => '(files.get -> shortcut resolve)', 'dur_ms' => ((Time.now - started_m) * 1000.0).round } if include_trace
 
             mime = (fm['mimeType'] || '').to_s
             name = (fm['name'] || '').to_s
@@ -1606,11 +1538,13 @@
           end
         end
 
-        {
+        out = {
           'uploaded' => uploaded,
           'failed'   => failed,
           'summary'  => { 'total' => ids.length, 'success' => uploaded.length, 'failed' => failed.length }
         }
+        out['trace'] = traces if include_trace
+        out
       end
     },
 
@@ -1643,7 +1577,7 @@
         code     = nil
         body = get(url_list)
           .params(pageSize: 1, orderBy: 'modifiedTime desc', spaces: 'drive', corpora: 'user',
-                  supportsAllDrives: true, includeItemsFromAllDrives: true,
+                  supportsAllDrives: true, includeItemsFromAllDrives: false,
                   fields: 'files(id,name)')
           .after_error_response(/.*/) do |c, b, h, _|
             error(call('normalize_http_error', c, b, h, url_list, { action: 'drive.files.list', verbose_errors: connection['verbose_errors'] }))
@@ -1777,8 +1711,15 @@
         # Prefer stdlib if present
         URI.encode_www_form_component(str.to_s)
       rescue
-        # Minimal fallback
-        str.to_s.gsub(/[^A-Za-z0-9\-\._~]/) { |m| '%%%02X' % m.ord }
+        # Fallback, percent-encode UTF-8 bytes, keep unreserved [A-Za-z0-9-._~]
+        s = str.to_s.encode('UTF-8', invalid: :replace, undef: :replace, replace: '')
+        s.bytes.map { |b|
+          if (b >= 0x30 && b <= 0x39) || (b >= 0x41 && b <= 0x5A) || (b >= 0x61 && b <= 0x7A) || [0x2D,0x2E,0x5F,0x7E].include?(b)
+            b.chr
+          else
+            '%%%02X' % b
+          end
+        }.join
       end
     end,
 
@@ -1896,13 +1837,18 @@
         when String  then Time.parse(dt) rescue nil
         else
           dt.respond_to?(:to_time) ? dt.to_time : nil
-        end
-      (t || Time.now).utc.iso8601
+        end 
+      t ? t.utc.iso8601 : nil # fallback
     end,
 
     safe_utf8: lambda do |bytes|
       s = bytes.to_s
       s.encode('UTF-8', invalid: :replace, undef: :replace, replace: '�')
+    end,
+
+    textual_mime?: lambda do |mime|
+      m = (mime || '').to_s
+      m.start_with?('text/') || %w[application/json application/xml text/csv image/svg+xml].include?(m)
     end,
 
     strip_urls_from_text: lambda do |text|
@@ -1927,6 +1873,10 @@
       when 'text/plain'    then 'txt'
       when 'text/csv'      then 'csv'
       when 'image/svg+xml' then 'svg'
+      when 'application/json' then 'json'
+      when 'application/xml'  then 'xml'
+      when 'text/html'        then 'html'
+      when 'text/markdown'    then 'md'
       else nil
       end
     end,
@@ -1999,6 +1949,33 @@
 
     # ---------- Drive helpers ----------
 
+    drive_fetch_meta_resolved: lambda do |fid_in, correlation_id, fields|
+      fid = (fid_in || '').to_s
+      base_fields = fields || 'id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress),shortcutDetails(targetId,targetMimeType)'
+      url_meta = call('build_endpoint_url', :drive, :file, fid)
+      meta = get(url_meta)
+               .params(fields: base_fields, supportsAllDrives: true)
+               .headers('X-Correlation-Id' => correlation_id)
+               .after_error_response(/.*/) do |c,b,h,_|
+                 error(call('normalize_http_error', c, b, h, url_meta,
+                            { action: 'Drive get (meta)', correlation_id: correlation_id, verbose_errors: verbose_errors }))
+               end
+      m = meta.is_a?(Hash) ? meta : {}
+      if m['mimeType'] == 'application/vnd.google-apps.shortcut' && m.dig('shortcutDetails','targetId')
+        fid2 = m.dig('shortcutDetails','targetId').to_s
+        url2 = call('build_endpoint_url', :drive, :file, fid2)
+        meta2 = get(url2)
+                  .params(fields: base_fields.sub(/,?shortcutDetails\([^)]*\)/, ''), supportsAllDrives: true)
+                  .headers('X-Correlation-Id' => correlation_id)
+                  .after_error_response(/.*/) do |c,b,h,_|
+                    error(call('normalize_http_error', c, b, h, url2,
+                               { action: 'Drive get (target meta)', correlation_id: correlation_id, verbose_errors: verbose_errors }))
+                  end
+        return [fid2, (meta2.is_a?(Hash) ? meta2 : {})]
+      end
+      [fid, m]
+    end,
+
     extract_drive_file_id: lambda do |raw|
       s = raw.to_s.strip
       return nil if s == ''
@@ -2056,7 +2033,7 @@
       end
 
       if (mt = o[:mime_type] || o['mime_type']).to_s.strip != ''
-        safe = mt.gsub("'", "\\\\'")
+        safe = mt.gsub("'", "\\'")
         clauses << "mimeType = '#{safe}'"
       end
 
