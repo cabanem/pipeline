@@ -4,73 +4,70 @@
   connection: {
     fields: [
       {
-        name: "client_id",
-        label: "Client ID",
+        name: "service_account_json",
+        label: "Service Account JSON",
         optional: false,
-        hint: "OAuth 2.0 Client ID from Google Cloud Console"
-      },
-      {
-        name: "client_secret", 
-        label: "Client Secret",
-        optional: false,
-        hint: "OAuth 2.0 Client Secret",
-        control_type: "password"
+        control_type: "text-area",
+        hint: "Paste the entire service account JSON key file contents"
       }
     ],
     
     authorization: {
-      type: "oauth2",
+      type: "custom_auth",
       
-      authorization_url: lambda do |connection|
-        "https://accounts.google.com/o/oauth2/v2/auth"
-      end,
-      
-      acquire: lambda do |connection, auth_code, redirect_uri|
+      acquire: lambda do |connection|
+        # Parse service account JSON
+        service_account = JSON.parse(connection["service_account_json"])
+        
+        # JWT header
+        header = {
+          alg: "RS256",
+          typ: "JWT"
+        }
+        
+        # JWT claims
+        now = Time.now.to_i
+        claims = {
+          iss: service_account["client_email"],
+          scope: [
+            "https://www.googleapis.com/auth/drive.readonly",
+            "https://www.googleapis.com/auth/devstorage.read_write"
+          ].join(" "),
+          aud: "https://oauth2.googleapis.com/token",
+          exp: now + 3600,  # 1 hour expiry
+          iat: now
+        }
+        
+        # Create JWT
+        header_encoded = header.to_json.encode_base64.gsub("=", "").gsub("+", "-").gsub("/", "_")
+        claims_encoded = claims.to_json.encode_base64.gsub("=", "").gsub("+", "-").gsub("/", "_")
+        
+        # Sign JWT with private key
+        private_key = OpenSSL::PKey::RSA.new(service_account["private_key"])
+        signature_input = "#{header_encoded}.#{claims_encoded}"
+        signature = private_key.sign(OpenSSL::Digest::SHA256.new, signature_input)
+        signature_encoded = signature.encode_base64.gsub("=", "").gsub("+", "-").gsub("/", "_")
+        
+        jwt = "#{header_encoded}.#{claims_encoded}.#{signature_encoded}"
+        
+        # Exchange JWT for access token
         response = post("https://oauth2.googleapis.com/token").
           payload(
-            client_id: connection["client_id"],
-            client_secret: connection["client_secret"],
-            grant_type: "authorization_code",
-            code: auth_code,
-            redirect_uri: redirect_uri
+            grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            assertion: jwt
           ).
           request_format_www_form_urlencoded
         
         {
           access_token: response["access_token"],
-          refresh_token: response["refresh_token"]
+          expires_in: response["expires_in"]
         }
       end,
       
-      refresh: lambda do |connection, refresh_token|
-        response = post("https://oauth2.googleapis.com/token").
-          payload(
-            client_id: connection["client_id"],
-            client_secret: connection["client_secret"],
-            grant_type: "refresh_token",
-            refresh_token: refresh_token
-          ).
-          request_format_www_form_urlencoded
-        
-        { access_token: response["access_token"] }
-      end,
-      
-      client_id: lambda do |connection|
-        connection["client_id"]
-      end,
-      
-      client_secret: lambda do |connection|
-        connection["client_secret"]
-      end,
-      
-      scopes: lambda do |connection|
-        [
-          "https://www.googleapis.com/auth/drive.readonly",
-          "https://www.googleapis.com/auth/devstorage.read_write",
-          "openid",
-          "email",
-          "profile"
-        ]
+      refresh: lambda do |connection, authorization|
+        # Service accounts don't use refresh tokens
+        # Just acquire a new token using the same JWT process
+        call(:acquire, connection)
       end,
       
       detect_on: [401],
