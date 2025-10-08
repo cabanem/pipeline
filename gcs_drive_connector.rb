@@ -121,6 +121,18 @@
   end,
 
   object_definitions: {
+    drive_change: {
+      fields: lambda do |object_definitions|
+        [
+          { name: 'change_type' },
+          { name: 'time' },
+          { name: 'removed', type: 'boolean' },
+          { name: 'file_id' },
+          { name: 'file', type: 'object', properties: object_definitions['drive_file'] }
+        ]
+      end
+    },
+
     drive_file: {
       fields: lambda do
         [
@@ -180,6 +192,162 @@
   },
 
   actions: {
+    # DRIVE: POLL
+    drive_changes_poll: {
+      title: 'Drive: Changes (poll page)',
+      subtitle: 'Fetch a page of Drive changes. Provide page_token to continue.',
+      help: {
+        body: 'If "page_token" is blank, the action fetches a new "startPageToken" and immediately reads the first page from it. Use "next_page_token" from the output to get the next page; when no more pages remain, the response may include "new_start_page_token" to persist for the next polling cycle.'
+      },
+
+      input_fields: lambda do
+        [
+          { name: 'page_token', label: 'Page token', hint: 'Use the prior next_page_token to continue.' },
+          { name: 'start_page_token', hint: 'Used only when page_token is blank; the action auto-fetches one if this is blank too.' },
+          { name: 'page_size', type: 'integer', default: 100, hint: '1–1000' },
+          { name: 'include_removed', type: 'boolean', control_type: 'checkbox', default: false,
+            hint: 'Include tombstones for removed files.' }
+        ]
+      end,
+
+      output_fields: lambda do |object_definitions|
+        [
+          { name: 'changes', type: 'array', of: 'object', properties: object_definitions['drive_change'] },
+          { name: 'count', type: 'integer' },
+          { name: 'has_more', type: 'boolean' },
+          { name: 'next_page_token' },
+          { name: 'new_start_page_token' },
+          { name: 'used_page_token' },
+          { name: 'trace', type: 'array', of: 'object', properties: [
+              { name: 'action' }, { name: 'correlation_id' },
+              { name: 'status', type: 'integer' }, { name: 'url' }, { name: 'dur_ms', type: 'integer' }
+          ]}
+        ]
+      end,
+
+      sample_output: lambda do
+        {
+          'changes' => [
+            {
+              'change_type' => 'file',
+              'time' => '2025-09-30T12:00:00Z',
+              'removed' => false,
+              'file_id' => '1a2b3c',
+              'file' => {
+                'id' => '1a2b3c', 'name' => 'Report.txt', 'mime_type' => 'text/plain',
+                'size' => 42, 'modified_time' => '2025-09-30T12:00:00Z', 'checksum' => 'abc',
+                'owners' => [{ 'displayName' => 'Owner', 'emailAddress' => 'owner@example.com' }]
+              }
+            }
+          ],
+          'count' => 1,
+          'has_more' => false,
+          'next_page_token' => nil,
+          'new_start_page_token' => '12345',
+          'used_page_token' => '12345'
+        }
+      end,
+
+      execute: lambda do |connection, input|
+        include_trace   = connection['include_trace'] == true
+        traces          = []
+        cid             = call('gen_correlation_id')
+
+        # 1. Decide token
+        token = (input['page_token'].to_s.strip)
+        if token == ''
+          token = (input['start_page_token'].to_s.strip)
+        end
+
+        # Auto-get startPageToken when neither provided
+        if token == ''
+          url_tok   = call('build_endpoint_url', :drive, :changes_start_token)
+          started_t = Time.now
+          code_t    = nil
+
+          tok_body = get(url_tok)
+            .params(supportsAllDrives: true)
+            .after_error_response(/.*/) do |code, body, headers, _msg|
+              norm = call('normalize_http_error', code, body, headers, url_tok,
+                          { action: 'Drive getStartPageToken', correlation_id: cid, verbose_errors: connection['verbose_errors'] })
+              error(norm)
+            end
+            .after_response do |code, body, _headers|
+              code_t = code.to_i
+              body
+            end
+
+          dur_t = ((Time.now - started_t) * 1000.0).round
+          traces << { 'action' => 'Drive getStartPageToken', 'correlation_id' => cid, 'status' => code_t, 'url' => url_tok, 'dur_ms' => dur_t } if include_trace
+          token = (tok_body['startPageToken'] || '').to_s
+          error('Failed to acquire startPageToken') if token == ''
+        end
+
+        # 2. Fetch page of changes
+        page_size = [[(input['page_size'] || 100).to_i, 1].max, 1000].min
+        url_chg   = call('build_endpoint_url', :drive, :changes)
+        started_c = Time.now
+        code_c    = nil
+
+        fields = 'nextPageToken,newStartPageToken,changes(changeType,time,removed,fileId,file(id,name,mimeType,modifiedTime,size,md5Checksum,owners(displayName,emailAddress)))'
+
+        body = get(url_chg)
+          .params(
+            pageToken: token,
+            pageSize: page_size,
+            includeRemoved: input['include_removed'] == true,
+            supportsAllDrives: true,
+            fields: fields
+          )
+          .after_error_response(/.*/) do |code, resp_body, headers, _msg|
+            norm = call('normalize_http_error', code, resp_body, headers, url_chg,
+                        { action: 'Drive changes.list', correlation_id: cid, verbose_errors: connection['verbose_errors'] })
+            error(norm)
+          end
+          .after_response do |code, resp_body, _headers|
+            code_c = code.to_i
+            resp_body
+          end
+
+        dur_c = ((Time.now - started_c) * 1000.0).round
+        traces << { 'action' => 'Drive changes.list', 'correlation_id' => cid, 'status' => code_c, 'url' => url_chg, 'dur_ms' => dur_c } if include_trace
+
+        # 3. Map output
+        changes = Array(body['changes']).map do |c|
+          f = c['file'] || {}
+          {
+            'change_type' => c['changeType'],
+            'time'        => c['time'],
+            'removed'     => !!c['removed'],
+            'file_id'     => c['fileId'],
+            'file'        => {
+              'id'            => f['id'],
+              'name'          => f['name'],
+              'mime_type'     => f['mimeType'],
+              'size'          => (f['size'] || 0).to_i,
+              'modified_time' => f['modifiedTime'],
+              'checksum'      => f['md5Checksum'],
+              'owners'        => Array(f['owners']).map { |o| { 'displayName' => o['displayName'], 'emailAddress' => o['emailAddress'] } }
+            }
+          }
+        end
+
+        next_tok = body['nextPageToken']
+        new_start = body['newStartPageToken']
+
+        out = {
+          'changes'              => changes,
+          'count'                => changes.length,
+          'has_more'             => !(next_tok.nil? || next_tok.to_s == ''),
+          'next_page_token'      => next_tok,
+          'new_start_page_token' => new_start,
+          'used_page_token'      => token
+        }
+        out['trace'] = traces if include_trace
+        out
+      end
+    },
+
     # DRIVE: LIST
     drive_list_files: {
       title: 'Drive: List files',
@@ -1384,7 +1552,142 @@
           'summary'  => { 'total' => ids.length, 'success' => uploaded.length, 'failed' => failed.length }
         }
       end
+    },
+
+    devtools_drive_changes_smoke: {
+      title: 'DEV: Drive changes smoke',
+      subtitle: 'Fetch start token and walk N pages to validate paging/tokens',
+      help: { body: 'Development-only helper. Keep max_pages small in shared orgs.' },
+
+      input_fields: lambda do
+        [
+          { name: 'start_page_token', hint: 'Optional. If blank, fetched automatically.' },
+          { name: 'max_pages', type: 'integer', default: 1 },
+          { name: 'page_size', type: 'integer', default: 50 },
+          { name: 'include_removed', type: 'boolean', control_type: 'checkbox', default: false }
+        ]
+      end,
+
+      output_fields: lambda do
+        [
+          { name: 'pages_fetched', type: 'integer' },
+          { name: 'total_changes', type: 'integer' },
+          { name: 'removed_count', type: 'integer' },
+          { name: 'next_page_token' },
+          { name: 'new_start_page_token' },
+          { name: 'page_tokens', type: 'array', of: 'string' },
+          { name: 'sample_changes', type: 'array', of: 'object', properties: [
+              { name: 'change_type' }, { name: 'time' }, { name: 'removed', type: 'boolean' }, { name: 'file_id' }, { name: 'file_name' }
+          ]},
+          { name: 'trace', type: 'array', of: 'object', properties: [
+              { name: 'action' }, { name: 'correlation_id' },
+              { name: 'status', type: 'integer' }, { name: 'url' }, { name: 'dur_ms', type: 'integer' }
+          ]}
+        ]
+      end,
+
+      sample_output: lambda do
+        {
+          'pages_fetched' => 1,
+          'total_changes' => 3,
+          'removed_count' => 1,
+          'next_page_token' => 'p2',
+          'new_start_page_token' => nil,
+          'page_tokens' => ['p1'],
+          'sample_changes' => [
+            { 'change_type' => 'file', 'time' => '2025-09-30T12:00:00Z', 'removed' => false, 'file_id' => '1a2b3c', 'file_name' => 'Report.txt' }
+          ]
+        }
+      end,
+
+      execute: lambda do |connection, input|
+        include_trace = connection['include_trace'] == true
+        traces        = []
+        cid           = call('gen_correlation_id')
+
+        url_tok = call('build_endpoint_url', :drive, :changes_start_token)
+        url_chg = call('build_endpoint_url', :drive, :changes)
+
+        # Acquire or use provided start token
+        token = (input['start_page_token'].to_s.strip)
+        if token == ''
+          started = Time.now
+          code    = nil
+          tbody = get(url_tok)
+            .params(supportsAllDrives: true)
+            .after_error_response(/.*/) do |c, b, h, _|
+              error(call('normalize_http_error', c, b, h, url_tok, { action: 'Drive getStartPageToken', correlation_id: cid, verbose_errors: connection['verbose_errors'] }))
+            end
+            .after_response { |c, b, _| code = c.to_i; b }
+          dur = ((Time.now - started) * 1000.0).round
+          traces << { 'action' => 'Drive getStartPageToken', 'correlation_id' => cid, 'status' => code, 'url' => url_tok, 'dur_ms' => dur } if include_trace
+          token = (tbody['startPageToken'] || '').to_s
+          error('Failed to acquire startPageToken') if token == ''
+        end
+
+        max_pages  = [[(input['max_pages'] || 1).to_i, 1].max, 20].min
+        page_size  = [[(input['page_size'] || 50).to_i, 1].max, 1000].min
+        include_removed = input['include_removed'] == true
+
+        fields = 'nextPageToken,newStartPageToken,changes(changeType,time,removed,fileId,file(id,name))'
+
+        pages   = 0
+        total   = 0
+        removed = 0
+        tokens  = []
+        last_next = nil
+        last_new  = nil
+        samples   = []
+
+        while pages < max_pages && token && token != ''
+          started = Time.now
+          code    = nil
+          body = get(url_chg)
+            .params(pageToken: token, pageSize: page_size, includeRemoved: include_removed, supportsAllDrives: true, fields: fields)
+            .after_error_response(/.*/) do |c, b, h, _|
+              error(call('normalize_http_error', c, b, h, url_chg, { action: 'Drive changes.list', correlation_id: cid, verbose_errors: connection['verbose_errors'] }))
+            end
+            .after_response { |c, b, _| code = c.to_i; b }
+          dur = ((Time.now - started) * 1000.0).round
+          traces << { 'action' => 'Drive changes.list', 'correlation_id' => cid, 'status' => code, 'url' => url_chg, 'dur_ms' => dur } if include_trace
+
+          tokens << token
+          arr = Array(body['changes'])
+          total += arr.length
+          removed += arr.count { |c| c['removed'] }
+
+          # keep a tiny sample for visual inspection
+          arr.first(3 - samples.length).each do |c|
+            samples << {
+              'change_type' => c['changeType'],
+              'time'        => c['time'],
+              'removed'     => !!c['removed'],
+              'file_id'     => c['fileId'],
+              'file_name'   => (c.dig('file', 'name') || '')
+            }
+          end
+
+          last_next = body['nextPageToken']
+          last_new  = body['newStartPageToken']
+          token     = last_next # advance
+          pages    += 1
+          break if token.nil? || token == ''
+        end
+
+        out = {
+          'pages_fetched'        => pages,
+          'total_changes'        => total,
+          'removed_count'        => removed,
+          'next_page_token'      => last_next,
+          'new_start_page_token' => last_new,
+          'page_tokens'          => tokens,
+          'sample_changes'       => samples
+        }
+        out['trace'] = traces if include_trace
+        out
+      end
     }
+
   },
 
   methods: {
@@ -1422,6 +1725,8 @@
           fid = (args[0] || '').to_s
           error('fileId required') if fid == ''
           "#{base}/files/#{fid}/export"
+        when 'changes'            then "#{base}/changes"
+        when 'changes_start_token' then "#{base}/changes/startPageToken"
         else
           error("Unknown drive op=#{o}")
         end
