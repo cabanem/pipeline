@@ -1,7 +1,7 @@
 {
   title: 'Drive Utilities',
   description: 'Google Drive utilities with resilience, telemetry, and multi-auth',
-  version: "0.3.0",
+  version: "0.4.0",
   custom_action: false,
 
   connection: {
@@ -267,6 +267,7 @@
 
           tok_body = get(url_tok)
             .params(supportsAllDrives: true)
+            .headers('X-Correlation-Id' => cid)
             .after_error_response(/.*/) do |code, body, headers, _msg|
               norm = call('normalize_http_error', code, body, headers, url_tok,
                           { action: 'Drive getStartPageToken', correlation_id: cid, verbose_errors: connection['verbose_errors'] })
@@ -299,6 +300,7 @@
             supportsAllDrives: true,
             fields: fields
           )
+          .headers('X-Correlation-Id' => cid)
           .after_error_response(/.*/) do |code, resp_body, headers, _msg|
             norm = call('normalize_http_error', code, resp_body, headers, url_chg,
                         { action: 'Drive changes.list', correlation_id: cid, verbose_errors: connection['verbose_errors'] })
@@ -416,9 +418,6 @@
           else
             'user'
           end
-
-        include_trace = connection['include_trace'] == true
-        traces = []
 
         # 4) HTTP request (no wrapper)
         include_trace = connection['include_trace'] == true
@@ -744,27 +743,36 @@
             # 2. Metadata (resolve shortcut once)
             fid = raw_id
             url_meta = call('build_endpoint_url', :drive, :file, fid)
-            meta = call('http_request',
-              method: :get, url: url_meta,
-              params: { fields: 'id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress),shortcutDetails(targetId,targetMimeType)', supportsAllDrives: true },
-              headers: { 'X-Correlation-Id' => per_cid },
-              context: { action: 'Drive get (meta)', correlation_id: per_cid, url: url_meta, verbose_errors: connection['verbose_errors'] }
-            )
-            traces << call('trace_pack', { action: 'Drive get (meta)', correlation_id: per_cid, url: url_meta }, meta) if include_trace
-            mdata = meta['data'].is_a?(Hash) ? meta['data'] : {}
+            started_m = Time.now
+            code_m    = nil
+            meta_body = get(url_meta)
+              .params(fields: 'id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress),shortcutDetails(targetId,targetMimeType)', supportsAllDrives: true)
+              .headers('X-Correlation-Id' => per_cid)
+              .after_error_response(/.*/) do |c, b, h, _|
+                error(call('normalize_http_error', c, b, h, url_meta,
+                           { action: 'Drive get (meta)', correlation_id: per_cid, verbose_errors: connection['verbose_errors'] }))
+              end
+              .after_response { |c, b, _| code_m = c.to_i; b }
+            traces << { 'action' => 'Drive get (meta)', 'correlation_id' => per_cid, 'status' => code_m, 'url' => url_meta, 'dur_ms' => ((Time.now - started_m) * 1000.0).round } if include_trace
+            mdata = meta_body.is_a?(Hash) ? meta_body : {}
 
             if mdata['mimeType'] == 'application/vnd.google-apps.shortcut' && mdata.dig('shortcutDetails', 'targetId')
               fid = mdata.dig('shortcutDetails', 'targetId')
               url_meta2 = call('build_endpoint_url', :drive, :file, fid)
-              meta = call('http_request',
-                method: :get, url: url_meta2,
-                params: { fields: 'id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress)', supportsAllDrives: true },
-                headers: { 'X-Correlation-Id' => per_cid },
-                context: { action: 'Drive get (target meta)', correlation_id: per_cid, url: url_meta2, verbose_errors: connection['verbose_errors'] }
-              )
-              traces << call('trace_pack', { action: 'Drive get (target meta)', correlation_id: per_cid, url: url_meta2 }, meta) if include_trace
-              mdata = meta['data'].is_a?(Hash) ? meta['data'] : {}
+              started_m2 = Time.now
+              code_m2    = nil
+              meta_body = get(url_meta2)
+                .params(fields: 'id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress)', supportsAllDrives: true)
+                .headers('X-Correlation-Id' => per_cid)
+                .after_error_response(/.*/) do |c, b, h, _|
+                  error(call('normalize_http_error', c, b, h, url_meta2,
+                             { action: 'Drive get (target meta)', correlation_id: per_cid, verbose_errors: connection['verbose_errors'] }))
+                end
+                .after_response { |c, b, _| code_m2 = c.to_i; b }
+              traces << { 'action' => 'Drive get (target meta)', 'correlation_id' => per_cid, 'status' => code_m2, 'url' => url_meta2, 'dur_ms' => ((Time.now - started_m2) * 1000.0).round } if include_trace
+              mdata = meta_body.is_a?(Hash) ? meta_body : {}
             end
+
 
             mime = (mdata['mimeType'] || '').to_s
             out = {
@@ -787,15 +795,20 @@
                 export_mime = call('get_export_mime', mime)
                 error("Export mapping not defined for Editors type #{mime}.") if export_mime.nil?
                 url_exp = call('build_endpoint_url', :drive, :export, fid)
-                exp = call('http_request',
-                  method: :get, url: url_exp,
-                  params: { mimeType: export_mime, supportsAllDrives: true },
-                  headers: { 'X-Correlation-Id' => per_cid },
-                  raw_response: true,
-                  context: { action: 'Drive export (text)', correlation_id: per_cid, url: url_exp, verbose_errors: connection['verbose_errors'] }
-                )
-                traces << call('trace_pack', { action: 'Drive export (text)', correlation_id: per_cid, url: url_exp }, exp) if include_trace
-                txt = call('safe_utf8', exp['data'])
+                started_e = Time.now
+                code_e    = nil
+                exp_body = get(url_exp)
+                  .params(mimeType: export_mime, supportsAllDrives: true)
+                  .headers('X-Correlation-Id' => per_cid)
+                  .response_format_raw
+                  .after_error_response(/.*/) do |c, b, h, _|
+                    error(call('normalize_http_error', c, b, h, url_exp,
+                               { action: 'Drive export (text)', correlation_id: per_cid, verbose_errors: connection['verbose_errors'] }))
+                  end
+                  .after_response { |c, b, _| code_e = c.to_i; b }
+                traces << { 'action' => 'Drive export (text)', 'correlation_id' => per_cid, 'status' => code_e, 'url' => url_exp, 'dur_ms' => ((Time.now - started_e) * 1000.0).round } if include_trace
+                txt = call('safe_utf8', exp_body)
+
                 txt = call('strip_urls_from_text', txt) if strip
                 out['text_content'] = txt
                 out['exported_as']  = export_mime
@@ -803,15 +816,19 @@
               else
                 error("Non-text file (#{mime}); use content_mode=bytes or none.") unless is_textual.call(mime)
                 url_dl = call('build_endpoint_url', :drive, :download, fid)
-                dl = call('http_request',
-                  method: :get, url: url_dl,
-                  params: { supportsAllDrives: true },
-                  headers: { 'X-Correlation-Id' => per_cid },
-                  raw_response: true,
-                  context: { action: 'Drive download (text)', correlation_id: per_cid, url: url_dl, verbose_errors: connection['verbose_errors'] }
-                )
-                traces << call('trace_pack', { action: 'Drive download (text)', correlation_id: per_cid, url: url_dl }, dl) if include_trace
-                txt = call('safe_utf8', dl['data'])
+                started_d = Time.now
+                code_d    = nil
+                dl_body = get(url_dl)
+                  .params(supportsAllDrives: true)
+                  .headers('X-Correlation-Id' => per_cid)
+                  .response_format_raw
+                  .after_error_response(/.*/) do |c, b, h, _|
+                    error(call('normalize_http_error', c, b, h, url_dl,
+                               { action: 'Drive download (text)', correlation_id: per_cid, verbose_errors: connection['verbose_errors'] }))
+                  end
+                  .after_response { |c, b, _| code_d = c.to_i; b }
+                traces << { 'action' => 'Drive download (text)', 'correlation_id' => per_cid, 'status' => code_d, 'url' => url_dl, 'dur_ms' => ((Time.now - started_d) * 1000.0).round } if include_trace
+                txt = call('safe_utf8', dl_body)
                 txt = call('strip_urls_from_text', txt) if strip
                 out['text_content'] = txt
               end
@@ -819,15 +836,19 @@
             when 'bytes'
               error('Editors files require content_mode=text (export).') if mime.start_with?('application/vnd.google-apps.')
               url_dl = call('build_endpoint_url', :drive, :download, fid)
-              dl = call('http_request',
-                method: :get, url: url_dl,
-                params: { supportsAllDrives: true },
-                headers: { 'X-Correlation-Id' => per_cid },
-                raw_response: true,
-                context: { action: 'Drive download (bytes)', correlation_id: per_cid, url: url_dl, verbose_errors: connection['verbose_errors'] }
-              )
-              traces << call('trace_pack', { action: 'Drive download (bytes)', correlation_id: per_cid, url: url_dl }, dl) if include_trace
-              out['content_bytes'] = [dl['data'].to_s].pack('m0')
+              started_db = Time.now
+              code_db    = nil
+              dl_body = get(url_dl)
+                .params(supportsAllDrives: true)
+                .headers('X-Correlation-Id' => per_cid)
+                .response_format_raw
+                .after_error_response(/.*/) do |c, b, h, _|
+                  error(call('normalize_http_error', c, b, h, url_dl,
+                             { action: 'Drive download (bytes)', correlation_id: per_cid, verbose_errors: connection['verbose_errors'] }))
+                end
+                .after_response { |c, b, _| code_db = c.to_i; b }
+              traces << { 'action' => 'Drive download (bytes)', 'correlation_id' => per_cid, 'status' => code_db, 'url' => url_dl, 'dur_ms' => ((Time.now - started_db) * 1000.0).round } if include_trace
+              out['content_bytes'] = [dl_body.to_s].pack('m0')
 
             else
               error("Unsupported content_mode=#{mode}. Use none|text|bytes.")
@@ -1279,8 +1300,6 @@
 
         end
 
-        up = resp['data'].is_a?(Hash) ? resp['data'] : {}
-
         # Map output
         gmd = {
           'bucket'       => up['bucket']       || bucket,
@@ -1477,26 +1496,31 @@
           per_cid = call('gen_correlation_id')
           begin
             # 1. Get Drive metadata (resolve shortcuts once)
-            fid = raw_id
-            meta = call('http_request',
-              method: :get,
-              url:    call('build_endpoint_url', :drive, :file, fid),
-              params: { fields: 'id,name,mimeType,modifiedTime,md5Checksum,shortcutDetails(targetId,targetMimeType)', supportsAllDrives: true },
-              headers: { 'X-Correlation-Id' => per_cid },
-              context: { action: 'Transfer: Get Drive file', file_id: fid, correlation_id: per_cid, verbose_errors: connection['verbose_errors'] }
-            )
-            fm = meta['data'].is_a?(Hash) ? meta['data'] : {}
+            url_meta = call('build_endpoint_url', :drive, :file, fid)
+            started_m = Time.now
+            code_m    = nil
+            meta_body = get(url_meta)
+              .params(fields: 'id,name,mimeType,modifiedTime,md5Checksum,shortcutDetails(targetId,targetMimeType)', supportsAllDrives: true)
+              .headers('X-Correlation-Id' => per_cid)
+              .after_error_response(/.*/) do |c,b,h,_|
+                error(call('normalize_http_error', c, b, h, url_meta,
+                           { action: 'Transfer: Get Drive file', correlation_id: per_cid, verbose_errors: connection['verbose_errors'] }))
+              end
+              .after_response { |c,b,_| code_m = c.to_i; b }
+            fm = meta_body.is_a?(Hash) ? meta_body : {}
 
             if fm['mimeType'] == 'application/vnd.google-apps.shortcut' && fm.dig('shortcutDetails', 'targetId')
               fid = fm.dig('shortcutDetails', 'targetId')
-              meta = call('http_request',
-                method: :get,
-                url:    call('build_endpoint_url', :drive, :file, fid),
-                params: { fields: 'id,name,mimeType,modifiedTime,md5Checksum', supportsAllDrives: true },
-                headers: { 'X-Correlation-Id' => per_cid },
-                context: { action: 'Transfer: Get target file', file_id: fid, correlation_id: per_cid, verbose_errors: connection['verbose_errors'] }
-              )
-              fm = meta['data'].is_a?(Hash) ? meta['data'] : {}
+              url_meta2 = call('build_endpoint_url', :drive, :file, fid)
+              meta_body = get(url_meta2)
+                .params(fields: 'id,name,mimeType,modifiedTime,md5Checksum', supportsAllDrives: true)
+                .headers('X-Correlation-Id' => per_cid)
+                .after_error_response(/.*/) do |c,b,h,_|
+                  error(call('normalize_http_error', c, b, h, url_meta2,
+                             { action: 'Transfer: Get target file', correlation_id: per_cid, verbose_errors: connection['verbose_errors'] }))
+                end
+                .after_response { |_c,b,_| b }
+              fm = meta_body.is_a?(Hash) ? meta_body : {}
             end
 
             mime = (fm['mimeType'] || '').to_s
@@ -1515,26 +1539,30 @@
               export_mime = call('get_export_mime', mime)
               error("Export mapping not defined for Editors type #{mime}.") if export_mime.nil?
 
-              exp = call('http_request',
-                method: :get,
-                url:    call('build_endpoint_url', :drive, :export, fid),
-                params: { mimeType: export_mime, supportsAllDrives: true },
-                headers: { 'X-Correlation-Id' => per_cid },
-                raw_response: true,
-                context: { action: 'Transfer: Export Drive file', file_id: fid, correlation_id: per_cid, verbose_errors: connection['verbose_errors'] }
-              )
-              bytes = exp['data']
+              url_exp = call('build_endpoint_url', :drive, :export, fid)
+              exp_body = get(url_exp)
+                .params(mimeType: export_mime, supportsAllDrives: true)
+                .headers('X-Correlation-Id' => per_cid)
+                .response_format_raw
+                .after_error_response(/.*/) do |c,b,h,_|
+                  error(call('normalize_http_error', c, b, h, url_exp,
+                             { action: 'Transfer: Export Drive file', correlation_id: per_cid, verbose_errors: connection['verbose_errors'] }))
+                end
+                .after_response { |_c,b,_| b }
+              bytes = exp_body
               upload_mime = export_mime
             else
-              dl = call('http_request',
-                method: :get,
-                url:    call('build_endpoint_url', :drive, :download, fid),
-                params: { supportsAllDrives: true },
-                headers: { 'X-Correlation-Id' => per_cid },
-                raw_response: true,
-                context: { action: 'Transfer: Download Drive file', file_id: fid, correlation_id: per_cid, verbose_errors: connection['verbose_errors'] }
-              )
-              bytes = dl['data']
+              url_dl = call('build_endpoint_url', :drive, :download, fid)
+              dl_body = get(url_dl)
+                .params(supportsAllDrives: true)
+                .headers('X-Correlation-Id' => per_cid)
+                .response_format_raw
+                .after_error_response(/.*/) do |c,b,h,_|
+                  error(call('normalize_http_error', c, b, h, url_dl,
+                             { action: 'Transfer: Download Drive file', correlation_id: per_cid, verbose_errors: connection['verbose_errors'] }))
+                end
+                .after_response { |_c,b,_| b }
+              bytes = dl_body
               upload_mime = (mime == '' ? 'application/octet-stream' : mime)
             end
 
@@ -1760,107 +1788,6 @@
     end,
 
     # ---------- HTTP wrapper with retries, JSON-error normalization ----------
-
-    http_request: lambda do |opts|
-      method            = (opts[:method] || opts['method'] || :get).to_sym
-      url               = (opts[:url] || opts['url']).to_s
-      params_in         = (opts[:params] || opts['params'] || {})
-      headers_in        = (opts[:headers] || opts['headers'] || {})
-      payload_in        = opts[:payload].nil? ? opts['payload'] : opts[:payload]
-      raw_response      = !!(opts[:raw_response] || opts['raw_response'])
-      raw_body          = !!(opts[:raw_body] || opts['raw_body'])
-      www_form_urlenc   = !!(opts[:www_form_urlencoded] || opts['www_form_urlencoded'])
-      context           = (opts[:context] || opts['context'] || {}) # { action, correlation_id, verbose_errors }
-
-      # Build request
-      max_retries = 5
-      attempt = 0
-
-      begin
-        attempt += 1
-        started = Time.now
-
-        req =
-          case method
-          when :get    then get(url)
-          when :post   then post(url)
-          when :put    then put(url)
-          when :patch  then patch(url)
-          when :delete then delete(url)
-          else
-            error("Unsupported HTTP method=#{method}")
-          end
-
-        # Query params (remove blanks)
-        params = (params_in || {}).reject { |_k, v| v.nil? || v.to_s == '' }
-        req = req.params(params) unless params.empty?
-
-        # Headers
-        hdrs = {}
-        headers_in.each { |k, v| hdrs[k] = v } if headers_in.is_a?(Hash)
-        req = req.headers(hdrs) unless hdrs.empty?
-
-        # Request body
-        if [:post, :put, :patch].include?(method) || (method == :delete && !raw_body.nil? && !payload_in.nil?)
-          if raw_body
-            # Send bytes/string as-is
-            req = req.payload(payload_in.to_s)
-          elsif www_form_urlenc
-            body = call('build_query_string', payload_in || {})
-            req = req.headers('Content-Type' => 'application/x-www-form-urlencoded')
-            req = req.payload(body)
-          else
-            # Default: JSON (Workato handles JSON serialization for hashes)
-            req = req.payload(payload_in) unless payload_in.nil?
-          end
-        end
-
-        req = req.response_format_raw if raw_response
-
-        # Normalize errors; we’ll raise and possibly retry.
-        req = req.after_error_response(/.*/) do |code, body, resp_headers, message|
-          norm = call('normalize_http_error', code, body, resp_headers, url, context)
-          error(norm) # raises
-        end
-
-        # Success path → capture code/body/headers
-        result = req.after_response do |code, body, resp_headers|
-          dur_ms = ((Time.now - started) * 1000.0).round
-          { 'data' => body, 'status' => code.to_i, 'headers' => resp_headers, 'duration' => dur_ms }
-        end
-
-        result
-
-      rescue => e
-        retryable, wait_s = call('should_retry?', e.message, attempt, max_retries)
-        if retryable
-          Kernel.sleep(wait_s)
-          retry
-        end
-        error(e.message) # give up with normalized message
-      end
-    end,
-
-    should_retry?: lambda do |message, attempt, max_retries|
-      # Google-style and HTTP-level retry signals
-      msg = message.to_s
-      retry_signals = (
-        msg.include?('HTTP 429') ||
-        msg.include?('userRateLimitExceeded') ||
-        msg.include?('rateLimitExceeded') ||
-        msg.include?('backendError') ||
-        msg.include?('internalError') ||
-        msg.include?('HTTP 5')
-      )
-      return [false, 0] unless retry_signals && attempt < max_retries
-
-      base = 0.5 # seconds
-      cap  = 16.0
-      wait = [base * (2 ** (attempt - 1)), cap].min
-      # Full jitter (0.5x–1.5x)
-      jitter = 0.5 + rand
-      [true, (wait * jitter)]
-    end,
 
     normalize_http_error: lambda do |code, body, headers, url, context|
       status_i = code.to_i
