@@ -293,7 +293,7 @@
         ]
       end,
       output_fields: lambda do |object_definitions|
-        object_definitions['drive_file_full'][:fields]
+        object_definitions['drive_file_full']
       end,
       execute: lambda do |_connection, input|
         file_id = call(:extract_drive_id, input['file_id_or_url'])
@@ -570,7 +570,7 @@
         [
           { name: 'bucket', optional: false },
           { name: 'gcs_prefix', optional: true, hint: 'E.g. "ingest/". No file ID is added; collisions are possible by design.' },
-          { name: 'drive_file_ids', type: 'array', of: 'string', optional: false, hint: 'IDs or URLs' },
+          { name: 'drive_file_ids', type: 'array', of: 'string', control_type: 'text-area', optional: false, hint: 'IDs or URLs' },
           { name: 'content_mode_for_editors', control_type: 'select', pick_list: 'editors_modes', optional: true, default: 'text' }
         ]
       end,
@@ -586,9 +586,13 @@
         uploaded = []
         failed = []
 
-        (input['drive_file_ids'] || []).each do |raw|
+        drive_files = (input['drive_file_ids'] || []).csv
+
+        drive_files.each do |raw|
           begin
-            file_id = call(:extract_drive_id, raw)
+            file_id = call(:extract_drive_id, raw) # trim whitespace
+            next if file_id.blank? # skip if line empty after strip
+            
             meta = call(:drive_get_meta_resolving_shortcut, file_id)
             fname = meta['name'].to_s
             object_name = "#{prefix}#{fname}"
