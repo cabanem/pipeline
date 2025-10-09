@@ -1,0 +1,743 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Vertex AI – Upstream Endpoint Contracts",
+    "version": "0.2.1",
+    "description": "Per-endpoint/method contracts for Vertex AI (Model Garden & Generative AI), plus OAuth/OIDC and GCS utilities used by the connector."
+  },
+
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": { "type": "http", "scheme": "bearer" }
+    },
+
+    "parameters": {
+      "XCorrelationId": {
+        "name": "X-Correlation-Id",
+        "in": "header",
+        "required": false,
+        "schema": { "type": "string" },
+        "description": "Workato correlation id; added by connector."
+      }
+    },
+
+    "schemas": {
+      "GoogleJsonError": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": { "type": "integer" },
+              "message": { "type": "string" },
+              "status": { "type": "string" },
+              "details": { "type": "array", "items": { "type": "object" } }
+            },
+            "required": ["code", "message"]
+          }
+        },
+        "required": ["error"]
+      },
+
+      "Content": {
+        "type": "object",
+        "properties": {
+          "role": { "type": "string", "enum": ["user", "model"] },
+          "parts": { "type": "array", "items": { "$ref": "#/components/schemas/Part" }, "minItems": 1 }
+        },
+        "required": ["role", "parts"]
+      },
+
+      "Part": {
+        "type": "object",
+        "properties": {
+          "text": { "type": "string" },
+          "inlineData": {
+            "type": "object",
+            "properties": {
+              "mimeType": { "type": "string" },
+              "data": { "type": "string", "description": "Base64-encoded bytes" }
+            },
+            "additionalProperties": false
+          },
+          "fileData": {
+            "type": "object",
+            "properties": {
+              "mimeType": { "type": "string" },
+              "fileUri": { "type": "string" }
+            },
+            "additionalProperties": false
+          },
+          "functionCall": { "type": "object", "additionalProperties": true },
+          "functionResponse": { "type": "object", "additionalProperties": true },
+          "executableCode": { "type": "object", "additionalProperties": true },
+          "codeExecutionResult": { "type": "object", "additionalProperties": true }
+        },
+        "additionalProperties": true
+      },
+
+      "Tool": {
+        "type": "object",
+        "properties": {
+          "googleSearch": { "type": "object", "additionalProperties": true },
+          "retrieval": {
+            "type": "object",
+            "properties": {
+              "vertexAiSearch": {
+                "type": "object",
+                "properties": {
+                  "datastore": { "type": "string" },
+                  "servingConfig": { "type": "string" }
+                },
+                "additionalProperties": true
+              }
+            },
+            "additionalProperties": true
+          },
+          "codeExecution": { "type": "object", "additionalProperties": true },
+          "functionDeclarations": {
+            "type": "array",
+            "items": { "type": "object", "additionalProperties": true }
+          }
+        },
+        "additionalProperties": true
+      },
+
+      "SafetySetting": {
+        "type": "object",
+        "properties": {
+          "category": { "type": "string" },
+          "threshold": { "type": "string" }
+        },
+        "additionalProperties": false
+      },
+
+      "GenerationConfig": {
+        "type": "object",
+        "properties": {
+          "temperature": { "type": "number" },
+          "topP": { "type": "number" },
+          "topK": { "type": "integer" },
+          "maxOutputTokens": { "type": "integer" },
+          "candidateCount": { "type": "integer" },
+          "stopSequences": { "type": "array", "items": { "type": "string" } },
+          "responseMimeType": { "type": "string" },
+          "responseSchema": { "type": "object", "additionalProperties": true }
+        },
+        "additionalProperties": true
+      },
+
+      "GenerateContentResponse": {
+        "type": "object",
+        "properties": {
+          "responseId": { "type": "string" },
+          "modelVersion": { "type": "string" },
+          "usageMetadata": {
+            "type": "object",
+            "properties": {
+              "promptTokenCount": { "type": "integer" },
+              "candidatesTokenCount": { "type": "integer" },
+              "totalTokenCount": { "type": "integer" }
+            },
+            "additionalProperties": true
+          },
+          "candidates": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "finishReason": { "type": "string" },
+                "safetyRatings": { "type": "array", "items": { "type": "object" } },
+                "groundingMetadata": { "type": "object", "additionalProperties": true },
+                "content": { "$ref": "#/components/schemas/Content" }
+              },
+              "additionalProperties": true
+            }
+          }
+        },
+        "additionalProperties": true
+      },
+
+      "CountTokensResponse": {
+        "type": "object",
+        "properties": {
+          "totalTokens": { "type": "integer" },
+          "totalBillableCharacters": { "type": "integer" },
+          "promptTokensDetails": { "type": "array", "items": { "type": "object", "additionalProperties": true } }
+        },
+        "required": ["totalTokens"],
+        "additionalProperties": false
+      },
+
+      "EmbeddingsInstance": {
+        "type": "object",
+        "properties": {
+          "content": { "type": "string" },
+          "title": { "type": "string" },
+          "task_type": {
+            "type": "string",
+            "enum": [
+              "RETRIEVAL_QUERY",
+              "RETRIEVAL_DOCUMENT",
+              "SEMANTIC_SIMILARITY",
+              "CLASSIFICATION",
+              "CLUSTERING",
+              "QUESTION_ANSWERING",
+              "FACT_VERIFICATION",
+              "CODE_RETRIEVAL_QUERY"
+            ]
+          }
+        },
+        "required": ["content"],
+        "additionalProperties": false
+      },
+
+      "EmbeddingsParameters": {
+        "type": "object",
+        "properties": {
+          "autoTruncate": { "type": "boolean" },
+          "outputDimensionality": { "type": "integer" }
+        },
+        "additionalProperties": false
+      },
+
+      "EmbeddingsPredictResponse": {
+        "type": "object",
+        "properties": {
+          "predictions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "embeddings": {
+                  "type": "object",
+                  "properties": {
+                    "values": { "type": "array", "items": { "type": "number" } },
+                    "statistics": {
+                      "type": "object",
+                      "properties": {
+                        "truncated": { "type": "boolean" },
+                        "token_count": { "type": "integer" }
+                      },
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": ["values"],
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": ["predictions"],
+        "additionalProperties": false
+      },
+
+      "EndpointPredictResponse": {
+        "type": "object",
+        "properties": {
+          "predictions": { "type": "array", "items": {} },
+          "deployedModelId": { "type": "string" }
+        },
+        "required": ["predictions"],
+        "additionalProperties": false
+      },
+
+      "BatchPredictionJob": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "displayName": { "type": "string" },
+          "model": { "type": "string" },
+          "modelVersionId": { "type": "string" },
+          "state": { "type": "string" },
+          "error": { "type": "object", "additionalProperties": true },
+          "inputConfig": {
+            "type": "object",
+            "properties": {
+              "instancesFormat": {
+                "type": "string",
+                "enum": ["jsonl", "csv", "bigquery", "tf-record", "tf-record-gzip", "file-list", "object", "array"]
+              },
+              "gcsSource": {
+                "type": "object",
+                "properties": { "uris": { "type": "array", "items": { "type": "string" } } },
+                "additionalProperties": false
+              },
+              "bigquerySource": {
+                "type": "object",
+                "properties": { "inputUri": { "type": "string" } },
+                "additionalProperties": false
+              }
+            },
+            "required": ["instancesFormat"],
+            "additionalProperties": false
+          },
+          "outputConfig": {
+            "type": "object",
+            "properties": {
+              "predictionsFormat": { "type": "string", "enum": ["jsonl", "csv", "bigquery"] },
+              "gcsDestination": {
+                "type": "object",
+                "properties": { "outputUriPrefix": { "type": "string" } },
+                "additionalProperties": false
+              },
+              "bigqueryDestination": {
+                "type": "object",
+                "properties": { "outputUri": { "type": "string" } },
+                "additionalProperties": false
+              }
+            },
+            "required": ["predictionsFormat"],
+            "additionalProperties": false
+          },
+          "modelParameters": { "type": "object", "additionalProperties": true },
+          "outputInfo": { "type": "object", "additionalProperties": true },
+          "resourcesConsumed": { "type": "object", "additionalProperties": true },
+          "partialFailures": { "type": "array", "items": { "type": "object" } }
+        },
+        "additionalProperties": true
+      },
+
+      "PublisherModel": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "versionId": { "type": "string" },
+          "displayName": { "type": "string" },
+          "launchStage": { "type": "string" },
+          "frameworks": { "type": "array", "items": { "type": "string" } },
+          "supportedActions": { "type": "object", "additionalProperties": true },
+          "predictSchemata": { "type": "object", "additionalProperties": true }
+        },
+        "additionalProperties": true
+      },
+
+      "PublisherModelsListResponse": {
+        "type": "object",
+        "properties": {
+          "publisherModels": { "type": "array", "items": { "$ref": "#/components/schemas/PublisherModel" } },
+          "nextPageToken": { "type": "string" }
+        },
+        "additionalProperties": false
+      },
+
+      "UploadMultipartMetadata": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "contentType": { "type": "string" },
+          "metadata": { "type": "object", "additionalProperties": { "type": "string" } }
+        },
+        "required": ["name"]
+      }
+    }
+  },
+
+  "paths": {
+    "/v1/{model}:generateContent": {
+      "servers": [{ "url": "https://aiplatform.googleapis.com" }],
+      "post": {
+        "operationId": "aiplatform.publishers.models.generateContent",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "model",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "Format: projects/{project}/locations/{location}/publishers/google/models/{modelId}."
+          },
+          { "$ref": "#/components/parameters/XCorrelationId" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "contents": { "type": "array", "items": { "$ref": "#/components/schemas/Content" } },
+                  "systemInstruction": { "$ref": "#/components/schemas/Content" },
+                  "tools": { "type": "array", "items": { "$ref": "#/components/schemas/Tool" } },
+                  "toolConfig": { "type": "object", "additionalProperties": true },
+                  "safetySettings": { "type": "array", "items": { "$ref": "#/components/schemas/SafetySetting" } },
+                  "generationConfig": { "$ref": "#/components/schemas/GenerationConfig" },
+                  "cachedContent": { "type": "string" }
+                },
+                "required": ["contents"],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "GenerateContent response", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GenerateContentResponse" } } } },
+          "default": { "description": "Error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GoogleJsonError" } } } }
+        },
+        "x-used-by": ["vertex.generate_content.execute"]
+      }
+    },
+
+    "/v1/{model}:countTokens": {
+      "servers": [{ "url": "https://aiplatform.googleapis.com" }],
+      "post": {
+        "operationId": "aiplatform.publishers.models.countTokens",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "model",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "Format: projects/{project}/locations/{location}/publishers/google/models/{modelId}."
+          },
+          { "$ref": "#/components/parameters/XCorrelationId" }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "instances": { "type": "array", "items": {} },
+                  "contents": { "type": "array", "items": { "$ref": "#/components/schemas/Content" } },
+                  "tools": { "type": "array", "items": { "$ref": "#/components/schemas/Tool" } },
+                  "systemInstruction": { "$ref": "#/components/schemas/Content" },
+                  "generationConfig": { "$ref": "#/components/schemas/GenerationConfig" }
+                },
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Token count", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CountTokensResponse" } } } },
+          "default": { "description": "Error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GoogleJsonError" } } } }
+        },
+        "x-used-by": ["vertex.count_tokens.execute"]
+      }
+    },
+
+    "/v1/{model}:predict": {
+      "servers": [{ "url": "https://aiplatform.googleapis.com" }],
+      "post": {
+        "operationId": "aiplatform.publishers.models.predict.embeddings",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "model",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "Embedding model. Format: projects/{project}/locations/{location}/publishers/google/models/{embeddingModelId}."
+          },
+          { "$ref": "#/components/parameters/XCorrelationId" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "instances": { "type": "array", "minItems": 1, "items": { "$ref": "#/components/schemas/EmbeddingsInstance" } },
+                  "parameters": { "$ref": "#/components/schemas/EmbeddingsParameters" }
+                },
+                "required": ["instances"],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Embeddings", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/EmbeddingsPredictResponse" } } } },
+          "default": { "description": "Error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GoogleJsonError" } } } }
+        },
+        "x-used-by": ["vertex.text_embeddings.predict"]
+      }
+    },
+
+    "/v1/{endpoint}:predict": {
+      "servers": [{ "url": "https://aiplatform.googleapis.com" }],
+      "post": {
+        "operationId": "aiplatform.endpoints.predict",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "endpoint",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "Endpoint resource. Format: projects/{project}/locations/{location}/endpoints/{endpointId}"
+          },
+          { "$ref": "#/components/parameters/XCorrelationId" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": { "instances": { "type": "array", "items": {} }, "parameters": {} },
+                "required": ["instances"],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Predict response", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/EndpointPredictResponse" } } } },
+          "default": { "description": "Error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GoogleJsonError" } } } }
+        },
+        "x-used-by": ["vertex.endpoints.predict"]
+      }
+    },
+
+    "/v1/projects/{project}/locations/{location}/batchPredictionJobs": {
+      "servers": [{ "url": "https://aiplatform.googleapis.com" }],
+      "post": {
+        "operationId": "aiplatform.batchPredictionJobs.create",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "project", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "location", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "$ref": "#/components/parameters/XCorrelationId" }
+        ],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BatchPredictionJob" } } } },
+        "responses": {
+          "200": { "description": "Created job", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BatchPredictionJob" } } } },
+          "default": { "description": "Error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GoogleJsonError" } } } }
+        },
+        "x-used-by": ["vertex.batch_prediction_jobs.create"]
+      }
+    },
+
+    "/v1/projects/{project}/locations/{location}/batchPredictionJobs/{jobId}": {
+      "servers": [{ "url": "https://aiplatform.googleapis.com" }],
+      "get": {
+        "operationId": "aiplatform.batchPredictionJobs.get",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "project", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "location", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "jobId", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "$ref": "#/components/parameters/XCorrelationId" }
+        ],
+        "responses": {
+          "200": { "description": "Batch job", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BatchPredictionJob" } } } },
+          "default": { "description": "Error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GoogleJsonError" } } } }
+        },
+        "x-used-by": ["vertex.batch_prediction_jobs.get"]
+      }
+    },
+
+    "/v1beta1/{parent}/models": {
+      "servers": [{ "url": "https://aiplatform.googleapis.com" }],
+      "get": {
+        "operationId": "aiplatform.publishers.models.list",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "parent",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "Format: publishers/{publisher} (e.g., publishers/google)."
+          },
+          { "name": "filter", "in": "query", "schema": { "type": "string" } },
+          { "name": "pageSize", "in": "query", "schema": { "type": "integer", "minimum": 1 } },
+          { "name": "pageToken", "in": "query", "schema": { "type": "string" } },
+          { "name": "view", "in": "query", "schema": { "type": "string" } },
+          { "name": "orderBy", "in": "query", "schema": { "type": "string" } },
+          { "name": "languageCode", "in": "query", "schema": { "type": "string" } },
+          { "name": "listAllVersions", "in": "query", "schema": { "type": "boolean" } },
+          { "$ref": "#/components/parameters/XCorrelationId" }
+        ],
+        "responses": {
+          "200": { "description": "Publisher models", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PublisherModelsListResponse" } } } },
+          "default": { "description": "Error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GoogleJsonError" } } } }
+        },
+        "x-used-by": ["vertex.models.list"]
+      }
+    },
+
+    "/o/oauth2/v2/auth": {
+      "servers": [{ "url": "https://accounts.google.com" }],
+      "get": {
+        "operationId": "oauth2.authorize",
+        "parameters": [
+          { "name": "client_id", "in": "query", "required": true, "schema": { "type": "string" } },
+          { "name": "response_type", "in": "query", "required": true, "schema": { "type": "string", "enum": ["code"] } },
+          { "name": "scope", "in": "query", "required": true, "schema": { "type": "string" } },
+          { "name": "access_type", "in": "query", "schema": { "type": "string", "enum": ["offline"] } },
+          { "name": "include_granted_scopes", "in": "query", "schema": { "type": "string", "enum": ["true"] } },
+          { "name": "prompt", "in": "query", "schema": { "type": "string", "enum": ["consent"] } },
+          { "name": "redirect_uri", "in": "query", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": { "302": { "description": "Redirect to consent/login" } },
+        "x-used-by": ["connection.authorization.options.oauth2.authorization_url"]
+      }
+    },
+
+    "/token": {
+      "servers": [{ "url": "https://oauth2.googleapis.com" }],
+      "post": {
+        "operationId": "oauth2.token",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "title": "authorization_code",
+                    "type": "object",
+                    "properties": {
+                      "client_id": { "type": "string" },
+                      "client_secret": { "type": "string" },
+                      "grant_type": { "type": "string", "const": "authorization_code" },
+                      "code": { "type": "string" },
+                      "redirect_uri": { "type": "string" }
+                    },
+                    "required": ["client_id", "client_secret", "grant_type", "code", "redirect_uri"]
+                  },
+                  {
+                    "title": "refresh_token",
+                    "type": "object",
+                    "properties": {
+                      "client_id": { "type": "string" },
+                      "client_secret": { "type": "string" },
+                      "grant_type": { "type": "string", "const": "refresh_token" },
+                      "refresh_token": { "type": "string" }
+                    },
+                    "required": ["client_id", "client_secret", "grant_type", "refresh_token"]
+                  },
+                  {
+                    "title": "jwt-bearer (service account)",
+                    "type": "object",
+                    "properties": {
+                      "grant_type": { "type": "string", "const": "urn:ietf:params:oauth:grant-type:jwt-bearer" },
+                      "assertion": { "type": "string" }
+                    },
+                    "required": ["grant_type", "assertion"]
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Access token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "access_token": { "type": "string" },
+                    "expires_in": { "type": "integer" },
+                    "token_type": { "type": "string" },
+                    "refresh_token": { "type": "string" },
+                    "scope": { "type": "string" }
+                  },
+                  "required": ["access_token", "expires_in", "token_type"]
+                }
+              }
+            }
+          },
+          "default": { "description": "Error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GoogleJsonError" } } } }
+        },
+        "x-used-by": ["oauth2.acquire", "oauth2.refresh", "custom.acquire (JWT)"]
+      }
+    },
+
+    "/v1/userinfo": {
+      "servers": [{ "url": "https://openidconnect.googleapis.com" }],
+      "get": {
+        "operationId": "oidc.userinfo",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "OIDC userinfo",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "sub": { "type": "string" },
+                    "name": { "type": "string" },
+                    "email": { "type": "string" },
+                    "picture": { "type": "string" }
+                  },
+                  "required": ["sub"]
+                }
+              }
+            }
+          },
+          "default": { "description": "Error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GoogleJsonError" } } } }
+        },
+        "x-used-by": ["connection.authorization.identity (OAuth2 mode)"]
+      }
+    },
+
+    "/upload/storage/v1/b/{bucket}/o": {
+      "servers": [{ "url": "https://www.googleapis.com" }],
+      "post": {
+        "operationId": "storage.objects.insert",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "bucket", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "uploadType", "in": "query", "required": true, "schema": { "type": "string", "enum": ["media", "multipart"] } },
+          { "name": "name", "in": "query", "required": false, "schema": { "type": "string" }, "description": "Required for uploadType=media" },
+          { "name": "ifGenerationMatch", "in": "query", "schema": { "type": ["integer", "string"] } },
+          { "name": "ifMetagenerationMatch", "in": "query", "schema": { "type": ["integer", "string"] } },
+          { "$ref": "#/components/parameters/XCorrelationId" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/octet-stream": { "schema": { "type": "string", "format": "binary", "description": "Raw bytes for uploadType=media" } },
+            "multipart/related": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "metadata": { "$ref": "#/components/schemas/UploadMultipartMetadata" },
+                  "media": { "type": "string", "format": "binary" }
+                },
+                "required": ["metadata", "media"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Created object",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "bucket": { "type": "string" },
+                    "name": { "type": "string" },
+                    "size": { "type": ["string", "integer"] },
+                    "contentType": { "type": "string" },
+                    "generation": { "type": "string" },
+                    "md5Hash": { "type": "string" },
+                    "crc32c": { "type": "string" },
+                    "mediaLink": { "type": "string" }
+                  },
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "default": { "description": "Error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GoogleJsonError" } } } }
+        },
+        "x-used-by": ["vertex.batch_io.gcs_simple_upload", "vertex.embeddings.bulk_input.prepare"]
+      }
+    }
+  }
+}
