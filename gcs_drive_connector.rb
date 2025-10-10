@@ -194,8 +194,24 @@
         ] + base
       end
     },
-    transfer_result: {
-      fields: lambda do |_connection|
+    transfer_batch_plan_item: {
+      fields: lambda do |_|
+        [
+          { name: 'drive_file_id_or_url', label: 'Drive file ID or URL', optional: false },
+          { name: 'target_object_name',   label: 'Override GCS object name', optional: true,
+            hint: 'If blank, uses Drive file name.' },
+          { name: 'editors_mode', label: 'Editors handling (override)',
+            optional: true,
+            control_type: 'select',
+            pick_list: 'editors_modes',
+            hint: 'If blank, the action-level Editors setting is used.' },
+          { name: 'content_type', label: 'Content-Type override', optional: true },
+          { name: 'custom_metadata', label: 'Custom metadata (override)', type: 'object', optional: true }
+        ]
+      end
+    },
+    transfer_batch_result: {
+      fields: lambda do |_|
         [
           { name: 'uploaded', type: 'array', of: 'object', properties: [
             { name: 'drive_file_id' }, { name: 'drive_name' }, { name: 'bucket' }, { name: 'gcs_object_name' },
@@ -204,8 +220,7 @@
           ]},
           { name: 'failed', type: 'array', of: 'object', properties: [
             { name: 'drive_file_id' }, { name: 'drive_name' }, { name: 'bucket' }, { name: 'gcs_object_name' },
-            { name: 'bytes_uploaded', type: 'integer' }, { name: 'content_type' },
-            { name: 'content_md5', type: 'string' }, { name: 'content_sha256', type: 'string' }
+            { name: 'error_code' }, { name: 'error_message' }
           ]},
           { name: 'summary', type: 'object', properties: [
             { name: 'total', type: 'integer' }, { name: 'success', type: 'integer' }, { name: 'failed', type: 'integer' }
@@ -502,7 +517,7 @@
 
     # 6) transfer_drive_to_gcs
     transfer_drive_to_gcs: {
-      title: 'Transfer: Drive → GCS',
+      title: 'Transfer: Drive -> GCS',
       description: 'For each Drive file ID, fetch content (export Editors to text if selected) and upload to GCS under a prefix.',
       input_fields: lambda do |_obj, _conn, config_fields|
         call(:ui_transfer_inputs, config_fields)
@@ -511,87 +526,77 @@
         object_definitions['transfer_result']
       end,
       execute: lambda do |connection, input|
-        bucket = input['bucket']
-        prefix = (input['gcs_prefix'] || '').to_s
-        prefix = "#{prefix}/" unless prefix.empty? || prefix.end_with?('/')
+        bucket       = input['bucket']
+        prefix       = call(:normalize_prefix, input['gcs_prefix'])
         editors_mode = (input['content_mode_for_editors'] || 'text').to_s
-        user_project = connection['user_project']
-        uploaded = []
-        failed = []
 
-        raw_input = input['drive_file_ids'].to_s
-        drive_files = raw_input.split(/[\s,]+/).map(&:strip).reject(&:blank?)
+        uploaded, failed = [], []
+        drive_files = Array(input['drive_file_ids']).map(&:to_s).flat_map { |s| s.split(/[\s,]+/) }
+                        .map(&:strip).reject(&:blank?)
 
         drive_files.each do |raw|
-          begin
-            file_id = call(:extract_drive_id, raw.strip)
-            next if file_id.blank?
-            meta = call(:drive_get_meta_resolving_shortcut, file_id)
-            fname = meta['name'].to_s
-            object_name = "#{prefix}#{fname}"
-            if call(:is_google_editors_mime?, meta['mimeType'])
-              if editors_mode == 'skip'
-                failed << { drive_file_id: file_id, error_message: 'Skipped Editors file (set content_mode_for_editors=text to export).', error_code: 'SKIPPED' }
-                next
-              end
-              export_mime = call(:editors_export_mime, meta['mimeType'])
-              bytes = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}/export")
-                      .params(mimeType: export_mime, supportsAllDrives: true)
-                      .response_format_raw
-              body = bytes.to_s
-              cs   = call(:compute_checksums, body)
-              created = post("https://www.googleapis.com/upload/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o")
-                        .params(uploadType: 'media', name: object_name, userProject: user_project)
-                        .headers('Content-Type': export_mime)
-                        .request_body(body)
-              uploaded << {
-                drive_file_id: file_id,
-                drive_name: fname,
-                bucket: created['bucket'],
-                gcs_object_name: created['name'],
-                bytes_uploaded: body.bytesize,
-                content_type: export_mime,
-                content_md5: cs['md5'],
-                content_sha256: cs['sha256']
-              }
-            else
-              ctype = meta['mimeType']
-              bytes = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}")
-                      .params(alt: 'media', supportsAllDrives: true)
-                      .response_format_raw
-              body = bytes.to_s
-              cs   = call(:compute_checksums, body)
-              created = post("https://www.googleapis.com/upload/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o")
-                        .params(uploadType: 'media', name: object_name, userProject: user_project)
-                        .headers('Content-Type': ctype)
-                        .request_body(body)
-              uploaded << {
-                drive_file_id: file_id,
-                drive_name: fname,
-                bucket: created['bucket'],
-                gcs_object_name: created['name'],
-                bytes_uploaded: body.bytesize,
-                content_type: ctype,
-                content_md5: cs['md5'],
-                content_sha256: cs['sha256']
-              }
-            end
-          rescue => e
-            code = (e.to_s[/\b(\d{3})\b/, 1] || 'ERROR')
-            failed << { drive_file_id: raw.strip, error_message: e.to_s, error_code: code }
+          file_id = call(:extract_drive_id, raw)
+          next if file_id.blank?
+          res = call(:transfer_one_drive_to_gcs, connection, file_id, bucket, "#{prefix}", editors_mode, nil, nil)
+          if res[:ok]
+            ok = res[:ok]
+            ok[:gcs_object_name] = "#{prefix}#{ok[:gcs_object_name]}" if prefix.present? && !ok[:gcs_object_name].to_s.start_with?(prefix)
+            uploaded << ok
+          else
+            failed << res[:error]
           end
         end
-        {
-          uploaded: uploaded,
+        { uploaded: uploaded,
           failed: failed,
-          summary: {
-            total: (uploaded.length + failed.length),
-            success: uploaded.length,
-            failed: failed.length
-          }
-        }
+          summary: { total: (uploaded.length + failed.length), success: uploaded.length, failed: failed.length } }
+      end
+    },
+
+    # 7) transfer_drive_to_gcs_batch
+    transfer_drive_to_gcs_batch: {
+      title: 'Transfer (Batch): Drive -> GCS',
+      description: 'Upload many Drive files to GCS in one run, with optional per-item overrides (name, Editors mode, content-type, metadata). Partial success is returned.',
+      input_fields: lambda do |_obj, _conn, config_fields|
+        call(:ui_transfer_batch_inputs, config_fields)
+      end,
+      output_fields: lambda do |object_definitions|
+        object_definitions['transfer_batch_result']
+      end,
+      execute: lambda do |connection, input|
+        bucket   = input['bucket']
+        prefix   = call(:normalize_prefix, input['gcs_prefix'])
+        def_mode = (input['default_editors_mode'] || 'text').to_s
+        def_ct   = input['default_content_type']
+        def_meta = input['default_custom_metadata']
+        stop_on_error = !!input['stop_on_error']
+
+        uploaded, failed = [], []
+        Array(input['items']).each_with_index do |it, idx|
+          file_id = call(:extract_drive_id, it['drive_file_id_or_url'])
+          next if file_id.blank?
+          editors_mode = (it['editors_mode'].presence || def_mode).to_s
+          ctype        = (it['content_type'].presence || def_ct)
+          meta         = (it['custom_metadata'].presence || def_meta)
+          target_name  = (it['target_object_name'].presence || nil)
+          object_name  = target_name.present? ? "#{prefix}#{target_name}" : nil
+
+          res = call(:transfer_one_drive_to_gcs, connection, file_id, bucket, (object_name || ''), editors_mode, ctype, meta)
+          if res[:ok]
+            ok = res[:ok]
+            ok[:gcs_object_name] = (object_name.presence || "#{prefix}#{ok[:gcs_object_name]}")
+            uploaded << ok
+          else
+            failed << res[:error]
+            break if stop_on_error
+          end
+        end
+
+        { uploaded: uploaded,
+          failed: failed,
+          summary: { total: (uploaded.length + failed.length), success: uploaded.length, failed: failed.length } }
       end
     }
+
   },
 
   # --------- PICK LISTS --------------------------------------------------
@@ -740,6 +745,88 @@
       signature = rsa.sign(OpenSSL::Digest::SHA256.new, signing_input)
 
       "#{signing_input}.#{call(:b64url, signature)}"
+    end,
+
+    normalize_prefix: lambda do |prefix|
+      p = (prefix || '').to_s
+      return '' if p.empty?
+      p.end_with?('/') ? p : "#{p}/"
+    end,
+
+    safe_string_object_metadata: lambda do |meta|
+      return {} unless meta.is_a?(Hash)
+      meta.transform_values { |v| v.nil? ? nil : v.to_s }
+    end,
+
+    # Core: transfer one Drive file to GCS. Returns {:ok=>hash} or {:error=>hash}.
+    transfer_one_drive_to_gcs: lambda do |connection, file_id, bucket, object_name, editors_mode, global_content_type, global_metadata|
+      user_project = connection['user_project']
+      begin
+        meta = call(:drive_get_meta_resolving_shortcut, file_id)
+        fname = meta['name'].to_s
+        oname = (object_name.presence || fname)
+        if call(:is_google_editors_mime?, meta['mimeType'])
+          if editors_mode == 'skip'
+            return { error: { drive_file_id: file_id, drive_name: fname, gcs_object_name: oname,
+                              error_code: 'SKIPPED',
+                              error_message: 'Skipped Editors file (set editors to text to export).' } }
+          end
+          export_mime = call(:editors_export_mime, meta['mimeType'])
+          body = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}/export")
+                .params(mimeType: export_mime, supportsAllDrives: true)
+                .response_format_raw
+                .to_s
+          cs = call(:compute_checksums, body)
+          created = post("https://www.googleapis.com/upload/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o")
+                    .params(uploadType: 'media', name: oname, userProject: user_project)
+                    .headers('Content-Type': (global_content_type.presence || export_mime))
+                    .request_body(body)
+          return { ok: {
+            drive_file_id: file_id, drive_name: fname, bucket: created['bucket'], gcs_object_name: created['name'],
+            bytes_uploaded: body.bytesize, content_type: (global_content_type.presence || export_mime),
+            content_md5: cs['md5'], content_sha256: cs['sha256']
+          } }
+        else
+          ctype = (global_content_type.presence || meta['mimeType'])
+          body = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}")
+                .params(alt: 'media', supportsAllDrives: true)
+                .response_format_raw
+                .to_s
+          cs = call(:compute_checksums, body)
+
+          # If metadata provided, switch to multipart upload to set metadata atomically.
+          meta_hash = call(:safe_string_object_metadata, global_metadata || {})
+          created =
+            if meta_hash.present?
+              boundary = "workato-multipart-#{SecureRandom.hex(8)}"
+              meta_json = { name: oname, contentType: ctype, metadata: meta_hash }.to_json
+              multipart =
+                "--#{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n#{meta_json}\r\n" \
+                "--#{boundary}\r\nContent-Type: #{ctype}\r\nContent-Transfer-Encoding: binary\r\n\r\n#{body}\r\n" \
+                "--#{boundary}--\r\n"
+              post("https://www.googleapis.com/upload/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o")
+                .params(uploadType: 'multipart', userProject: user_project)
+                .headers('Content-Type': "multipart/related; boundary=#{boundary}")
+                .request_body(multipart)
+            else
+              post("https://www.googleapis.com/upload/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o")
+                .params(uploadType: 'media', name: oname, userProject: user_project)
+                .headers('Content-Type': ctype)
+                .request_body(body)
+            end
+          return { ok: {
+            drive_file_id: file_id, drive_name: fname, bucket: created['bucket'], gcs_object_name: created['name'],
+            bytes_uploaded: body.bytesize, content_type: ctype,
+            content_md5: cs['md5'], content_sha256: cs['sha256']
+          } }
+        end
+      rescue => e
+        code = (e.to_s[/\b(\d{3})\b/, 1] || 'ERROR')
+        return { error: {
+          drive_file_id: file_id, drive_name: (defined?(fname) ? fname : nil),
+          gcs_object_name: object_name, error_code: code, error_message: e.to_s
+        } }
+      end
     end,
 
     # --- UI HELPERS ---
@@ -892,7 +979,7 @@
       ]
     end,
 
-    # Assemble inputs for Drive → GCS transfer
+    # Assemble inputs for Drive -> GCS transfer
     ui_transfer_inputs: lambda do |_config_fields|
       [
         { name: 'bucket', optional: false, label: 'Destination bucket' },
@@ -908,6 +995,21 @@
         },
         { name: 'content_mode_for_editors', control_type: 'select', pick_list: 'editors_modes',
           optional: true, default: 'text', label: 'Editors files handling' }
+      ]
+    end,
+
+    # Assemble inputs for batch Drive -> GCS transfer
+    ui_transfer_batch_inputs: lambda do |_config_fields|
+      [
+        { name: 'bucket', optional: false, label: 'Destination bucket' },
+        { name: 'gcs_prefix', optional: true, label: 'Destination prefix' },
+        { name: 'default_editors_mode', control_type: 'select', pick_list: 'editors_modes',
+          optional: true, default: 'text', label: 'Default Editors handling' },
+        { name: 'default_content_type', optional: true, label: 'Default Content-Type' },
+        { name: 'default_custom_metadata', type: 'object', optional: true, label: 'Default custom metadata' },
+        { name: 'stop_on_error', type: 'boolean', control_type: 'checkbox', default: false, label: 'Stop on first error' },
+        { name: 'items', type: 'array', of: 'object', label: 'Items',
+          properties: call(:object_definitions)['transfer_batch_plan_item']['fields'].call(nil), optional: false }
       ]
     end
 
