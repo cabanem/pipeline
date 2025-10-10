@@ -83,7 +83,7 @@
       token_url: 'https://oauth2.googleapis.com/token',
       
       # Refresh rules
-      refresh_on: [401, 403],
+      refresh_on: [401],
 
       detect_on: [/UNAUTHENTICATED/i, /invalid[_-]?token/i, /expired/i, /insufficient/i]
     }
