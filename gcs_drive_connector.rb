@@ -194,6 +194,24 @@
         ] + base
       end
     },
+    transfer_result: {
+      fields: lambda do |_connection|
+        [
+          { name: 'uploaded', type: 'array', of: 'object', properties: [
+            { name: 'drive_file_id' }, { name: 'drive_name' }, { name: 'bucket' }, { name: 'gcs_object_name' },
+            { name: 'bytes_uploaded', type: 'integer' }, { name: 'content_type' },
+            { name: 'content_md5', type: 'string' }, { name: 'content_sha256', type: 'string' }
+          ]},
+          { name: 'failed', type: 'array', of: 'object', properties: [
+            { name: 'drive_file_id' }, { name: 'drive_name' }, { name: 'bucket' }, { name: 'gcs_object_name' },
+            { name: 'error_code' }, { name: 'error_message' }
+          ]},
+          { name: 'summary', type: 'object', properties: [
+            { name: 'total', type: 'integer' }, { name: 'success', type: 'integer' }, { name: 'failed', type: 'integer' }
+          ]}
+        ]
+      end
+    },
     transfer_batch_plan_item: {
       fields: lambda do |_|
         [
