@@ -153,8 +153,11 @@
     # --- Composite definitions
     # Call other object definitions
     drive_file_min: {
-      fields: lambda do |object_definitions|
-        object_definitions['drive_file_base_fields']
+      fields: lambda do |_|
+        [
+          { name: 'id', type: 'string' },
+          { name: 'name', type: 'string' }
+        ]
       end
     },
     drive_file_full: {
@@ -183,8 +186,25 @@
       fields: lambda do |object_definitions|
         base = Array(object_definitions['list_page_meta'])
         ([
-          { name: 'files', type: 'array', of: 'object', properties: object_definitions['drive_file_base_fields'] },
-          { name: 'file_ids', type: 'array', of: 'string', hint: 'Convenience: IDs extracted from files[].id' }
+          {
+            name: 'files',
+            type: 'array',
+            of: 'object',
+            properties: object_definitions['drive_file_base_fields']  # full per-file metadata
+          },
+          {
+            name: 'file_ids',
+            type: 'array',
+            of: 'string',
+            hint: 'Convenience: IDs extracted from files[].id'
+          },
+          {
+            name: 'items_for_transfer',
+            type: 'array',
+            of: 'object',
+            properties: call(:schema_transfer_batch_plan_item_fields), # matches batch transfer items[]
+            hint: 'Directly map into Transfer (batch) → items'
+          }
         ] + base + Array(object_definitions['envelope_fields']))
       end
     },
@@ -325,45 +345,69 @@
                 fields: 'files(id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress)),nextPageToken'
               )
         files = (res['files'] || []).map { |f| call(:map_drive_meta, f) }
+        items_for_transfer = files.map do |f|
+          {
+            'drive_file_id_or_url' => f['id'],
+            # The rest are optional; user can override later in the batch action
+            'target_object_name'   => nil,
+            'editors_mode'         => nil,
+            'content_type'         => nil,
+            'custom_metadata'      => nil
+          }
+        end
         next_token = res['nextPageToken']
         base = {
-          'files'           => files,
-          'file_ids'        => files.map { |f| f['id'] }.compact,
-          'count'           => files.length,
-          'has_more'        => next_token.present?,
-          'next_page_token' => next_token
+          'files'               => files,
+          'file_ids'            => files.map { |f| f['id'] }.compact,
+          'items_for_transfer'  => items_for_transfer,
+          'count'               => files.length,
+          'has_more'            => next_token.present?,
+          'next_page_token'     => next_token
         }
         base.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
       rescue => e
-        # On failure, return empty page + envelope (no raise, predictable shape)
+        # Predictable empty shape (string keys) on failure
         {}.merge(
-          files: [], count: 0, has_more: false, next_page_token: nil
+          'files'            => [],
+          'file_ids'         => [],
+          'items_for_transfer' => [],
+          'count'            => 0,
+          'has_more'         => false,
+          'next_page_token'  => nil
         ).merge(
           call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s)
         )
       end,
       sample_output: lambda do
         {
-          files: [
+          'files' => [
             {
-              id: '1AbCdEfGhIjK',
-              name: 'example.txt',
-              mime_type: 'text/plain',
-              size: 42,
-              modified_time: '2024-01-01T12:00:00Z',
-              checksum: 'd41d8cd98f00b204e9800998ecf8427e',
-              web_view_url: 'https://drive.google.com/file/d/1AbCdEfGhIjK/view',
-              owners: [{ display_name: 'Drive Bot', email: 'bot@example.com' }]
+              'id'            => '1AbCdEfGhIjK',
+              'name'          => 'example.txt',
+              'mime_type'     => 'text/plain',
+              'size'          => 42,
+              'modified_time' => '2024-01-01T12:00:00Z',
+              'checksum'      => 'd41d8cd98f00b204e9800998ecf8427e',
+              'web_view_url'  => 'https://drive.google.com/file/d/1AbCdEfGhIjK/view',
+              'owners'        => [{ 'display_name' => 'Drive Bot', 'email' => 'bot@example.com' }]
             }
           ],
-          file_ids: ['1AbCdEfGhIjK'],
-          count: 1,
-          has_more: false,
-          next_page_token: nil,
-          ok: true,
-          telemetry: { http_status: 200, message: 'OK', duration_ms: 1, correlation_id: 'sample' }
+          'file_ids' => ['1AbCdEfGhIjK'],
+          'items_for_transfer' => [
+            {
+              'drive_file_id_or_url' => '1AbCdEfGhIjK',
+              'target_object_name'   => nil,
+              'editors_mode'         => nil,
+              'content_type'         => nil,
+              'custom_metadata'      => nil
+            }
+          ],
+          'count'           => 1,
+          'has_more'        => false,
+          'next_page_token' => nil,
+          'ok' => true,
+          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 1, 'correlation_id' => 'sample' }
         }
-      end,
     },
 
     # 2) drive_get_file
