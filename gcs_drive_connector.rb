@@ -32,10 +32,10 @@
       # Obtain/refresh the access token
       acquire: lambda do |connection|
         # Use default superset (Drive + GCS). Cached per scope set.
-        token_str = call(:auth_build_access_token!, connection, scopes: DEFAULT_SCOPES)
+        token_str = call(:auth_build_access_token!, connection, scopes: call(:const_default_scopes))
         # Build a stable shape for Workato’s connection store.
         # Pull from cache so we have expires_in/at without re-exchanging:
-        scope_key = DEFAULT_SCOPES.join(' ')
+        scope_key = call(:const_default_scopes).join(' ')
         cached = (connection['__token_cache'] ||= {})[scope_key]
 
         {
@@ -992,7 +992,14 @@
   methods: {
 
     # --- 1. URL BUILDERS + CONSTS --------
-    
+    const_default_scopes: -> { [
+      'https://www.googleapis.com/auth/drive',
+      'https://www.googleapis.com/auth/devstorage.read_write'
+      #'https://www.googleapis.com/auth/cloud-platform`',
+    ] },
+    const_drive_scope: -> { [ 'https://www.googleapis.com/auth/drive' ] },
+    const_gcs_scope: -> { [ 'https://www.googleapis.com/auth/devstorage.read_write' ] },
+
     # --- 2. UTILITIES (PURE) -------------
     util_extract_drive_id: lambda do |str|
       s = (str || '').to_s.strip
@@ -1111,11 +1118,6 @@
 
     # --- 5. AUTH HELPERS -----------------
 
-    DEFAULT_SCOPES = [
-      'https://www.googleapis.com/auth/drive',
-      'https://www.googleapis.com/auth/devstorage.read_write'
-    ].freeze,
-
     # Base64url without padding
     b64url: lambda do |bytes|
       Base64.urlsafe_encode64(bytes).gsub(/=+$/, '')
@@ -1138,10 +1140,10 @@
     auth_normalize_scopes: lambda do |scopes|
       arr =
         case scopes
-        when nil then DEFAULT_SCOPES
+        when nil    then call(:const_default_scopes)
         when String then scopes.split(/\s+/)
-        when Array then scopes
-        else DEFAULT_SCOPES
+        when Array  then scopes
+        else              call(:const_default_scopes)
         end
       arr.map(&:to_s).reject(&:empty?).uniq
     end,
@@ -1149,9 +1151,12 @@
     auth_token_cache_get: lambda do |connection, scope_key|
       cache = (connection['__token_cache'] ||= {})
       tok   = cache[scope_key]
+
       return nil unless tok.is_a?(Hash) && tok['access_token'].present? && tok['expires_at'].present?
-      exp = Time.parse(tok['expires_at']) rescue nil
-      return nil unless exp && Time.now < (exp - 60) # cache until exp-60s
+      
+      exp   = Time.parse(tok['expires_at']) rescue nil
+      
+      return nil unless exp && Time.now < (exp - 60) # valid until exp-60s
       tok
     end,
 
@@ -1168,11 +1173,11 @@
 
       scope_str = scopes.join(' ')
       payload = {
-        iss: key['client_email'],
+        iss:   key['client_email'],
         scope: scope_str,
-        aud: token_url,
-        iat: now,
-        exp: now + 3600 # max 1 hour per Google
+        aud:   token_url,
+        iat:   now,
+        exp:   now + 3600 # Google max 1h
       }
 
       assertion = call(:jwt_sign_rs256, payload, key['private_key'])
@@ -1180,31 +1185,29 @@
       res = post(token_url)
               .payload(
                 grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-                assertion: assertion
+                assertion:  assertion
               )
               .request_format_www_form_urlencoded
 
-      exp_at = (Time.now + res['expires_in'].to_i).utc.iso8601
       {
         'access_token' => res['access_token'],
         'token_type'   => res['token_type'],
         'expires_in'   => res['expires_in'],
-        'expires_at'   => exp_at,
+        'expires_at'   => (Time.now + res['expires_in'].to_i).utc.iso8601,
         'scope_key'    => scope_str
       }
     end,
 
-# Public surface: returns *string* access token, cached by scope set
-auth_build_access_token!: lambda do |connection, scopes: nil|
-  set = call(:auth_normalize_scopes, scopes)
-  scope_key = set.join(' ')
-  cached = call(:auth_token_cache_get, connection, scope_key)
-  return cached['access_token'] if cached
-
-  fresh = call(:auth_issue_token!, connection, set)
-  call(:auth_token_cache_put, connection, scope_key, fresh)['access_token']
-end,
-
+    # Public surface: returns *string* access token, cached by scope set
+    auth_build_access_token!: lambda do |connection, scopes: nil|
+      set = call(:auth_normalize_scopes, scopes)
+      scope_key = set.join(' ')
+      if (cached = call(:auth_token_cache_get, connection, scope_key))
+        return cached['access_token']
+      end
+      fresh = call(:auth_issue_token!, connection, set)
+      call(:auth_token_cache_put, connection, scope_key, fresh)['access_token']
+    end,
 
     # --- 6. CORE WORKFLOWS ---------------
 
