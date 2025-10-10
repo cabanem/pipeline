@@ -27,19 +27,19 @@
         name: 'default_probe_bucket',
         label: 'Default probe bucket (GCS)',
         hint: 'Used by connection test + Permission probe when no bucket is provided.',
-        optional: true, ngIf: 'input.set_defaults_for_probe' == "true"
+        optional: true, ngIf: 'input.set_defaults_for_probe == "true"'
       },
       {
         name: 'canary_drive_folder_id_or_url',
         label: 'Canary Drive folder (ID or URL)',
         hint: 'Probe lists files here (first 3). Leave blank to probe corpus without parent filter.',
-        optional: true, ngIf: 'input.set_defaults_for_probe' == "true"
+        optional: true, ngIf: 'input.set_defaults_for_probe == "true"'
       },
       {
         name: 'canary_shared_drive_id',
         label: 'Canary shared drive ID (optional)',
         hint: 'If set, probe uses corpora=drive and this driveId.',
-        optional: true, ngIf: 'input.set_defaults_for_probe' == "true"
+        optional: true, ngIf: 'input.set_defaults_for_probe == "true"'
        }
     ],
 
@@ -94,9 +94,9 @@
     {
       ok: res['ok'],
       whoami: res['whoami'],
-      drive_ok: res.dig('drive','ok'),
-      gcs_ok: res.dig('gcs','ok'),
-      requester_pays_detected: res['requester_pays_detected']
+      drive_ok: Array(res['drive_access']).any?,
+      gcs_ok: Array(res['gcs_access']).any?,
+      requester_pays_detected: !!res['requester_pays_detected']
     }
   end,
 
@@ -1450,7 +1450,7 @@
     # --- 6. CORE WORKFLOWS ---------------
 
     # transfer one Drive file to GCS. Returns {:ok=>hash} or {:error=>hash}.
-    transfer_one_drive_to_gcs: lambda do |connection, file_id, bucket, object_name, editors_mode, global_content_type, global_metadata|
+    transfer_one_drive_to_gcs: lambda do |connection, file_id, bucket, object_name, editors_mode, editors_export_format, global_content_type, global_metadata|
       user_project = connection['user_project']
       begin
         meta = call(:meta_get_resolve_shortcut, file_id)
@@ -1593,7 +1593,7 @@
       # Breadth-first traversal from root_id.
       # Returns array of mapped file metas (not including folders when filters['exclude_folders'] is true).
       # Always discovers folders regardless of mime filter, then lists files for each folder honoring filters.
-      folder_mime = 'application/vnd.google-apps.folder' # official folder MIME. :contentReference[oaicite:2]{index=2}
+      folder_mime = 'application/vnd.google-apps.folder' # official folder MIME.
       limit = [[overall_limit.to_i, 1].max, 10_000].min
       depth_cap = max_depth.to_i <= 0 ? Float::INFINITY : max_depth.to_i
 
