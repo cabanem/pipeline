@@ -270,7 +270,11 @@
     drive_list_files: {
       title: 'Drive: List files',
       subtitle: 'List files in Drive',
-      description: 'Return a page of Drive files with minimal metadata (newest first).',
+      help: lambda do |_|
+        {
+          body: 'Return a page of Drive files with minimal metadata (newest first).'
+        }
+      end,
       input_fields: lambda do |_obj, _conn, config_fields|
         call(:ui_drive_list_inputs, config_fields)
       end,
@@ -354,7 +358,11 @@
     drive_get_file: {
       title: 'Drive: Get file',
       subtitle: 'Fetch Drive file metadata and content',
-      description: 'Fetch Drive file metadata and optionally content (text or bytes). Shortcuts are resolved once.',
+      help: lambda do |_|
+        {
+          body: 'Fetch Drive file metadata and optionally content (text or bytes). Shortcuts are resolved once.'
+        }
+      end,
       input_fields: lambda do |_obj, _conn, config_fields|
         call(:ui_drive_get_inputs, config_fields)
       end,
@@ -427,7 +435,11 @@
     gcs_list_objects: {
       title: 'GCS: List objects',
       subtitle: 'List objects in Google Cloud Storage bucket',
-      description: 'List objects in a bucket, optionally using prefix and delimiter.',
+      help: lambda do |_|
+        {
+          body: 'List objects in a bucket, optionally using prefix and delimiter.'
+        }
+      end,
       input_fields: lambda do |_obj, _conn, config_fields|
         call(:ui_gcs_list_inputs, config_fields)
       end,
@@ -475,7 +487,11 @@
     gcs_get_object: {
       title: 'GCS: Get object',
       subtitle: 'Fetch an object from Google Cloud Storage bucket',
-      description: 'Fetch GCS object metadata and optionally content (text or bytes).',
+      help: lambda do |_|
+        {
+          body: 'Fetch GCS object metadata and optionally content (text or bytes).'
+        }
+      end,
       input_fields: lambda do |_obj, _conn, config_fields|
         call(:ui_gcs_get_inputs, config_fields)
       end,
@@ -528,7 +544,11 @@
     gcs_put_object: {
       title: 'GCS: Put object',
       subtitle: 'Upload an object to Google Cloud Storage bucket',
-      description: 'Upload text or bytes to GCS. Returns created object metadata and bytes_uploaded.',
+      help: lambda do |_|
+        {
+          body: 'Upload text or bytes to GCS. Returns created object metadata and bytes_uploaded.'
+        }
+      end,
       input_fields: lambda do |_obj, _conn, config_fields|
         call(:ui_gcs_put_inputs, config_fields)
       end,
@@ -595,7 +615,11 @@
     transfer_drive_to_gcs: {
       title: 'Transfer: Drive → GCS',
       subtitle: 'Transfer a single file from Drive to Cloud Storage bucket',
-      description: 'For each Drive file ID, fetch content (export Editors to text if selected) and upload to GCS under a prefix.',
+      help: lambda do |_|
+        {
+          body: 'For each Drive file ID, fetch content (export Editors to text if selected) and upload to GCS under a prefix.'
+        }
+      end,
       input_fields: lambda do |_obj, _conn, config_fields|
         call(:ui_transfer_inputs, config_fields)
       end,
@@ -642,7 +666,11 @@
     transfer_drive_to_gcs_batch: {
       title: 'Transfer: Drive → GCS',
       subtitle: 'Transfer multiple items from Drive to Cloud Storage bucket',
-      description: 'Upload many Drive files to GCS in one run, with optional per-item overrides (name, Editors mode, content-type, metadata). Partial success is returned.',
+      help: lambda do |_|
+        {
+          body: 'Upload many Drive files to GCS in one run, with optional per-item overrides (name, Editors mode, content-type, metadata). Partial success is returned.'
+        }
+      end,
       batch: true,
       input_fields: lambda do |_obj, _conn, config_fields|
         call(:ui_transfer_batch_inputs, config_fields)
