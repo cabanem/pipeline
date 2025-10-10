@@ -3,7 +3,7 @@
   title: 'Google Drive + GCS Utilities',
   version: '0.4',
 
-  # --------- CONNECTION --------------------------------------------------
+  # --------- CONNECTION ---------------------------------------------------
   connection: {
     fields: [
       {
@@ -90,13 +90,13 @@
     }
   },
 
-  # --------- CONNECTION TEST ---------------------------------------------
+  # --------- CONNECTION TEST ----------------------------------------------
   test: lambda do |_connection|
     get('https://www.googleapis.com/drive/v3/about')
       .params(fields: 'user,storageQuota')
   end,
 
-  # --------- OBJECT DEFINITIONS ------------------------------------------
+  # --------- OBJECT DEFINITIONS -------------------------------------------
   object_definitions: {
     # --- Base definitions
     drive_file_base_fields: {
@@ -263,7 +263,7 @@
     }
   },
 
-  # --------- ACTIONS -----------------------------------------------------
+  # --------- ACTIONS ------------------------------------------------------
   actions: {
 
     # 1) drive_list_files
@@ -279,7 +279,7 @@
       execute: lambda do |_connection, input|
         t0 = Time.now
         corr = SecureRandom.uuid
-        folder_id = call(:extract_drive_id, input['folder_id_or_url'])
+        folder_id = call(:util_extract_drive_id, input['folder_id_or_url'])
         q = ["trashed=false"]
 
         filters = input['filters'] || {}
@@ -289,10 +289,10 @@
 
         # Date filtering (ISO-8601)
         if filters['modified_after'].present?
-          q << "modifiedTime >= '#{call(:to_iso8601_utc, filters['modified_after'])}'"
+          q << "modifiedTime >= '#{call(:util_to_iso8601_utc, filters['modified_after'])}'"
         end
         if filters['modified_before'].present?
-          q << "modifiedTime <= '#{call(:to_iso8601_utc, filters['modified_before'])}'"
+          q << "modifiedTime <= '#{call(:util_to_iso8601_utc, filters['modified_before'])}'"
         end
         # MIME filters
         if filters['mime_types'].present?
@@ -344,7 +344,7 @@
         {}.merge(
           files: [], count: 0, has_more: false, next_page_token: nil
         ).merge(
-          call(:telemetry_envelope, t0, corr, false, call(:parse_error_code, e), e.to_s)
+          call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s)
         )
       end
     },
@@ -362,39 +362,39 @@
       execute: lambda do |_connection, input|
         t0 = Time.now
         corr = SecureRandom.uuid
-        file_id = call(:extract_drive_id, input['file_id_or_url'])
+        file_id = call(:util_extract_drive_id, input['file_id_or_url'])
         meta = call(:drive_get_meta_resolving_shortcut, file_id)
 
         result = call(:map_drive_meta, meta)
 
         mode = (input['content_mode'] || 'none').to_s
-        strip = input.dig('postprocess', 'strip_urls') ? true : false
+        strip = input.dig('postprocess', 'util_strip_urls') ? true : false
 
         if mode == 'none'
           result.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
 
         elsif mode == 'text'
-          if call(:is_google_editors_mime?, meta['mimeType'])
-            export_mime = call(:editors_export_mime, meta['mimeType'])
+          if call(:util_is_google_editors_mime?, meta['mimeType'])
+            export_mime = call(:util_editors_export_mime, meta['mimeType'])
             bytes = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}/export")
                     .params(mimeType: export_mime, supportsAllDrives: true)
                     .response_format_raw # treat response as new
             raw  = bytes.to_s
-            text = call(:force_utf8, raw)
-            text = call(:strip_urls, text) if strip
-            cs = call(:compute_checksums, raw)
+            text = call(:util_force_utf8, raw)
+            text = call(:util_strip_urls, text) if strip
+            cs = call(:util_compute_checksums, raw)
             result.merge(exported_as: export_mime, text_content: text, content_md5: cs['md5'], content_sha256: cs['sha256'])
                   .merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
 
           else
-            if call(:is_textual_mime?, meta['mimeType'])
+            if call(:util_is_textual_mime?, meta['mimeType'])
               bytes = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}")
                       .params(alt: 'media', supportsAllDrives: true)
                       .response_format_raw
               raw  = bytes.to_s
-              text = call(:force_utf8, raw)
-              text = call(:strip_urls, text) if strip
-              cs = call(:compute_checksums, raw)
+              text = call(:util_force_utf8, raw)
+              text = call(:util_strip_urls, text) if strip
+              cs = call(:util_compute_checksums, raw)
               result.merge(text_content: text, content_md5: cs['md5'], content_sha256: cs['sha256'])
                     .merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
             else
@@ -402,14 +402,14 @@
             end
           end
         elsif mode == 'bytes'
-          if call(:is_google_editors_mime?, meta['mimeType'])
+          if call(:util_is_google_editors_mime?, meta['mimeType'])
             error('400 Bad Request - Editors files require content_mode=text (export).')
           end
           bytes = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}")
                   .params(alt: 'media', supportsAllDrives: true, acknowledgeAbuse: false)
                   .response_format_raw
           raw = bytes.to_s
-          cs  = call(:compute_checksums, raw)
+          cs  = call(:util_compute_checksums, raw)
           result.merge(content_bytes: Base64.strict_encode64(raw), content_md5: cs['md5'], content_sha256: cs['sha256'])
                 .merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
         else
@@ -417,7 +417,7 @@
         end
       rescue => e
         # Predictable shape on error
-        {}.merge(call(:telemetry_envelope, t0, corr, false, call(:parse_error_code, e), e.to_s))
+        {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
       end
     },
 
@@ -463,7 +463,7 @@
         {}.merge(
           objects: [], prefixes: [], count: 0, has_more: false, next_page_token: nil
         ).merge(
-          call(:telemetry_envelope, t0, corr, false, call(:parse_error_code, e), e.to_s)
+          call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s)
         )
       end
     },
@@ -487,21 +487,21 @@
                .params(alt: 'json', userProject: connection['user_project'])
         base = call(:map_gcs_meta, meta)
         mode = (input['content_mode'] || 'none').to_s
-        strip = input.dig('postprocess', 'strip_urls') ? true : false
+        strip = input.dig('postprocess', 'util_strip_urls') ? true : false
         ctype = meta['contentType']
         if mode == 'none'
           base.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
         elsif mode == 'text'
-          unless call(:is_textual_mime?, ctype)
+          unless call(:util_is_textual_mime?, ctype)
             error('415 Unsupported Media Type - Non-text object; use content_mode=bytes or none.')
           end
           bytes = get("https://storage.googleapis.com/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o/#{ERB::Util.url_encode(name)}")
                   .params(alt: 'media', userProject: connection['user_project'])
                   .response_format_raw
           raw  = bytes.to_s
-          text = call(:force_utf8, raw)
-          text = call(:strip_urls, text) if strip
-          cs = call(:compute_checksums, raw)
+          text = call(:util_force_utf8, raw)
+          text = call(:util_strip_urls, text) if strip
+          cs = call(:util_compute_checksums, raw)
           base.merge(text_content: text, content_md5: cs['md5'], content_sha256: cs['sha256'])
               .merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
         elsif mode == 'bytes'
@@ -509,14 +509,14 @@
                   .params(alt: 'media', userProject: connection['user_project'])
                   .response_format_raw
           raw = bytes.to_s
-          cs  = call(:compute_checksums, raw)
+          cs  = call(:util_compute_checksums, raw)
           base.merge(content_bytes: Base64.strict_encode64(raw), content_md5: cs['md5'], content_sha256: cs['sha256'])
               .merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
         else
           error("400 Bad Request - Unknown content_mode: #{mode}")
         end
       rescue => e
-        {}.merge(call(:telemetry_envelope, t0, corr, false, call(:parse_error_code, e), e.to_s))
+        {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
       end
     },
 
@@ -536,7 +536,7 @@
         bucket = input['bucket']
         name = input['object_name']
         mode = input['content_mode']
-        strip = input.dig('postprocess', 'strip_urls') ? true : false
+        strip = input.dig('postprocess', 'util_strip_urls') ? true : false
         adv  = input['advanced'] || {}
         meta = adv['custom_metadata']
         meta = meta.transform_values { |v| v.nil? ? nil : v.to_s } if meta.present?
@@ -544,7 +544,7 @@
           if mode == 'text'
             text = input['text_content']
             error('400 Bad Request - text_content is required when content_mode=text.') if text.nil?
-            text = call(:strip_urls, text) if strip
+            text = call(:util_strip_urls, text) if strip
             [text.to_s.dup.force_encoding('UTF-8'), (adv['content_type'].presence || 'text/plain; charset=UTF-8')]
           elsif mode == 'bytes'
             b64 = input['content_bytes']
@@ -582,7 +582,7 @@
           .merge(bytes_uploaded: bytes_uploaded)
           .merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
       rescue => e
-        {}.merge(call(:telemetry_envelope, t0, corr, false, call(:parse_error_code, e), e.to_s))
+        {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
       end
     },
 
@@ -600,7 +600,7 @@
         t0 = Time.now
         corr = SecureRandom.uuid
         bucket       = input['bucket']
-        prefix       = call(:normalize_prefix, input['gcs_prefix'])
+        prefix       = call(:util_normalize_prefix, input['gcs_prefix'])
         editors_mode = (input['content_mode_for_editors'] || 'text').to_s
 
         uploaded, failed = [], []
@@ -608,7 +608,7 @@
                         .map(&:strip).reject(&:blank?)
 
         drive_files.each do |raw|
-          file_id = call(:extract_drive_id, raw)
+          file_id = call(:util_extract_drive_id, raw)
           next if file_id.blank?
           res = call(:transfer_one_drive_to_gcs, connection, file_id, bucket, "#{prefix}", editors_mode, nil, nil)
           if res[:ok]
@@ -628,7 +628,7 @@
         base.merge(call(:telemetry_envelope, t0, corr, ok, code, msg))
       rescue => e
         { uploaded: [], failed: [], summary: { total: 0, success: 0, failed: 0 } }
-        .merge(call(:telemetry_envelope, t0, corr, false, call(:parse_error_code, e), e.to_s))
+        .merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
       end
     },
 
@@ -647,7 +647,7 @@
         t0 = Time.now
         corr = SecureRandom.uuid
         bucket       = input['bucket']
-        prefix   = call(:normalize_prefix, input['gcs_prefix'])
+        prefix   = call(:util_normalize_prefix, input['gcs_prefix'])
         def_mode = (input['default_editors_mode'] || 'text').to_s
         def_ct   = input['default_content_type']
         def_meta = input['default_custom_metadata']
@@ -655,7 +655,7 @@
 
         uploaded, failed = [], []
         Array(input['items']).each_with_index do |it, idx|
-          file_id = call(:extract_drive_id, it['drive_file_id_or_url'])
+          file_id = call(:util_extract_drive_id, it['drive_file_id_or_url'])
           next if file_id.blank?
           editors_mode = (it['editors_mode'].presence || def_mode).to_s
           ctype        = (it['content_type'].presence || def_ct)
@@ -682,13 +682,13 @@
         base.merge(call(:telemetry_envelope, t0, corr, ok, code, msg))
       rescue => e
         { uploaded: [], failed: [], summary: { total: 0, success: 0, failed: 0 } }
-        .merge(call(:telemetry_envelope, t0, corr, false, call(:parse_error_code, e), e.to_s))
+        .merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
       end
     }
 
   },
 
-  # --------- PICK LISTS --------------------------------------------------
+  # --------- PICK LISTS ---------------------------------------------------
   pick_lists: {
     content_modes: lambda do |_|
       [
@@ -711,10 +711,12 @@
     end
   },
 
-  # --------- METHODS -----------------------------------------------------
+  # --------- METHODS ------------------------------------------------------
   methods: {
-    # --- Shared rules ---
-    extract_drive_id: lambda do |str|
+    # --- URL BUILDERS + CONSTS --------
+    
+    # --- UTILITIES (PURE) -------------
+    util_extract_drive_id: lambda do |str|
       s = (str || '').to_s.strip
       return nil if s.empty?
       m = s.match(%r{/d/([a-zA-Z0-9_-]+)}) ||
@@ -723,27 +725,27 @@
       m ? m[1] : s
     end,
 
-    to_iso8601_utc: lambda do |t|
+    util_to_iso8601_utc: lambda do |t|
       Time.parse(t.to_s).utc.iso8601
     rescue
       t
     end,
 
-    to_int_or_nil: lambda do |val|
+    util_to_int_or_nil: lambda do |val|
       v = val.to_s
       v.empty? ? nil : v.to_i
     end,
 
-    is_textual_mime?: lambda do |mime|
+    util_is_textual_mime?: lambda do |mime|
       m = (mime || '').downcase
       m.start_with?('text/') || %w[application/json application/xml image/svg+xml].include?(m)
     end,
 
-    is_google_editors_mime?: lambda do |mime|
+    util_is_google_editors_mime?: lambda do |mime|
       (mime || '').start_with?('application/vnd.google-apps.')
     end,
 
-    editors_export_mime: lambda do |mime|
+    util_editors_export_mime: lambda do |mime|
       case mime
       when 'application/vnd.google-apps.document'     then 'text/plain'
       when 'application/vnd.google-apps.spreadsheet'  then 'text/csv'
@@ -755,21 +757,58 @@
       end
     end,
 
-    strip_urls: lambda do |text|
+    util_strip_urls: lambda do |text|
       text.to_s.gsub(%r{https?://\S+|www\.\S+}, '')
     end,
 
-    force_utf8: lambda do |bytes|
+    util_force_utf8: lambda do |bytes|
       s = bytes.to_s
       s.force_encoding('UTF-8')
       s.valid_encoding? ? s : s.encode('UTF-8', invalid: :replace, undef: :replace, replace: '')
     end,
 
+    # Compute MD5 and SHA-256 from raw bytes
+    util_compute_checksums: lambda do |raw|
+      s = raw.to_s
+      md5 = OpenSSL::Digest::MD5.hexdigest(s)
+      sha = OpenSSL::Digest::SHA256.hexdigest(s)
+      { 'md5' => md5, 'sha256' => sha }
+    end,
+
+    util_normalize_prefix: lambda do |prefix|
+      p = (prefix || '').to_s
+      return '' if p.empty?
+      p.end_with?('/') ? p : "#{p}/"
+    end,
+
+    # --- 3. TELEMETRY --------------------
+
+    telemetry_envelope: lambda do |started_at, correlation_id, ok, code, message|
+      dur = ((Time.now - started_at) * 1000.0).to_i
+      {
+        ok: !!ok,
+        telemetry: {
+          http_status: code.to_i,
+          message: (message || (ok ? 'OK' : 'ERROR')).to_s,
+          duration_ms: dur,
+          correlation_id: correlation_id
+        }
+      }
+    end,
+
+    telemetry_parse_error_code: lambda do |err|
+      # Pull first 3-digit code; fallback 0
+      m = err.to_s.match(/\b(\d{3})\b/)
+      m ? m[1].to_i : 0
+    end,
+
+    # --- 4. MAPPERS (UPSTREAM → SCHEMA) --
+
     map_gcs_meta: lambda do |o|
       {
         bucket:       o['bucket'],
         name:         o['name'],
-        size:         call(:to_int_or_nil, o['size']),
+        size:         call(:util_to_int_or_nil, o['size']),
         content_type: o['contentType'],
         updated:      o['updated'],
         generation:   o['generation'].to_s,
@@ -784,38 +823,14 @@
         id: f['id'],
         name: f['name'],
         mime_type: f['mimeType'],
-        size: call(:to_int_or_nil, f['size']),
+        size: call(:util_to_int_or_nil, f['size']),
         modified_time: f['modifiedTime'],
         checksum: f['md5Checksum'],
         owners: (f['owners'] || []).map { |o| { display_name: o['displayName'], email: o['emailAddress'] } }
       }
     end,
 
-    drive_get_meta_resolving_shortcut: lambda do |file_id|
-      meta = get("https://www.googleapis.com/drive/v3/files/#{file_id}")
-             .params(
-               supportsAllDrives: true,
-               fields: 'id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress),shortcutDetails'
-             )
-      target = meta.dig('shortcutDetails', 'targetId')
-      if target.present?
-        get("https://www.googleapis.com/drive/v3/files/#{target}")
-          .params(
-            supportsAllDrives: true,
-            fields: 'id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress)'
-          )
-      else
-        meta
-      end
-    end,
-
-    # Compute MD5 and SHA-256 from raw bytes
-    compute_checksums: lambda do |raw|
-      s = raw.to_s
-      md5 = OpenSSL::Digest::MD5.hexdigest(s)
-      sha = OpenSSL::Digest::SHA256.hexdigest(s)
-      { 'md5' => md5, 'sha256' => sha }
-    end,
+    # --- 5. AUTH HELPERS -----------------
 
     # Base64url without padding
     b64url: lambda do |bytes|
@@ -836,55 +851,27 @@
       "#{signing_input}.#{call(:b64url, signature)}"
     end,
 
-    normalize_prefix: lambda do |prefix|
-      p = (prefix || '').to_s
-      return '' if p.empty?
-      p.end_with?('/') ? p : "#{p}/"
-    end,
+    # --- 6. CORE WORKFLOWS ---------------
 
-    safe_string_object_metadata: lambda do |meta|
-      return {} unless meta.is_a?(Hash)
-      meta.transform_values { |v| v.nil? ? nil : v.to_s }
-    end,
-
-    telemetry_envelope: lambda do |started_at, correlation_id, ok, code, message|
-      dur = ((Time.now - started_at) * 1000.0).to_i
-      {
-        ok: !!ok,
-        telemetry: {
-          http_status: code.to_i,
-          message: (message || (ok ? 'OK' : 'ERROR')).to_s,
-          duration_ms: dur,
-          correlation_id: correlation_id
-        }
-      }
-    end,
-
-    parse_error_code: lambda do |err|
-      # Pull first 3-digit code; fallback 0
-      m = err.to_s.match(/\b(\d{3})\b/)
-      m ? m[1].to_i : 0
-    end,
-
-    # Core: transfer one Drive file to GCS. Returns {:ok=>hash} or {:error=>hash}.
+    # transfer one Drive file to GCS. Returns {:ok=>hash} or {:error=>hash}.
     transfer_one_drive_to_gcs: lambda do |connection, file_id, bucket, object_name, editors_mode, global_content_type, global_metadata|
       user_project = connection['user_project']
       begin
         meta = call(:drive_get_meta_resolving_shortcut, file_id)
         fname = meta['name'].to_s
         oname = (object_name.presence || fname)
-        if call(:is_google_editors_mime?, meta['mimeType'])
+        if call(:util_is_google_editors_mime?, meta['mimeType'])
           if editors_mode == 'skip'
             return { error: { drive_file_id: file_id, drive_name: fname, gcs_object_name: oname,
                               error_code: 'SKIPPED',
                               error_message: 'Skipped Editors file (set editors to text to export).' } }
           end
-          export_mime = call(:editors_export_mime, meta['mimeType'])
+          export_mime = call(:util_editors_export_mime, meta['mimeType'])
           body = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}/export")
                 .params(mimeType: export_mime, supportsAllDrives: true)
                 .response_format_raw
                 .to_s
-          cs = call(:compute_checksums, body)
+          cs = call(:util_compute_checksums, body)
           created = post("https://www.googleapis.com/upload/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o")
                     .params(uploadType: 'media', name: oname, userProject: user_project)
                     .headers('Content-Type': (global_content_type.presence || export_mime))
@@ -900,7 +887,7 @@
                 .params(alt: 'media', supportsAllDrives: true)
                 .response_format_raw
                 .to_s
-          cs = call(:compute_checksums, body)
+          cs = call(:util_compute_checksums, body)
 
           # If metadata provided, switch to multipart upload to set metadata atomically.
           meta_hash = call(:safe_string_object_metadata, global_metadata || {})
@@ -937,7 +924,33 @@
       end
     end,
 
-    # --- UI HELPERS ---
+    # --- 7. DRIVE/GCS METADATA -----------
+
+    drive_get_meta_resolving_shortcut: lambda do |file_id|
+      meta = get("https://www.googleapis.com/drive/v3/files/#{file_id}")
+             .params(
+               supportsAllDrives: true,
+               fields: 'id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress),shortcutDetails'
+             )
+      target = meta.dig('shortcutDetails', 'targetId')
+      if target.present?
+        get("https://www.googleapis.com/drive/v3/files/#{target}")
+          .params(
+            supportsAllDrives: true,
+            fields: 'id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress)'
+          )
+      else
+        meta
+      end
+    end,
+
+    safe_string_object_metadata: lambda do |meta|
+      return {} unless meta.is_a?(Hash)
+      meta.transform_values { |v| v.nil? ? nil : v.to_s }
+    end,
+
+    # --- 8. UI BUILDERS ------------------
+
     # Pick-list field with extends_schema for dynamic re-rendering
     ui_content_mode_field: lambda do |pick_list_key, default|
       {
@@ -966,7 +979,7 @@
             hint: 'Required when mode is text.' },
           { name: 'postprocess', type: 'object', optional: true, label: 'Post-process',
             properties: [
-              { name: 'strip_urls', type: 'boolean', control_type: 'checkbox',
+              { name: 'util_strip_urls', type: 'boolean', control_type: 'checkbox',
                 label: 'Strip URLs from text', default: false }
             ] }
         ]
@@ -979,7 +992,7 @@
       [{
         name: 'postprocess', type: 'object', optional: true, label: 'Post-process',
         properties: [
-          { name: 'strip_urls', type: 'boolean', control_type: 'checkbox',
+          { name: 'util_strip_urls', type: 'boolean', control_type: 'checkbox',
             label: 'Strip URLs from text', default: false }
         ]
       }]
