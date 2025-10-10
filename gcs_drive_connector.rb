@@ -1,5 +1,7 @@
+# v0.4 - implement improved telemetry
 {
   title: 'Google Drive + GCS Utilities',
+  version: '0.4',
 
   # --------- CONNECTION --------------------------------------------------
   connection: {
@@ -134,21 +136,21 @@
         Array(object_definitions['gcs_object_base_fields']) + [
           { name: 'text_content', type: 'string' },
           { name: 'content_bytes', type: 'string', hint: 'Base64' },
-          { name: 'content_bytes', type: 'string', hint: 'Base64' },
           { name: 'content_md5', type: 'string', hint: 'Computed from fetched content' },
           { name: 'content_sha256', type: 'string', hint: 'Computed from fetched content' }
-        ]
+        ] + Array(object_definitions['envelope_fields'])
       end
     },
     gcs_object_with_bytes_uploaded: {
       fields: lambda do |object_definitions|
         Array(object_definitions['gcs_object_base_fields']) + [
           { name: 'bytes_uploaded', type: 'integer' }
-        ]
+        ] + Array(object_definitions['envelope_fields'])
       end
     },
 
     # --- Composite definitions
+    # Call other object definitions
     drive_file_min: {
       fields: lambda do |object_definitions|
         object_definitions['drive_file_base_fields']
@@ -160,43 +162,34 @@
           { name: 'exported_as', type: 'string' },
           { name: 'text_content', type: 'string' },
           { name: 'content_bytes', type: 'string', hint: 'Base64' },
-          { name: 'content_bytes', type: 'string', hint: 'Base64' },
           { name: 'content_md5', type: 'string', hint: 'Computed from fetched content' },
           { name: 'content_sha256', type: 'string', hint: 'Computed from fetched content' }
-        ]
-      end
-    },
-    list_page_meta: {
-      fields: lambda do |_connection|
-        [
-          { name: 'count', type: 'integer' },
-          { name: 'has_more', type: 'boolean' },
-          { name: 'next_page_token', type: 'string' }
-        ]
+        ] + Array(object_definitions['envelope_fields'])
       end
     },
     gcs_list_page: {
       fields: lambda do |object_definitions|
         base = Array(object_definitions['list_page_meta'])
-        [
+        ([
           { name: 'objects', type: 'array', of: 'object',
             properties: Array(object_definitions['gcs_object_base_fields']) },
           { name: 'prefixes', type: 'array', of: 'string' }
-        ] + base
+        ] + base + Array(object_definitions['envelope_fields']))
       end
     },
     drive_list_page: {
       fields: lambda do |object_definitions|
         base = Array(object_definitions['list_page_meta'])
-        [
+        ([
           { name: 'files', type: 'array', of: 'object',
             properties: Array(object_definitions['drive_file_base_fields']) }
-        ] + base
+        ] + base + Array(object_definitions['envelope_fields']))
       end
     },
+    # --- Schema
     transfer_result: {
-      fields: lambda do |_connection|
-        [
+      fields: lambda do |object_definitions|
+        ([
           { name: 'uploaded', type: 'array', of: 'object', properties: [
             { name: 'drive_file_id' }, { name: 'drive_name' }, { name: 'bucket' }, { name: 'gcs_object_name' },
             { name: 'bytes_uploaded', type: 'integer' }, { name: 'content_type' },
@@ -209,7 +202,7 @@
           { name: 'summary', type: 'object', properties: [
             { name: 'total', type: 'integer' }, { name: 'success', type: 'integer' }, { name: 'failed', type: 'integer' }
           ]}
-        ]
+        ] + Array(object_definitions['envelope_fields']))
       end
     },
     transfer_batch_plan_item: {
@@ -229,8 +222,8 @@
       end
     },
     transfer_batch_result: {
-      fields: lambda do |_|
-        [
+      fields: lambda do |object_definitions|
+        ([
           { name: 'uploaded', type: 'array', of: 'object', properties: [
             { name: 'drive_file_id' }, { name: 'drive_name' }, { name: 'bucket' }, { name: 'gcs_object_name' },
             { name: 'bytes_uploaded', type: 'integer' }, { name: 'content_type' },
@@ -243,6 +236,28 @@
           { name: 'summary', type: 'object', properties: [
             { name: 'total', type: 'integer' }, { name: 'success', type: 'integer' }, { name: 'failed', type: 'integer' }
           ]}
+        ] + Array(object_definitions['envelope_fields']))
+      end
+    },
+    envelope_fields: {
+      fields: lambda do |_|
+        [
+          { name: 'ok', type: 'boolean' },
+          { name: 'telemetry', type: 'object', properties: [
+            { name: 'http_status', type: 'integer' },
+            { name: 'message', type: 'string' },
+            { name: 'duration_ms', type: 'integer' },
+            { name: 'correlation_id', type: 'string' }
+          ] }
+        ]
+      end
+    },
+    list_page_meta: {
+      fields: lambda do |_connection|
+        [
+          { name: 'count', type: 'integer' },
+          { name: 'has_more', type: 'boolean' },
+          { name: 'next_page_token', type: 'string' }
         ]
       end
     }
@@ -262,6 +277,8 @@
         object_definitions['drive_list_page']
       end,
       execute: lambda do |_connection, input|
+        t0 = Time.now
+        corr = SecureRandom.uuid
         folder_id = call(:extract_drive_id, input['folder_id_or_url'])
         q = ["trashed=false"]
 
@@ -315,12 +332,20 @@
           call(:map_drive_meta, f)
         end
         next_token = res['nextPageToken']
-        {
+        base = {
           files: files,
           count: files.length,
           has_more: next_token.present?,
           next_page_token: next_token
         }
+        base.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+      rescue => e
+        # On failure, return empty page + envelope (no raise, predictable shape)
+        {}.merge(
+          files: [], count: 0, has_more: false, next_page_token: nil
+        ).merge(
+          call(:telemetry_envelope, t0, corr, false, call(:parse_error_code, e), e.to_s)
+        )
       end
     },
 
@@ -335,6 +360,8 @@
         object_definitions['drive_file_full']
       end,
       execute: lambda do |_connection, input|
+        t0 = Time.now
+        corr = SecureRandom.uuid
         file_id = call(:extract_drive_id, input['file_id_or_url'])
         meta = call(:drive_get_meta_resolving_shortcut, file_id)
 
@@ -344,7 +371,8 @@
         strip = input.dig('postprocess', 'strip_urls') ? true : false
 
         if mode == 'none'
-          result
+          result.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+
         elsif mode == 'text'
           if call(:is_google_editors_mime?, meta['mimeType'])
             export_mime = call(:editors_export_mime, meta['mimeType'])
@@ -355,8 +383,9 @@
             text = call(:force_utf8, raw)
             text = call(:strip_urls, text) if strip
             cs = call(:compute_checksums, raw)
-            result.merge(exported_as: export_mime, text_content: text,
-                         content_md5: cs['md5'], content_sha256: cs['sha256'])
+            result.merge(exported_as: export_mime, text_content: text, content_md5: cs['md5'], content_sha256: cs['sha256'])
+                  .merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+
           else
             if call(:is_textual_mime?, meta['mimeType'])
               bytes = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}")
@@ -366,8 +395,8 @@
               text = call(:force_utf8, raw)
               text = call(:strip_urls, text) if strip
               cs = call(:compute_checksums, raw)
-              result.merge(text_content: text,
-                           content_md5: cs['md5'], content_sha256: cs['sha256'])
+              result.merge(text_content: text, content_md5: cs['md5'], content_sha256: cs['sha256'])
+                    .merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
             else
               error('415 Unsupported Media Type - Non-text file; use content_mode=bytes or none.')
             end
@@ -381,11 +410,14 @@
                   .response_format_raw
           raw = bytes.to_s
           cs  = call(:compute_checksums, raw)
-          result.merge(content_bytes: Base64.strict_encode64(raw),
-                       content_md5: cs['md5'], content_sha256: cs['sha256'])
+          result.merge(content_bytes: Base64.strict_encode64(raw), content_md5: cs['md5'], content_sha256: cs['sha256'])
+                .merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
         else
           error("400 Bad Request - Unknown content_mode: #{mode}")
         end
+      rescue => e
+        # Predictable shape on error
+        {}.merge(call(:telemetry_envelope, t0, corr, false, call(:parse_error_code, e), e.to_s))
       end
     },
 
@@ -400,6 +432,8 @@
         object_definitions['gcs_list_page']
       end,
       execute: lambda do |connection, input|
+        t0 = Time.now
+        corr = SecureRandom.uuid
         filters = input['filters'] || {}
         paging  = input['paging']  || {}
         page_size = [[(paging['max_results'] || 1000).to_i, 1].max, 1000].min
@@ -417,13 +451,20 @@
           call(:map_gcs_meta, o)
         end
         next_token = res['nextPageToken']
-        {
+        base = {
           objects: items,
           prefixes: res['prefixes'] || [],
           count: items.length,
           has_more: next_token.present?,
           next_page_token: next_token
         }
+        base.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+      rescue => e
+        {}.merge(
+          objects: [], prefixes: [], count: 0, has_more: false, next_page_token: nil
+        ).merge(
+          call(:telemetry_envelope, t0, corr, false, call(:parse_error_code, e), e.to_s)
+        )
       end
     },
 
@@ -438,6 +479,8 @@
         object_definitions['gcs_object_with_content']
       end,
       execute: lambda do |connection, input|
+        t0 = Time.now
+        corr = SecureRandom.uuid
         bucket = input['bucket']
         name = input['object_name']
         meta = get("https://storage.googleapis.com/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o/#{ERB::Util.url_encode(name)}")
@@ -447,7 +490,7 @@
         strip = input.dig('postprocess', 'strip_urls') ? true : false
         ctype = meta['contentType']
         if mode == 'none'
-          base
+          base.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
         elsif mode == 'text'
           unless call(:is_textual_mime?, ctype)
             error('415 Unsupported Media Type - Non-text object; use content_mode=bytes or none.')
@@ -460,6 +503,7 @@
           text = call(:strip_urls, text) if strip
           cs = call(:compute_checksums, raw)
           base.merge(text_content: text, content_md5: cs['md5'], content_sha256: cs['sha256'])
+              .merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
         elsif mode == 'bytes'
           bytes = get("https://storage.googleapis.com/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o/#{ERB::Util.url_encode(name)}")
                   .params(alt: 'media', userProject: connection['user_project'])
@@ -467,9 +511,12 @@
           raw = bytes.to_s
           cs  = call(:compute_checksums, raw)
           base.merge(content_bytes: Base64.strict_encode64(raw), content_md5: cs['md5'], content_sha256: cs['sha256'])
+              .merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
         else
           error("400 Bad Request - Unknown content_mode: #{mode}")
         end
+      rescue => e
+        {}.merge(call(:telemetry_envelope, t0, corr, false, call(:parse_error_code, e), e.to_s))
       end
     },
 
@@ -484,6 +531,8 @@
         object_definitions['gcs_object_with_bytes_uploaded']
       end,
       execute: lambda do |connection, input|
+        t0 = Time.now
+        corr = SecureRandom.uuid
         bucket = input['bucket']
         name = input['object_name']
         mode = input['content_mode']
@@ -529,13 +578,17 @@
               .headers('Content-Type': ctype)
               .request_body(body_bytes)
           end
-        call(:map_gcs_meta, created).merge(bytes_uploaded: bytes_uploaded)
+        call(:map_gcs_meta, created)
+          .merge(bytes_uploaded: bytes_uploaded)
+          .merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+      rescue => e
+        {}.merge(call(:telemetry_envelope, t0, corr, false, call(:parse_error_code, e), e.to_s))
       end
     },
 
     # 6) transfer_drive_to_gcs
     transfer_drive_to_gcs: {
-      title: 'Transfer: Drive -> GCS',
+      title: 'Transfer: Drive → GCS',
       description: 'For each Drive file ID, fetch content (export Editors to text if selected) and upload to GCS under a prefix.',
       input_fields: lambda do |_obj, _conn, config_fields|
         call(:ui_transfer_inputs, config_fields)
@@ -544,6 +597,8 @@
         object_definitions['transfer_result']
       end,
       execute: lambda do |connection, input|
+        t0 = Time.now
+        corr = SecureRandom.uuid
         bucket       = input['bucket']
         prefix       = call(:normalize_prefix, input['gcs_prefix'])
         editors_mode = (input['content_mode_for_editors'] || 'text').to_s
@@ -564,16 +619,24 @@
             failed << res[:error]
           end
         end
-        { uploaded: uploaded,
-          failed: failed,
-          summary: { total: (uploaded.length + failed.length), success: uploaded.length, failed: failed.length } }
+
+        summary = { total: (uploaded.length + failed.length), success: uploaded.length, failed: failed.length }
+        base = { uploaded: uploaded, failed: failed, summary: summary }
+        ok = failed.empty?
+        code = ok ? 200 : 207
+        msg  = ok ? 'OK' : 'Partial'
+        base.merge(call(:telemetry_envelope, t0, corr, ok, code, msg))
+      rescue => e
+        { uploaded: [], failed: [], summary: { total: 0, success: 0, failed: 0 } }
+        .merge(call(:telemetry_envelope, t0, corr, false, call(:parse_error_code, e), e.to_s))
       end
     },
 
     # 7) transfer_drive_to_gcs_batch
     transfer_drive_to_gcs_batch: {
-      title: 'Transfer (Batch): Drive -> GCS',
+      title: 'Transfer: Drive → GCS',
       description: 'Upload many Drive files to GCS in one run, with optional per-item overrides (name, Editors mode, content-type, metadata). Partial success is returned.',
+      batch: true,
       input_fields: lambda do |_obj, _conn, config_fields|
         call(:ui_transfer_batch_inputs, config_fields)
       end,
@@ -581,7 +644,9 @@
         object_definitions['transfer_batch_result']
       end,
       execute: lambda do |connection, input|
-        bucket   = input['bucket']
+        t0 = Time.now
+        corr = SecureRandom.uuid
+        bucket       = input['bucket']
         prefix   = call(:normalize_prefix, input['gcs_prefix'])
         def_mode = (input['default_editors_mode'] || 'text').to_s
         def_ct   = input['default_content_type']
@@ -609,9 +674,15 @@
           end
         end
 
-        { uploaded: uploaded,
-          failed: failed,
-          summary: { total: (uploaded.length + failed.length), success: uploaded.length, failed: failed.length } }
+        summary = { total: (uploaded.length + failed.length), success: uploaded.length, failed: failed.length }
+        base = { uploaded: uploaded, failed: failed, summary: summary }
+        ok = failed.empty?
+        code = ok ? 200 : 207
+        msg  = ok ? 'OK' : 'Partial'
+        base.merge(call(:telemetry_envelope, t0, corr, ok, code, msg))
+      rescue => e
+        { uploaded: [], failed: [], summary: { total: 0, success: 0, failed: 0 } }
+        .merge(call(:telemetry_envelope, t0, corr, false, call(:parse_error_code, e), e.to_s))
       end
     }
 
@@ -774,6 +845,25 @@
     safe_string_object_metadata: lambda do |meta|
       return {} unless meta.is_a?(Hash)
       meta.transform_values { |v| v.nil? ? nil : v.to_s }
+    end,
+
+    telemetry_envelope: lambda do |started_at, correlation_id, ok, code, message|
+      dur = ((Time.now - started_at) * 1000.0).to_i
+      {
+        ok: !!ok,
+        telemetry: {
+          http_status: code.to_i,
+          message: (message || (ok ? 'OK' : 'ERROR')).to_s,
+          duration_ms: dur,
+          correlation_id: correlation_id
+        }
+      }
+    end,
+
+    parse_error_code: lambda do |err|
+      # Pull first 3-digit code; fallback 0
+      m = err.to_s.match(/\b(\d{3})\b/)
+      m ? m[1].to_i : 0
     end,
 
     # Core: transfer one Drive file to GCS. Returns {:ok=>hash} or {:error=>hash}.
