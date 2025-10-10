@@ -914,7 +914,7 @@
           cs = call(:util_compute_checksums, body)
 
           # If metadata provided, switch to multipart upload to set metadata atomically.
-          meta_hash = call(:safe_string_object_metadata, global_metadata || {})
+          meta_hash = call(:util_safe_string_object_metadata, global_metadata || {})
           created =
             if meta_hash.present?
               boundary = "workato-multipart-#{SecureRandom.hex(8)}"
@@ -1156,7 +1156,7 @@
         { name: 'items', type: 'array', of: 'object', label: 'Items',
           properties: call(:schema_transfer_batch_plan_item_fields), optional: false }
       ]
-    end
+    end,
 
     # --- 9. SCHEMA -----------------------
     schema_transfer_batch_plan_item_fields: lambda do
