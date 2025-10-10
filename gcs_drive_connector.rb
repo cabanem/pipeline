@@ -19,22 +19,27 @@
         optional: true
       },
       {
+        name: 'set_defaults_for_probe', type: 'boolean', control_type: 'checkbox',
+        extends_schema: true, optional: false,
+        hint: 'Optionally set default bucket and Drive folder for connection test'
+      },
+      {
         name: 'default_probe_bucket',
         label: 'Default probe bucket (GCS)',
         hint: 'Used by connection test + Permission probe when no bucket is provided.',
-        optional: true
+        optional: true, ngIf: 'input.set_defaults_for_probe' == "true"
       },
       {
         name: 'canary_drive_folder_id_or_url',
         label: 'Canary Drive folder (ID or URL)',
         hint: 'Probe lists files here (first 3). Leave blank to probe corpus without parent filter.',
-        optional: true
+        optional: true, ngIf: 'input.set_defaults_for_probe' == "true"
       },
       {
         name: 'canary_shared_drive_id',
         label: 'Canary shared drive ID (optional)',
         hint: 'If set, probe uses corpora=drive and this driveId.',
-        optional: true
+        optional: true, ngIf: 'input.set_defaults_for_probe' == "true"
        }
     ],
 
@@ -75,10 +80,6 @@
   },
 
   # --------- CONNECTION TEST ----------------------------------------------
-  test: lambda do |_connection|
-    get('https://www.googleapis.com/drive/v3/about')
-      .params(fields: 'user,storageQuota')
-  end,
 
   test: lambda do |connection|
     # Leverage the same probe logic as the action.
@@ -284,6 +285,7 @@
     drive_list_files: {
       title: 'Drive: List files',
       subtitle: 'List files in Drive',
+      display_priority: 10,
       help: lambda do |_|
         {
           body: 'Return a page of Drive files with minimal metadata (newest first).'
@@ -448,6 +450,7 @@
     drive_get_file: {
       title: 'Drive: Get file',
       subtitle: 'Fetch Drive file metadata and content',
+      display_priority: 10,
       help: lambda do |_|
         {
           body: 'Fetch Drive file metadata and optionally content (text or bytes). Shortcuts are resolved once.'
@@ -478,7 +481,7 @@
 
         elsif mode == 'text'
           if call(:util_is_google_editors_mime?, meta['mimeType'])
-            export_mime = call(:util_editors_export_mime, meta['mimeType'])
+            export_mime = call(:util_editors_export_mime, meta['mimeType'], input['editors_export_format'])
             bytes = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}/export")
                     .params(mimeType: export_mime, supportsAllDrives: true)
                     .response_format_raw # treat response as new
@@ -528,6 +531,7 @@
     gcs_list_objects: {
       title: 'GCS: List objects',
       subtitle: 'List objects in Google Cloud Storage bucket',
+      display_priority: 10,
       help: lambda do |_|
         {
           body: 'List objects in a bucket, optionally using prefix and delimiter.'
@@ -610,6 +614,7 @@
     gcs_get_object: {
       title: 'GCS: Get object',
       subtitle: 'Fetch an object from Google Cloud Storage bucket',
+      display_priority: 10,
       help: lambda do |_|
         {
           body: 'Fetch GCS object metadata and optionally content (text or bytes).'
@@ -703,6 +708,7 @@
     gcs_put_object: {
       title: 'GCS: Put object',
       subtitle: 'Upload an object to Google Cloud Storage bucket',
+      display_priority: 10,
       help: lambda do |_|
         {
           body: 'Upload text or bytes to GCS. Returns created object metadata and bytes_uploaded.'
@@ -798,6 +804,7 @@
     transfer_drive_to_gcs: {
       title: 'Transfer: Drive → GCS',
       subtitle: 'Transfer a single file from Drive to Cloud Storage bucket',
+      display_priority: 10,
       help: lambda do |_|
         {
           body: 'For each Drive file ID, fetch content (export Editors to text if selected) and upload to GCS under a prefix.'
@@ -818,6 +825,7 @@
         bucket       = input['bucket']
         prefix       = call(:util_normalize_prefix, input['gcs_prefix'])
         editors_mode = (input['content_mode_for_editors'] || 'text').to_s
+        editors_fmt  = input['editors_export_format']
 
         uploaded, failed = [], []
         drive_files = Array(input['drive_file_ids']).map(&:to_s).flat_map { |s| s.split(/[\s,]+/) }
@@ -826,7 +834,7 @@
         drive_files.each do |raw|
           file_id = call(:util_extract_drive_id, raw)
           next if file_id.blank?
-          res = call(:transfer_one_drive_to_gcs, connection, file_id, bucket, "#{prefix}", editors_mode, nil, nil)
+          res = call(:transfer_one_drive_to_gcs, connection, file_id, bucket, "#{prefix}", editors_mode, editors_fmt, nil, nil)
           if res['ok']
             ok = res['ok']
             ok[:gcs_object_name] = "#{prefix}#{ok[:gcs_object_name]}" if prefix.present? && !ok[:gcs_object_name].to_s.start_with?(prefix)
@@ -886,6 +894,7 @@
     transfer_drive_to_gcs_batch: {
       title: 'Transfer: Drive → GCS',
       subtitle: 'Transfer multiple items from Drive to Cloud Storage bucket',
+      display_priority: 10,
       help: lambda do |_|
         {
           body: 'Upload many Drive files to GCS in one run, with optional per-item overrides (name, Editors mode, content-type, metadata). Partial success is returned.'
@@ -907,6 +916,7 @@
         bucket       = input['bucket']
         prefix   = call(:util_normalize_prefix, input['gcs_prefix'])
         def_mode = (input['default_editors_mode'] || 'text').to_s
+        def_fmt  = input['default_editors_export_format']
         def_ct   = input['default_content_type']
         def_meta = input['default_custom_metadata']
         stop_on_error = !!input['stop_on_error']
@@ -921,7 +931,8 @@
           target_name  = (it['target_object_name'].presence || nil)
           object_name  = target_name.present? ? "#{prefix}#{target_name}" : nil
 
-          res = call(:transfer_one_drive_to_gcs, connection, file_id, bucket, (object_name || ''), editors_mode, ctype, meta)
+          editors_fmt  = (it['editors_export_format'].presence || def_fmt)
+          res = call(:transfer_one_drive_to_gcs, connection, file_id, bucket, (object_name || ''), editors_mode, editors_fmt, ctype, meta)
           if res['ok']
             ok = res['ok']
             ok[:gcs_object_name] = (object_name.presence || "#{prefix}#{ok[:gcs_object_name]}")
@@ -982,6 +993,7 @@
     permission_probe: {
       title: 'Permission probe (Drive & GCS)',
       subtitle: 'Verify token identity, Drive visibility, GCS access, and requester-pays',
+      display_priority: 1,
       input_fields: lambda do |_|
         [
           { name: 'bucket', label: 'GCS bucket', optional: true, hint: 'Defaults to connection.default_probe_bucket' },
@@ -1015,6 +1027,7 @@
         drive_id = (input['drive_id'].presence || connection['canary_shared_drive_id'])
         call(:do_permission_probe, connection, bucket, folder, drive_id, prefix)
       end
+    }
   },
 
   # --------- PICK LISTS ---------------------------------------------------
@@ -1036,6 +1049,19 @@
       [
         ['text (export Editors to plain/csv/svg per mapping)', 'text'],
         ['skip (do not transfer Editors files)', 'skip']
+      ]
+    end,
+    editors_export_formats: lambda do |_|
+      # The value is the MIME we will pass to files.export.
+      [
+        ['Docs → PDF',  'application/pdf'],
+        ['Docs → DOCX', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
+        ['Sheets → CSV (first sheet)', 'text/csv'],
+        ['Sheets → XLSX', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'],
+        ['Slides → PDF', 'application/pdf'],
+        ['Slides → TXT (speaker notes omitted)', 'text/plain'],
+        ['Drawings → SVG', 'image/svg+xml'],
+        ['Drawings → PNG', 'image/png']
       ]
     end
   },
@@ -1082,15 +1108,46 @@
       (mime || '').start_with?('application/vnd.google-apps.')
     end,
 
-    util_editors_export_mime: lambda do |mime|
-      case mime
-      when 'application/vnd.google-apps.document'     then 'text/plain'
-      when 'application/vnd.google-apps.spreadsheet'  then 'text/csv'
-      when 'application/vnd.google-apps.presentation' then 'text/plain'
-      when 'application/vnd.google-apps.drawing'      then 'image/svg+xml'
+    # Choose the export MIME for Google Drive files
+    # If caller provides preferred_export_mime, use it *when compatible* with the source type,
+    # otherwise fall back to a sensible default that Google accepts.
+    util_editors_export_mime: lambda do |source_mime, preferred_export_mime|
+      src = (source_mime || '')
+      pref = preferred_export_mime.to_s
+
+      case src
+      when 'application/vnd.google-apps.document'
+        allowed = %w[
+          application/pdf
+          application/vnd.openxmlformats-officedocument.wordprocessingml.document
+          text/plain
+        ]
+        allowed.include?(pref) ? pref : 'application/pdf'
+
+      when 'application/vnd.google-apps.spreadsheet'
+        allowed = %w[
+          text/csv
+          application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+        ]
+        allowed.include?(pref) ? pref : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+
+      when 'application/vnd.google-apps.presentation'
+        allowed = %w[
+          application/pdf
+          text/plain
+        ]
+        allowed.include?(pref) ? pref : 'application/pdf'
+
+      when 'application/vnd.google-apps.drawing'
+        allowed = %w[
+          image/svg+xml
+          image/png
+        ]
+        allowed.include?(pref) ? pref : 'image/svg+xml'
+
       else
-        # Defensive default; Google will 400 for unsupported combos anyway.
-        'text/plain'
+        # Non-editors or unknown → caller should not invoke export.
+        pref.presence || 'application/octet-stream'
       end
     end,
 
@@ -1412,7 +1469,7 @@
               'error_message'  => 'Skipped Editors file (set editors to text to export).'
             } }
           end
-          export_mime = call(:util_editors_export_mime, meta['mimeType'])
+          export_mime = call(:util_editors_export_mime, meta['mimeType'], editors_export_format)
           body = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}/export")
                 .params(mimeType: export_mime, supportsAllDrives: true)
                 .response_format_raw
@@ -1682,7 +1739,17 @@
         { name: 'file_id_or_url', optional: false, label: 'File ID or URL' },
         call(:ui_content_mode_field, 'content_modes', 'none')
       ]
-      base + call(:ui_read_postprocess_if_text, mode)
+      extra =
+        if mode == 'text'
+          [
+            { name: 'editors_export_format', label: 'Editors export format',
+              control_type: 'select', pick_list: 'editors_export_formats', optional: true,
+              hint: 'Only used when the file is a Google Editors type. Default: PDF for Docs, XLSX for Sheets, PDF for Slides, SVG for Drawings.' }
+          ] + call(:ui_read_postprocess_if_text, mode)
+        else
+          []
+        end
+      base + extra
     end,
 
     # Assemble inputs for Drive LIST
@@ -1749,15 +1816,12 @@
         { name: 'bucket', optional: false, label: 'Destination bucket' },
         { name: 'gcs_prefix', optional: true, label: 'Destination prefix',
           hint: 'E.g. "ingest/". Drive file name is used for object name.' },
-        {
-          name: 'drive_file_ids',
-          type: 'array', of: 'string',
-          optional: false,
-          label: 'Drive file IDs or URLs',
-          hint: 'Map from List files → file_ids, or paste multiple.'
-        },
+        { name: 'drive_file_ids', type: 'array', of: 'string', optional: false,
+          label: 'Drive file IDs or URLs', hint: 'Map from List files → file_ids, or paste multiple.' },
         { name: 'content_mode_for_editors', control_type: 'select', pick_list: 'editors_modes',
-          optional: true, default: 'text', label: 'Editors files handling' }
+          optional: true, default: 'text', label: 'Editors files handling' },
+        { name: 'editors_export_format', label: 'Editors export format (when Editors=text)',
+          control_type: 'select', pick_list: 'editors_export_formats', optional: true }
       ]
     end,
 
@@ -1768,6 +1832,8 @@
         { name: 'gcs_prefix', optional: true, label: 'Destination prefix' },
         { name: 'default_editors_mode', control_type: 'select', pick_list: 'editors_modes',
           optional: true, default: 'text', label: 'Default Editors handling' },
+        { name: 'default_editors_export_format', control_type: 'select', pick_list: 'editors_export_formats',
+          optional: true, label: 'Default Editors export format' },
         { name: 'default_content_type', optional: true, label: 'Default Content-Type' },
         { name: 'default_custom_metadata', type: 'object', optional: true, label: 'Default custom metadata' },
         { name: 'stop_on_error', type: 'boolean', control_type: 'checkbox', default: false, label: 'Stop on first error' },
@@ -1782,11 +1848,11 @@
         { name: 'drive_file_id_or_url', label: 'Drive file ID or URL', optional: false },
         { name: 'target_object_name',   label: 'Override GCS object name', optional: true,
           hint: 'If blank, uses Drive file name.' },
-        { name: 'editors_mode', label: 'Editors handling (override)',
-          optional: true,
-          control_type: 'select',
-          pick_list: 'editors_modes',
-          hint: 'If blank, the action-level Editors setting is used.' },
+        { name: 'editors_mode', label: 'Editors handling (override)', optional: true, control_type: 'select',
+          pick_list: 'editors_modes',  hint: 'If blank, the action-level Editors setting is used.' },
+        { name: 'editors_export_format', label: 'Editors export format (override)',
+          control_type: 'select', pick_list: 'editors_export_formats', optional: true,
+          hint: 'Only used when editors_mode=text and file is a Google Editors type.' },
         { name: 'content_type', label: 'Content-Type override', optional: true },
         { name: 'custom_metadata', label: 'Custom metadata (override)', type: 'object', optional: true }
       ]
