@@ -131,7 +131,7 @@
     # fail to resolve at runtime).
     gcs_object_with_content: {
       fields: lambda do |object_definitions|
-        object_definitions['gcs_object_base_fields'] + [
+        Array(object_definitions['gcs_object_base_fields']) + [
           { name: 'text_content', type: 'string' },
           { name: 'content_bytes', type: 'string', hint: 'Base64' }
         ]
@@ -139,7 +139,7 @@
     },
     gcs_object_with_bytes_uploaded: {
       fields: lambda do |object_definitions|
-        object_definitions['gcs_object_base_fields'] + [
+        Array(object_definitions['gcs_object_base_fields']) + [
           { name: 'bytes_uploaded', type: 'integer' }
         ]
       end
@@ -153,7 +153,7 @@
     },
     drive_file_full: {
       fields: lambda do |object_definitions|
-        object_definitions['drive_file_base_fields'] + [
+        Array(object_definitions['drive_file_base_fields']) + [
           { name: 'exported_as', type: 'string' },
           { name: 'text_content', type: 'string' },
           { name: 'content_bytes', type: 'string', hint: 'Base64' }
@@ -171,18 +171,21 @@
     },
     gcs_list_page: {
       fields: lambda do |object_definitions|
+        base = Array(object_definitions['list_page_meta'])
         [
-          { name: 'objects', type: 'array', of: 'object', properties: object_definitions['gcs_object_base_fields'] },
+          { name: 'objects', type: 'array', of: 'object',
+            properties: Array(object_definitions['gcs_object_base_fields']) },
           { name: 'prefixes', type: 'array', of: 'string' }
-        ] + object_definitions['list_page_meta']
+        ] + base
       end
     },
-    # Mirrors drive_list_files execute payload: { files: [...], <page_meta> }
     drive_list_page: {
       fields: lambda do |object_definitions|
+        base = Array(object_definitions['list_page_meta'])
         [
-          { name: 'files', type: 'array', of: 'object', properties: object_definitions['drive_file_base_fields'] }
-        ] + object_definitions['list_page_meta']
+          { name: 'files', type: 'array', of: 'object',
+            properties: Array(object_definitions['drive_file_base_fields']) }
+        ] + base
       end
     },
     transfer_result: {
