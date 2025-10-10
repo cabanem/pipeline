@@ -207,18 +207,7 @@
     },
     transfer_batch_plan_item: {
       fields: lambda do |_|
-        [
-          { name: 'drive_file_id_or_url', label: 'Drive file ID or URL', optional: false },
-          { name: 'target_object_name',   label: 'Override GCS object name', optional: true,
-            hint: 'If blank, uses Drive file name.' },
-          { name: 'editors_mode', label: 'Editors handling (override)',
-            optional: true,
-            control_type: 'select',
-            pick_list: 'editors_modes',
-            hint: 'If blank, the action-level Editors setting is used.' },
-          { name: 'content_type', label: 'Content-Type override', optional: true },
-          { name: 'custom_metadata', label: 'Custom metadata (override)', type: 'object', optional: true }
-        ]
+        call(:schema_transfer_batch_plan_item_fields)
       end
     },
     transfer_batch_result: {
@@ -1165,7 +1154,23 @@
         { name: 'default_custom_metadata', type: 'object', optional: true, label: 'Default custom metadata' },
         { name: 'stop_on_error', type: 'boolean', control_type: 'checkbox', default: false, label: 'Stop on first error' },
         { name: 'items', type: 'array', of: 'object', label: 'Items',
-          properties: call(:object_definitions)['transfer_batch_plan_item']['fields'].call(nil), optional: false }
+          properties: call(:schema_transfer_batch_plan_item_fields), optional: false }
+      ]
+    end
+
+    # --- 9. SCHEMA -----------------------
+    schema_transfer_batch_plan_item_fields: lambda do
+      [
+        { name: 'drive_file_id_or_url', label: 'Drive file ID or URL', optional: false },
+        { name: 'target_object_name',   label: 'Override GCS object name', optional: true,
+          hint: 'If blank, uses Drive file name.' },
+        { name: 'editors_mode', label: 'Editors handling (override)',
+          optional: true,
+          control_type: 'select',
+          pick_list: 'editors_modes',
+          hint: 'If blank, the action-level Editors setting is used.' },
+        { name: 'content_type', label: 'Content-Type override', optional: true },
+        { name: 'custom_metadata', label: 'Custom metadata (override)', type: 'object', optional: true }
       ]
     end
 
