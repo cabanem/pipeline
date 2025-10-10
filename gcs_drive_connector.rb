@@ -133,7 +133,10 @@
       fields: lambda do |object_definitions|
         Array(object_definitions['gcs_object_base_fields']) + [
           { name: 'text_content', type: 'string' },
-          { name: 'content_bytes', type: 'string', hint: 'Base64' }
+          { name: 'content_bytes', type: 'string', hint: 'Base64' },
+          { name: 'content_bytes', type: 'string', hint: 'Base64' },
+          { name: 'content_md5', type: 'string', hint: 'Computed from fetched content' },
+          { name: 'content_sha256', type: 'string', hint: 'Computed from fetched content' }
         ]
       end
     },
@@ -156,7 +159,10 @@
         Array(object_definitions['drive_file_base_fields']) + [
           { name: 'exported_as', type: 'string' },
           { name: 'text_content', type: 'string' },
-          { name: 'content_bytes', type: 'string', hint: 'Base64' }
+          { name: 'content_bytes', type: 'string', hint: 'Base64' },
+          { name: 'content_bytes', type: 'string', hint: 'Base64' },
+          { name: 'content_md5', type: 'string', hint: 'Computed from fetched content' },
+          { name: 'content_sha256', type: 'string', hint: 'Computed from fetched content' }
         ]
       end
     },
@@ -192,10 +198,14 @@
       fields: lambda do |_connection|
         [
           { name: 'uploaded', type: 'array', of: 'object', properties: [
-            { name: 'drive_file_id' }, { name: 'drive_name' }, { name: 'bucket' }, { name: 'gcs_object_name' }, { name: 'bytes_uploaded', type: 'integer' }, { name: 'content_type' }
+            { name: 'drive_file_id' }, { name: 'drive_name' }, { name: 'bucket' }, { name: 'gcs_object_name' },
+            { name: 'bytes_uploaded', type: 'integer' }, { name: 'content_type' },
+            { name: 'content_md5', type: 'string' }, { name: 'content_sha256', type: 'string' }
           ]},
           { name: 'failed', type: 'array', of: 'object', properties: [
-            { name: 'drive_file_id' }, { name: 'error_message' }, { name: 'error_code' }
+            { name: 'drive_file_id' }, { name: 'drive_name' }, { name: 'bucket' }, { name: 'gcs_object_name' },
+            { name: 'bytes_uploaded', type: 'integer' }, { name: 'content_type' },
+            { name: 'content_md5', type: 'string' }, { name: 'content_sha256', type: 'string' }
           ]},
           { name: 'summary', type: 'object', properties: [
             { name: 'total', type: 'integer' }, { name: 'success', type: 'integer' }, { name: 'failed', type: 'integer' }
@@ -308,17 +318,23 @@
             bytes = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}/export")
                     .params(mimeType: export_mime, supportsAllDrives: true)
                     .response_format_raw # treat response as new
-            text = call(:force_utf8, bytes.to_s)
+            raw  = bytes.to_s
+            text = call(:force_utf8, raw)
             text = call(:strip_urls, text) if strip
-            result.merge(exported_as: export_mime, text_content: text)
+            cs = call(:compute_checksums, raw)
+            result.merge(exported_as: export_mime, text_content: text,
+                         content_md5: cs['md5'], content_sha256: cs['sha256'])
           else
             if call(:is_textual_mime?, meta['mimeType'])
               bytes = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}")
                       .params(alt: 'media', supportsAllDrives: true)
                       .response_format_raw
-              text = call(:force_utf8, bytes.to_s)
+              raw  = bytes.to_s
+              text = call(:force_utf8, raw)
               text = call(:strip_urls, text) if strip
-              result.merge(text_content: text)
+              cs = call(:compute_checksums, raw)
+              result.merge(text_content: text,
+                           content_md5: cs['md5'], content_sha256: cs['sha256'])
             else
               error('415 Unsupported Media Type - Non-text file; use content_mode=bytes or none.')
             end
@@ -330,7 +346,10 @@
           bytes = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}")
                   .params(alt: 'media', supportsAllDrives: true, acknowledgeAbuse: false)
                   .response_format_raw
-          result.merge(content_bytes: Base64.strict_encode64(bytes.to_s))
+          raw = bytes.to_s
+          cs  = call(:compute_checksums, raw)
+          result.merge(content_bytes: Base64.strict_encode64(raw),
+                       content_md5: cs['md5'], content_sha256: cs['sha256'])
         else
           error("400 Bad Request - Unknown content_mode: #{mode}")
         end
@@ -403,14 +422,18 @@
           bytes = get("https://storage.googleapis.com/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o/#{ERB::Util.url_encode(name)}")
                   .params(alt: 'media', userProject: connection['user_project'])
                   .response_format_raw
-          text = call(:force_utf8, bytes.to_s)
+          raw  = bytes.to_s
+          text = call(:force_utf8, raw)
           text = call(:strip_urls, text) if strip
-          base.merge(text_content: text)
+          cs = call(:compute_checksums, raw)
+          base.merge(text_content: text, content_md5: cs['md5'], content_sha256: cs['sha256'])
         elsif mode == 'bytes'
           bytes = get("https://storage.googleapis.com/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o/#{ERB::Util.url_encode(name)}")
                   .params(alt: 'media', userProject: connection['user_project'])
                   .response_format_raw
-          base.merge(content_bytes: Base64.strict_encode64(bytes.to_s))
+          raw = bytes.to_s
+          cs  = call(:compute_checksums, raw)
+          base.merge(content_bytes: Base64.strict_encode64(raw), content_md5: cs['md5'], content_sha256: cs['sha256'])
         else
           error("400 Bad Request - Unknown content_mode: #{mode}")
         end
@@ -516,6 +539,7 @@
                       .params(mimeType: export_mime, supportsAllDrives: true)
                       .response_format_raw
               body = bytes.to_s
+              cs   = call(:compute_checksums, body)
               created = post("https://www.googleapis.com/upload/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o")
                         .params(uploadType: 'media', name: object_name, userProject: user_project)
                         .headers('Content-Type': export_mime)
@@ -526,7 +550,9 @@
                 bucket: created['bucket'],
                 gcs_object_name: created['name'],
                 bytes_uploaded: body.bytesize,
-                content_type: export_mime
+                content_type: export_mime,
+                content_md5: cs['md5'],
+                content_sha256: cs['sha256']
               }
             else
               ctype = meta['mimeType']
@@ -534,6 +560,7 @@
                       .params(alt: 'media', supportsAllDrives: true)
                       .response_format_raw
               body = bytes.to_s
+              cs   = call(:compute_checksums, body)
               created = post("https://www.googleapis.com/upload/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o")
                         .params(uploadType: 'media', name: object_name, userProject: user_project)
                         .headers('Content-Type': ctype)
@@ -544,7 +571,9 @@
                 bucket: created['bucket'],
                 gcs_object_name: created['name'],
                 bytes_uploaded: body.bytesize,
-                content_type: ctype
+                content_type: ctype,
+                content_md5: cs['md5'],
+                content_sha256: cs['sha256']
               }
             end
           rescue => e
@@ -684,6 +713,14 @@
       else
         meta
       end
+    end,
+
+    # Compute MD5 and SHA-256 from raw bytes
+    compute_checksums: lambda do |raw|
+      s = raw.to_s
+      md5 = OpenSSL::Digest::MD5.hexdigest(s)
+      sha = OpenSSL::Digest::SHA256.hexdigest(s)
+      { 'md5' => md5, 'sha256' => sha }
     end,
 
     # Base64url without padding
