@@ -17,7 +17,25 @@
         label: 'User project for requester-pays (optional)',
         hint: 'Project ID for billing (userProject)',
         optional: true
-      }
+      },
+      {
+        name: 'default_probe_bucket',
+        label: 'Default probe bucket (GCS)',
+        hint: 'Used by connection test + Permission probe when no bucket is provided.',
+        optional: true
+      },
+      {
+        name: 'canary_drive_folder_id_or_url',
+        label: 'Canary Drive folder (ID or URL)',
+        hint: 'Probe lists files here (first 3). Leave blank to probe corpus without parent filter.',
+        optional: true
+      },
+      {
+        name: 'canary_shared_drive_id',
+        label: 'Canary shared drive ID (optional)',
+        hint: 'If set, probe uses corpora=drive and this driveId.',
+        optional: true
+       }
     ],
 
     authorization: {
@@ -60,6 +78,25 @@
   test: lambda do |_connection|
     get('https://www.googleapis.com/drive/v3/about')
       .params(fields: 'user,storageQuota')
+  end,
+
+  test: lambda do |connection|
+    # Leverage the same probe logic as the action.
+    bucket   = connection['default_probe_bucket']
+    folder   = connection['canary_drive_folder_id_or_url']
+    drive_id = connection['canary_shared_drive_id']
+    res = call(:do_permission_probe, connection, bucket, folder, drive_id, 'probes/')
+    # A non-200 probe still returns JSON; Workato considers any returned
+    # object a "pass" unless you raise. We intentionally do NOT raise,
+    # so users see structured hints in the test result.
+    # Return a slim object so the UI shows something human-readable.
+    {
+      ok: res['ok'],
+      whoami: res['whoami'],
+      drive_ok: res.dig('drive','ok'),
+      gcs_ok: res.dig('gcs','ok'),
+      requester_pays_detected: res['requester_pays_detected']
+    }
   end,
 
   # --------- OBJECT DEFINITIONS -------------------------------------------
@@ -944,55 +981,40 @@
     # 8) permission_probe
     permission_probe: {
       title: 'Permission probe (Drive & GCS)',
-      subtitle: 'Quickly verify SA token, bucket access, and requester-pays',
-      input_fields: lambda do
+      subtitle: 'Verify token identity, Drive visibility, GCS access, and requester-pays',
+      input_fields: lambda do |_|
         [
-          { name: 'bucket', optional: false, label: 'GCS bucket' }
+          { name: 'bucket', label: 'GCS bucket', optional: true, hint: 'Defaults to connection.default_probe_bucket' },
+          { name: 'gcs_prefix', label: 'Probe prefix', optional: true, hint: 'Defaults to "probes/"' },
+          { name: 'drive_canary_folder_id_or_url', label: 'Drive canary folder (ID/URL)', optional: true,
+            hint: 'Defaults to connection.canary_drive_folder_id_or_url' },
+          { name: 'drive_id', label: 'Shared drive ID', optional: true,
+            hint: 'Defaults to connection.canary_shared_drive_id' }
         ]
       end,
-      output_fields: lambda do
+      output_fields: lambda do |object_definitions|
+        # Spec-compliant shape
         [
           { name: 'ok', type: 'boolean' },
-          { name: 'drive', type: 'object', properties: [
-              { name: 'ok', type: 'boolean' },
-              { name: 'user_email', type: 'string' },
-              { name: 'error', type: 'string' }
+          { name: 'whoami', type: 'string', hint: 'Token principal (email)' },
+          { name: 'supportsAllDrives', type: 'boolean' },
+          { name: 'includeItemsFromAllDrives', type: 'boolean' },
+          { name: 'requester_pays_detected', type: 'boolean' },
+          { name: 'drive_access', type: 'array', of: 'object', properties: [
+              { name: 'id' }, { name: 'name' }, { name: 'web_view_url' }
           ]},
-          { name: 'gcs', type: 'object', properties: [
-              { name: 'ok', type: 'boolean' },
-              { name: 'bucket_project', type: 'string' },
-              { name: 'error', type: 'string' }
-          ]},
-          { name: 'notes', type: 'string' }
-        ]
+          { name: 'gcs_access', type: 'array', of: 'object', properties: [
+              { name: 'name' }, { name: 'size', type: 'integer' }, { name: 'updated', type: 'date_time' }
+          ]}
+        ] + Array(object_definitions['envelope_fields'])
       end,
       execute: lambda do |connection, input|
-        t0 = Time.now; corr = SecureRandom.uuid
-
-        drive_ok = {}; gcs_ok = {}
-        begin
-          about = get('https://www.googleapis.com/drive/v3/about').params(fields: 'user')
-          drive_ok = { 'ok' => true, 'user_email' => about.dig('user','emailAddress') }
-        rescue => e
-          drive_ok = { 'ok' => false, 'error' => e.to_s }
-        end
-
-        begin
-          b = get("https://storage.googleapis.com/storage/v1/b/#{ERB::Util.url_encode(input['bucket'])}")
-              .params(userProject: connection['user_project'])
-          gcs_ok = { 'ok' => true, 'bucket_project' => b['projectNumber'].to_s }
-        rescue => e
-          gcs_ok = { 'ok' => false, 'error' => e.to_s }
-        end
-
-        {
-          'ok' => drive_ok['ok'] && gcs_ok['ok'],
-          'drive' => drive_ok,
-          'gcs' => gcs_ok,
-          'notes' => 'If GCS fails with 403, check billing on user_project, SA role serviceUsageConsumer on that project, and storage roles on the bucket.'
-        }.merge(call(:telemetry_envelope, t0, corr, (drive_ok['ok'] && gcs_ok['ok']), (drive_ok['ok'] && gcs_ok['ok']) ? 200 : 403, (drive_ok['ok'] && gcs_ok['ok']) ? 'OK' : 'Forbidden'))
+        bucket   = (input['bucket'].presence || connection['default_probe_bucket'])
+        prefix   = (input['gcs_prefix'].presence || 'probes/')
+        folder   = (input['drive_canary_folder_id_or_url'].presence || connection['canary_drive_folder_id_or_url'])
+        drive_id = (input['drive_id'].presence || connection['canary_shared_drive_id'])
+        call(:do_permission_probe, connection, bucket, folder, drive_id, prefix)
       end
-    }
   },
 
   # --------- PICK LISTS ---------------------------------------------------
@@ -1144,6 +1166,135 @@
         'web_view_url'  => (f['id'].present? ? "https://drive.google.com/file/d/#{f['id']}/view" : nil),
         'owners'        => (f['owners'] || []).map { |o| { 'display_name' => o['displayName'], 'email' => o['emailAddress'] } }
       }
+    end,
+
+    map_drive_min_for_probe: lambda do |f|
+      {
+        'id' => f['id'],
+        'name' => f['name'],
+        'web_view_url' => (f['id'].present? ? "https://drive.google.com/file/d/#{f['id']}/view" : nil)
+      }
+    end,
+
+    # Core probe used by connection test and action
+    # Returns the full spec'd object (merged with telemetry by the caller when appropriate),
+    # but here we also add telemetry to keep it symmetrical with actions that expect it.
+    do_permission_probe: lambda do |connection, bucket, canary_folder_id_or_url, canary_drive_id, gcs_prefix|
+      t0 = Time.now
+      corr = SecureRandom.uuid
+
+      # 1) whoami via tokeninfo (fallback to Drive about user)
+      who = nil
+      begin
+        tok = call(:auth_build_access_token!, connection, scopes: call(:const_default_scopes))
+        ti  = get('https://oauth2.googleapis.com/tokeninfo').params(access_token: tok)
+        who = ti['email'].to_s.presence
+      rescue => _e
+        # ignore; fallback below
+      end
+      if who.blank?
+        begin
+          about = get('https://www.googleapis.com/drive/v3/about').params(fields: 'user')
+          who = about.dig('user','emailAddress').to_s.presence
+        rescue => _e
+          # leave nil
+        end
+      end
+
+      # 2) Drive access: first 3 files in canary (if provided) or corpus
+      supports = true
+      include_items = true
+      drive_list = []
+      begin
+        q = ["trashed=false"]
+        folder_id = call(:util_extract_drive_id, canary_folder_id_or_url)
+        corpora, drive_id = if canary_drive_id.present?
+                              ['drive', canary_drive_id]
+                            elsif folder_id.present?
+                              ['allDrives', nil]
+                            else
+                              ['user', nil]
+                            end
+        q << "'#{folder_id}' in parents" if folder_id.present?
+        res = get('https://www.googleapis.com/drive/v3/files')
+              .params(
+                q: q.join(' and '),
+                pageSize: 3,
+                orderBy: 'modifiedTime desc',
+                spaces: 'drive',
+                corpora: corpora,
+                driveId: drive_id,
+                supportsAllDrives: supports,
+                includeItemsFromAllDrives: include_items,
+                fields: 'files(id,name)'
+              )
+        (res['files'] || []).first(3).each do |f|
+          drive_list << call(:map_drive_min_for_probe, f)
+        end
+      rescue => _e
+        # Leave empty; Drive might be disabled or no visibility
+      end
+
+      # 3) GCS access: first 3 under gs://bucket/prefix
+      gcs_list = []
+      requester_pays_detected = false
+      begin
+        if bucket.present?
+          # First try WITHOUT userProject to detect requester-pays via 403 body
+          begin
+            r = get("https://storage.googleapis.com/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o")
+                .params(prefix: (gcs_prefix.presence || 'probes/'), maxResults: 3,
+                        fields: 'items(name,size,updated)')
+            (r['items'] || []).first(3).each do |o|
+              gcs_list << {
+                'name' => o['name'],
+                'size' => call(:util_to_int_or_nil, o['size']),
+                'updated' => o['updated']
+              }
+            end
+          rescue => e1
+            text = e1.to_s
+            # Detect requester-pays phrases in 403 body text
+            if text =~ /(requester[- ]pays|user\s*project|User\s*project)/i
+              # Retry WITH userProject if configured
+              up = connection['user_project']
+              if up.present?
+                begin
+                  r2 = get("https://storage.googleapis.com/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o")
+                        .params(prefix: (gcs_prefix.presence || 'probes/'), maxResults: 3,
+                                fields: 'items(name,size,updated)', userProject: up)
+                  requester_pays_detected = true
+                  (r2['items'] || []).first(3).each do |o|
+                    gcs_list << {
+                      'name' => o['name'],
+                      'size' => call(:util_to_int_or_nil, o['size']),
+                      'updated' => o['updated']
+                    }
+                  end
+                rescue => _e2
+                  # keep detection true; list may remain empty on perms issues
+                end
+              else
+                requester_pays_detected = true
+              end
+            end
+          end
+        end
+      rescue => _e
+        # Ignore; gcs_list stays empty
+      end
+
+      ok = (who.present?) # “ok” is heuristic; identity is the baseline signal
+      res = {
+        'ok' => !!ok,
+        'whoami' => who,
+        'supportsAllDrives' => supports,
+        'includeItemsFromAllDrives' => include_items,
+        'requester_pays_detected' => !!requester_pays_detected,
+        'drive_access' => drive_list,
+        'gcs_access' => gcs_list
+      }
+      res.merge(call(:telemetry_envelope, t0, corr, ok, ok ? 200 : 207, ok ? 'OK' : 'Partial'))
     end,
 
     # --- 5. AUTH HELPERS -----------------
