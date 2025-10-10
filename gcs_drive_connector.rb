@@ -1,6 +1,5 @@
-# v0.4 - implement improved telemetry
 {
-  title: 'Google Drive + GCS Utilities',
+  title: 'Google Drive with Cloud Storage',
   version: '0.4',
 
   # --------- CONNECTION ---------------------------------------------------
@@ -33,7 +32,7 @@
       # Obtain/refresh the access token
       acquire: lambda do |connection|
         key = JSON.parse(connection['service_account_key_json'].to_s)
-        # token_url = (key['token_uri'].presence || 'https://oauth2.googleapis.com/token') # <<-- can remove, JWT does not require
+        token_url = (key['token_uri'].presence || 'https://oauth2.googleapis.com/token') # <<-- can remove, JWT does not require
         now = Time.now.to_i
 
         scopes = [
@@ -408,6 +407,7 @@
           'ok' => true,
           'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 1, 'correlation_id' => 'sample' }
         }
+      end
     },
 
     # 2) drive_get_file
@@ -793,12 +793,12 @@
           file_id = call(:util_extract_drive_id, raw)
           next if file_id.blank?
           res = call(:transfer_one_drive_to_gcs, connection, file_id, bucket, "#{prefix}", editors_mode, nil, nil)
-          if res[:ok]
-            ok = res[:ok]
+          if res['ok']
+            ok = res['ok']
             ok[:gcs_object_name] = "#{prefix}#{ok[:gcs_object_name]}" if prefix.present? && !ok[:gcs_object_name].to_s.start_with?(prefix)
             uploaded << ok
           else
-            failed << res[:error]
+            failed << res['error']
           end
         end
 
@@ -888,12 +888,12 @@
           object_name  = target_name.present? ? "#{prefix}#{target_name}" : nil
 
           res = call(:transfer_one_drive_to_gcs, connection, file_id, bucket, (object_name || ''), editors_mode, ctype, meta)
-          if res[:ok]
-            ok = res[:ok]
+          if res['ok']
+            ok = res['ok']
             ok[:gcs_object_name] = (object_name.presence || "#{prefix}#{ok[:gcs_object_name]}")
             uploaded << ok
           else
-            failed << res[:error]
+            failed << res['error']
             break if stop_on_error
           end
         end
@@ -942,8 +942,60 @@
           'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 1, 'correlation_id' => 'sample' }
         }
       end
-    }
+    },
 
+    # 8) permission_probe
+    permission_probe: {
+      title: 'Permission probe (Drive & GCS)',
+      subtitle: 'Quickly verify SA token, bucket access, and requester-pays',
+      input_fields: lambda do
+        [
+          { name: 'bucket', optional: false, label: 'GCS bucket' }
+        ]
+      end,
+      output_fields: lambda do
+        [
+          { name: 'ok', type: 'boolean' },
+          { name: 'drive', type: 'object', properties: [
+              { name: 'ok', type: 'boolean' },
+              { name: 'user_email', type: 'string' },
+              { name: 'error', type: 'string' }
+          ]},
+          { name: 'gcs', type: 'object', properties: [
+              { name: 'ok', type: 'boolean' },
+              { name: 'bucket_project', type: 'string' },
+              { name: 'error', type: 'string' }
+          ]},
+          { name: 'notes', type: 'string' }
+        ]
+      end,
+      execute: lambda do |connection, input|
+        t0 = Time.now; corr = SecureRandom.uuid
+
+        drive_ok = {}; gcs_ok = {}
+        begin
+          about = get('https://www.googleapis.com/drive/v3/about').params(fields: 'user')
+          drive_ok = { 'ok' => true, 'user_email' => about.dig('user','emailAddress') }
+        rescue => e
+          drive_ok = { 'ok' => false, 'error' => e.to_s }
+        end
+
+        begin
+          b = get("https://storage.googleapis.com/storage/v1/b/#{ERB::Util.url_encode(input['bucket'])}")
+              .params(userProject: connection['user_project'])
+          gcs_ok = { 'ok' => true, 'bucket_project' => b['projectNumber'].to_s }
+        rescue => e
+          gcs_ok = { 'ok' => false, 'error' => e.to_s }
+        end
+
+        {
+          'ok' => drive_ok['ok'] && gcs_ok['ok'],
+          'drive' => drive_ok,
+          'gcs' => gcs_ok,
+          'notes' => 'If GCS fails with 403, check billing on user_project, SA role serviceUsageConsumer on that project, and storage roles on the bucket.'
+        }.merge(call(:telemetry_envelope, t0, corr, (drive_ok['ok'] && gcs_ok['ok']), (drive_ok['ok'] && gcs_ok['ok']) ? 200 : 403, (drive_ok['ok'] && gcs_ok['ok']) ? 'OK' : 'Forbidden'))
+      end
+    }
   },
 
   # --------- PICK LISTS ---------------------------------------------------
