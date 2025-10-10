@@ -1,6 +1,6 @@
 {
   title: 'Google Drive with Cloud Storage',
-  version: '0.4',
+  version: '0.5',
 
   # --------- CONNECTION ---------------------------------------------------
   connection: {
@@ -31,52 +31,19 @@
 
       # Obtain/refresh the access token
       acquire: lambda do |connection|
-        key = JSON.parse(connection['service_account_key_json'].to_s)
-        token_url = (key['token_uri'].presence || 'https://oauth2.googleapis.com/token') # <<-- can remove, JWT does not require
-        now = Time.now.to_i
-
-        scopes = [
-          'https://www.googleapis.com/auth/cloud-platform',
-          'https://www.googleapis.com/auth/drive.readonly'
-        ].join(' ')
-
-        payload = {
-          iss: key['client_email'],
-          scope: scopes,
-          aud: token_url,
-          iat: now,
-          exp: now + 3600 # max 1 hour
-        }
-
-        assertion = call(:jwt_sign_rs256, payload, key['private_key'])
-
-        res = post(token_url)
-                .payload(
-                  grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-                  assertion: assertion
-                )
-                .request_format_www_form_urlencoded
+        # Use default superset (Drive + GCS). Cached per scope set.
+        token_str = call(:auth_build_access_token!, connection, scopes: DEFAULT_SCOPES)
+        # Build a stable shape for Workato’s connection store.
+        # Pull from cache so we have expires_in/at without re-exchanging:
+        scope_key = DEFAULT_SCOPES.join(' ')
+        cached = (connection['__token_cache'] ||= {})[scope_key]
 
         {
-          access_token: res['access_token'],
-          token_type: res['token_type'],
-          expires_in: res['expires_in'],
-          # cushion refresh by 60s
-          expires_at: (Time.now + res['expires_in'].to_i - 60).utc.iso8601
+          access_token: token_str,
+          token_type:   'Bearer',
+          expires_in:   (cached && cached['expires_in']) || 3600,
+          expires_at:   (cached && cached['expires_at']) || (Time.now + 3600 - 60).utc.iso8601
         }
-      end,
-
-      # URL: base
-      #base_uri: lambda do |connection|
-      #end,
-
-      # URL: authorization
-      authorization_url: lambda do |connection|
-        scopes = [
-          'https://www.googleapis.com/auth/cloud-platform',
-          'https://www.googleapis.com/auth/drive.readonly'
-        ].join(' ')
-        "https://accounts.google.com/o/oauth2/v2/auth?response_type=code&access_type=offline&include_granted_scopes=true&scope=#{CGI.escape(scopes)}"
       end,
 
       # URL: token
@@ -1023,9 +990,10 @@
 
   # --------- METHODS ------------------------------------------------------
   methods: {
-    # --- URL BUILDERS + CONSTS --------
+
+    # --- 1. URL BUILDERS + CONSTS --------
     
-    # --- UTILITIES (PURE) -------------
+    # --- 2. UTILITIES (PURE) -------------
     util_extract_drive_id: lambda do |str|
       s = (str || '').to_s.strip
       return nil if s.empty?
@@ -1095,15 +1063,15 @@
 
     telemetry_envelope: lambda do |started_at, correlation_id, ok, code, message|
       dur = ((Time.now - started_at) * 1000.0).to_i
-    {
-      'ok' => !!ok,
-      'telemetry' => {
-        'http_status'    => code.to_i,
-        'message'        => (message || (ok ? 'OK' : 'ERROR')).to_s,
-        'duration_ms'    => dur,
-        'correlation_id' => correlation_id
+      {
+        'ok' => !!ok,
+        'telemetry' => {
+          'http_status'    => code.to_i,
+          'message'        => (message || (ok ? 'OK' : 'ERROR')).to_s,
+          'duration_ms'    => dur,
+          'correlation_id' => correlation_id
+        }
       }
-    }
     end,
 
     telemetry_parse_error_code: lambda do |err|
@@ -1143,6 +1111,11 @@
 
     # --- 5. AUTH HELPERS -----------------
 
+    DEFAULT_SCOPES = [
+      'https://www.googleapis.com/auth/drive',
+      'https://www.googleapis.com/auth/devstorage.read_write'
+    ].freeze,
+
     # Base64url without padding
     b64url: lambda do |bytes|
       Base64.urlsafe_encode64(bytes).gsub(/=+$/, '')
@@ -1161,6 +1134,77 @@
 
       "#{signing_input}.#{call(:b64url, signature)}"
     end,
+
+    auth_normalize_scopes: lambda do |scopes|
+      arr =
+        case scopes
+        when nil then DEFAULT_SCOPES
+        when String then scopes.split(/\s+/)
+        when Array then scopes
+        else DEFAULT_SCOPES
+        end
+      arr.map(&:to_s).reject(&:empty?).uniq
+    end,
+
+    auth_token_cache_get: lambda do |connection, scope_key|
+      cache = (connection['__token_cache'] ||= {})
+      tok   = cache[scope_key]
+      return nil unless tok.is_a?(Hash) && tok['access_token'].present? && tok['expires_at'].present?
+      exp = Time.parse(tok['expires_at']) rescue nil
+      return nil unless exp && Time.now < (exp - 60) # cache until exp-60s
+      tok
+    end,
+
+    auth_token_cache_put: lambda do |connection, scope_key, token_hash|
+      cache = (connection['__token_cache'] ||= {})
+      cache[scope_key] = token_hash
+      token_hash
+    end,
+
+    auth_issue_token!: lambda do |connection, scopes|
+      key = JSON.parse(connection['service_account_key_json'].to_s)
+      token_url = (key['token_uri'].presence || 'https://oauth2.googleapis.com/token')
+      now = Time.now.to_i
+
+      scope_str = scopes.join(' ')
+      payload = {
+        iss: key['client_email'],
+        scope: scope_str,
+        aud: token_url,
+        iat: now,
+        exp: now + 3600 # max 1 hour per Google
+      }
+
+      assertion = call(:jwt_sign_rs256, payload, key['private_key'])
+
+      res = post(token_url)
+              .payload(
+                grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+                assertion: assertion
+              )
+              .request_format_www_form_urlencoded
+
+      exp_at = (Time.now + res['expires_in'].to_i).utc.iso8601
+      {
+        'access_token' => res['access_token'],
+        'token_type'   => res['token_type'],
+        'expires_in'   => res['expires_in'],
+        'expires_at'   => exp_at,
+        'scope_key'    => scope_str
+      }
+    end,
+
+# Public surface: returns *string* access token, cached by scope set
+auth_build_access_token!: lambda do |connection, scopes: nil|
+  set = call(:auth_normalize_scopes, scopes)
+  scope_key = set.join(' ')
+  cached = call(:auth_token_cache_get, connection, scope_key)
+  return cached['access_token'] if cached
+
+  fresh = call(:auth_issue_token!, connection, set)
+  call(:auth_token_cache_put, connection, scope_key, fresh)['access_token']
+end,
+
 
     # --- 6. CORE WORKFLOWS ---------------
 
