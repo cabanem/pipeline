@@ -289,12 +289,8 @@
     drive_get_file: {
       title: 'Drive: Get file (meta + optional content)',
       description: 'Fetch Drive file metadata and optionally content (text or bytes). Shortcuts are resolved once.',
-      input_fields: lambda do |_|
-        [
-          { name: 'file_id_or_url', optional: false },
-          { name: 'content_mode', control_type: 'select', pick_list: 'content_modes', optional: false, default: 'none' },
-          { name: 'postprocess', type: 'object', properties: [{ name: 'strip_urls', type: 'boolean', default: false }], optional: true }
-        ]
+      input_fields: lambda do |_obj, _conn, config_fields|
+        call(:ui_drive_get_inputs, config_fields)
       end,
       output_fields: lambda do |object_definitions|
         object_definitions['drive_file_full']
@@ -439,26 +435,8 @@
     gcs_put_object: {
       title: 'GCS: Put object',
       description: 'Upload text or bytes to GCS. Returns created object metadata and bytes_uploaded.',
-      input_fields: lambda do |_|
-        [
-          { name: 'bucket', optional: false },
-          { name: 'object_name', optional: false },
-          { name: 'content_mode', control_type: 'select', pick_list: 'content_modes_write', optional: false, default: 'text' },
-          { name: 'text_content', optional: true, hint: 'Required when content_mode=text' },
-          { name: 'content_bytes', optional: true, hint: 'Base64; required when content_mode=bytes' },
-          { name: 'content_type', optional: true, hint: 'Default text/plain; charset=UTF-8 for text, application/octet-stream for bytes' },
-          { name: 'custom_metadata', type: 'object', optional: true },
-          {
-            name: 'preconditions',
-            type: 'object',
-            optional: true,
-            properties: [
-              { name: 'if_generation_match', optional: true },
-              { name: 'if_metageneration_match', optional: true }
-            ]
-          },
-          { name: 'postprocess', type: 'object', properties: [{ name: 'strip_urls', type: 'boolean', default: false }], optional: true }
-        ]
+      input_fields: lambda do |_obj, _conn, config_fields|
+        call(:ui_gcs_put_inputs, config_fields)
       end,
       output_fields: lambda do |object_definitions|
         object_definitions['gcs_object_with_bytes_uploaded']
@@ -748,6 +726,104 @@
       signature = rsa.sign(OpenSSL::Digest::SHA256.new, signing_input)
 
       "#{signing_input}.#{call(:b64url, signature)}"
-    end
+    end,
+
+    # ---------------- UI HELPERS (DRY) ----------------
+    # Pick-list field with extends_schema for dynamic re-rendering
+    ui_content_mode_field: lambda do |pick_list_key, default|
+      {
+        name: 'content_mode',
+        label: 'Content mode',
+        control_type: 'select',
+        pick_list: pick_list_key,
+        optional: false,
+        default: default,
+        extends_schema: true,
+        hint: 'Switch to reveal relevant inputs.'
+      }
+    end,
+
+    # For PUT (write): either text content + postprocess, or base64 bytes
+    ui_write_body_fields: lambda do |mode|
+      if mode == 'bytes'
+        [
+          { name: 'content_bytes', optional: false, label: 'Content (Base64)',
+            hint: 'Required when mode is bytes.' }
+        ]
+      else
+        [
+          { name: 'text_content', optional: false, label: 'Content (text)',
+            control_type: 'text-area',
+            hint: 'Required when mode is text.' },
+          { name: 'postprocess', type: 'object', optional: true, label: 'Post-process',
+            properties: [
+              { name: 'strip_urls', type: 'boolean', control_type: 'checkbox',
+                label: 'Strip URLs from text', default: false }
+            ] }
+        ]
+      end
+    end,
+
+    # For GET (read): show postprocess only for text mode
+    ui_read_postprocess_if_text: lambda do |mode|
+      return [] unless mode == 'text'
+      [{
+        name: 'postprocess', type: 'object', optional: true, label: 'Post-process',
+        properties: [
+          { name: 'strip_urls', type: 'boolean', control_type: 'checkbox',
+            label: 'Strip URLs from text', default: false }
+        ]
+      }]
+    end,
+
+    # Advanced drawer shared by actions that talk to GCS
+    ui_gcs_advanced: lambda do
+      [{
+        name: 'advanced', type: 'object', optional: true, label: 'Advanced',
+        properties: [
+          { name: 'content_type', optional: true, label: 'Content-Type',
+            hint: 'Defaults: text/plain; charset=UTF-8 (text), application/octet-stream (bytes).' },
+          { name: 'custom_metadata', type: 'object', optional: true, label: 'Custom metadata' },
+          { name: 'preconditions', type: 'object', optional: true, label: 'Preconditions',
+            properties: [
+              { name: 'if_generation_match', optional: true, label: 'If-Generation-Match' },
+              { name: 'if_metageneration_match', optional: true, label: 'If-Metageneration-Match' }
+            ] }
+        ]
+      }]
+    end,
+
+    # Assemble inputs for GCS PUT
+    ui_gcs_put_inputs: lambda do |config_fields|
+      mode = (config_fields['content_mode'] || 'text').to_s
+      base = [
+        { name: 'bucket', optional: false, label: 'Bucket' },
+        { name: 'object_name', optional: false, label: 'Object name' },
+        call(:ui_content_mode_field, 'content_modes_write', 'text')
+      ]
+      base + call(:ui_write_body_fields, mode) + call(:ui_gcs_advanced)
+    end,
+
+    # Assemble inputs for GCS GET
+    ui_gcs_get_inputs: lambda do |config_fields|
+      mode = (config_fields['content_mode'] || 'none').to_s
+      base = [
+        { name: 'bucket', optional: false, label: 'Bucket' },
+        { name: 'object_name', optional: false, label: 'Object name' },
+        call(:ui_content_mode_field, 'content_modes', 'none')
+      ]
+      base + call(:ui_read_postprocess_if_text, mode)
+    end,
+
+    # Assemble inputs for Drive GET
+    ui_drive_get_inputs: lambda do |config_fields|
+      mode = (config_fields['content_mode'] || 'none').to_s
+      base = [
+        { name: 'file_id_or_url', optional: false, label: 'File ID or URL' },
+        call(:ui_content_mode_field, 'content_modes', 'none')
+      ]
+      base + call(:ui_read_postprocess_if_text, mode)
+    end,
+
   }
 }
