@@ -252,12 +252,15 @@
           body: 'Return a page of Drive files with minimal metadata (newest first).'
         }
       end,
+
       input_fields: lambda do |_obj, _conn, config_fields|
         call(:ui_drive_list_inputs, config_fields)
       end,
+
       output_fields: lambda do |object_definitions|
         object_definitions['drive_list_page']
       end,
+
       execute: lambda do |_connection, input|
         t0 = Time.now
         corr = SecureRandom.uuid
@@ -266,6 +269,10 @@
 
         filters = input['filters'] || {}
         paging  = input['paging']  || {}
+        recursive = !!input['recursive']
+        max_depth = (input['max_depth'].to_i rescue 0)
+        overall_limit = (input['overall_limit'].presence || 1000).to_i
+
 
         page_size = [[(paging['max_results'] || 100).to_i, 1].max, 1000].min
 
@@ -297,40 +304,63 @@
                             else
                               ['user', nil]
                             end
-        res = get('https://www.googleapis.com/drive/v3/files')
-              .params(
-                q: q.join(' and '),
-                pageSize: page_size,
-                pageToken: paging['page_token'],
-                orderBy: 'modifiedTime desc',
-                spaces: 'drive',
-                corpora: corpora,
-                driveId: drive_id,
-                supportsAllDrives: true,
-                includeItemsFromAllDrives: true, # should remain TRUE - else user config settings can omit shared files
-                fields: 'files(id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress)),nextPageToken'
-              )
-        files = (res['files'] || []).map { |f| call(:map_drive_meta, f) }
-        items_for_transfer = files.map do |f|
-          {
-            'drive_file_id_or_url' => f['id'],
-            # The rest are optional; user can override later in the batch action
-            'target_object_name'   => nil,
-            'editors_mode'         => nil,
-            'content_type'         => nil,
-            'custom_metadata'      => nil
+        if recursive && folder_id.present?
+          # BFS over the subtree rooted at folder_id
+          files = call(:drive_bfs_collect_files!, folder_id, filters, corpora, drive_id, overall_limit, max_depth)
+          items_for_transfer = files.map { |f|
+            {
+              'drive_file_id_or_url' => f['id'],
+              'target_object_name'   => nil,
+              'editors_mode'         => nil,
+              'content_type'         => nil,
+              'custom_metadata'      => nil
+            }
           }
+          base = {
+            'files'               => files,
+            'file_ids'            => files.map { |f| f['id'] }.compact,
+            'items_for_transfer'  => items_for_transfer,
+            'count'               => files.length,
+            'has_more'            => false,
+            'next_page_token'     => nil
+          }
+          base.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+        else
+          # Existing single-page behavior (non-recursive or no folder specified)
+          res = get('https://www.googleapis.com/drive/v3/files')
+                .params(
+                  q: q.join(' and '),
+                  pageSize: page_size,
+                  pageToken: paging['page_token'],
+                  orderBy: 'modifiedTime desc',
+                  spaces: 'drive',
+                  corpora: corpora,
+                  driveId: drive_id,
+                  supportsAllDrives: true,
+                  includeItemsFromAllDrives: true,
+                  fields: 'files(id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress)),nextPageToken'
+                )
+          files = (res['files'] || []).map { |f| call(:map_drive_meta, f) }
+          items_for_transfer = files.map do |f|
+            {
+              'drive_file_id_or_url' => f['id'],
+              'target_object_name'   => nil,
+              'editors_mode'         => nil,
+              'content_type'         => nil,
+              'custom_metadata'      => nil
+            }
+          end
+          next_token = res['nextPageToken']
+          base = {
+            'files'               => files,
+            'file_ids'            => files.map { |f| f['id'] }.compact,
+            'items_for_transfer'  => items_for_transfer,
+            'count'               => files.length,
+            'has_more'            => next_token.present?,
+            'next_page_token'     => next_token
+          }
+          base.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
         end
-        next_token = res['nextPageToken']
-        base = {
-          'files'               => files,
-          'file_ids'            => files.map { |f| f['id'] }.compact,
-          'items_for_transfer'  => items_for_transfer,
-          'count'               => files.length,
-          'has_more'            => next_token.present?,
-          'next_page_token'     => next_token
-        }
-        base.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
       rescue => e
         # Predictable empty shape (string keys) on failure
         {}.merge(
@@ -399,7 +429,7 @@
         t0 = Time.now
         corr = SecureRandom.uuid
         file_id = call(:util_extract_drive_id, input['file_id_or_url'])
-        meta = call(:drive_get_meta_resolving_shortcut, file_id)
+        meta = call(:meta_get_resolve_shortcut, file_id)
 
         result = call(:map_drive_meta, meta)
 
@@ -995,7 +1025,7 @@
     const_default_scopes: -> { [
       'https://www.googleapis.com/auth/drive',
       'https://www.googleapis.com/auth/devstorage.read_write'
-      #'https://www.googleapis.com/auth/cloud-platform`',
+      #'https://www.googleapis.com/auth/cloud-platform`', # n/a in our tenant
     ] },
     const_drive_scope: -> { [ 'https://www.googleapis.com/auth/drive' ] },
     const_gcs_scope: -> { [ 'https://www.googleapis.com/auth/devstorage.read_write' ] },
@@ -1215,7 +1245,7 @@
     transfer_one_drive_to_gcs: lambda do |connection, file_id, bucket, object_name, editors_mode, global_content_type, global_metadata|
       user_project = connection['user_project']
       begin
-        meta = call(:drive_get_meta_resolving_shortcut, file_id)
+        meta = call(:meta_get_resolve_shortcut, file_id)
         fname = meta['name'].to_s
         oname = (object_name.presence || fname)
 
@@ -1304,9 +1334,9 @@
       end
     end,
 
-    # --- 7. DRIVE/GCS METADATA -----------
+    # --- 7. METADATA ---------------------
 
-    drive_get_meta_resolving_shortcut: lambda do |file_id|
+    meta_get_resolve_shortcut: lambda do |file_id|
       meta = get("https://www.googleapis.com/drive/v3/files/#{file_id}")
              .params(
                supportsAllDrives: true,
@@ -1329,7 +1359,84 @@
       meta.transform_values { |v| v.nil? ? nil : v.to_s }
     end,
 
-    # --- 8. UI BUILDERS ------------------
+    # --- 8. DRIVE ------------------------
+
+    drive_query_children!: lambda do |parent_id, q_extra_arr, page_size, page_token, corpora, drive_id|
+      # Builds and executes files.list for children of a single parent.
+      # q_extra_arr: array of additional q fragments (already sanitized).
+      q_parts = ["trashed=false", "'#{parent_id}' in parents"] + Array(q_extra_arr)
+      res = get('https://www.googleapis.com/drive/v3/files')
+              .params(
+                q: q_parts.join(' and '),
+                pageSize: [[page_size.to_i, 1].max, 1000].min,
+                pageToken: page_token,
+                orderBy: 'modifiedTime desc',
+                spaces: 'drive',
+                corpora: corpora,
+                driveId: drive_id,
+                supportsAllDrives: true,
+                includeItemsFromAllDrives: true,
+                fields: 'files(id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress)),nextPageToken'
+              )
+      [res['files'] || [], res['nextPageToken']]
+    end,
+
+    drive_bfs_collect_files!: lambda do |root_id, filters, corpora, drive_id, overall_limit, max_depth|
+      # Breadth-first traversal from root_id.
+      # Returns array of mapped file metas (not including folders when filters['exclude_folders'] is true).
+      # Always discovers folders regardless of mime filter, then lists files for each folder honoring filters.
+      folder_mime = 'application/vnd.google-apps.folder' # official folder MIME. :contentReference[oaicite:2]{index=2}
+      limit = [[overall_limit.to_i, 1].max, 10_000].min
+      depth_cap = max_depth.to_i <= 0 ? Float::INFINITY : max_depth.to_i
+
+      # Build file filter fragments for q
+      q_files = []
+      if filters['modified_after'].present?
+        q_files << "modifiedTime >= '#{call(:util_to_iso8601_utc, filters['modified_after'])}'"
+      end
+      if filters['modified_before'].present?
+        q_files << "modifiedTime <= '#{call(:util_to_iso8601_utc, filters['modified_before'])}'"
+      end
+      if filters['mime_types'].present?
+        ors = Array(filters['mime_types']).map { |mt| "mimeType='#{mt}'" }.join(' or ')
+        q_files << "(#{ors})"
+      end
+      if !!filters['exclude_folders']
+        q_files << "mimeType != '#{folder_mime}'"
+      end
+
+      results = []
+      queue = [[root_id, 1]] # [folder_id, depth]
+
+      until queue.empty? || results.length >= limit
+        parent_id, depth = queue.shift
+
+        # 1) Discover subfolders at this parent (do not apply user mime filters here)
+        folder_page_token = nil
+        loop do
+          folders, folder_page_token = call(
+            :drive_query_children!, parent_id, ["mimeType='#{folder_mime}'"], 1000, folder_page_token, corpora, drive_id)
+          folders.each do |f|
+            queue << [f['id'], depth + 1] if depth < depth_cap
+          end
+          break if folder_page_token.blank?
+        end
+
+        # 2) List files at this parent honoring user filters
+        file_page_token = nil
+        loop do
+          files, file_page_token = call(
+            :drive_query_children!, parent_id, q_files, (limit - results.length), file_page_token, corpora, drive_id)
+          mapped = files.map { |f| call(:map_drive_meta, f) }
+          results.concat(mapped)
+          break if file_page_token.blank? || results.length >= limit
+        end
+      end
+
+      results
+    end,
+
+    # --- 9. UI BUILDERS ------------------
 
     # Pick-list field with extends_schema for dynamic re-rendering
     ui_content_mode_field: lambda do |pick_list_key, default|
@@ -1430,9 +1537,14 @@
     # Assemble inputs for Drive LIST
     ui_drive_list_inputs: lambda do |_config_fields|
       [
-        { name: 'folder_id_or_url', label: 'Folder ID or URL', optional: true,
-          hint: 'Leave blank to search My Drive / corpus.' },
+        { name: 'folder_id_or_url', label: 'Folder ID or URL', optional: true, hint: 'Leave blank to search My Drive / corpus.' },
         { name: 'drive_id', label: 'Shared drive ID', optional: true },
+        { name: 'recursive', type: 'boolean', control_type: 'checkbox', label: 'Recurse into subfolders',
+          optional: true, default: false, hint: 'When enabled and a Folder is provided, lists files in the entire subtree.' },
+        { name: 'max_depth', type: 'integer', optional: true, label: 'Maximum depth',
+          hint: '0 or blank = unlimited. Depth 1 = just the folder itself, 2 = its subfolders, etc.' },
+        { name: 'overall_limit', type: 'integer', optional: true, label: 'Overall result limit',
+          hint: 'Hard cap across the whole subtree. Default 1000. Upper bound 10000.' },
         {
           name: 'filters', type: 'object', optional: true, label: 'Filters',
           properties: [
@@ -1513,7 +1625,7 @@
       ]
     end,
 
-    # --- 9. SCHEMA -----------------------
+    # --- 10. SCHEMA ----------------------
     schema_transfer_batch_plan_item_fields: lambda do
       [
         { name: 'drive_file_id_or_url', label: 'Drive file ID or URL', optional: false },
