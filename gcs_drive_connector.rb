@@ -212,46 +212,42 @@
     drive_list_files: {
       title: 'Drive: List files',
       description: 'Return a page of Drive files with minimal metadata (newest first).',
-      input_fields: lambda do |_|
-        [
-          { name: 'folder_id_or_url', label: 'Folder ID or URL', optional: true },
-          { name: 'drive_id', label: 'Shared drive ID', optional: true },
-          { name: 'modified_after', type: 'date_time', optional: true },
-          { name: 'modified_before', type: 'date_time', optional: true },
-          { name: 'mime_types', type: 'array', of: 'string', optional: true, hint: "Exact mimeType matches; any of these (OR)." },
-          { name: 'exclude_folders', type: 'boolean', optional: true, default: false },
-          { name: 'max_results', type: 'integer', optional: true, hint: '1-1000, default 100' },
-          { name: 'page_token', type: 'string', optional: true }
-        ]
+      input_fields: lambda do |_obj, _conn, config_fields|
+        call(:ui_drive_list_inputs, config_fields)
       end,
       output_fields: lambda do |object_definitions|
         object_definitions['drive_list_page']
       end,
       execute: lambda do |_connection, input|
         folder_id = call(:extract_drive_id, input['folder_id_or_url'])
-        page_size = [[(input['max_results'] || 100).to_i, 1].max, 1000].min
         q = ["trashed=false"]
 
+        filters = input['filters'] || {}
+        paging  = input['paging']  || {}
+
+        page_size = [[(paging['max_results'] || 100).to_i, 1].max, 1000].min
+
         # Date filtering (ISO-8601)
-        if input['modified_after'].present?
-          q << "modifiedTime >= '#{call(:to_iso8601_utc, input['modified_after'])}'"
+        if filters['modified_after'].present?
+          q << "modifiedTime >= '#{call(:to_iso8601_utc, filters['modified_after'])}'"
         end
-        if input['modified_before'].present?
-          q << "modifiedTime <= '#{call(:to_iso8601_utc, input['modified_before'])}'"
+        if filters['modified_before'].present?
+          q << "modifiedTime <= '#{call(:to_iso8601_utc, filters['modified_before'])}'"
         end
         # MIME filters
-        if input['mime_types'].present?
-          ors = input['mime_types'].map { |mt| "mimeType='#{mt}'" }.join(' or ')
+        if filters['mime_types'].present?
+          ors = filters['mime_types'].map { |mt| "mimeType='#{mt}'" }.join(' or ')
           q << "(#{ors})"
         end
         # Exclude folders
-        if input['exclude_folders']
+        if !!filters['exclude_folders']
           q << "mimeType != 'application/vnd.google-apps.folder'"
         end
         # Folder filter
         if folder_id.present?
           q << "'#{folder_id}' in parents"
         end
+
         corpora, drive_id = if input['drive_id'].present?
                               ['drive', input['drive_id']]
                             elsif folder_id.present?
@@ -263,7 +259,7 @@
               .params(
                 q: q.join(' and '),
                 pageSize: page_size,
-                pageToken: input['page_token'],
+                pageToken: paging['page_token'],
                 orderBy: 'modifiedTime desc',
                 spaces: 'drive',
                 corpora: corpora,
@@ -345,28 +341,23 @@
     gcs_list_objects: {
       title: 'GCS: List objects',
       description: 'List objects in a bucket, optionally using prefix and delimiter.',
-      input_fields: lambda do |_|
-        [
-          { name: 'bucket', optional: false },
-          { name: 'prefix', optional: true },
-          { name: 'delimiter', optional: true, hint: 'Use "/" to emulate folders' },
-          { name: 'include_versions', type: 'boolean', optional: true, default: false },
-          { name: 'max_results', type: 'integer', optional: true, hint: '1–1000, default 1000' },
-          { name: 'page_token', optional: true }
-        ]
+      input_fields: lambda do |_obj, _conn, config_fields|
+        call(:ui_gcs_list_inputs, config_fields)
       end,
       output_fields: lambda do |object_definitions|
         object_definitions['gcs_list_page']
       end,
       execute: lambda do |connection, input|
-        page_size = [[(input['max_results'] || 1000).to_i, 1].max, 1000].min
+        filters = input['filters'] || {}
+        paging  = input['paging']  || {}
+        page_size = [[(paging['max_results'] || 1000).to_i, 1].max, 1000].min
         res = get("https://storage.googleapis.com/storage/v1/b/#{URI.encode_www_form_component(input['bucket'])}/o")
               .params(
-                prefix: input['prefix'],
-                delimiter: input['delimiter'],
-                pageToken: input['page_token'],
+                prefix: filters['prefix'],
+                delimiter: filters['delimiter'],
+                pageToken: paging['page_token'],
                 maxResults: page_size,
-                versions: !!input['include_versions'],
+                versions: !!filters['include_versions'],
                 fields: 'items(bucket,name,size,contentType,updated,generation,md5Hash,crc32c,metadata),nextPageToken,prefixes',
                 userProject: connection['user_project']
               )
@@ -388,13 +379,8 @@
     gcs_get_object: {
       title: 'GCS: Get object (meta + optional content)',
       description: 'Fetch GCS object metadata and optionally content (text or bytes).',
-      input_fields: lambda do |_|
-        [
-          { name: 'bucket', optional: false },
-          { name: 'object_name', optional: false },
-          { name: 'content_mode', control_type: 'select', pick_list: 'content_modes', optional: false, default: 'none' },
-          { name: 'postprocess', type: 'object', properties: [{ name: 'strip_urls', type: 'boolean', default: false }], optional: true }
-        ]
+      input_fields: lambda do |_obj, _conn, config_fields|
+        call(:ui_gcs_get_inputs, config_fields)
       end,
       output_fields: lambda do |object_definitions|
         object_definitions['gcs_object_with_content']
@@ -446,25 +432,27 @@
         name = input['object_name']
         mode = input['content_mode']
         strip = input.dig('postprocess', 'strip_urls') ? true : false
-        meta = input['custom_metadata']
+        adv  = input['advanced'] || {}
+        meta = adv['custom_metadata']
         meta = meta.transform_values { |v| v.nil? ? nil : v.to_s } if meta.present?
         body_bytes, ctype =
           if mode == 'text'
             text = input['text_content']
             error('400 Bad Request - text_content is required when content_mode=text.') if text.nil?
             text = call(:strip_urls, text) if strip
-            [text.to_s.dup.force_encoding('UTF-8'), (input['content_type'].presence || 'text/plain; charset=UTF-8')]
+            [text.to_s.dup.force_encoding('UTF-8'), (adv['content_type'].presence || 'text/plain; charset=UTF-8')]
           elsif mode == 'bytes'
             b64 = input['content_bytes']
             error('400 Bad Request - content_bytes is required when content_mode=bytes.') if b64.nil?
-            [Base64.decode64(b64.to_s), (input['content_type'].presence || 'application/octet-stream')]
+            [Base64.decode64(b64.to_s), (adv['content_type'].presence || 'application/octet-stream')]
           else
             error("400 Bad Request - Unknown content_mode: #{mode}")
           end
         bytes_uploaded = body_bytes.bytesize
         q = {
-          ifGenerationMatch: input.dig('preconditions', 'if_generation_match'),
-          ifMetagenerationMatch: input.dig('preconditions', 'if_metageneration_match'),
+          ifGenerationMatch: adv.dig('preconditions', 'if_generation_match'),
+          ifMetagenerationMatch: adv.dig('preconditions', 'if_metageneration_match'),
+
           userProject: connection['user_project']
         }.compact
         created =
@@ -493,19 +481,8 @@
     transfer_drive_to_gcs: {
       title: 'Transfer: Drive → GCS',
       description: 'For each Drive file ID, fetch content (export Editors to text if selected) and upload to GCS under a prefix.',
-      input_fields: lambda do |_|
-        [
-          { name: 'bucket', optional: false },
-          { name: 'gcs_prefix', optional: true, hint: 'E.g. "ingest/". Drive file name is used as GCS object name.' },
-          {
-            name: 'drive_file_ids',
-            type: 'array', of: 'string',
-            control_type: 'text-area',
-            optional: false,
-            hint: 'Paste one Drive file ID or URL per line.'
-          },
-          { name: 'content_mode_for_editors', control_type: 'select', pick_list: 'editors_modes', optional: true, default: 'text' }
-        ]
+      input_fields: lambda do |_obj, _conn, config_fields|
+        call(:ui_transfer_inputs, config_fields)
       end,
       output_fields: lambda do |object_definitions|
         object_definitions['transfer_result']
@@ -728,7 +705,7 @@
       "#{signing_input}.#{call(:b64url, signature)}"
     end,
 
-    # ---------------- UI HELPERS (DRY) ----------------
+    # --- UI HELPERS ---
     # Pick-list field with extends_schema for dynamic re-rendering
     ui_content_mode_field: lambda do |pick_list_key, default|
       {
@@ -824,6 +801,78 @@
       ]
       base + call(:ui_read_postprocess_if_text, mode)
     end,
+
+    # Assemble inputs for Drive LIST
+    ui_drive_list_inputs: lambda do |_config_fields|
+      [
+        { name: 'folder_id_or_url', label: 'Folder ID or URL', optional: true,
+          hint: 'Leave blank to search My Drive / corpus.' },
+        { name: 'drive_id', label: 'Shared drive ID', optional: true },
+        {
+          name: 'filters', type: 'object', optional: true, label: 'Filters',
+          properties: [
+            { name: 'modified_after', type: 'date_time', optional: true, label: 'Modified after' },
+            { name: 'modified_before', type: 'date_time', optional: true, label: 'Modified before' },
+            { name: 'mime_types', type: 'array', of: 'string', optional: true,
+              hint: 'Exact mimeType values (OR).' },
+            { name: 'exclude_folders', type: 'boolean', control_type: 'checkbox',
+              optional: true, default: false, label: 'Exclude folders' }
+          ]
+        },
+        {
+          name: 'paging', type: 'object', optional: true, label: 'Paging',
+          properties: [
+            { name: 'max_results', type: 'integer', optional: true, label: 'Max results',
+              hint: '1–1000, default 100' },
+            { name: 'page_token', type: 'string', optional: true }
+          ]
+        }
+      ]
+    end,
+
+    # Assemble inputs for GCS LIST
+    ui_gcs_list_inputs: lambda do |_config_fields|
+      [
+        { name: 'bucket', optional: false, label: 'Bucket' },
+        {
+          name: 'filters', type: 'object', optional: true, label: 'Filters',
+          properties: [
+            { name: 'prefix', optional: true, label: 'Prefix' },
+            { name: 'delimiter', optional: true, label: 'Delimiter',
+              hint: 'Use "/" to emulate folders.' },
+            { name: 'include_versions', type: 'boolean', control_type: 'checkbox',
+              optional: true, default: false, label: 'Include noncurrent versions' }
+          ]
+        },
+        {
+          name: 'paging', type: 'object', optional: true, label: 'Paging',
+          properties: [
+            { name: 'max_results', type: 'integer', optional: true, label: 'Max results',
+              hint: '1–1000, default 1000' },
+            { name: 'page_token', optional: true, label: 'Page token' }
+          ]
+        }
+      ]
+    end,
+
+    # Assemble inputs for Drive → GCS transfer
+    ui_transfer_inputs: lambda do |_config_fields|
+      [
+        { name: 'bucket', optional: false, label: 'Destination bucket' },
+        { name: 'gcs_prefix', optional: true, label: 'Destination prefix',
+          hint: 'E.g. "ingest/". Drive file name is used for object name.' },
+        {
+          name: 'drive_file_ids',
+          type: 'array', of: 'string',
+          control_type: 'text-area',
+          optional: false,
+          label: 'Drive file IDs or URLs',
+          hint: 'Paste one per line.'
+        },
+        { name: 'content_mode_for_editors', control_type: 'select', pick_list: 'editors_modes',
+          optional: true, default: 'text', label: 'Editors files handling' }
+      ]
+    end
 
   }
 }
