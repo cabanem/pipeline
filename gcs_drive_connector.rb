@@ -108,6 +108,7 @@
           { name: 'size', type: 'integer' },
           { name: 'modified_time', type: 'date_time' },
           { name: 'checksum', type: 'string' },
+          { name: 'web_view_url', type: 'string', hint: 'Open in Drive' },
           { name: 'owners', type: 'array', of: 'object', properties: [{ name: 'display_name' }, { name: 'email' }] }
         ]
       end
@@ -172,7 +173,7 @@
         base = Array(object_definitions['list_page_meta'])
         ([
           { name: 'objects', type: 'array', of: 'object',
-            properties: Array(object_definitions['gcs_object_base_fields']) },
+            properties: object_definitions['gcs_object_base_fields'] },
           { name: 'prefixes', type: 'array', of: 'string' }
         ] + base + Array(object_definitions['envelope_fields']))
       end
@@ -181,8 +182,8 @@
       fields: lambda do |object_definitions|
         base = Array(object_definitions['list_page_meta'])
         ([
-          { name: 'files', type: 'array', of: 'object',
-            properties: Array(object_definitions['drive_file_base_fields']) }
+          { name: 'files', type: 'array', of: 'object', properties: object_definitions['drive_file_base_fields'] },
+          { name: 'file_ids', type: 'array', of: 'string', hint: 'Convenience: IDs extracted from files[].id' }
         ] + base + Array(object_definitions['envelope_fields']))
       end
     },
@@ -328,6 +329,7 @@
         next_token = res['nextPageToken']
         base = {
           files: files,
+          file_ids: files.map { |f| f[:id] }.compact,
           count: files.length,
           has_more: next_token.present?,
           next_page_token: next_token
@@ -340,7 +342,29 @@
         ).merge(
           call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s)
         )
-      end
+      end,
+      sample_output: lambda do
+        {
+          files: [
+            {
+              id: '1AbCdEfGhIjK',
+              name: 'example.txt',
+              mime_type: 'text/plain',
+              size: 42,
+              modified_time: '2024-01-01T12:00:00Z',
+              checksum: 'd41d8cd98f00b204e9800998ecf8427e',
+              web_view_url: 'https://drive.google.com/file/d/1AbCdEfGhIjK/view',
+              owners: [{ display_name: 'Drive Bot', email: 'bot@example.com' }]
+            }
+          ],
+          file_ids: ['1AbCdEfGhIjK'],
+          count: 1,
+          has_more: false,
+          next_page_token: nil,
+          ok: true,
+          telemetry: { http_status: 200, message: 'OK', duration_ms: 1, correlation_id: 'sample' }
+        }
+      end,
     },
 
     # 2) drive_get_file
@@ -850,6 +874,7 @@
         size: call(:util_to_int_or_nil, f['size']),
         modified_time: f['modifiedTime'],
         checksum: f['md5Checksum'],
+        web_view_url: (f['id'].present? ? "https://drive.google.com/file/d/#{f['id']}/view" : nil),
         owners: (f['owners'] || []).map { |o| { display_name: o['displayName'], email: o['emailAddress'] } }
       }
     end,
@@ -1133,10 +1158,9 @@
         {
           name: 'drive_file_ids',
           type: 'array', of: 'string',
-          control_type: 'text-area',
           optional: false,
           label: 'Drive file IDs or URLs',
-          hint: 'Paste one per line.'
+          hint: 'Map from List files → file_ids, or paste multiple.'
         },
         { name: 'content_mode_for_editors', control_type: 'select', pick_list: 'editors_modes',
           optional: true, default: 'text', label: 'Editors files handling' }
