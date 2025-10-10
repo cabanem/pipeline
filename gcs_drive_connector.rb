@@ -96,7 +96,7 @@
 
   # --------- OBJECT DEFINITIONS ------------------------------------------
   object_definitions: {
-    # --- Base Definitions
+    # --- Base definitions
     drive_file_base_fields: {
       fields: lambda do |_connection|
         [
@@ -125,7 +125,27 @@
         ]
       end
     },
-    # --- Composite Definitions
+
+    # --- Full composite definitions
+    # Prefer full composite over pass-through (pt via concat can
+    # fail to resolve at runtime).
+    gcs_object_with_content: {
+      fields: lambda do |object_definitions|
+        object_definitions['gcs_object_base_fields'] + [
+          { name: 'text_content', type: 'string' },
+          { name: 'content_bytes', type: 'string', hint: 'Base64' }
+        ]
+      end
+    },
+    gcs_object_with_bytes_uploaded: {
+      fields: lambda do |object_definitions|
+        object_definitions['gcs_object_base_fields'] + [
+          { name: 'bytes_uploaded', type: 'integer' }
+        ]
+      end
+    },
+
+    # --- Composite definitions
     drive_file_min: {
       fields: lambda do |object_definitions|
         object_definitions['drive_file_base_fields']
@@ -139,11 +159,6 @@
           { name: 'content_bytes', type: 'string', hint: 'Base64' }
         ]
       end
-    },
-    gcs_object: {
-        fields: lambda do |object_definitions|
-            object_definitions['gcs_object_base_fields']
-        end
     },
     list_page_meta: {
       fields: lambda do |_connection|
@@ -159,6 +174,14 @@
         [
           { name: 'objects', type: 'array', of: 'object', properties: object_definitions['gcs_object_base_fields'] },
           { name: 'prefixes', type: 'array', of: 'string' }
+        ] + object_definitions['list_page_meta']
+      end
+    },
+    # Mirrors drive_list_files execute payload: { files: [...], <page_meta> }
+    drive_list_page: {
+      fields: lambda do |object_definitions|
+        [
+          { name: 'files', type: 'array', of: 'object', properties: object_definitions['drive_file_base_fields'] }
         ] + object_definitions['list_page_meta']
       end
     },
@@ -199,9 +222,7 @@
         ]
       end,
       output_fields: lambda do |object_definitions|
-        [
-            { name: 'files', type: 'array', of: 'object', properties: object_definitions['drive_file_min'] }
-        ] + object_definitions['list_page_meta']
+        object_definitions['drive_list_page']
       end,
       execute: lambda do |_connection, input|
         folder_id = call(:extract_drive_id, input['folder_id_or_url'])
@@ -377,10 +398,7 @@
         ]
       end,
       output_fields: lambda do |object_definitions|
-        object_definitions['gcs_object'] + [
-          { name: 'text_content', type: 'string' },
-          { name: 'content_bytes', type: 'string', hint: 'Base64' }
-        ]
+        object_definitions['gcs_object_with_content']
       end,
       execute: lambda do |connection, input|
         bucket = input['bucket']
@@ -440,7 +458,7 @@
         ]
       end,
       output_fields: lambda do |object_definitions|
-        object_definitions['gcs_object'] + [{ name: 'bytes_uploaded', type: 'integer' }]
+        object_definitions['gcs_object_with_bytes_uploaded']
       end,
       execute: lambda do |connection, input|
         bucket = input['bucket']
@@ -664,6 +682,20 @@
       s = bytes.to_s
       s.force_encoding('UTF-8')
       s.valid_encoding? ? s : s.encode('UTF-8', invalid: :replace, undef: :replace, replace: '')
+    end,
+
+    map_gcs_meta: lambda do |o|
+      {
+        bucket:       o['bucket'],
+        name:         o['name'],
+        size:         call(:to_int_or_nil, o['size']),
+        content_type: o['contentType'],
+        updated:      o['updated'],
+        generation:   o['generation'].to_s,
+        md5_hash:     o['md5Hash'],
+        crc32c:       o['crc32c'],
+        metadata:     o['metadata'] || {}
+      }
     end,
 
     map_drive_meta: lambda do |f|
