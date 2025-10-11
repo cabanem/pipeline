@@ -292,6 +292,18 @@
         }
       end,
 
+      # PURPOSE
+      #   Fetch Drive file metadata and, optionally, content as text or bytes.
+      #   Google Editors files are exported when `content_mode=text` with a sensible default/override.
+      #
+      # CONTENT RULES
+      #   - Editors types (Docs/Sheets/Slides/Drawings) cannot be downloaded via `alt=media` → must export.
+      #   - Non-text binaries reject `content_mode=text` with 415 (guardrail to avoid mojibake).
+      #
+      # OUTPUT STABILITY
+      #   Uses drive_file_full schema (adds text_content/content_bytes and checksums) for consistent data pills.
+
+
       input_fields: lambda do |_obj, _conn, config_fields|
         call(:ui_drive_list_inputs, config_fields)
       end,
@@ -301,8 +313,11 @@
       end,
 
       execute: lambda do |_connection, input|
+        # Correlation id and duration for logs / analytics
         t0 = Time.now
         corr = SecureRandom.uuid
+
+        # Normalize folder id (accepts ID or full url)
         folder_id = call(:util_extract_drive_id, input['folder_id_or_url'])
         q = ["trashed=false"]
 
@@ -312,30 +327,31 @@
         max_depth = (input['max_depth'].to_i rescue 0)
         overall_limit = (input['overall_limit'].presence || 1000).to_i
 
-
+        # Enforce Drive pageSize bounds (1..1000)
         page_size = [[(paging['max_results'] || 100).to_i, 1].max, 1000].min
 
-        # Date filtering (ISO-8601)
+        # Date filters (Google expects RFC3339/ISO-8601 UTC)
         if filters['modified_after'].present?
           q << "modifiedTime >= '#{call(:util_to_iso8601_utc, filters['modified_after'])}'"
         end
         if filters['modified_before'].present?
           q << "modifiedTime <= '#{call(:util_to_iso8601_utc, filters['modified_before'])}'"
         end
-        # MIME filters
+        # MIME filters or group. Caller provides exact mimeType vals
         if filters['mime_types'].present?
           ors = filters['mime_types'].map { |mt| "mimeType='#{mt}'" }.join(' or ')
           q << "(#{ors})"
         end
-        # Exclude folders
+        # Folder filters - exclude folders when caller declines them (folders have special MIME)
         if !!filters['exclude_folders']
           q << "mimeType != 'application/vnd.google-apps.folder'"
         end
-        # Folder filter
+        # Restrict to parent folder if requested
         if folder_id.present?
           q << "'#{folder_id}' in parents"
         end
 
+        # Corpora/driveId are critical for correctness across My Drive vs Shared
         corpora, drive_id = if input['drive_id'].present?
                               ['drive', input['drive_id']]
                             elsif folder_id.present?
@@ -344,8 +360,10 @@
                               ['user', nil]
                             end
         if recursive && folder_id.present?
-          # BFS over the subtree rooted at folder_id
+          # BFS over the subtree rooted at folder_id (returns a single combined result (not paginated))
+          # Honors filters and caps result w/ 'overall_limit', 'max_depth'
           files = call(:drive_bfs_collect_files!, folder_id, filters, corpora, drive_id, overall_limit, max_depth)
+          # Prep read-to-map batch transfer plan items (aligns w/recipe UI)
           items_for_transfer = files.map { |f|
             {
               'drive_file_id_or_url' => f['id'],
@@ -365,7 +383,7 @@
           }
           base.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
         else
-          # Existing single-page behavior (non-recursive or no folder specified)
+          # Single page list (caller may iterate using next_page_token)
           res = get('https://www.googleapis.com/drive/v3/files')
                 .params(
                   q: q.join(' and '),
@@ -379,6 +397,7 @@
                   includeItemsFromAllDrives: true,
                   fields: 'files(id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress)),nextPageToken'
                 )
+          # Map upstream → schema: coerces size, derives web_view_url, normalizes owners[].
           files = (res['files'] || []).map { |f| call(:map_drive_meta, f) }
           items_for_transfer = files.map do |f|
             {
@@ -401,7 +420,7 @@
           base.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
         end
       rescue => e
-        # Predictable empty shape (string keys) on failure
+        # Predictable empty page on failure, plus telemetry. Keeps data pills stable.
         {}.merge(
           'files'            => [],
           'file_ids'         => [],
@@ -413,6 +432,7 @@
           call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s)
         )
       end,
+
       sample_output: lambda do
         {
           'files' => [
@@ -466,20 +486,25 @@
       end,
 
       execute: lambda do |_connection, input|
+        # Correlation id and duration for logs / analytics
         t0 = Time.now
         corr = SecureRandom.uuid
+
+        # Normalize folder id (shortcuts resolved 1x via meta_get_resolve_shortcut)
         file_id = call(:util_extract_drive_id, input['file_id_or_url'])
         meta = call(:meta_get_resolve_shortcut, file_id)
-
         result = call(:map_drive_meta, meta)
 
+        # Eval content mode, url processing behavior
         mode = (input['content_mode'] || 'none').to_s
         strip = input.dig('postprocess', 'util_strip_urls') ? true : false
 
+        # No mode specified on input
         if mode == 'none'
           result.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
 
         elsif mode == 'text'
+          # Editors branch → export to requested/compat MIME
           if call(:util_is_google_editors_mime?, meta['mimeType'])
             export_mime = call(:util_editors_export_mime, meta['mimeType'], input['editors_export_format'])
             bytes = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}/export")
@@ -493,6 +518,7 @@
                   .merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
 
           else
+            # Regular file (only allow textual MIME in this case)
             if call(:util_is_textual_mime?, meta['mimeType'])
               bytes = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}")
                       .params(alt: 'media', supportsAllDrives: true)
@@ -504,10 +530,12 @@
               result.merge(text_content: text, content_md5: cs['md5'], content_sha256: cs['sha256'])
                     .merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
             else
+              # Guardrail: caller likely wanted bytes for binaries
               error('415 Unsupported Media Type - Non-text file; use content_mode=bytes or none.')
             end
           end
         elsif mode == 'bytes'
+          # Editors cannot be downloaded as bytes; force export via text
           if call(:util_is_google_editors_mime?, meta['mimeType'])
             error('400 Bad Request - Editors files require content_mode=text (export).')
           end
@@ -522,7 +550,7 @@
           error("400 Bad Request - Unknown content_mode: #{mode}")
         end
       rescue => e
-        # Predictable shape on error
+        # Predictable shape on error (consumers can key off telemetry)
         {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
       end
     },
@@ -538,6 +566,14 @@
         }
       end,
 
+      # PURPOSE
+      #   List a page of objects and common prefixes from a GCS bucket.
+      #   Mirrors GCS list API while returning a Workato-friendly shape for mapping + paging.
+      #
+      # REQUESTER-PAYS
+      #   `userProject` is forwarded from the connection when set, avoiding 403s on RP buckets.
+
+
       input_fields: lambda do |_obj, _conn, config_fields|
         call(:ui_gcs_list_inputs, config_fields)
       end,
@@ -547,11 +583,16 @@
       end,
 
       execute: lambda do |connection, input|
+        # Correlation id and duration for logs / analytics
         t0 = Time.now
         corr = SecureRandom.uuid
         filters = input['filters'] || {}
         paging  = input['paging']  || {}
+
+        # Enforce GCS maxResults bounds (1..1000)
         page_size = [[(paging['max_results'] || 1000).to_i, 1].max, 1000].min
+
+        # Use fields projection for lean response, faster UI
         res = get("https://storage.googleapis.com/storage/v1/b/#{URI.encode_www_form_component(input['bucket'])}/o")
               .params(
                 prefix: filters['prefix'],
@@ -562,6 +603,8 @@
                 fields: 'items(bucket,name,size,contentType,updated,generation,md5Hash,crc32c,metadata),nextPageToken,prefixes',
                 userProject: connection['user_project']
               )
+
+        # Map upstream → schema, surface flat list of names for easy mapping
         items = (res['items'] || []).map { |o| call(:map_gcs_meta, o) }
         next_token = res['nextPageToken']
         base = {
@@ -574,6 +617,7 @@
         }
         base.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
       rescue => e
+        # Predictable empty page on failure w/telemetry
         {}.merge(
           'objects'         => [],
           'prefixes'        => [],
@@ -621,6 +665,13 @@
         }
       end,
 
+      # PURPOSE
+      #   Fetch GCS object metadata and optionally its content as text (UTF-8) or bytes (Base64),
+      #   with MD5/SHA-256 checksums for integrity/traceability.
+      #
+      # CONTENT RULES
+      #   - `content_mode=text` allowed only for textual MIME; otherwise 415 to prevent garbage text.
+
       input_fields: lambda do |_obj, _conn, config_fields|
         call(:ui_gcs_get_inputs, config_fields)
       end,
@@ -630,10 +681,14 @@
       end,
 
       execute: lambda do |connection, input|
+        # Correlation id and duration for logs / analytics
         t0 = Time.now
         corr = SecureRandom.uuid
+
         bucket = input['bucket']
         name = input['object_name']
+        
+        # Fetch metadata first (derive contentType for branch decisions)
         meta = get("https://storage.googleapis.com/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o/#{ERB::Util.url_encode(name)}")
                .params(alt: 'json', userProject: connection['user_project'])
         base = call(:map_gcs_meta, meta)
@@ -648,6 +703,7 @@
 
         # - Text
         elsif mode == 'text'
+          # Guardrail: only textual MIME types → decode to UTF-8 (optionally strip URLs)
           unless call(:util_is_textual_mime?, ctype)
             error('415 Unsupported Media Type - Non-text object; use content_mode=bytes or none.')
           end
@@ -666,6 +722,7 @@
 
         # - Bytes
         elsif mode == 'bytes'
+          # Always allowed, returns Base64 plus checksums
           bytes = get("https://storage.googleapis.com/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o/#{ERB::Util.url_encode(name)}")
                   .params(alt: 'media', userProject: connection['user_project'])
                   .response_format_raw
@@ -680,6 +737,7 @@
           error("400 Bad Request - Unknown content_mode: #{mode}")
         end
       rescue => e
+        # Boring envelope on error for recipe stability
         {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
       end,
 
@@ -715,6 +773,14 @@
         }
       end,
 
+      # PURPOSE
+      #   Upload text or bytes to GCS with optional Content-Type, metadata, and preconditions.
+      #   Calculates `bytes_uploaded` and returns canonical object metadata for mapping.
+      #
+      # MULTIPART VS MEDIA
+      #   - If caller supplies custom metadata → use multipart upload so meta + content are atomic.
+      #   - Else → media upload with `name` query param.
+
       input_fields: lambda do |_obj, _conn, config_fields|
         call(:ui_gcs_put_inputs, config_fields)
       end,
@@ -724,26 +790,30 @@
       end,
 
       execute: lambda do |connection, input|
+        # Correlation ID and duration for logs/analytics
         t0 = Time.now
         corr = SecureRandom.uuid
-        bucket = input['bucket']
-        name = input['object_name']
-        mode = input['content_mode']
-        strip = input.dig('postprocess', 'util_strip_urls') ? true : false
-        adv  = input['advanced'] || {}
-        meta = adv['custom_metadata']
-        meta = meta.transform_values { |v| v.nil? ? nil : v.to_s } if meta.present?
+
+        bucket  = input['bucket']
+        name    = input['object_name']
+        mode    = input['content_mode']
+        strip   = input.dig('postprocess', 'util_strip_urls') ? true : false
+        adv     = input['advanced'] || {}
+        meta    = adv['custom_metadata']
+        meta    = meta.transform_values { |v| v.nil? ? nil : v.to_s } if meta.present?
 
         # Branched execution
         body_bytes, ctype =
 
           # - Text
           if mode == 'text'
+            # Guardrail: text_content is required; optionally strip URLs
             text = input['text_content']
             error('400 Bad Request - text_content is required when content_mode=text.') if text.nil?
             text = call(:util_strip_urls, text) if strip
             [text.to_s.dup.force_encoding('UTF-8'), (adv['content_type'].presence || 'text/plain; charset=UTF-8')]
           elsif mode == 'bytes'
+            # Guardrail: content_bytes required; decode Base64 and default to octet stream
             b64 = input['content_bytes']
             error('400 Bad Request - content_bytes is required when content_mode=bytes.') if b64.nil?
             [Base64.decode64(b64.to_s), (adv['content_type'].presence || 'application/octet-stream')]
@@ -751,6 +821,7 @@
             error("400 Bad Request - Unknown content_mode: #{mode}")
           end
         bytes_uploaded = body_bytes.bytesize
+        # Preconditions + requester-pays (userProject) forwarded to server
         q = {
           ifGenerationMatch: adv.dig('preconditions', 'if_generation_match'),
           ifMetagenerationMatch: adv.dig('preconditions', 'if_metageneration_match'),
@@ -759,6 +830,7 @@
         }.compact
         created =
           if meta.present?
+            # Multipart upload: sets metadata and content in one request
             boundary = "workato-multipart-#{SecureRandom.hex(8)}"
             meta_json = { name: name, contentType: ctype, metadata: meta }.to_json
             multipart =
@@ -770,15 +842,18 @@
               .headers('Content-Type': "multipart/related; boundary=#{boundary}")
               .request_body(multipart)
           else
+            # Media upload: simplest path when no custom metadata is needed
             post("https://www.googleapis.com/upload/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o")
               .params(q.merge(uploadType: 'media', name: name))
               .headers('Content-Type': ctype)
               .request_body(body_bytes)
           end
+        # Return normalized metadata and bytes_uploaded for downstream mapping
         call(:map_gcs_meta, created)
           .merge('bytes_uploaded' => bytes_uploaded)
           .merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
       rescue => e
+        # Envelope only on error for data pill stability
         {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
       end,
 
@@ -811,6 +886,16 @@
         }
       end,
 
+      # PURPOSE
+      #   Transfer one or more Drive files by ID/URL into a GCS bucket/prefix.
+      #   Editors files are exported (default `text`) unless caller sets `skip`.
+      #
+      # OBJECT NAMING
+      #   Uses Drive file name by default; optional `gcs_prefix` prepended for folder-like organization.
+      #
+      # PARTIALS & TELEMETRY
+      #   Returns uploaded[] & failed[] arrays with a summary; http_status=207 when any item fails.
+
       input_fields: lambda do |_obj, _conn, config_fields|
         call(:ui_transfer_inputs, config_fields)
       end,
@@ -820,23 +905,29 @@
       end,
 
       execute: lambda do |connection, input|
+        # Correlation id, duration for logging/analytics
         t0 = Time.now
         corr = SecureRandom.uuid
+
         bucket       = input['bucket']
         prefix       = call(:util_normalize_prefix, input['gcs_prefix'])
         editors_mode = (input['content_mode_for_editors'] || 'text').to_s
         editors_fmt  = input['editors_export_format']
 
         uploaded, failed = [], []
+        # Accepts IDs or URLs (splits on whitespace, commas for ui)
         drive_files = Array(input['drive_file_ids']).map(&:to_s).flat_map { |s| s.split(/[\s,]+/) }
                         .map(&:strip).reject(&:blank?)
 
         drive_files.each do |raw|
           file_id = call(:util_extract_drive_id, raw)
           next if file_id.blank?
+
+          # Core transfer - handles errors vs binary, metadata propogation, checksums, RP buckets
           res = call(:transfer_one_drive_to_gcs, connection, file_id, bucket, "#{prefix}", editors_mode, editors_fmt, nil, nil)
           if res['ok']
             ok = res['ok']
+            # Ensure returned object_name reflects prefix (cosmetic)
             ok[:gcs_object_name] = "#{prefix}#{ok[:gcs_object_name]}" if prefix.present? && !ok[:gcs_object_name].to_s.start_with?(prefix)
             uploaded << ok
           else
@@ -844,6 +935,7 @@
           end
         end
 
+        # Summarize for dashboard-style analytics, recipe guardrails
         summary = {
           'total'   => (uploaded.length + failed.length),
           'success' => uploaded.length,
@@ -859,6 +951,7 @@
         msg  = ok ? 'OK' : 'Partial'
         base.merge(call(:telemetry_envelope, t0, corr, ok, code, msg))
       rescue => e
+        # Predictable output on error
         {
           'uploaded' => [],
           'failed'   => [],
@@ -902,6 +995,13 @@
       end,
       batch: true,
 
+      # PURPOSE
+      #   Batch version of Drive→GCS transfer. Each item may override Editors handling,
+      #   Content-Type, metadata, and target object name. Partial success is allowed.
+      #
+      # STOP-ON-ERROR
+      #   Optional boolean to fail fast for strict workflows; otherwise continues and returns 207.
+
       input_fields: lambda do |_obj, _conn, config_fields|
         call(:ui_transfer_batch_inputs, config_fields)
       end,
@@ -911,8 +1011,10 @@
       end,
 
       execute: lambda do |connection, input|
+        # Correlation ID, duration
         t0 = Time.now
         corr = SecureRandom.uuid
+
         bucket       = input['bucket']
         prefix   = call(:util_normalize_prefix, input['gcs_prefix'])
         def_mode = (input['default_editors_mode'] || 'text').to_s
@@ -923,6 +1025,7 @@
 
         uploaded, failed = [], []
         Array(input['items']).each_with_index do |it, idx|
+          # Normalize per-item overrides; fall back to defaults where absent
           file_id = call(:util_extract_drive_id, it['drive_file_id_or_url'])
           next if file_id.blank?
           editors_mode = (it['editors_mode'].presence || def_mode).to_s
@@ -932,6 +1035,7 @@
           object_name  = target_name.present? ? "#{prefix}#{target_name}" : nil
 
           editors_fmt  = (it['editors_export_format'].presence || def_fmt)
+          # Single file transfer core (editors/binary branches, RP via userProject)
           res = call(:transfer_one_drive_to_gcs, connection, file_id, bucket, (object_name || ''), editors_mode, editors_fmt, ctype, meta)
           if res['ok']
             ok = res['ok']
@@ -943,6 +1047,7 @@
           end
         end
 
+        # Return both success/failure lanes and computed summary
         summary = {
           'total'   => (uploaded.length + failed.length),
           'success' => uploaded.length,
@@ -958,6 +1063,7 @@
         msg  = ok ? 'OK' : 'Partial'
         base.merge(call(:telemetry_envelope, t0, corr, ok, code, msg))
       rescue => e
+        # Consistent failure envelopes for mapping
         {
           'uploaded' => [],
           'failed'   => [],
@@ -994,6 +1100,16 @@
       title: 'Permission probe (Drive & GCS)',
       subtitle: 'Verify token identity, Drive visibility, GCS access, and requester-pays',
       display_priority: 1,
+      # PURPOSE
+      #   One-shot diagnostic to verify:
+      #     1) Token identity (email)
+      #     2) Drive visibility (first 3 files in canary folder or corpus)
+      #     3) GCS access to gs://bucket/prefix (first 3 objects)
+      #     4) Requester-pays detection (auto retries with userProject if configured)
+      #
+      # SHAPE
+      #   Returns a human-readable summary plus telemetry, so connection test and recipes
+      #   can surface actionable hints without raising (reduces setup friction).
       input_fields: lambda do |_|
         [
           { name: 'bucket', label: 'GCS bucket', optional: true, hint: 'Defaults to connection.default_probe_bucket' },
@@ -1025,6 +1141,7 @@
         prefix   = (input['gcs_prefix'].presence || 'probes/')
         folder   = (input['drive_canary_folder_id_or_url'].presence || connection['canary_drive_folder_id_or_url'])
         drive_id = (input['drive_id'].presence || connection['canary_shared_drive_id'])
+        # Delegate to shared method used by connection test for single-source of truth
         call(:do_permission_probe, connection, bucket, folder, drive_id, prefix)
       end
     }
