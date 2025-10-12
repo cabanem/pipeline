@@ -75,7 +75,7 @@
 
   # --------- CONNECTION TEST ----------------------------------------------
 
-  test: ->(connection) {
+  test: lambda do |connection|
     # Fast path: if defaults provided, exercise a real, auth’d call to surface IAM/billing issues early.
     if %w[true 1 yes].include?(connection['set_defaults_for_probe'].to_s.downcase) && connection['default_probe_gen_model'].present?
       # Evaluate connection fields
@@ -90,13 +90,13 @@
     else
       get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models').params(pageSize: 1)
     end
-  },
+  end,
 
   # --------- OBJECT DEFINITIONS -------------------------------------------
 
   object_definitions: {
     content_part: {
-      fields: ->() {
+      fields: lambda do
         [
           { name: 'text' },
           { name: 'inlineData', type: 'object', properties: [
@@ -118,22 +118,22 @@
               { name: 'outcome' }, { name: 'stdout' }, { name: 'stderr' }
           ]}
         ]
-      }
+      end
     },
 
     # Per contract: role ∈ {user, model}
     content: {
-      fields: ->(object_definitions) {
+      fields: lambda do |object_definitions|
         [
           { name: 'role', control_type: 'select', pick_list: 'roles', optional: false },
           { name: 'parts', type: 'array', of: 'object',
             properties: object_definitions['content_part'], optional: false }
         ]
-      }
+      end
     },
 
     generation_config: {
-      fields: ->() {
+      fields: lambda do
         [
           { name: 'temperature',       type: 'number'  },
           { name: 'topP',              type: 'number'  },
@@ -144,20 +144,20 @@
           { name: 'responseMimeType' },
           { name: 'responseSchema',    type: 'object' } # structured output
         ]
-      }
+      end
     },
 
     safety_setting: {
-      fields: ->() {
+      fields: lambda do
         [
           { name: 'category'  },   # e.g., HARM_CATEGORY_*
           { name: 'threshold' }    # e.g., BLOCK_LOW_AND_ABOVE
         ]
-      }
+      end
     },
 
     generate_content_output: {
-      fields: ->() {
+      fields: lambda do
         [
           { name: 'responseId' },
           { name: 'modelVersion' },
@@ -185,12 +185,12 @@
             ]}
           ]}
         ]
-      }
+      end
     },
 
     # Align to contract: embeddings object, not array
     embed_output: {
-      fields: ->() {
+      fields: lambda do
         [
           { name: 'predictions', type: 'array', of: 'object', properties: [
               { name: 'embeddings', type: 'object', properties: [
@@ -210,20 +210,20 @@
             ]
           }
         ]
-      }
+      end
     },
 
     predict_output: {
-      fields: ->() {
+      fields: lambda do
         [
           { name: 'predictions', type: 'array', of: 'object' },
           { name: 'deployedModelId' }
         ]
-      }
+      end
     },
 
     batch_job: {
-      fields: ->() {
+      fields: lambda do |_|
         [
           { name: 'name' },
           { name: 'displayName' },
@@ -236,11 +236,11 @@
           { name: 'partialFailures', type: 'array', of: 'object' },
           { name: 'labels', type: 'object' }
         ]
-      }
+      end
     },
 
     envelope_fields: {
-      fields: ->(_) {
+      fields: lambda do |_|
         [
           { name: 'ok', type: 'boolean' },
           { name: 'telemetry', type: 'object', properties: [
@@ -250,7 +250,7 @@
             { name: 'correlation_id', type: 'string' }
           ] }
         ]
-      }
+      end
     }
 
   },
@@ -911,38 +911,6 @@
       end
     },
 
-    upload_to_gcs: {
-      title: 'Utility: Upload to Cloud Storage (simple upload)',
-      description: 'Simple media upload to GCS (uploadType=media)',
-
-      input_fields: lambda do
-        [
-          { name: 'bucket',      optional: false },
-          { name: 'object_name', optional: false, label: 'Object path/name' },
-          { name: 'content_type', optional: false },
-          { name: 'file', type: 'file', optional: false }
-        ]
-      end,
-
-      output_fields: lambda do
-        [ { name: 'bucket' }, { name: 'name' }, { name: 'generation' },
-          { name: 'size' }, { name: 'contentType' }, { name: 'mediaLink' } ]
-      end,
-
-      execute: lambda do |_connection, input|
-        post("https://storage.googleapis.com/upload/storage/v1/b/#{CGI.escape(input['bucket'])}/o")
-          .params(uploadType: 'media', name: input['object_name'])
-          .headers('Content-Type': input['content_type'])
-          .request_body(input['file'])
-      end,
-
-      sample_output: lambda do
-        { 'bucket' => 'my-bucket', 'name' => 'docs/foo.pdf', 'generation' => '1728533890000',
-          'size' => '123456', 'contentType' => 'application/pdf',
-          'mediaLink' => 'https://storage.googleapis.com/download/storage/v1/b/my-bucket/o/docs%2Ffoo.pdf?gen=...' }
-      end
-    },
-
     # Predict
     endpoint_predict: {
       title: 'Endpoint predict (custom model)',
@@ -1119,15 +1087,15 @@
   # --------- PICK LISTS ---------------------------------------------------
 
   pick_lists: {
-    modes_classification: ->() {
+    modes_classification: lambda do
       [%w[Embedding embedding], %w[Generative generative], %w[Hybrid hybrid]]
-    },
+    end,
 
-    modes_grounding: ->() {
+    modes_grounding: lambda do
       [%w[Google\ Search google_search], %w[Vertex\ AI\ Search vertex_ai_search]]
-    },
+    end,
 
-    models_embedding: ->(_connection) {
+    models_embedding: lambda do |connection|
       begin
         # v1beta1 publishers.models.list — global; no project/location.
         resp = get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models')
@@ -1146,9 +1114,9 @@
         ids = []
       end
       ids.map { |id| [id, id] }
-    },
+    end,
 
-    models_generative: ->(connection) {
+    models_generative: lambda do |connection|
       begin
         resp = get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models')
                 .params(pageSize: 200)
@@ -1160,21 +1128,18 @@
         items = []
       end
       items.map { |id| [id, id] }
-    },
+    end,
 
     # Contract-conformant roles (system handled via system_preamble)
-    roles: ->() { [['user','user'], ['model','model']] }
+    roles: lambda do
+      [['user','user'], ['model','model']]
+    end
   },
 
   # --------- METHODS ------------------------------------------------------
   methods: {
-    ensure_project_id!: lambda do |connection|
-      pid = (connection['project_id'].presence ||
-              (JSON.parse(connection['service_account_key_json'].to_s)['project_id'] rescue nil)).to_s
-      error('Project ID is required (not found in connection or key)') if pid.blank?
-      connection['project_id'] = pid
-      pid
-    end,
+
+    # --- Telemetry and resilience -----------------------------------------
 
     telemetry_envelope: lambda do |started_at, correlation_id, ok, code, message|
       dur = ((Time.now - started_at) * 1000.0).to_i
@@ -1189,22 +1154,26 @@
       }
     end,
 
-    telemetry_parse_error_code: ->(err) {
+    telemetry_parse_error_code: lambda do |err|
       m = err.to_s.match(/\b(\d{3})\b/)
       m ? m[1].to_i : 500
-    },
+    end,
 
-    const_default_scopes: -> { [
-      'https://www.googleapis.com/auth/cloud-platform'
-    ] },
+    build_correlation_id: lambda do
+      SecureRandom.uuid
+    end,
 
-    build_correlation_id: ->() { SecureRandom.uuid },
+    # --- Auth (JWT → OAuth) -----------------------------------------------
 
-    clamp_int: ->(n, min, max) { [[n.to_i, min].max, max].min },
+    const_default_scopes: lambda do
+       [ 'https://www.googleapis.com/auth/cloud-platform' ]
+    end,
 
-    b64url: ->(bytes) { Base64.urlsafe_encode64(bytes).gsub(/=+$/, '') },
+    b64url: lambda do |bytes|
+      Base64.urlsafe_encode64(bytes).gsub(/=+$/, '')
+    end,
 
-    jwt_sign_rs256: ->(claims, private_key_pem) {
+    jwt_sign_rs256: lambda do |claims, private_key_pem|
       header = { alg: 'RS256', typ: 'JWT' }
       enc_h  = call(:b64url, header.to_json)
       enc_p  = call(:b64url, claims.to_json)
@@ -1212,9 +1181,9 @@
       rsa = OpenSSL::PKey::RSA.new(private_key_pem.to_s)
       sig = rsa.sign(OpenSSL::Digest::SHA256.new, input)
       "#{input}.#{call(:b64url, sig)}"
-    },
+    end,
 
-    auth_normalize_scopes: ->(scopes) {
+    auth_normalize_scopes: lambda do |scopes|
       arr = case scopes
             when nil    then ['https://www.googleapis.com/auth/cloud-platform']
             when String then scopes.split(/\s+/)
@@ -1222,23 +1191,24 @@
             else              ['https://www.googleapis.com/auth/cloud-platform']
             end
       arr.map(&:to_s).reject(&:empty?).uniq
-    },
+    end,
 
-    auth_token_cache_get: ->(connection, scope_key) {
+    auth_token_cache_get: lambda do |connection, scope_key|
       cache = (connection['__token_cache'] ||= {})
       tok   = cache[scope_key]
       return nil unless tok.is_a?(Hash) && tok['access_token'].present? && tok['expires_at'].present?
       exp = Time.parse(tok['expires_at']) rescue nil
       return nil unless exp && Time.now < (exp - 60)
       tok
-    },
-    auth_token_cache_put: ->(connection, scope_key, token_hash) {
+    end,
+
+    auth_token_cache_put: lambda do |connection, scope_key, token_hash|
       cache = (connection['__token_cache'] ||= {})
       cache[scope_key] = token_hash
       token_hash
-    },
+    end,
 
-    auth_issue_token!: ->(connection, scopes) {
+    auth_issue_token!: lambda do |onnection, scopes|
       # Safely parse sa key json
       key = JSON.parse(connection['service_account_key_json'].to_s)
       # Guard for sa key exists
@@ -1273,9 +1243,9 @@
         'expires_at'   => (Time.now + res['expires_in'].to_i).utc.iso8601,
         'scope_key'    => scope_str
       }
-    },
+    end,
 
-    auth_build_access_token!: ->(connection, scopes: nil) {
+    auth_build_access_token!: lambda do |connection, scopes: nil|
       set = call(:auth_normalize_scopes, scopes)
       scope_key = set.join(' ')
       if (cached = call(:auth_token_cache_get, connection, scope_key))
@@ -1283,28 +1253,20 @@
       end
       fresh = call(:auth_issue_token!, connection, set)
       call(:auth_token_cache_put, connection, scope_key, fresh)['access_token']
-    },
+    end,
 
-    safe_array: ->(v) {
-      return [] if v.nil? || v == false
-      return v  if v.is_a?(Array)
-      [v]
-    },
-    safe_integer: ->(v) { return nil if v.nil?; Integer(v) rescue v.to_i },
-    safe_float:   ->(v) { return nil if v.nil?; Float(v)   rescue v.to_f },
-    # -------------------- API endpoint reconciliation -----------------
-    # --- Host and URL
-    # - Regional
-    aipl_service_host: ->(connection, loc=nil) {
+    # --- URL and resource building ----------------------------------------
+
+    aipl_service_host: lambda do |connection, loc=nil|
       l = (loc || connection['location']).to_s.downcase
       (l.blank? || l == 'global') ? 'aiplatform.googleapis.com' : "#{l}-aiplatform.googleapis.com"
-    },
+    end,
 
-    aipl_v1_url: ->(connection, loc, path) {
+    aipl_v1_url: lambda do |connection, loc, path|
       "https://#{call(:aipl_service_host, connection, loc)}/v1/#{path}"
-    },
+    end,
 
-    endpoint_predict_url: ->(connection, endpoint) {
+    endpoint_predict_url: lambda do |connection, endpoint|
       ep = call(:normalize_endpoint_identifier, endpoint).to_s
       # Allow fully-qualified dedicated endpoint URLs.
       return (ep.include?(':predict') ? ep : "#{ep}:predict") if ep.start_with?('http')
@@ -1316,16 +1278,15 @@
 
       host = call(:aipl_service_host, connection, loc)
       "https://#{host}/v1/#{call(:build_endpoint_path, connection, ep)}:predict"
-    },
+    end,
 
-    build_endpoint_path: ->(connection, endpoint) {
+    build_endpoint_path: lambda do |connection, endpoint|
       ep = call(:normalize_endpoint_identifier, endpoint)
       ep.start_with?('projects/') ? ep :
         "projects/#{connection['project_id']}/locations/#{connection['location']}/endpoints/#{ep}"
-    },
+    end,
 
-    # --- Model
-    build_model_path_with_global_preview: ->(connection, model) {
+    build_model_path_with_global_preview: lambda do |connection, model|
       # Enforce project location (inference from connection)
       call(:ensure_project_id!, connection)
 
@@ -1350,9 +1311,9 @@
       else
         "projects/#{connection['project_id']}/locations/#{loc}/publishers/google/models/#{m}"
       end
-    },
+    end,
 
-    build_embedding_model_path: ->(connection, model) {
+    build_embedding_model_path: lambda do |connection, model|
       # Enforce project location (inference from connection)
       call(:ensure_project_id!, connection)
 
@@ -1375,54 +1336,128 @@
       else
         "projects/#{connection['project_id']}/locations/#{loc}/publishers/google/models/#{m}"
       end
-    },
+    end,
 
-    # --- Location or region
-    ensure_regional_location!: ->(connection) {
+    # --- Guards, normalization --------------------------------------------
+
+    ensure_project_id!: lambda do |connection|
+      pid = (connection['project_id'].presence ||
+              (JSON.parse(connection['service_account_key_json'].to_s)['project_id'] rescue nil)).to_s
+      error('Project ID is required (not found in connection or key)') if pid.blank?
+      connection['project_id'] = pid
+      pid
+    end,
+
+    ensure_regional_location!: lambda do |connection|
       loc = (connection['location'] || '').downcase
       error("This action requires a regional location (e.g., us-central1). Current location is '#{loc}'.") if loc.blank? || loc == 'global'
-    },
+    end,
 
-    embedding_region: ->(connection) {
+    embedding_region: lambda do |connection|
       loc = (connection['location'] || '').to_s.downcase
-      # Embeddings support global and multi-regional endpoints. Respect caller choice; default to global.
       loc.present? ? loc : 'global'
-    },
+    end,
 
-    # Normalize a user-provided "endpoint" into a String as well.
-    normalize_endpoint_identifier: ->(raw) {
+    normalize_endpoint_identifier: lambda do |raw|
       return '' if raw.nil? || raw == true || raw == false
       if raw.is_a?(Hash)
-        v = raw['value'] || raw[:value] ||
-            raw['id']    || raw[:id]    ||
-            raw['path']  || raw[:path]  ||
-            raw['name']  || raw[:name]  ||
-            raw.to_s
+        v = raw['value'] || raw[:value] || raw['id'] || raw[:id] || raw['path'] || raw[:path] || raw['name'] || raw[:name] || raw.to_s
         return v.to_s.strip
+      end; raw.to_s.strip
+    end,
+
+    normalize_model_identifier: lambda do |raw|
+      # Normalize a user-provided "model" into a String.
+      # Accepts String or Hash (from datapills/pick lists). Prefers common keys.
+      return '' if raw.nil? || raw == true || raw == false
+      if raw.is_a?(Hash)
+        v = raw['value'] || raw[:value] || raw['id'] || raw[:id] || raw['path'] || raw[:path] || raw['name'] || raw[:name] || raw.to_s
+        return v.to_s.strip
+      end; raw.to_s.strip
+    end,
+
+    normalize_boolean: lambda do |v|
+      %w[true 1 yes on].include?(v.to_s.strip.downcase)
+    end,
+
+    normalize_input_keys: lambda do |input|
+      (input || {}).to_h.transform_keys(&:to_s)
+    end,
+
+    # --- Sanitizers and conversion ----------------------------------------
+
+    safe_array: lambda do |v|
+      return [] if v.nil? || v == false
+      return v  if v.is_a?(Array)
+      [v]
+    end,
+
+    safe_integer: lambda do |v|
+      return nil if v.nil?; Integer(v) rescue v.to_i
+    end,
+
+    safe_float: lambda do |v|
+      return nil if v.nil?; Float(v)   rescue v.to_f
+    end,
+
+    clamp_int: lambda do |n, min, max|
+      [[n.to_i, min].max, max].min
+    end,
+
+    sanitize_embedding_params: lambda do |raw|
+      h = {}
+      # Only include autoTruncate when explicitly true (keeps payload minimal)
+      h['autoTruncate'] = true if raw['autoTruncate'] == true
+
+      if raw['outputDimensionality'].present?
+        od = call(:safe_integer, raw['outputDimensionality'])
+        error('outputDimensionality must be a positive integer') if od && od < 1
+        h['outputDimensionality'] = od if od
       end
-      raw.to_s.strip
-    },
+      h
+    end,
+  
+    sanitize_generation_config: lambda do |cfg|
+      return nil if cfg.nil? || (cfg.respond_to?(:empty?) && cfg.empty?)
+      g = cfg.dup
+      # String
+      g['responseMimeType'] = g['responseMimeType'].to_s if g.key?('responseMimeType')
+      # Floats
+      g['temperature']     = call(:safe_float,  g['temperature'])     if g.key?('temperature')
+      g['topP']            = call(:safe_float,  g['topP'])            if g.key?('topP')
+      # Integers
+      g['topK']            = call(:safe_integer,g['topK'])            if g.key?('topK')
+      g['maxOutputTokens'] = call(:safe_integer,g['maxOutputTokens']) if g.key?('maxOutputTokens')
+      g['candidateCount']  = call(:safe_integer,g['candidateCount'])  if g.key?('candidateCount')
+      # Arrays
+      g['stopSequences']   = call(:safe_array, g['stopSequences']).map(&:to_s) if g.key?('stopSequences')
+      # Strip
+      g.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
+      g
+    end,
 
-    # Build a single email text body for classification
-    build_email_text: ->(subject, body) {
-      s = subject.to_s.strip
-      b = body.to_s.strip
-      parts = []
-      parts << "Subject: #{s}" if s.present?
-      parts << "Body:\n#{b}"    if b.present?
-      parts.join("\n\n")
-    },
+    sanitize_contents_roles: lambda do |contents|
+      call(:safe_array, contents).map do |c|
+        h = c.is_a?(Hash) ? c.transform_keys(&:to_s) : {}
+        role = (h['role'] || 'user').to_s.downcase
+        error("Invalid role: #{role}") unless %w[user model].include?(role)
+        h['role'] = role
+        h
+      end
+    end,
 
-    # Extracts float vector from embedding prediction (both shapes supported)
-    extract_embedding_vector: ->(pred) {
+    # --- Embeddings -------------------------------------------------------
+
+    extract_embedding_vector: lambda do |pred|
+      # Extracts float vector from embedding prediction (both shapes supported)
       vec = pred.dig('embeddings', 'values') ||
             pred.dig('embeddings', 0, 'values') ||
             pred['values']
       error('Embedding prediction missing values') if vec.blank?
       vec.map(&:to_f)
-    },
+    end,
 
-    vector_cosine_similarity: ->(a, b) {
+    vector_cosine_similarity: lambda do |a, b|
       return 0.0 if a.blank? || b.blank?
       error("Embedding dimensions differ: #{a.length} vs #{b.length}") if a.length != b.length
       dot = 0.0; sum_a = 0.0; sum_b = 0.0
@@ -1432,19 +1467,18 @@
       end
       denom = Math.sqrt(sum_a) * Math.sqrt(sum_b)
       denom.zero? ? 0.0 : (dot / denom)
-    },
+    end,
 
-    # Conservative instance limits by model family
-    embedding_max_instances: ->(model_path_or_id) {
+    embedding_max_instances: lambda do |model_path_or_id|
       id = model_path_or_id.to_s.split('/').last
       if id.start_with?('gemini-embedding-001')
         1
       else
         250
       end
-    },
+    end,
 
-    predict_embeddings: ->(connection, model_path, instances, params={}) {
+    predict_embeddings: lambda do |connection, model_path, instances, params={}|
       max  = call(:embedding_max_instances, model_path)
       preds = []
       billable = 0
@@ -1463,10 +1497,41 @@
       out = { 'predictions' => preds }
       out['metadata'] = { 'billableCharacterCount' => billable } if billable > 0
       out
-    },
+    end,
 
-    # Minimal, schema-constrained JSON referee using Gemini
-    llm_referee: ->(connection, model, email_text, shortlist_names, all_cats, fallback_category = nil) {
+    # --- Generative -------------------------------------------------------
+
+    system_instruction_from_text: lamda do |text|
+      return nil if text.blank?
+      { 'role' => 'system', 'parts' => [ { 'text' => text.to_s } ] }
+    end,
+
+    format_context_chunks: lamda do |chunks|
+      # Stable, parseable layout the model can learn
+      call(:safe_array, chunks).each_with_index.map { |c, i|
+        cid  = c['id'] || "chunk-#{i+1}"
+        src  = c['source']
+        uri  = c['uri']
+        sc   = c['score']
+        meta = c['metadata']
+
+        header = ["[#{cid}]",
+                  (src.present? ? "source=#{src}" : nil),
+                  (uri.present? ? "uri=#{uri}"     : nil),
+                  (sc  ? "score=#{sc}"             : nil)].compact.join(' ')
+
+        body = c['text'].to_s
+        meta_str = meta.present? ? "\n(meta: #{meta.to_json})" : ''
+        "#{header}\n#{body}#{meta_str}"
+      }.join("\n\n---\n\n")
+    end,
+
+    safe_parse_json: lamda do |s|
+      JSON.parse(s) rescue { 'answer' => s }
+    end,
+
+    llm_referee: lamda do |connection, model, email_text, shortlist_names, all_cats, fallback_category = nil|
+      # Minimal, schema-constrained JSON referee using Gemini
       model_path = call(:build_model_path_with_global_preview, connection, model)
 
       cats_norm = call(:safe_array, all_cats).map { |c| c.is_a?(Hash) ? c : { 'name' => c.to_s } }
@@ -1551,97 +1616,24 @@
       error('Referee returned no valid category and no fallback is configured') if parsed['category'].blank?
 
       parsed
-    },
+    end,
 
-    sanitize_contents_roles: ->(contents) {
-      call(:safe_array, contents).map do |c|
-        h = c.is_a?(Hash) ? c.transform_keys(&:to_s) : {}
-        role = (h['role'] || 'user').to_s.downcase
-        error("Invalid role: #{role}") unless %w[user model].include?(role)
-        h['role'] = role
-        h
-      end
-    },
-
-    # Accept plain text and produce a proper systemInstruction
-    system_instruction_from_text: ->(text) {
-      return nil if text.blank?
-      { 'role' => 'system', 'parts' => [ { 'text' => text.to_s } ] }
-    },
-
-    format_context_chunks: ->(chunks) {
-      # Stable, parseable layout the model can learn
-      call(:safe_array, chunks).each_with_index.map { |c, i|
-        cid  = c['id'] || "chunk-#{i+1}"
-        src  = c['source']
-        uri  = c['uri']
-        sc   = c['score']
-        meta = c['metadata']
-
-        header = ["[#{cid}]",
-                  (src.present? ? "source=#{src}" : nil),
-                  (uri.present? ? "uri=#{uri}"     : nil),
-                  (sc  ? "score=#{sc}"             : nil)].compact.join(' ')
-
-        body = c['text'].to_s
-        meta_str = meta.present? ? "\n(meta: #{meta.to_json})" : ''
-        "#{header}\n#{body}#{meta_str}"
-      }.join("\n\n---\n\n")
-    },
-
-    safe_parse_json: ->(s) {
-      JSON.parse(s) rescue { 'answer' => s }
-    },
+    # --- Miscellaneous ----------------------------------------------------
     
-    # Normalize a user-provided "model" into a String.
-    # Accepts String or Hash (from datapills/pick lists). Prefers common keys.
-    normalize_model_identifier: ->(raw) {
-      return '' if raw.nil? || raw == true || raw == false
-      if raw.is_a?(Hash)
-        v = raw['value'] || raw[:value] ||
-            raw['id']    || raw[:id]    ||
-            raw['path']  || raw[:path]  ||
-            raw['name']  || raw[:name]  ||
-            raw.to_s
-        return v.to_s.strip
-      end
-      raw.to_s.strip
-    },
+    build_email_text: lamda do |subject, body|
+      # Build a single email text body for classification
+      s = subject.to_s.strip
+      b = body.to_s.strip
+      parts = []
+      parts << "Subject: #{s}" if s.present?
+      parts << "Body:\n#{b}"    if b.present?
+      parts.join("\n\n")
+    end,
 
-    # Like Array#map but safe against nil/false/non-arrays.
-    safe_map: ->(v) { call(:safe_array, v).map { |x| yield(x) } },
-
-    sanitize_embedding_params: ->(raw) {
-      h = {}
-      # Only include autoTruncate when explicitly true (keeps payload minimal)
-      h['autoTruncate'] = true if raw['autoTruncate'] == true
-
-      if raw['outputDimensionality'].present?
-        od = call(:safe_integer, raw['outputDimensionality'])
-        error('outputDimensionality must be a positive integer') if od && od < 1
-        h['outputDimensionality'] = od if od
-      end
-      h
-    },
-  
-    sanitize_generation_config: ->(cfg) {
-      return nil if cfg.nil? || (cfg.respond_to?(:empty?) && cfg.empty?)
-      g = cfg.dup
-      # String
-      g['responseMimeType'] = g['responseMimeType'].to_s if g.key?('responseMimeType')
-      # Floats
-      g['temperature']     = call(:safe_float,  g['temperature'])     if g.key?('temperature')
-      g['topP']            = call(:safe_float,  g['topP'])            if g.key?('topP')
-      # Integers
-      g['topK']            = call(:safe_integer,g['topK'])            if g.key?('topK')
-      g['maxOutputTokens'] = call(:safe_integer,g['maxOutputTokens']) if g.key?('maxOutputTokens')
-      g['candidateCount']  = call(:safe_integer,g['candidateCount'])  if g.key?('candidateCount')
-      # Arrays
-      g['stopSequences']   = call(:safe_array, g['stopSequences']).map(&:to_s) if g.key?('stopSequences')
-      # Strip
-      g.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
-      g
-    }
+    safe_map: lamda do |v|
+      # Like Array#map but safe against nil/false/non-arrays.
+      call(:safe_array, v).map { |x| yield(x) }
+    end
 
   },
 
