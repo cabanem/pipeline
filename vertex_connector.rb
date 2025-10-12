@@ -526,10 +526,17 @@
           if has_gcs
             import_cfg['gcsSource'] = { 'uris' => call(:safe_array, input['gcs_uris']) }
           else
-            import_cfg['googleDriveSource'] = {
-              'folderId' => input['drive_folder_id'],
-              'fileIds'  => call(:safe_array, input['drive_file_ids'])
-            }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
+            # Map folder w/file IDs into the required resourceIDs[] array
+            res_ids = []
+            if input['drive_folder_id'].present?
+              res_ids << { 'resourceId' => input['drive_folder_id'].to_s, 'resourceType' => 'FOLDER' }
+            end
+            call(:safe_array, input['drive_file_ids']).each do |fid|
+              res_ids << { 'resourceId' => fid.to_s, 'resourceType' => 'FILE' }
+            end
+            error('Provide drive_folder_id or drive_file_ids') if res_ids.empty?
+            imp
+            import_cfg['googleDriveSource'] = { 'resourceIds' => res_ids }
           end
 
           # Optional knobs
@@ -542,7 +549,7 @@
           payload = { 'importRagFilesConfig' => import_cfg }
 
           loc = (connection['location'] || '').downcase
-          url = call(:aipl_v1_url, connection, loc, "#{corpus}:ragFiles:import")
+          url = call(:aipl_v1_url, connection, loc, "#{corpus}/ragFiles:import")
           resp = post(url).payload(payload)
 
           resp.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
@@ -1019,7 +1026,7 @@
 
     gen_answer_with_context: {
       title: 'Generative: Generate (use provided context chunks)',
-      subtitle: 
+      subtitle: '',
       help: lambda do |_|
         { body: 'Answer a question using caller-supplied context chunks (RAG-lite). Returns structured JSON with citations.' }
       end,
@@ -1167,9 +1174,9 @@
     # 3) Embeddings
     embed_text: {
       title: 'Embeddings: Embed text',
-      subtitle: 'Get embeddings from a publisher embedding model'
+      subtitle: 'Get embeddings from a publisher embedding model',
       help: lambda do |_|
-        { 'POST :predict on a publisher embedding model' }
+        { body: 'POST :predict on a publisher embedding model' }
       end,
       display_priority: 7,
       retry_on_request: ['GET', 'HEAD', 'POST'],
