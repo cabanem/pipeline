@@ -2,7 +2,7 @@
 
 {
   title: 'Vertex AI Adapter',
-  version: '0.9.0',
+  version: '1.0.0',
   description: 'Vertex AI (Gemini + Text Embeddings + Endpoints) via service account JWT',
 
   # --------- CONNECTION ---------------------------------------------------
@@ -259,10 +259,14 @@
 
   actions: {
 
-    # Email categorization
+    # 1. Email categorization
     gen_categorize_email: {
-      title: 'Generative - Categorize email',
-      description: 'Classify an email into one of the provided categories using embeddings (default) or a generative referee.',
+      title: 'Categorize email',
+      subtitle: 'Classify an email into a category',
+      help: lambda do |_|
+        { body: 'Classify an email into one of the provided categories using embeddings (default) or a generative referee.'}
+      end,
+      display_priority: 10,
       retry_on_request: ['GET', 'HEAD', 'POST'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
@@ -453,10 +457,14 @@
       end
     },
 
-    # Generate content (Gemini)
+    # 2. Generate content (Gemini)
     gen_generate_content: {
-      title: 'Generative - Generate content (Gemini)',
-      description: 'POST :generateContent on a publisher model',
+      title: 'Generative: Generate content (Gemini)',
+      subtitle: 'Generate content from a prompt',
+      help: lambda do |_|
+        { body: 'Provide a prompt to generate content from an LLM. Uses "POST :generateContent".'}
+      end,
+      display_priority: 9,
       retry_on_request: ['GET', 'HEAD', 'POST'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
@@ -544,8 +552,9 @@
     },
 
     gen_generate_grounded: {
-      title: 'Generative - Generate (grounded)',
-      description: 'Generate with grounding via Google Search or Vertex AI Search',
+      title: 'Generative: Generate (grounded)',
+      subtitle: 'Generate with grounding via Google Search or Vertex AI Search',
+      display_priority: 9
       retry_on_request: ['GET', 'HEAD', 'POST'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
@@ -639,8 +648,12 @@
     },
 
     gen_answer_with_context: {
-      title: 'Generative - Answer with provided context chunks',
-      description: 'Answer a question using caller-supplied context chunks (RAG-lite). Returns structured JSON with citations.',
+      title: 'Generative: Answer with provided context chunks',
+      subtitle: 
+      help: lambda do |_|
+        { body: 'Answer a question using caller-supplied context chunks (RAG-lite). Returns structured JSON with citations.' }
+      end,
+      display_priority: 9,
       retry_on_request: ['GET', 'HEAD', 'POST'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
@@ -781,10 +794,14 @@
       end
     },
 
-    # Generate embeddings
+    # 3. Embeddings
     embed_text: {
-      title: 'Embedding - Embed text',
-      description: 'POST :predict on a publisher embedding model',
+      title: 'Embeddings: Embed text',
+      subtitle: 'Get embeddings from a publisher embedding model'
+      help: lambda do |_|
+        { 'POST :predict on a publisher embedding model' }
+      end,
+      display_priority: 8,
       retry_on_request: ['GET', 'HEAD', 'POST'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
@@ -852,69 +869,12 @@
         }
       end
     },
- 
-    # Utility
-    count_tokens: {
-      title: 'Utility: Count tokens',
-      description: 'POST :countTokens on a publisher model',
-      retry_on_request: ['GET', 'HEAD', 'POST'],
-      retry_on_response: [408, 429, 500, 502, 503, 504],
-      max_retries: 3,
-
-      input_fields: lambda do |object_definitions|
-        [
-          { name: 'model', label: 'Model', optional: false, control_type: 'select', pick_list: 'models_generative',
-            toggle_hint: 'Use custom value', toggle_field: { name: 'model', label: 'Model', type: 'string', control_type: 'text' } },
-          { name: 'contents', type: 'array', of: 'object', properties: object_definitions['content'], optional: false },
-          { name: 'system_preamble', label: 'System preamble (text)', optional: true }
-        ]
-      end,
-
-      output_fields: lambda do |object_definitions|
-        [
-          { name: 'totalTokens', type: 'integer' },
-          { name: 'totalBillableCharacters', type: 'integer' },
-          { name: 'promptTokensDetails', type: 'array', of: 'object' }
-        ] + Array(object_definitions['envelope_fields'])
-      end,
-
-      execute:  lambda do |connection, input|
-        # Correlation id and duration for logs / analytics
-        t0 = Time.now
-        corr = call(:build_correlation_id)
-
-        # Compute model path
-        model_path = call(:build_model_path_with_global_preview, connection, input['model'])
-
-        # Build payload
-        contents   = call(:sanitize_contents_roles, input['contents'])
-        error('At least one non-system message is required in contents') if contents.blank?
-        sys_inst   = call(:system_instruction_from_text, input['system_preamble'])
-
-        loc = (connection['location'].presence || 'global').to_s.downcase
-        begin
-          resp = post(call(:aipl_v1_url, connection, loc, "#{model_path}:countTokens")).payload({
-            'contents'          => contents,
-            'systemInstruction' => sys_inst
-          }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) })
-          resp.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
-        rescue => e
-          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
-        end
-      end,
-
-      sample_output: lambda do
-        { 'totalTokens' => 31, 'totalBillableCharacters' => 96,
-          'promptTokensDetails' => [ { 'modality' => 'TEXT', 'tokenCount' => 31 } ],
-          'ok' => true,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr' } }
-      end
-    },
 
     # Predict
     endpoint_predict: {
-      title: 'Endpoint predict (custom model)',
-      description: 'POST :predict to a Vertex AI Endpoint',
+      title: 'Prediction: Endpoint predict (custom model)',
+      subtitle: 'POST :predict to a Vertex AI Endpoint',
+      display_priority: 7,
       retry_on_request: ['GET', 'HEAD', 'POST'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
@@ -963,8 +923,9 @@
 
     batch_prediction_create: {
       title: 'Batch: Create prediction job',
-      description: 'Create projects.locations.batchPredictionJobs',
+      subtitle: 'Create projects.locations.batchPredictionJobs',
       batch: true,
+      display_priority: 6,
 
       input_fields: lambda do
         [
@@ -1039,8 +1000,9 @@
 
     batch_prediction_get: {
       title: 'Batch: Fetch prediction job (get)',
-      description: 'Get a batch prediction job by ID',
+      subtitle: 'Get a batch prediction job by ID',
       batch: true,
+      display_priority: 6,
 
       input_fields: lambda do
         [ { name: 'job_id', optional: false } ]
@@ -1081,7 +1043,67 @@
           'ok' => true,
           'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr' } }
       end
+    },
+
+    # Utility
+    count_tokens: {
+      title: 'Utility: Count tokens',
+      description: 'POST :countTokens on a publisher model',
+      display_priority: 5,
+      retry_on_request: ['GET', 'HEAD', 'POST'],
+      retry_on_response: [408, 429, 500, 502, 503, 504],
+      max_retries: 3,
+
+      input_fields: lambda do |object_definitions|
+        [
+          { name: 'model', label: 'Model', optional: false, control_type: 'select', pick_list: 'models_generative',
+            toggle_hint: 'Use custom value', toggle_field: { name: 'model', label: 'Model', type: 'string', control_type: 'text' } },
+          { name: 'contents', type: 'array', of: 'object', properties: object_definitions['content'], optional: false },
+          { name: 'system_preamble', label: 'System preamble (text)', optional: true }
+        ]
+      end,
+
+      output_fields: lambda do |object_definitions|
+        [
+          { name: 'totalTokens', type: 'integer' },
+          { name: 'totalBillableCharacters', type: 'integer' },
+          { name: 'promptTokensDetails', type: 'array', of: 'object' }
+        ] + Array(object_definitions['envelope_fields'])
+      end,
+
+      execute:  lambda do |connection, input|
+        # Correlation id and duration for logs / analytics
+        t0 = Time.now
+        corr = call(:build_correlation_id)
+
+        # Compute model path
+        model_path = call(:build_model_path_with_global_preview, connection, input['model'])
+
+        # Build payload
+        contents   = call(:sanitize_contents_roles, input['contents'])
+        error('At least one non-system message is required in contents') if contents.blank?
+        sys_inst   = call(:system_instruction_from_text, input['system_preamble'])
+
+        loc = (connection['location'].presence || 'global').to_s.downcase
+        begin
+          resp = post(call(:aipl_v1_url, connection, loc, "#{model_path}:countTokens")).payload({
+            'contents'          => contents,
+            'systemInstruction' => sys_inst
+          }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) })
+          resp.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+        rescue => e
+          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
+        end
+      end,
+
+      sample_output: lambda do
+        { 'totalTokens' => 31, 'totalBillableCharacters' => 96,
+          'promptTokensDetails' => [ { 'modality' => 'TEXT', 'tokenCount' => 31 } ],
+          'ok' => true,
+          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr' } }
+      end
     }
+
   },
 
   # --------- PICK LISTS ---------------------------------------------------
@@ -1501,12 +1523,12 @@
 
     # --- Generative -------------------------------------------------------
 
-    system_instruction_from_text: lamda do |text|
+    system_instruction_from_text: lambda do |text|
       return nil if text.blank?
       { 'role' => 'system', 'parts' => [ { 'text' => text.to_s } ] }
     end,
 
-    format_context_chunks: lamda do |chunks|
+    format_context_chunks: lambda do |chunks|
       # Stable, parseable layout the model can learn
       call(:safe_array, chunks).each_with_index.map { |c, i|
         cid  = c['id'] || "chunk-#{i+1}"
@@ -1526,11 +1548,11 @@
       }.join("\n\n---\n\n")
     end,
 
-    safe_parse_json: lamda do |s|
+    safe_parse_json: lambda do |s|
       JSON.parse(s) rescue { 'answer' => s }
     end,
 
-    llm_referee: lamda do |connection, model, email_text, shortlist_names, all_cats, fallback_category = nil|
+    llm_referee: lambda do |connection, model, email_text, shortlist_names, all_cats, fallback_category = nil|
       # Minimal, schema-constrained JSON referee using Gemini
       model_path = call(:build_model_path_with_global_preview, connection, model)
 
@@ -1620,7 +1642,7 @@
 
     # --- Miscellaneous ----------------------------------------------------
     
-    build_email_text: lamda do |subject, body|
+    build_email_text: lambda do |subject, body|
       # Build a single email text body for classification
       s = subject.to_s.strip
       b = body.to_s.strip
@@ -1630,7 +1652,7 @@
       parts.join("\n\n")
     end,
 
-    safe_map: lamda do |v|
+    safe_map: lambda do |v|
       # Like Array#map but safe against nil/false/non-arrays.
       call(:safe_array, v).map { |x| yield(x) }
     end
