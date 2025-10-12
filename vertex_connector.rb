@@ -2,7 +2,7 @@
 
 {
   title: 'Vertex AI Adapter',
-  version: '1.0.0',
+  version: '0.9.1',
   description: 'Vertex AI (Gemini + Text Embeddings + Endpoints) via service account JWT',
 
   # --------- CONNECTION ---------------------------------------------------
@@ -259,7 +259,7 @@
 
   actions: {
 
-    # 1. Email categorization
+    # 1) Email categorization
     gen_categorize_email: {
       title: 'Categorize email',
       subtitle: 'Classify an email into a category',
@@ -457,14 +457,384 @@
       end
     },
 
-    # 2. Generate content (Gemini)
+    # 2) RAG engine (Vertex AI)
+    rag_files_import: {
+      title: 'RAG: Import files to corpus',
+      subtitle: 'projects.locations.ragCorpora.ragFiles:import',
+      display_priority: 9,
+      retry_on_request: ['GET','HEAD','POST'],
+      retry_on_response: [408,429,500,502,503,504],
+      max_retries: 3,
+
+      input_fields: lambda do
+        [
+          { name: 'rag_corpus', optional: false,
+            hint: 'projects/{project}/locations/{region}/ragCorpora/{corpus}' },
+
+          # Exactly one source family:
+          { name: 'gcs_uris', type: 'array', of: 'string', optional: true,
+            hint: 'e.g., gs://bucket/path/** or specific URIs' },
+
+          { name: 'drive_folder_id', optional: true,
+            hint: 'Google Drive folder ID (share with Vertex RAG service agent)' },
+          { name: 'drive_file_ids', type: 'array', of: 'string', optional: true,
+            hint: 'Optional explicit file IDs if not using folder' },
+
+          # Tuning / ops
+          { name: 'maxEmbeddingRequestsPerMin', type: 'integer', optional: true },
+          { name: 'rebuildAnnIndex', type: 'boolean', optional: true, default: false,
+            hint: 'Set true after first large import to build ANN index' },
+          { name: 'importResultGcsSink', type: 'object', optional: true, properties: [
+              { name: 'outputUriPrefix', optional: false, hint: 'gs://bucket/prefix/' }
+            ]
+          }
+        ]
+      end,
+
+      output_fields: lambda do |_|
+        [
+          { name: 'name' },           # LRO: projects/.../operations/...
+          { name: 'done', type: 'boolean' },
+          { name: 'metadata', type: 'object' },
+          { name: 'error', type: 'object' }
+        ] + [
+          { name: 'ok', type: 'boolean' },
+          { name: 'telemetry', type: 'object', properties: [
+            { name: 'http_status', type: 'integer' },
+            { name: 'message' }, { name: 'duration_ms', type: 'integer' },
+            { name: 'correlation_id' }
+          ]}
+        ]
+      end,
+
+      execute: lambda do |connection, input|
+        t0 = Time.now
+        corr = call(:build_correlation_id)
+        begin
+          call(:ensure_project_id!, connection)
+          call(:ensure_regional_location!, connection)
+
+          corpus = call(:normalize_rag_corpus, connection, input['rag_corpus'])
+          error('rag_corpus is required') if corpus.blank?
+
+          # Validate XOR sources
+          has_gcs   = call(:safe_array, input['gcs_uris']).present?
+          has_drive = input['drive_folder_id'].present? || call(:safe_array, input['drive_file_ids']).present?
+          error('Provide exactly one source family: GCS or Drive') if (has_gcs && has_drive) || (!has_gcs && !has_drive)
+
+          import_cfg = {}
+          if has_gcs
+            import_cfg['gcsSource'] = { 'uris' => call(:safe_array, input['gcs_uris']) }
+          else
+            import_cfg['googleDriveSource'] = {
+              'folderId' => input['drive_folder_id'],
+              'fileIds'  => call(:safe_array, input['drive_file_ids'])
+            }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
+          end
+
+          # Optional knobs
+          import_cfg['maxEmbeddingRequestsPerMin'] = call(:safe_integer, input['maxEmbeddingRequestsPerMin']) if input.key?('maxEmbeddingRequestsPerMin')
+          import_cfg['rebuildAnnIndex']            = true  if input['rebuildAnnIndex'] == true
+          if input['importResultGcsSink'].is_a?(Hash) && input['importResultGcsSink']['outputUriPrefix'].present?
+            import_cfg['importResultGcsSink'] = { 'outputUriPrefix' => input['importResultGcsSink']['outputUriPrefix'].to_s }
+          end
+
+          payload = { 'importRagFilesConfig' => import_cfg }
+
+          loc = (connection['location'] || '').downcase
+          url = call(:aipl_v1_url, connection, loc, "#{corpus}:ragFiles:import")
+          resp = post(url).payload(payload)
+
+          resp.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+        rescue => e
+          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
+        end
+      end,
+
+      sample_output: lambda do
+        {
+          'name' => 'projects/p/locations/us-central1/operations/1234567890',
+          'done' => false,
+          'ok' => true,
+          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 18, 'correlation_id' => 'sample' }
+        }
+      end
+    },
+
+    rag_retrieve_contexts: {
+      title: 'RAG: Retrieve contexts',
+      subtitle: 'projects.locations:retrieveContexts (Vertex RAG Store)',
+      display_priority: 9,
+      retry_on_request: ['GET','HEAD','POST'],
+      retry_on_response: [408,429,500,502,503,504],
+      max_retries: 3,
+
+      input_fields: lambda do
+        [
+          { name: 'rag_corpus', optional: false,
+            hint: 'projects/{project}/locations/{region}/ragCorpora/{corpus}' },
+          { name: 'question', optional: false },
+          { name: 'restrict_to_file_ids', type: 'array', of: 'string', optional: true },
+          { name: 'max_contexts', type: 'integer', optional: true, default: 20 }
+        ]
+      end,
+
+      output_fields: lambda do |_|
+        [
+          { name: 'question' },
+          { name: 'contexts', type: 'array', of: 'object', properties: [
+              { name: 'id' },
+              { name: 'text' },
+              { name: 'score', type: 'number' },
+              { name: 'source' },
+              { name: 'uri' },
+              { name: 'metadata', type: 'object' }
+            ]
+          }
+        ] + [
+          { name: 'ok', type: 'boolean' },
+          { name: 'telemetry', type: 'object', properties: [
+            { name: 'http_status', type: 'integer' },
+            { name: 'message' }, { name: 'duration_ms', type: 'integer' },
+            { name: 'correlation_id' }
+          ]}
+        ]
+      end,
+
+      execute: lambda do |connection, input|
+        t0 = Time.now
+        corr = call(:build_correlation_id)
+        begin
+          call(:ensure_project_id!, connection)
+          call(:ensure_regional_location!, connection)
+
+          corpus = call(:normalize_rag_corpus, connection, input['rag_corpus'])
+          error('rag_corpus is required') if corpus.blank?
+
+          loc = (connection['location'] || '').downcase
+          parent = "projects/#{connection['project_id']}/locations/#{loc}"
+
+          rag_res = { 'ragCorpus' => corpus }
+          ids = call(:safe_array, input['restrict_to_file_ids'])
+          rag_res['ragFileIds'] = ids if ids.present?
+
+          payload = {
+            'query'       => { 'text' => input['question'].to_s },
+            'dataSource'  => { 'vertexRagStore' => { 'ragResources' => [rag_res] } }
+          }
+
+          url  = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
+          resp = post(url).payload(payload)
+
+          raw = (resp.dig('contexts','contexts') || [])
+          maxn = call(:clamp_int, (input['max_contexts'] || 20), 1, 200)
+          mapped = raw.first(maxn).each_with_index.map do |c, i|
+            {
+              'id'       => (c['chunkId'] || "ctx-#{i+1}"),
+              'text'     => c['text'],
+              'score'    => (c['score'] || c['relevanceScore'] || 0.0).to_f,
+              'source'   => c['source'] || c.dig('metadata','source'),
+              'uri'      => c['sourceUri'] || c.dig('metadata','uri'),
+              'metadata' => c['metadata']
+            }
+          end
+
+          {
+            'question' => input['question'],
+            'contexts' => mapped
+          }.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+        rescue => e
+          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
+        end
+      end,
+
+      sample_output: lambda do
+        {
+          'question' => 'What is the PTO carryover policy?',
+          'contexts' => [
+            { 'id' => 'doc-42#c3', 'text' => 'Employees may carry over up to 40 hours...', 'score' => 0.91,
+              'source' => 'handbook', 'uri' => 'https://drive.google.com/file/d/abc...', 'metadata' => { 'page' => 7 } }
+          ],
+          'ok' => true,
+          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 22, 'correlation_id' => 'sample' }
+        }
+      end
+    },
+
+    rag_answer: {
+      title: 'RAG: Retrieve + answer (one-shot)',
+      subtitle: 'Retrieve contexts from a corpus and generate a cited answer',
+      display_priority: 9,
+      retry_on_request: ['GET','HEAD','POST'],
+      retry_on_response: [408,429,500,502,503,504],
+      max_retries: 3,
+
+      input_fields: lambda do |_|
+        [
+          { name: 'model', label: 'Model', optional: false, control_type: 'select', pick_list: 'models_generative',
+            toggle_hint: 'Use custom value', toggle_field: { name: 'model', label: 'Model', type: 'string', control_type: 'text' } },
+          { name: 'rag_corpus', optional: false,
+            hint: 'projects/{project}/locations/{region}/ragCorpora/{corpus}' },
+          { name: 'question', optional: false },
+
+          { name: 'restrict_to_file_ids', type: 'array', of: 'string', optional: true },
+          { name: 'max_contexts', type: 'integer', optional: true, default: 12 },
+
+          { name: 'system_preamble', optional: true,
+            hint: 'e.g., Only answer from retrieved contexts; say “I don’t know” otherwise.' },
+          { name: 'temperature', type: 'number', optional: true, hint: 'Default 0' }
+        ]
+      end,
+
+      output_fields: lambda do |_|
+        [
+          { name: 'answer' },
+          { name: 'citations', type: 'array', of: 'object', properties: [
+              { name: 'chunk_id' }, { name: 'source' }, { name: 'uri' }, { name: 'score', type: 'number' }
+            ]
+          },
+          { name: 'responseId' },
+          { name: 'usage', type: 'object', properties: [
+              { name: 'promptTokenCount', type: 'integer' },
+              { name: 'candidatesTokenCount', type: 'integer' },
+              { name: 'totalTokenCount', type: 'integer' }
+            ]
+          },
+          { name: 'ok', type: 'boolean' },
+          { name: 'telemetry', type: 'object', properties: [
+            { name: 'http_status', type: 'integer' },
+            { name: 'message' }, { name: 'duration_ms', type: 'integer' },
+            { name: 'correlation_id' }
+          ]}
+        ]
+      end,
+
+      execute: lambda do |connection, input|
+        t0 = Time.now
+        corr = call(:build_correlation_id)
+        begin
+          call(:ensure_project_id!, connection)
+          call(:ensure_regional_location!, connection)
+
+          # 1) Retrieve contexts (inline call to same API used by rag_retrieve_contexts)
+          corpus = call(:normalize_rag_corpus, connection, input['rag_corpus'])
+          error('rag_corpus is required') if corpus.blank?
+
+          loc    = (connection['location'] || '').downcase
+          parent = "projects/#{connection['project_id']}/locations/#{loc}"
+
+          rag_res = { 'ragCorpus' => corpus }
+          ids = call(:safe_array, input['restrict_to_file_ids'])
+          rag_res['ragFileIds'] = ids if ids.present?
+
+          retrieve_payload = {
+            'query'      => { 'text' => input['question'].to_s },
+            'dataSource' => { 'vertexRagStore' => { 'ragResources' => [rag_res] } }
+          }
+
+          retr_url = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
+          retr_resp = post(retr_url).payload(retrieve_payload)
+          raw_ctxs = (retr_resp.dig('contexts','contexts') || [])
+
+          maxn  = call(:clamp_int, (input['max_contexts'] || 12), 1, 100)
+          chunks = raw_ctxs.first(maxn).each_with_index.map do |c, i|
+            {
+              'id'      => (c['chunkId'] || "ctx-#{i+1}"),
+              'text'    => c['text'].to_s,
+              'source'  => c['source'] || c.dig('metadata','source'),
+              'uri'     => c['sourceUri'] || c.dig('metadata','uri'),
+              'score'   => (c['score'] || c['relevanceScore'] || 0.0).to_f,
+              'metadata'=> c['metadata']
+            }
+          end
+          error('No contexts retrieved; check corpus/permissions/region') if chunks.empty?
+
+          # 2) Generate structured answer with your existing schema pattern
+          model_path = call(:build_model_path_with_global_preview, connection, input['model'])
+
+          gen_cfg = {
+            'temperature'       => (input['temperature'].present? ? call(:safe_float, input['temperature']) : 0),
+            'maxOutputTokens'   => 1024,
+            'responseMimeType'  => 'application/json',
+            'responseSchema'    => {
+              'type' => 'object', 'additionalProperties' => false,
+              'properties' => {
+                'answer'    => { 'type' => 'string' },
+                'citations' => {
+                  'type'  => 'array',
+                  'items' => {
+                    'type' => 'object', 'additionalProperties' => false,
+                    'properties' => {
+                      'chunk_id' => { 'type' => 'string' },
+                      'source'   => { 'type' => 'string' },
+                      'uri'      => { 'type' => 'string' },
+                      'score'    => { 'type' => 'number' }
+                    }
+                  }
+                }
+              },
+              'required' => ['answer']
+            }
+          }
+
+          sys_text = (input['system_preamble'].presence ||
+            'Answer using ONLY the retrieved context chunks. If the context is insufficient, reply with “I don’t know.” '\
+            'Keep answers concise and include citations with chunk_id, source, uri, and score.')
+          sys_inst = { 'role' => 'system', 'parts' => [ { 'text' => sys_text } ] }
+
+          ctx_blob = call(:format_context_chunks, chunks)
+          contents = [
+            { 'role' => 'user', 'parts' => [
+                { 'text' => "Question:\n#{input['question']}\n\nContext:\n#{ctx_blob}" }
+              ]
+            }
+          ]
+
+          gen_payload = {
+            'contents'          => contents,
+            'systemInstruction' => sys_inst,
+            'generationConfig'  => gen_cfg
+          }
+
+          gen_url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
+          gen_resp = post(gen_url).payload(gen_payload)
+
+          text = gen_resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
+          parsed = call(:safe_parse_json, text)
+
+          {
+            'answer'     => (parsed['answer'] || text),
+            'citations'  => (parsed['citations'] || []),
+            'responseId' => gen_resp['responseId'],
+            'usage'      => gen_resp['usageMetadata']
+          }.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+        rescue => e
+          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
+        end
+      end,
+
+      sample_output: lambda do
+        {
+          'answer' => 'Employees may carry over up to 40 hours of PTO.',
+          'citations' => [
+            { 'chunk_id' => 'doc-42#c3', 'source' => 'handbook', 'uri' => 'https://drive.google.com/file/d/abc...', 'score' => 0.91 }
+          ],
+          'responseId' => 'resp-123',
+          'usage' => { 'promptTokenCount' => 298, 'candidatesTokenCount' => 156, 'totalTokenCount' => 454 },
+          'ok' => true,
+          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 44, 'correlation_id' => 'sample' }
+        }
+      end
+    },
+
+    # 3) Generate content (Gemini)
     gen_generate_content: {
       title: 'Generative: Generate content (Gemini)',
       subtitle: 'Generate content from a prompt',
       help: lambda do |_|
         { body: 'Provide a prompt to generate content from an LLM. Uses "POST :generateContent".'}
       end,
-      display_priority: 9,
+      display_priority: 8,
       retry_on_request: ['GET', 'HEAD', 'POST'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
@@ -554,7 +924,7 @@
     gen_generate_grounded: {
       title: 'Generative: Generate (grounded)',
       subtitle: 'Generate with grounding via Google Search or Vertex AI Search',
-      display_priority: 9
+      display_priority: 8,
       retry_on_request: ['GET', 'HEAD', 'POST'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
@@ -648,12 +1018,12 @@
     },
 
     gen_answer_with_context: {
-      title: 'Generative: Answer with provided context chunks',
+      title: 'Generative: Generate (use provided context chunks)',
       subtitle: 
       help: lambda do |_|
         { body: 'Answer a question using caller-supplied context chunks (RAG-lite). Returns structured JSON with citations.' }
       end,
-      display_priority: 9,
+      display_priority: 8,
       retry_on_request: ['GET', 'HEAD', 'POST'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
@@ -794,14 +1164,14 @@
       end
     },
 
-    # 3. Embeddings
+    # 3) Embeddings
     embed_text: {
       title: 'Embeddings: Embed text',
       subtitle: 'Get embeddings from a publisher embedding model'
       help: lambda do |_|
         { 'POST :predict on a publisher embedding model' }
       end,
-      display_priority: 8,
+      display_priority: 7,
       retry_on_request: ['GET', 'HEAD', 'POST'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
@@ -870,11 +1240,11 @@
       end
     },
 
-    # Predict
+    # 4) Predict
     endpoint_predict: {
       title: 'Prediction: Endpoint predict (custom model)',
       subtitle: 'POST :predict to a Vertex AI Endpoint',
-      display_priority: 7,
+      display_priority: 6,
       retry_on_request: ['GET', 'HEAD', 'POST'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
@@ -1045,7 +1415,7 @@
       end
     },
 
-    # Utility
+    # 6) Utility
     count_tokens: {
       title: 'Utility: Count tokens',
       description: 'POST :countTokens on a publisher model',
@@ -1230,7 +1600,7 @@
       token_hash
     end,
 
-    auth_issue_token!: lambda do |onnection, scopes|
+    auth_issue_token!: lambda do |connection, scopes|
       # Safely parse sa key json
       key = JSON.parse(connection['service_account_key_json'].to_s)
       # Guard for sa key exists
@@ -1638,6 +2008,18 @@
       error('Referee returned no valid category and no fallback is configured') if parsed['category'].blank?
 
       parsed
+    end,
+
+    # --- RAG helpers ----------------------------------------------------------
+    normalize_rag_corpus: lambda do |connection, raw|
+      v = raw.to_s.strip
+      return '' if v.blank?
+      return v if v.start_with?('projects/')
+      # Allow short form: just corpus id -> expand using connection project/region
+      call(:ensure_project_id!, connection)
+      loc = (connection['location'] || '').to_s.downcase
+      error("RAG corpus requires regional location; got '#{loc}'") if loc.blank? || loc == 'global'
+      "projects/#{connection['project_id']}/locations/#{loc}/ragCorpora/#{v}"
     end,
 
     # --- Miscellaneous ----------------------------------------------------
