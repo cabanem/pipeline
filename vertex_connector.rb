@@ -9,52 +9,60 @@
 
   connection: {
     fields: [
-      { name: 'service_account_key_json', control_type: 'text-area', optional: false,
-        hint: 'Paste full JSON key'}, 
-      # Deprecate soon
+      { name: 'service_account_key_json', control_type: 'text-area',  optional: false, hint: 'Paste full JSON key' },
+      { name: 'location',                                             optional: false, hint: 'e.g., global, us-central1, us-east4' },
       { name: 'project_id', optional: false, hint: 'GCP project ID' },
-      { name: 'location', optional: false, hint: 'e.g., global, us-central1, us-east4' },
-      { name: 'quota_project_id', label: 'Quota/billing project (optional)', optional: true, extends_schema: true,
+      { name: 'quota_project_id', label: 'Quota/billing project', optional: true, extends_schema: true,
         hint: 'Sets x-goog-user-project for billing/quota. Service account must have roles/serviceusage.serviceUsageConsumer on this project.' },
-      { name: 'client_email', label: 'Service account client_email', optional: true, extends_schema: true },
-      { name: 'private_key',  label: 'Service account private_key',  optional: true, extends_schema: true,
-        control_type: 'password', multiline: true, hint: 'Include BEGIN/END PRIVATE KEY lines.' }
+      { name: 'show_legacy_sa_fields', label: 'Show legacy SA fields',optional: true,
+        extends_schema: true, default: false, control_type: 'checkbox', type: 'boolean' },
+        
+      { name: 'client_email', label: 'Service account client_email (deprecated)', optional: true, extends_schema: true, 
+        ngIf: 'input.show_legacy_sa_fields == "true"' },
+      { name: 'private_key',  label: 'Service account private_key (deprecated)',  optional: true, control_type: 'password', multiline: true, 
+        extends_schema: true, ngIf: 'input.show_legacy_sa_fields == "true"', hint: 'Include BEGIN/END PRIVATE KEY lines.' },
     ],
 
     authorization: {
+      # Custom JWT-bearer --> OAuth access token exchange
       type: 'custom',
 
-      acquire: ->(connection) {
-        token_str = call(:auth_build_access_token!, connection,
-                        scopes: ['https://www.googleapis.com/auth/cloud-platform'])
-        scope_key = 'https://www.googleapis.com/auth/cloud-platform'
-        cached = (connection['__token_cache'] ||= {})[scope_key]
+      acquire: lambda do |connection|
+        # Build token via cache-aware helper
+        scopes   = call(:const_default_scopes) # ['https://www.googleapis.com/auth/cloud-platform']
+        token    = call(:auth_build_access_token!, connection, scopes: scopes)
+        scope_key = scopes.join(' ')
+
+        # Pull metadata from the cache written by auth_build_access_token!
+        cached   = (connection['__token_cache'] ||= {})[scope_key]
+
+        # Build payload
         {
-          access_token: token_str,
+          access_token: token,
           token_type:   'Bearer',
           expires_in:   (cached && cached['expires_in']) || 3600,
           expires_at:   (cached && cached['expires_at']) || (Time.now + 3600 - 60).utc.iso8601
         }
-      },
+      end,
 
-      apply: ->(connection) {
-        hdrs = {
+      apply: lambda do |connection|
+        # Keep headers minimal; envelope/correlation lives in actions.
+        headers(
           'Authorization': "Bearer #{connection['access_token']}",
-          'Accept': 'application/json'
-        }
-        qp = connection['quota_project_id'].to_s.strip
-        hdrs['x-goog-user-project'] = qp if qp.present?
-        corr = call(:build_correlation_id)
-        hdrs['X-Correlation-Id'] = corr if corr.present?
-        headers(hdrs)
-      },
+          'x-goog-user-project': connection['quota_project_id'].to_s.strip.presence
+        )
+      end,
+
+      token_url: 'https://oauth2.googleapis.com/token',
 
       # Let Workato trigger re-acquire on auth errors
       refresh_on: [401],
       detect_on:  [/UNAUTHENTICATED/i, /invalid[_-]?token/i, /expired/i, /insufficient/i]
     },
 
-    base_uri: ->(_connection) { 'https://aiplatform.googleapis.com' }
+    base_uri: lambda do |_connection|
+      'https://aiplatform.googleapis.com'
+    end
   },
 
   # --------- CONNECTION TEST ----------------------------------------------
