@@ -11,12 +11,17 @@
     fields: [
       { name: 'service_account_key_json', control_type: 'text-area',  optional: false, hint: 'Paste full JSON key' },
       { name: 'location',                                             optional: false, hint: 'e.g., global, us-central1, us-east4' },
-      { name: 'project_id', optional: false, hint: 'GCP project ID' },
-      { name: 'quota_project_id', label: 'Quota/billing project', optional: true, extends_schema: true,
+      { name: 'project_id', optional: true, hint: 'GCP project ID (inferred from key if blank)' },
+      { name: 'user_project', label: 'User project for quota/billing', optional: true, extends_schema: true,
         hint: 'Sets x-goog-user-project for billing/quota. Service account must have roles/serviceusage.serviceUsageConsumer on this project.' },
+      { name: 'set_defaults_for_probe', type: 'boolean', control_type: 'checkbox', hint: 'Optionally set default model(s) for connection test' },
+      { name: 'default_probe_gen_model', optional: true, ngIf: 'input.set_defaults_for_probe == "true"',
+        hint: 'e.g., gemini-2.0-flash' },
+      { name: 'default_probe_embed_model', optional: true, ngIf: 'input.set_defaults_for_probe == "true"',
+        hint: 'e.g., text-embedding-005' },
+
       { name: 'show_legacy_sa_fields', label: 'Show legacy SA fields',optional: true,
         extends_schema: true, default: false, control_type: 'checkbox', type: 'boolean' },
-        
       { name: 'client_email', label: 'Service account client_email (deprecated)', optional: true, extends_schema: true, 
         ngIf: 'input.show_legacy_sa_fields == "true"' },
       { name: 'private_key',  label: 'Service account private_key (deprecated)',  optional: true, control_type: 'password', multiline: true, 
@@ -46,11 +51,11 @@
       end,
 
       apply: lambda do |connection|
-        # Keep headers minimal; envelope/correlation lives in actions.
-        headers(
-          'Authorization': "Bearer #{connection['access_token']}",
-          'x-goog-user-project': connection['quota_project_id'].to_s.strip.presence
-        )
+        # Keep headers minimal; envelope/correlation lives in actions
+        h   = { 'Authorization': "Bearer #{connection['access_token']}"}
+        up  = connection['user_project'].to_s.strip
+        h['x-goog-user-project'] = up if up.present?
+        headers(h)
       end,
 
       token_url: 'https://oauth2.googleapis.com/token',
@@ -67,9 +72,21 @@
 
   # --------- CONNECTION TEST ----------------------------------------------
 
-  test: ->(_connection) {
-    get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models')
-      .params(pageSize: 1, view: 'BASIC')
+  test: ->(connection) {
+    # Fast path: if defaults provided, exercise a real, auth’d call to surface IAM/billing issues early.
+    if connection['set_defaults_for_probe'] == true && connection['default_probe_gen_model'].present?
+      # Evaluate connection fields
+      call(:ensure_project_id!, connection)
+      # Build model path (global preview)
+      model_path = call(:build_model_path_with_global_preview, connection, connection['default_probe_gen_model'])
+      # Define location (prefer connection, fallback to global)
+      loc = (connection['location'].presence || 'global').to_s.downcase
+      # POST to endpoint
+      post(call(:aipl_v1_url, connection, loc, "#{model_path}:countTokens"))
+        .payload({ 'contents' => [{ 'role' => 'user', 'parts' => [{ 'text' => 'ping' }] }] })
+    else
+      get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models').params(pageSize: 1)
+    end
   },
 
   # --------- OBJECT DEFINITIONS -------------------------------------------
@@ -239,7 +256,7 @@
 
   actions: {
 
-    # -------------------- Email categorization ------------------------
+    # Email categorization
     gen_categorize_email: {
       title: 'Generative - Categorize email',
       description: 'Classify an email into one of the provided categories using embeddings (default) or a generative referee.',
@@ -426,13 +443,14 @@
               { 'category' => 'Tech Support', 'prob' => 0.10 },
               { 'category' => 'Sales', 'prob' => 0.04 }
             ]
-          }
+          },
+          'ok' => true,
+          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr' }
         }
       end
     },
 
-    # -------------------- Generate content (Gemini) -------------------
-    # --- Gemini
+    # Generate content (Gemini)
     gen_generate_content: {
       title: 'Generative - Generate content (Gemini)',
       description: 'POST :generateContent on a publisher model',
@@ -467,7 +485,7 @@
       end,
 
       output_fields: lambda do |object_definitions|
-         object_definitions['generate_content_output']
+         Array(object_definitions['generate_content_output']) + Array(object_definitions['envelope_fields'])
       end,
 
       execute: lambda do |connection, input|
@@ -505,12 +523,13 @@
             { 'finishReason' => 'STOP',
               'content' => { 'role' => 'model', 'parts' => [ { 'text' => 'Hello, world.' } ] },
               'groundingMetadata' => { 'citationSources' => [ { 'uri' => 'https://example.com' } ] } }
-          ]
+          ],
+          'ok' => true,
+          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr' }
         }
       end
     },
 
-    # --- Grounded
     gen_generate_grounded: {
       title: 'Generative - Generate (grounded)',
       description: 'Generate with grounding via Google Search or Vertex AI Search',
@@ -541,7 +560,7 @@
       end,
 
       output_fields: lambda do |object_definitions|
-        object_definitions['generate_content_output']
+        Array(object_definitions['generate_content_output']) + Array(object_definitions['envelope_fields'])
       end,
 
       execute: lambda do |connection, input|
@@ -590,12 +609,13 @@
           'candidates' => [
             { 'content' => { 'role' => 'model', 'parts' => [ { 'text' => 'Grounded answer...' } ] },
               'groundingMetadata' => { 'citationSources' => [ { 'uri' => 'https://en.wikipedia.org/wiki/...' } ] } }
-          ]
+          ],
+          'ok' => true,
+          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr' }
         }
       end
     },
 
-    # --- Query with context chunks
     gen_answer_with_context: {
       title: 'Generative - Answer with provided context chunks',
       description: 'Answer a question using caller-supplied context chunks (RAG-lite). Returns structured JSON with citations.',
@@ -732,12 +752,14 @@
             { 'chunk_id' => 'doc-42#p3', 'source' => 'postmortem', 'uri' => 'https://kb/acme/pm-42#p3', 'score' => 0.89 }
           ],
           'responseId' => 'resp-789',
-          'usage' => { 'promptTokenCount' => 311, 'candidatesTokenCount' => 187, 'totalTokenCount' => 498 }
+          'usage' => { 'promptTokenCount' => 311, 'candidatesTokenCount' => 187, 'totalTokenCount' => 498 },
+          'ok' => true,
+          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr' }
         }
       end
     },
 
-    # -------------------- Embeddings ---------------------------------
+    # Generate embeddings
     embed_text: {
       title: 'Embedding - Embed text',
       description: 'POST :predict on a publisher embedding model',
@@ -767,7 +789,7 @@
       execute: lambda do |connection, input|
         # Correlation id and duration for logs / analytics
         t0 = Time.now
-        corr = SecureRandom.uuid
+        call(:build_correlation_id)
         
         begin
           model_path = call(:build_embedding_model_path, connection, input['model'])
@@ -802,14 +824,15 @@
             { 'embeddings' => { 'values' => [0.023, -0.045, 0.067],
               'statistics' => { 'truncated' => false, 'token_count' => 18 } } }
           ],
-          'metadata' => { 'billableCharacterCount' => 230 }
+          'metadata' => { 'billableCharacterCount' => 230 },
+          'ok' => true,
+          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr' }
         }
       end
 
     },
  
-    # -------------------- Utility ------------------------------------
-    # --- Count tokens
+    # Utility
     count_tokens: {
       title: 'Utility: Count tokens',
       description: 'POST :countTokens on a publisher model',
@@ -831,7 +854,7 @@
           { name: 'totalTokens', type: 'integer' },
           { name: 'totalBillableCharacters', type: 'integer' },
           { name: 'promptTokensDetails', type: 'array', of: 'object' }
-        ]
+        ] + Array(object_definitions['envelope_fields'])
       end,
 
       execute:  lambda do |connection, input|
@@ -852,11 +875,12 @@
 
       sample_output: lambda do
         { 'totalTokens' => 31, 'totalBillableCharacters' => 96,
-          'promptTokensDetails' => [ { 'modality' => 'TEXT', 'tokenCount' => 31 } ] }
+          'promptTokensDetails' => [ { 'modality' => 'TEXT', 'tokenCount' => 31 } ],
+          'ok' => true,
+          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr' } }
       end
     },
 
-    # --- GCS simple upload
     upload_to_gcs: {
       title: 'Utility: Upload to Cloud Storage (simple upload)',
       description: 'Simple media upload to GCS (uploadType=media)',
@@ -889,8 +913,7 @@
       end
     },
 
-    # -------------------- Predict ------------------------------------
-    # --- Generic
+    # Predict
     endpoint_predict: {
       title: 'Endpoint predict (custom model)',
       description: 'POST :predict to a Vertex AI Endpoint',
@@ -907,10 +930,12 @@
       end,
 
       output_fields: lambda do |object_definitions|
-        object_definitions['predict_output']
+        Array(object_definitions['predict_output']) + Array(object_definitions['envelope_fields'])
       end,
 
       execute: lambda do |connection, input|
+        # Evaluate connection fields
+        call(:ensure_project_id!, connection)
         call(:ensure_regional_location!, connection) # require non-global
 
         url = call(:endpoint_predict_url, connection, input['endpoint'])
@@ -921,11 +946,12 @@
 
       sample_output: lambda do
         { 'predictions' => [ { 'score' => 0.92, 'label' => 'positive' } ],
-          'deployedModelId' => '1234567890' }
+          'deployedModelId' => '1234567890',
+          'ok' => true,
+          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr' } }
       end
     },
 
-    # --- Batch (create job)
     batch_prediction_create: {
       title: 'Batch: Create prediction job',
       description: 'Create projects.locations.batchPredictionJobs',
@@ -946,10 +972,12 @@
       end,
 
       output_fields: lambda do |object_definitions|
-        object_definitions['batch_job']
+        Array(object_definitions['batch_job']) + Array(object_definitions['envelope_fields'])
       end,
 
       execute: lambda do |connection, input|
+        # Evaluate connection fields
+        call(:ensure_project_id!, connection)
         call(:ensure_regional_location!, connection)
 
         payload = {
@@ -973,15 +1001,16 @@
         post(call(:aipl_v1_url, connection, loc, path)).payload(payload)
       end,
 
-      sample_output: ->() {
+      sample_output: lambda do
         { 'name' => 'projects/p/locations/us-central1/batchPredictionJobs/123',
           'displayName' => 'batch-2025-10-06',
           'state' => 'JOB_STATE_PENDING',
-          'model' => 'projects/p/locations/us-central1/models/456' }
-      }
+          'model' => 'projects/p/locations/us-central1/models/456' },
+          'ok' => true,
+          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr' }
+      end
     },
 
-    # --- Batch (get job result)
     batch_prediction_get: {
       title: 'Batch: Fetch prediction job (get)',
       description: 'Get a batch prediction job by ID',
@@ -992,11 +1021,14 @@
       end,
 
       output_fields: lambda do |object_definitions|
-        object_definitions['batch_job']
+        Array(object_definitions['batch_job']) + Array(object_definitions['envelope_fields'])
       end,
 
       execute: lambda do |connection, input|
+        # Evaluate connection fields
+        call(:ensure_project_id!, connection)
         call(:ensure_regional_location!, connection)
+
         name = input['job_id'].to_s.start_with?('projects/') ?
           input['job_id'] :
           "projects/#{connection['project_id']}/locations/#{connection['location']}/batchPredictionJobs/#{input['job_id']}"
@@ -1008,7 +1040,9 @@
         { 'name' => 'projects/p/locations/us-central1/batchPredictionJobs/123',
           'displayName' => 'batch-2025-10-06',
           'state' => 'JOB_STATE_SUCCEEDED',
-          'outputInfo' => { 'gcsOutputDirectory' => 'gs://my-bucket/prediction-...' } }
+          'outputInfo' => { 'gcsOutputDirectory' => 'gs://my-bucket/prediction-...' },
+          'ok' => true,
+          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr' } }
       end
     }
   },
@@ -1028,7 +1062,7 @@
       begin
         # v1beta1 publishers.models.list — global; no project/location.
         resp = get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models')
-                .params(pageSize: 200, view: 'BASIC')
+                .params(pageSize: 200)
 
         ids = call(:safe_array, resp['publisherModels'])
                 .map { |m| m['name'].to_s.split('/').last } # publishers/google/models/<id>
@@ -1048,7 +1082,7 @@
     models_generative: ->(connection) {
       begin
         resp = get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models')
-                .params(pageSize: 200, view: 'BASIC')
+                .params(pageSize: 200)
         items = call(:safe_array, resp['publisherModels'])
                   .map { |m| m['name'].to_s.split('/').last }
                   .select { |id| id.start_with?('gemini-') }
@@ -1065,6 +1099,14 @@
 
   # --------- METHODS ------------------------------------------------------
   methods: {
+    ensure_project_id!: ->(connection) {
+      pid = (connection['project_id'].presence ||
+              (JSON.parse(connection['service_account_key_json'].to_s)['project_id'] rescue nil)).to_s
+      error('Project ID is required (not found in connection or key)') if pid.blank?
+      connection['project_id'] = pid
+      pid
+    },
+
     telemetry_envelope: ->(started_at, correlation_id, ok, code, message) {
       dur = ((Time.now - started_at) * 1000.0).to_i
       {
@@ -1082,6 +1124,10 @@
       m = err.to_s.match(/\b(\d{3})\b/)
       m ? m[1].to_i : 0
     },
+
+    const_default_scopes: -> { [
+      'https://www.googleapis.com/auth/cloud-platform'
+    ] },
 
     build_correlation_id: ->() { SecureRandom.uuid },
 
@@ -1124,7 +1170,13 @@
     },
 
     auth_issue_token!: ->(connection, scopes) {
+      # Safely parse sa key json
       key = JSON.parse(connection['service_account_key_json'].to_s)
+      # Guard for sa key exists
+      error('Invalid service account key: missing client_email') if key['client_email'].to_s.strip.empty?
+      error('Invalid service account key: missing private_key') if key['private_key'].to_s.strip.empty?
+      # Normalize pk newlines to satisfy OpenSSL
+      pk = key['private_key'].to_s.gsub(/\\n/, "\n")
       token_url = (key['token_uri'].presence || 'https://oauth2.googleapis.com/token')
       now = Time.now.to_i
       scope_str = scopes.join(' ')
@@ -1135,10 +1187,16 @@
         iat:   now,
         exp:   now + 3600
       }
-      assertion = call(:jwt_sign_rs256, payload, key['private_key'])
+
+      # Build assertion
+      assertion = call(:jwt_sign_rs256, payload, pk)
+
+      # POST to ep
       res = post(token_url)
               .payload(grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion: assertion)
               .request_format_www_form_urlencoded
+
+      # Parse response
       {
         'access_token' => res['access_token'],
         'token_type'   => res['token_type'],
@@ -1199,6 +1257,10 @@
 
     # --- Model
     build_model_path_with_global_preview: ->(connection, model) {
+      # Enforce project location (inference from connection)
+      call(:ensure_project_id!, connection)
+
+      # Normalize model identifier
       m = call(:normalize_model_identifier, model)
       error('Model is required') if m.blank?
       return m if m.start_with?('projects/')
@@ -1222,6 +1284,10 @@
     },
 
     build_embedding_model_path: ->(connection, model) {
+      # Enforce project location (inference from connection)
+      call(:ensure_project_id!, connection)
+
+      # Normalize model identifier
       m = call(:normalize_model_identifier, model)
       error('Embedding model is required') if m.blank?
       return m if m.start_with?('projects/')
@@ -1492,6 +1558,8 @@
     sanitize_generation_config: ->(cfg) {
       return nil if cfg.nil? || (cfg.respond_to?(:empty?) && cfg.empty?)
       g = cfg.dup
+      # String
+      g['responseMimeType'] = g['responseMimeType'].to_s if g.key?('responseMimeType')
       # Floats
       g['temperature']     = call(:safe_float,  g['temperature'])     if g.key?('temperature')
       g['topP']            = call(:safe_float,  g['topP'])            if g.key?('topP')
