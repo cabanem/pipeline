@@ -14,7 +14,10 @@
       { name: 'project_id', optional: true, hint: 'GCP project ID (inferred from key if blank)' },
       { name: 'user_project', label: 'User project for quota/billing', optional: true, extends_schema: true,
         hint: 'Sets x-goog-user-project for billing/quota. Service account must have roles/serviceusage.serviceUsageConsumer on this project.' },
-      { name: 'set_defaults_for_probe', type: 'boolean', control_type: 'checkbox', hint: 'Optionally set default model(s) for connection test' },
+
+      # Defaults for test probe
+      { name: 'set_defaults_for_probe', type: 'boolean', control_type: 'checkbox', extends_schema: true, optional: false, 
+        default: false, hint: 'Optionally set default model(s) for connection test' },
       { name: 'default_probe_gen_model', optional: true, ngIf: 'input.set_defaults_for_probe == "true"',
         hint: 'e.g., gemini-2.0-flash' },
       { name: 'default_probe_embed_model', optional: true, ngIf: 'input.set_defaults_for_probe == "true"',
@@ -74,7 +77,7 @@
 
   test: ->(connection) {
     # Fast path: if defaults provided, exercise a real, auth’d call to surface IAM/billing issues early.
-    if connection['set_defaults_for_probe'] == true && connection['default_probe_gen_model'].present?
+    if %w[true 1 yes].include?(connection['set_defaults_for_probe'].to_s.downcase) && connection['default_probe_gen_model'].present?
       # Evaluate connection fields
       call(:ensure_project_id!, connection)
       # Build model path (global preview)
@@ -489,6 +492,10 @@
       end,
 
       execute: lambda do |connection, input|
+        # Correlation id and duration for logs / analytics
+        t0 = Time.now
+        corr = call(:build_correlation_id)
+
         # Compute model path
         model_path = call(:build_model_path_with_global_preview, connection, input['model'])
 
@@ -510,7 +517,13 @@
 
         # Call endpoint
         loc = (connection['location'].presence || 'global').to_s.downcase
-        post(call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")).payload(payload)
+        begin
+          resp = post(call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")).payload(payload)
+          resp.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+        rescue => e
+          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
+        end
+
 
       end,
 
@@ -564,6 +577,10 @@
       end,
 
       execute: lambda do |connection, input|
+        # Correlation id and duration for logs / analytics
+        t0 = Time.now
+        corr = call(:build_correlation_id)
+
         # Compute model path
         model_path = call(:build_model_path_with_global_preview, connection, input['model'])
 
@@ -599,7 +616,12 @@
 
         # Call endpoint
         loc = (connection['location'].presence || 'global').to_s.downcase
-        post(call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")).payload(payload)
+        begin
+          resp = post(call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")).payload(payload)
+          resp.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+        rescue => e
+          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
+        end
       end,
 
       sample_output: lambda do
@@ -789,7 +811,7 @@
       execute: lambda do |connection, input|
         # Correlation id and duration for logs / analytics
         t0 = Time.now
-        call(:build_correlation_id)
+        corr = call(:build_correlation_id)
         
         begin
           model_path = call(:build_embedding_model_path, connection, input['model'])
@@ -829,7 +851,6 @@
           'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr' }
         }
       end
-
     },
  
     # Utility
@@ -849,7 +870,7 @@
         ]
       end,
 
-      output_fields: lambda do |_|
+      output_fields: lambda do |object_definitions|
         [
           { name: 'totalTokens', type: 'integer' },
           { name: 'totalBillableCharacters', type: 'integer' },
@@ -858,6 +879,10 @@
       end,
 
       execute:  lambda do |connection, input|
+        # Correlation id and duration for logs / analytics
+        t0 = Time.now
+        corr = call(:build_correlation_id)
+
         # Compute model path
         model_path = call(:build_model_path_with_global_preview, connection, input['model'])
 
@@ -867,10 +892,15 @@
         sys_inst   = call(:system_instruction_from_text, input['system_preamble'])
 
         loc = (connection['location'].presence || 'global').to_s.downcase
-        post(call(:aipl_v1_url, connection, loc, "#{model_path}:countTokens")).payload({
-          'contents'          => contents,
-          'systemInstruction' => sys_inst
-        }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) })
+        begin
+          resp = post(call(:aipl_v1_url, connection, loc, "#{model_path}:countTokens")).payload({
+            'contents'          => contents,
+            'systemInstruction' => sys_inst
+          }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) })
+          resp.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+        rescue => e
+          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
+        end
       end,
 
       sample_output: lambda do
@@ -934,14 +964,25 @@
       end,
 
       execute: lambda do |connection, input|
+        # Correlation id and duration for logs / analytics
+        t0 = Time.now
+        corr = call(:build_correlation_id)
+
         # Evaluate connection fields
         call(:ensure_project_id!, connection)
         call(:ensure_regional_location!, connection) # require non-global
 
+        # Build URL
         url = call(:endpoint_predict_url, connection, input['endpoint'])
-        post(url)
-          .payload({ 'instances' => input['instances'], 'parameters' => input['parameters'] }.delete_if { |_k, v| v.nil? })
 
+        # Call EP
+        begin
+          resp = post(url)
+            .payload({ 'instances' => input['instances'], 'parameters' => input['parameters'] }.delete_if { |_k, v| v.nil? })
+          resp.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+        rescue => e
+          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
+        end
       end,
 
       sample_output: lambda do
@@ -976,10 +1017,15 @@
       end,
 
       execute: lambda do |connection, input|
+        # Correlation id and duration for logs / analytics
+        t0 = Time.now
+        corr = call(:build_correlation_id)
+
         # Evaluate connection fields
         call(:ensure_project_id!, connection)
         call(:ensure_regional_location!, connection)
 
+        # Build the payload
         payload = {
           'displayName'  => input['displayName'],
           'model'        => input['model'],
@@ -998,16 +1044,28 @@
         loc  = connection['location']
         path = "projects/#{connection['project_id']}/locations/#{loc}/batchPredictionJobs"
 
-        post(call(:aipl_v1_url, connection, loc, path)).payload(payload)
+        # Call ep
+        begin
+          resp = post(call(:aipl_v1_url, connection, loc, path)).payload(payload)
+          resp.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+        rescue => e
+          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
+        end
       end,
 
       sample_output: lambda do
-        { 'name' => 'projects/p/locations/us-central1/batchPredictionJobs/123',
+        { 'name'        => 'projects/p/locations/us-central1/batchPredictionJobs/123',
           'displayName' => 'batch-2025-10-06',
-          'state' => 'JOB_STATE_PENDING',
-          'model' => 'projects/p/locations/us-central1/models/456' },
-          'ok' => true,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr' }
+          'state'       => 'JOB_STATE_PENDING',
+          'model'       => 'projects/p/locations/us-central1/models/456',
+          'ok'          => true,
+          'telemetry'   => { 
+            'http_status'     => 200,
+            'message'         => 'OK',
+            'duration_ms'     => 12,
+            'correlation_id'  => 'sample-corr'
+          }
+        }
       end
     },
 
@@ -1025,6 +1083,10 @@
       end,
 
       execute: lambda do |connection, input|
+        # Correlation id and duration for logs / analytics
+        t0 = Time.now
+        corr = call(:build_correlation_id)
+
         # Evaluate connection fields
         call(:ensure_project_id!, connection)
         call(:ensure_regional_location!, connection)
@@ -1033,7 +1095,14 @@
           input['job_id'] :
           "projects/#{connection['project_id']}/locations/#{connection['location']}/batchPredictionJobs/#{input['job_id']}"
         loc = connection['location']
-        get(call(:aipl_v1_url, connection, loc, name.sub(%r{^/v1/}, '')))
+
+        # Call EP
+        begin
+          resp = get(call(:aipl_v1_url, connection, loc, name.sub(%r{^/v1/}, '')))
+          resp.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+        rescue => e
+          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
+        end
       end,
 
       sample_output: lambda do
@@ -1099,15 +1168,15 @@
 
   # --------- METHODS ------------------------------------------------------
   methods: {
-    ensure_project_id!: ->(connection) {
+    ensure_project_id!: lambda do |connection|
       pid = (connection['project_id'].presence ||
               (JSON.parse(connection['service_account_key_json'].to_s)['project_id'] rescue nil)).to_s
       error('Project ID is required (not found in connection or key)') if pid.blank?
       connection['project_id'] = pid
       pid
-    },
+    end,
 
-    telemetry_envelope: ->(started_at, correlation_id, ok, code, message) {
+    telemetry_envelope: lambda do |started_at, correlation_id, ok, code, message|
       dur = ((Time.now - started_at) * 1000.0).to_i
       {
         'ok' => !!ok,
@@ -1118,11 +1187,11 @@
           'correlation_id' => correlation_id
         }
       }
-    },
+    end,
 
     telemetry_parse_error_code: ->(err) {
       m = err.to_s.match(/\b(\d{3})\b/)
-      m ? m[1].to_i : 0
+      m ? m[1].to_i : 500
     },
 
     const_default_scopes: -> { [
@@ -1368,7 +1437,7 @@
     # Conservative instance limits by model family
     embedding_max_instances: ->(model_path_or_id) {
       id = model_path_or_id.to_s.split('/').last
-      if id.include?('gemini-embedding-001')
+      if id.start_with?('gemini-embedding-001')
         1
       else
         250
