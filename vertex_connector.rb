@@ -561,7 +561,9 @@
 
           resp.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
         rescue => e
-          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
+          g = call(:extract_google_error, e)
+          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
+          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
         end
       end,
 
@@ -661,7 +663,9 @@
             'contexts' => mapped
           }.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
         rescue => e
-          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
+          g = call(:extract_google_error, e)
+          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
+          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
         end
       end,
 
@@ -833,7 +837,9 @@
             'usage'      => gen_resp['usageMetadata']
           }.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
         rescue => e
-          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
+          g = call(:extract_google_error, e)
+          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
+          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
         end
       end,
 
@@ -1518,16 +1524,20 @@
         sys_inst   = call(:system_instruction_from_text, input['system_preamble'])
 
         loc = (connection['location'].presence || 'global').to_s.downcase
-        aipl_v1_url = call(:aipl_v1_url, connection, loc, "#{model_path}:countTokens")
+        url = call(:aipl_v1_url, connection, loc, "#{model_path}:countTokens")
 
         begin
           resp = post(url)
-                   .headers(call(:request_headers, corr))
-                   .payload(call(:json_compact, {
-          }))
+                    .headers(call(:request_headers, corr))
+                    .payload(call(:json_compact, {
+                      'contents'          => contents,
+                      'systemInstruction' => sys_inst
+                    }))
           resp.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
         rescue => e
-          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
+          g = call(:extract_google_error, e)
+          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
+          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
         end
       end,
 
@@ -1623,12 +1633,36 @@
           return code.to_i if code
         end
       rescue; end
+      # Try JSON body error.code
+      begin
+        body = (err.respond_to?(:[]) && err.dig('response','body')).to_s
+        j = JSON.parse(body) rescue nil
+        c = j && j.dig('error','code')
+        return c.to_i if c
+      rescue; end
       m = err.to_s.match(/\b(\d{3})\b/)
       m ? m[1].to_i : 500
     end,
 
     build_correlation_id: lambda do
       SecureRandom.uuid
+    end,
+
+    extract_google_error: lambda do |err|
+      # Try to pull {error:{code,message,details}} from Workato HTTPError
+      begin
+        body = (err.respond_to?(:[]) && err.dig('response','body')).to_s
+        json = JSON.parse(body) rescue nil
+        if json && json['error']
+          code    = json['error']['code']
+          message = json['error']['message']
+          details = json['error']['details']
+          return { 'code' => code, 'message' => message, 'details' => details, 'raw' => json }
+        end
+        # Some services embed message at top-level
+        return { 'message' => json['message'], 'raw' => json } if json && json['message']
+      rescue; end
+      {}
     end,
 
     # --- Auth (JWT → OAuth) -----------------------------------------------
@@ -2088,7 +2122,8 @@
       parsed
     end,
 
-    # --- RAG helpers ----------------------------------------------------------
+    # --- RAG helpers ------------------------------------------------------
+
     normalize_rag_corpus: lambda do |connection, raw|
       v = raw.to_s.strip
       return '' if v.blank?
@@ -2118,8 +2153,12 @@
     end.
 
     request_headers: lambda do |correlation_id, extra=nil|
-      # Minimal, uniform request headers for observability
-      base = { 'X-Correlation-Id': correlation_id.to_s }
+      # Uniform JSON headers for Vertex; keep Authorization from apply()
+      base = {
+        'X-Correlation-Id': correlation_id.to_s,
+        'Content-Type':      'application/json',
+        'Accept':            'application/json'
+      }
       extra.is_a?(Hash) ? base.merge(extra) : base
     end,
 
