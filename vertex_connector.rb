@@ -380,8 +380,8 @@
             sims = cat_vecs.each_with_index.map { |v, i| [i, call(:vector_cosine_similarity, email_vec, v)] }
             sims.sort_by! { |(_i, s)| -s }
 
-            scores = sims.map { |(i, s)| { 'category' => cats[i]['name'], 'score' => (((s + 1.0) / 2.0).round(6)), 'cosine' => s.round(6) } }
-            top = scores.first
+            scores     = sims.map { |(i, s)| { 'category' => cats[i]['name'], 'score' => (((s + 1.0) / 2.0).round(6)), 'cosine' => s.round(6) } }
+            top        = scores.first
             chosen     = top['category']
             confidence = top['score']
 
@@ -498,8 +498,7 @@
           { name: 'importResultGcsSink', type: 'object', optional: true, properties: [
               { name: 'outputUriPrefix', optional: false, hint: 'gs://bucket/prefix/' }
             ]},
-          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true,
-            hint: 'Echo request URL/body and Google error body for troubleshooting' }
+          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true, hint: 'Echo request URL/body and Google error body for troubleshooting' }
         ]
       end,
 
@@ -543,7 +542,8 @@
           resp = post(url)
                    .headers(call(:request_headers, corr))
                    .payload(req_body)
-          out = resp.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+          code = call(:telemetry_success_code, resp)
+          out = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
           if call(:normalize_boolean, input['debug'])
             ops_root = "https://#{call(:aipl_service_host, connection, loc)}/v1/projects/#{connection['project_id']}/locations/#{loc}/operations"
             dbg = call(:debug_pack, true, url, req_body, nil) || {}
@@ -892,7 +892,8 @@
           resp = post(url)
                   .headers(call(:request_headers, corr))
                   .payload(call(:json_compact, payload))
-          resp.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+          code = call(:telemetry_success_code, resp)
+          resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
         rescue => e
           {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
         end
@@ -999,7 +1000,8 @@
           resp = post(url)
                   .headers(call(:request_headers, corr))
                   .payload(call(:json_compact, payload))
-          resp.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+          code = call(:telemetry_success_code, resp)
+          resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
         rescue => e
           {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
         end
@@ -1298,7 +1300,8 @@
           resp = post(url)
                    .headers(call(:request_headers, corr))
                    .payload(call(:json_compact, payload))
-          resp.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+          code = call(:telemetry_success_code, resp)
+          resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
         rescue => e
           {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
         end
@@ -1371,7 +1374,8 @@
           resp = post(url)
                    .headers(call(:request_headers, corr))
                    .payload(call(:json_compact, payload))
-          resp.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+          code = call(:telemetry_success_code, resp)
+          resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
         rescue => e
           {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
         end
@@ -1426,7 +1430,8 @@
         # Call EP
         begin
           resp = get(url).headers(call(:request_headers, corr))
-          resp.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+          code = call(:telemetry_success_code, resp)
+          resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
         rescue => e
           {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
         end
@@ -1491,7 +1496,8 @@
                       'contents'          => contents,
                       'systemInstruction' => sys_inst
                     }))
-          resp.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+          code = call(:telemetry_success_code, resp)
+          resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
         rescue => e
           g = call(:extract_google_error, e)
           msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
@@ -1586,6 +1592,10 @@
           'correlation_id' => correlation_id
         }
       }
+    end,
+
+    telemetry_success_code: lambda do |resp|
+      (resp['status'] || resp['status_code'] || 200).to_i
     end,
 
     telemetry_parse_error_code: lambda do |err|
