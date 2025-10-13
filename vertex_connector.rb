@@ -473,8 +473,8 @@
 
       input_fields: lambda do
         [
-          { name: 'rag_corpus', optional: false,
-            hint: 'projects/{project}/locations/{region}/ragCorpora/{corpus}' },
+          { name: 'rag_corpus_resource_name', optional: false,
+            hint: 'Accepts either full resource name (e.g., "projects/{project}/locations/{region}/ragCorpora/{corpus}") or the "corpus"' },
 
           # Exactly one source family:
           { name: 'gcs_uris', type: 'array', of: 'string', optional: true,
@@ -522,45 +522,11 @@
           call(:ensure_project_id!, connection)
           call(:ensure_regional_location!, connection)
 
-          corpus = call(:normalize_rag_corpus, connection, input['rag_corpus'])
-          error('rag_corpus is required') if corpus.blank?
+          corpus = call(:normalize_rag_corpus, connection, input['rag_corpus_resource_name'])
+          error('rag_corpus_resource_name is required') if corpus.blank?
 
-          # Validate XOR sources
-          has_gcs   = call(:safe_array, input['gcs_uris']).present?
-          has_drive = input['drive_folder_id'].present? || call(:safe_array, input['drive_file_ids']).present?
-          error('Provide exactly one source family: GCS or Drive') if (has_gcs && has_drive) || (!has_gcs && !has_drive)
-
-          import_cfg = {}
-          if has_gcs
-            uris = call(:safe_array, input['gcs_uris']).map(&:to_s)
-            bad = uris.find { |u| u.include?('*') }
-            error("gcs_uris does not support wildcards; got: #{bad}") if bad
-            import_cfg['gcsSource'] = { 'uris' => uris }
-          else
-            # Map folder and/or file IDs into resourceIds[] with strict normalization
-            res_ids = []
-            if input['drive_folder_id'].present?
-              folder_id = call(:normalize_drive_folder_id, input['drive_folder_id'])
-              error('drive_folder_id is not a valid Drive ID') if folder_id.blank?
-              res_ids << { 'resourceId' => folder_id, 'resourceType' => 'RESOURCE_TYPE_FOLDER' }
-            end
-            call(:safe_array, input['drive_file_ids']).each do |fid|
-              file_id = call(:normalize_drive_file_id, fid)
-              error('drive_file_ids contains an invalid Drive ID') if file_id.blank?
-              res_ids << { 'resourceId' => file_id, 'resourceType' => 'RESOURCE_TYPE_FILE' }
-            end
-            error('Provide drive_folder_id or drive_file_ids (and share the Drive resource with the Vertex RAG Data Service Agent)') if res_ids.empty?
-            import_cfg['googleDriveSource'] = { 'resourceIds' => res_ids }
-          end
-
-          # Optional knobs
-          import_cfg['maxEmbeddingRequestsPerMin'] = call(:safe_integer, input['maxEmbeddingRequestsPerMin']) if input.key?('maxEmbeddingRequestsPerMin')
-          import_cfg['rebuildAnnIndex']            = true  if input['rebuildAnnIndex'] == true
-          if input['importResultGcsSink'].is_a?(Hash) && input['importResultGcsSink']['outputUriPrefix'].present?
-            import_cfg['importResultGcsSink'] = { 'outputUriPrefix' => input['importResultGcsSink']['outputUriPrefix'].to_s }
-          end
-
-          payload = { 'importRagFilesConfig' => import_cfg }
+          # Build payload
+          payload  = call(:build_rag_import_payload!, input)
 
           loc = (connection['location'] || '').downcase
           url = call(:aipl_v1_url, connection, loc, "#{corpus}/ragFiles:import")
@@ -608,7 +574,7 @@
       input_fields: lambda do
         [
           { name: 'rag_corpus', optional: false,
-            hint: 'projects/{project}/locations/{region}/ragCorpora/{corpus}' },
+            hint: 'Accepts either full resource name (e.g., "projects/{project}/locations/{region}/ragCorpora/{corpus}") or the "corpus"' },
           { name: 'question', optional: false },
           { name: 'restrict_to_file_ids', type: 'array', of: 'string', optional: true },
           { name: 'max_contexts', type: 'integer', optional: true, default: 20 }
@@ -651,32 +617,16 @@
           loc = (connection['location'] || '').downcase
           parent = "projects/#{connection['project_id']}/locations/#{loc}"
 
-          rag_res = { 'ragCorpus' => corpus }
-          ids = call(:safe_array, input['restrict_to_file_ids']).map { |x| call(:normalize_drive_file_id, x) }.reject(&:blank?)
-          rag_res['ragFileIds'] = ids if ids.present?
-
-          payload = {
-            'query'       => { 'text' => input['question'].to_s },
-            'dataSource'  => { 'vertexRagStore' => { 'ragResources' => [rag_res] } }
-          }
+          payload = call(:build_rag_retrieve_payload, input['question'], corpus, input['restrict_to_file_ids'])
 
           url  = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
           resp = post(url)
                    .headers(call(:request_headers, corr))
                    .payload(call(:json_compact, payload))
 
-          raw = (resp.dig('contexts','contexts') || [])
-          maxn = call(:clamp_int, (input['max_contexts'] || 20), 1, 200)
-          mapped = raw.first(maxn).each_with_index.map do |c, i|
-            {
-              'id'       => (c['chunkId'] || "ctx-#{i+1}"),
-              'text'     => c['text'],
-              'score'    => (c['score'] || c['relevanceScore'] || 0.0).to_f,
-              'source'   => (c['sourceDisplayName'] || c.dig('metadata','source') ),
-              'uri'      => (c['sourceUri']        || c.dig('metadata','uri')     ),
-              'metadata' => c['metadata']
-            }
-          end
+          raw   = call(:normalize_retrieve_contexts!, resp)
+          maxn  = call(:clamp_int, (input['max_contexts'] || 20), 1, 200)
+          mapped = call(:map_context_chunks, raw, maxn)
 
           {
             'question' => input['question'],
@@ -766,33 +716,16 @@
           loc    = (connection['location'] || '').downcase
           parent = "projects/#{connection['project_id']}/locations/#{loc}"
 
-          rag_res = { 'ragCorpus' => corpus }
-          ids = call(:safe_array, input['restrict_to_file_ids'])
-          rag_res['ragFileIds'] = ids if ids.present?
-
-          retrieve_payload = {
-            'query'      => { 'text' => input['question'].to_s },
-            'dataSource' => { 'vertexRagStore' => { 'ragResources' => [rag_res] } }
-          }
+          retrieve_payload = call(:build_rag_retrieve_payload, input['question'], corpus, input['restrict_to_file_ids'])
 
           retr_url  = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
           retr_resp = post(retr_url)
                         .headers(call(:request_headers, corr))
                         .payload(call(:json_compact, retrieve_payload))
-          raw_ctxs = (retr_resp.dig('contexts','contexts') || [])
+          raw_ctxs = call(:normalize_retrieve_contexts!, retr_resp)
 
           maxn  = call(:clamp_int, (input['max_contexts'] || 12), 1, 100)
-          chunks = raw_ctxs.first(maxn).each_with_index.map do |c, i|
-            {
-              'id'      => (c['chunkId'] || "ctx-#{i+1}"),
-              'text'    => c['text'].to_s,
-              'source'  => (c['sourceDisplayName'] || c.dig('metadata','source')),
-              'uri'     => (c['sourceUri']        || c.dig('metadata','uri')),
-
-              'score'   => (c['score'] || c['relevanceScore'] || 0.0).to_f,
-              'metadata'=> c['metadata']
-            }
-          end
+          chunks = call(:map_context_chunks, raw_ctxs, maxn)
           error('No contexts retrieved; check corpus/permissions/region') if chunks.empty?
 
           # 2) Generate structured answer with your existing schema pattern
@@ -1991,6 +1924,78 @@
 
     normalize_drive_file_id:   lambda { |raw| call(:normalize_drive_resource_id, raw) },
     normalize_drive_folder_id: lambda { |raw| call(:normalize_drive_resource_id, raw) },
+    normalize_retrieve_contexts!: lambda do |raw_resp|
+      # Accept both shapes:
+      #   { "contexts": [ {...}, {...} ] }
+      #   { "contexts": { "contexts": [ ... ] } }  # some beta responses
+      arr = raw_resp['contexts']
+      arr = arr['contexts'] if arr.is_a?(Hash) && arr.key?('contexts')
+      Array(arr)
+    end,
+
+    build_rag_retrieve_payload: lambda do |question, rag_corpus, restrict_ids = []|
+      rag_res = { 'ragCorpus' => rag_corpus }
+      ids     = call(:safe_array, restrict_ids).map { |x| call(:normalize_drive_file_id, x) }.reject(&:blank?)
+      rag_res['ragFileIds'] = ids if ids.present?
+      {
+        'query'      => { 'text' => question.to_s },
+        'dataSource' => { 'vertexRagStore' => { 'ragResources' => [rag_res] } }
+      }
+    end,
+
+    map_context_chunks: lambda do |raw_contexts, maxn = 20|
+      call(:safe_array, raw_contexts).first(maxn).each_with_index.map do |c, i|
+        {
+          'id'       => (c['chunkId'] || "ctx-#{i+1}"),
+          'text'     => c['text'].to_s,
+          'score'    => (c['score'] || c['relevanceScore'] || 0.0).to_f,
+          'source'   => (c['sourceDisplayName'] || c.dig('metadata','source')),
+          'uri'      => (c['sourceUri']        || c.dig('metadata','uri')),
+          'metadata' => c['metadata']
+        }
+      end
+    end,
+
+    build_rag_import_payload!: lambda do |input|
+      # Validates XOR and constructs { importRagFilesConfig: { ... } }
+      has_gcs   = call(:safe_array, input['gcs_uris']).present?
+      has_drive = input['drive_folder_id'].present? || call(:safe_array, input['drive_file_ids']).present?
+      error('Provide exactly one source family: GCS or Drive') if (has_gcs && has_drive) || (!has_gcs && !has_drive)
+
+      cfg = {}
+      if has_gcs
+        uris = call(:safe_array, input['gcs_uris']).map(&:to_s)
+        bad  = uris.find { |u| u.include?('*') }
+        error("gcs_uris does not support wildcards; got: #{bad}") if bad
+        cfg['gcsSource'] = { 'uris' => uris }
+      else
+        res_ids = []
+        if input['drive_folder_id'].present?
+          folder_id = call(:normalize_drive_folder_id, input['drive_folder_id'])
+          error('drive_folder_id is not a valid Drive ID') if folder_id.blank?
+          res_ids << { 'resourceId' => folder_id, 'resourceType' => 'RESOURCE_TYPE_FOLDER' }
+        end
+        call(:safe_array, input['drive_file_ids']).each do |fid|
+          file_id = call(:normalize_drive_file_id, fid)
+          error('drive_file_ids contains an invalid Drive ID') if file_id.blank?
+          res_ids << { 'resourceId' => file_id, 'resourceType' => 'RESOURCE_TYPE_FILE' }
+        end
+        error('Provide drive_folder_id or drive_file_ids (and share with Vertex RAG Data Service Agent)') if res_ids.empty?
+        cfg['googleDriveSource'] = { 'resourceIds' => res_ids }
+      end
+
+      # Optional knobs
+      if input.key?('maxEmbeddingRequestsPerMin')
+        cfg['maxEmbeddingRequestsPerMin'] = call(:safe_integer, input['maxEmbeddingRequestsPerMin'])
+      end
+      cfg['rebuildAnnIndex'] = true if input['rebuildAnnIndex'] == true
+      sink = input['importResultGcsSink']
+      if sink.is_a?(Hash) && sink['outputUriPrefix'].present?
+        cfg['importResultGcsSink'] = { 'outputUriPrefix' => sink['outputUriPrefix'].to_s }
+      end
+
+      { 'importRagFilesConfig' => cfg }
+    end,
 
     # --- Sanitizers and conversion ----------------------------------------
 
