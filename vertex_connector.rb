@@ -478,7 +478,8 @@
 
           # Exactly one source family:
           { name: 'gcs_uris', type: 'array', of: 'string', optional: true,
-            hint: 'e.g., gs://bucket/path/** or specific URIs' },
+            hint: 'Pass files or directory prefixes (e.g., gs://bucket/dir). Wildcards (*, **) are NOT supported.' },
+
 
           { name: 'drive_folder_id', optional: true,
             hint: 'Google Drive folder ID (share with Vertex RAG service agent)' },
@@ -531,7 +532,10 @@
 
           import_cfg = {}
           if has_gcs
-            import_cfg['gcsSource'] = { 'uris' => call(:safe_array, input['gcs_uris']) }
+            uris = call(:safe_array, input['gcs_uris']).map(&:to_s)
+            bad = uris.find { |u| u.include?('*') }
+            error("gcs_uris does not support wildcards; got: #{bad}") if bad
+            import_cfg['gcsSource'] = { 'uris' => uris }
           else
             # Map folder and/or file IDs into resourceIds[] with strict normalization
             res_ids = []
@@ -545,7 +549,7 @@
               error('drive_file_ids contains an invalid Drive ID') if file_id.blank?
               res_ids << { 'resourceId' => file_id, 'resourceType' => 'RESOURCE_TYPE_FILE' }
             end
-            error('Provide drive_folder_id or drive_file_ids') if res_ids.empty?
+            error('Provide drive_folder_id or drive_file_ids (and share the Drive resource with the Vertex RAG Data Service Agent)') if res_ids.empty?
             import_cfg['googleDriveSource'] = { 'resourceIds' => res_ids }
           end
 
@@ -565,7 +569,12 @@
                    .headers(call(:request_headers, corr))
                    .payload(req_body)
           out = resp.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
-          out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
+          if call(:normalize_boolean, input['debug'])
+            ops_root = "https://#{call(:aipl_service_host, connection, loc)}/v1/projects/#{connection['project_id']}/locations/#{loc}/operations"
+            dbg = call(:debug_pack, true, url, req_body, nil) || {}
+            dbg['ops_list_url'] = ops_root
+            out['debug'] = dbg
+          end
           out
 
         rescue => e
@@ -1663,33 +1672,30 @@
       begin
         body = (err.respond_to?(:[]) && err.dig('response','body')).to_s
         json = JSON.parse(body) rescue nil
-        if json && json['error']
-          return {
-            'code'    => json['error']['code'],
-            'message' => json['error']['message'],
-            'details' => json['error']['details'],
-            'raw'     => json
-          }
-          det = json['error']['details'] || []
-          # Pull google.rpc.BadRequest violations, if present
-          bad = det.find { |d| (d['@type'] || '').end_with?('google.rpc.BadRequest') } || {}
-          vios = (bad['fieldViolations'] || bad['violations'] || []).map do |v|
-            # normalize field/message keys across variants
-            {
-              'field'   => v['field']   || v['fieldPath'] || v['subject'] || nil,
-              'reason'  => v['description'] || v['message'] || v['reason'] || nil
+        if json
+          # google.rpc.Status shape
+          if json['error']
+            det   = json['error']['details'] || []
+            bad   = det.find { |d| (d['@type'] || '').end_with?('google.rpc.BadRequest') } || {}
+            vlist = (bad['fieldViolations'] || bad['violations'] || []).map do |v|
+              {
+                'field'  => v['field'] || v['fieldPath'] || v['subject'],
+                'reason' => v['description'] || v['message'] || v['reason']
+              }.compact
+            end.reject(&:empty?)
+            return {
+              'code'       => json['error']['code'],
+              'message'    => json['error']['message'],
+              'details'    => json['error']['details'],
+              'violations' => vlist,
+              'raw'        => json
             }
-          end.reject { |h| h['field'].nil? && h['reason'].nil? }
-          return {
-            'code'      => json['error']['code'],
-            'message'   => json['error']['message'],
-            'details'   => json['error']['details'],
-            'violations'=> vios,
-            'raw'       => json
-          }
+          end
+          # some endpoints return {message:"..."} at top level
+          return { 'message' => json['message'], 'raw' => json } if json['message']
         end
-        return { 'message' => json['message'], 'raw' => json } if json && json['message']
-      rescue; end
+      rescue
+      end
       {}
     end,
 
