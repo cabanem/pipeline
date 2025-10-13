@@ -476,16 +476,18 @@
 
       input_fields: lambda do
         [
-          { name: 'source_family', label: 'Source family', optional: false, control_type: 'select', extends_schema: true,
-            pick_list: 'rag_source_families', hint: 'Choose which source you are importing from (purely a UI gate; validation still enforced at runtime).' },
           { name: 'rag_corpus_resource_name', optional: false, hint: 'Accepts either full resource name (e.g., "projects/{project}/locations/{region}/ragCorpora/{corpus}") or the "corpus"' },
 
           # Exactly one source family:
+          { name: 'source_family', label: 'Source family', optional: false, control_type: 'select', extends_schema: true,
+            pick_list: 'rag_source_families', hint: 'Choose which source you are importing from (purely a UI gate; validation still enforced at runtime).' },
           { name: 'gcs_uris',         optional: true, ngIf: 'input.source_family == "gcs"',   type: 'array', of: 'string', 
             hint: 'Pass files or directory prefixes (e.g., gs://bucket/dir). Wildcards (*, **) are NOT supported.' },
-          { name: 'drive_folder_id',  optional: true, ngIf: 'input.source_family == "drive"', 
+          { name: 'folder_or_files', label: 'Drive input type' optional: true, ngif: 'input.source_family == "drive"', control_type: 'select', extends_schema: true,
+            pick_list: 'drive_input_type' },
+          { name: 'drive_folder_id',  optional: true, ngIf: 'input.folder_or_files == "folder"', 
             hint: 'Google Drive folder ID (share with Vertex RAG service agent)' },
-          { name: 'drive_file_ids',   optional: true, ngIf: 'input.source_family == "drive"', type: 'array', of: 'string', 
+          { name: 'drive_file_ids',   optional: true, ngIf: 'input.folder_or_files == "files"', type: 'array', of: 'string', 
             hint: 'Optional explicit file IDs if not using folder' },
 
           # Tuning / ops
@@ -494,6 +496,7 @@
           { name: 'importResultGcsSink', type: 'object', optional: true, properties: [
               { name: 'outputUriPrefix', optional: false, hint: 'gs://bucket/prefix/' }
             ]},
+          # Debug
           { name: 'show_debug', label: 'Show debug options', type: 'boolean', control_type: 'checkbox', optional: true, 
             extends_schema: true, default: false },
           { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true, ngIf: 'input.show_debug == "true"',
@@ -1573,6 +1576,12 @@
       [
         ['Google Cloud Storage', 'gcs'],
         ['Google Drive', 'drive']
+      ]
+    end,
+    drive_input_type: lambda do
+      [
+        ['Drive Files', 'files'],
+        ['Drive Folder', 'folder']
       ]
     end
   },
