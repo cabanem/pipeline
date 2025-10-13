@@ -85,10 +85,14 @@
       # Define location (prefer connection, fallback to global)
       loc = (connection['location'].presence || 'global').to_s.downcase
       # POST to endpoint
-      post(call(:aipl_v1_url, connection, loc, "#{model_path}:countTokens"))
+      url = call(:aipl_v1_url, connection, loc, "#{model_path}:countTokens")
+      post(url)
+        .headers(call(:request_headers, call(:build_correlation_id)))
         .payload({ 'contents' => [{ 'role' => 'user', 'parts' => [{ 'text' => 'ping' }] }] })
     else
-      get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models').params(pageSize: 1)
+      get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models')
+        .headers(call(:request_headers, call(:build_correlation_id)))
+        .params(pageSize: 1)
     end
   end,
 
@@ -327,6 +331,7 @@
       end,
 
       execute: lambda do |connection, input|
+        # Build correlation ID, now (for traceability)
         t0   = Time.now
         corr = call(:build_correlation_id)
         begin
@@ -508,6 +513,7 @@
       end,
 
       execute: lambda do |connection, input|
+        # Build correlation ID, now (for traceability)
         t0 = Time.now
         corr = call(:build_correlation_id)
         begin
@@ -529,13 +535,12 @@
             # Map folder w/file IDs into the required resourceIDs[] array
             res_ids = []
             if input['drive_folder_id'].present?
-              res_ids << { 'resourceId' => input['drive_folder_id'].to_s, 'resourceType' => 'FOLDER' }
+              res_ids << { 'resourceId' => input['drive_folder_id'].to_s, 'resourceType' => 'RESOURCE_TYPE_FOLDER' }
             end
             call(:safe_array, input['drive_file_ids']).each do |fid|
-              res_ids << { 'resourceId' => fid.to_s, 'resourceType' => 'FILE' }
+              res_ids << { 'resourceId' => fid.to_s, 'resourceType' => 'RESOURCE_TYPE_FILE' }
             end
             error('Provide drive_folder_id or drive_file_ids') if res_ids.empty?
-            imp
             import_cfg['googleDriveSource'] = { 'resourceIds' => res_ids }
           end
 
@@ -550,7 +555,9 @@
 
           loc = (connection['location'] || '').downcase
           url = call(:aipl_v1_url, connection, loc, "#{corpus}/ragFiles:import")
-          resp = post(url).payload(payload)
+          resp = post(url)
+                   .headers(call(:request_headers, corr))
+                   .payload(call(:json_compact, payload))
 
           resp.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
         rescue => e
@@ -609,6 +616,7 @@
       end,
 
       execute: lambda do |connection, input|
+        # Build correlation ID, now (for traceability)
         t0 = Time.now
         corr = call(:build_correlation_id)
         begin
@@ -631,7 +639,9 @@
           }
 
           url  = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
-          resp = post(url).payload(payload)
+          resp = post(url)
+                   .headers(call(:request_headers, corr))
+                   .payload(call(:json_compact, payload))
 
           raw = (resp.dig('contexts','contexts') || [])
           maxn = call(:clamp_int, (input['max_contexts'] || 20), 1, 200)
@@ -640,8 +650,8 @@
               'id'       => (c['chunkId'] || "ctx-#{i+1}"),
               'text'     => c['text'],
               'score'    => (c['score'] || c['relevanceScore'] || 0.0).to_f,
-              'source'   => c['source'] || c.dig('metadata','source'),
-              'uri'      => c['sourceUri'] || c.dig('metadata','uri'),
+              'source'   => (c['sourceDisplayName'] || c.dig('metadata','source') ),
+              'uri'      => (c['sourceUri']        || c.dig('metadata','uri')     ),
               'metadata' => c['metadata']
             }
           end
@@ -717,9 +727,11 @@
       end,
 
       execute: lambda do |connection, input|
+        # Build correlation id and now (logging)
         t0 = Time.now
         corr = call(:build_correlation_id)
         begin
+          # Validate inputs
           call(:ensure_project_id!, connection)
           call(:ensure_regional_location!, connection)
 
@@ -739,8 +751,10 @@
             'dataSource' => { 'vertexRagStore' => { 'ragResources' => [rag_res] } }
           }
 
-          retr_url = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
-          retr_resp = post(retr_url).payload(retrieve_payload)
+          retr_url  = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
+          retr_resp = post(retr_url)
+                        .headers(call(:request_headers, corr))
+                        .payload(call(:json_compact, retrieve_payload))
           raw_ctxs = (retr_resp.dig('contexts','contexts') || [])
 
           maxn  = call(:clamp_int, (input['max_contexts'] || 12), 1, 100)
@@ -748,8 +762,9 @@
             {
               'id'      => (c['chunkId'] || "ctx-#{i+1}"),
               'text'    => c['text'].to_s,
-              'source'  => c['source'] || c.dig('metadata','source'),
-              'uri'     => c['sourceUri'] || c.dig('metadata','uri'),
+              'source'  => (c['sourceDisplayName'] || c.dig('metadata','source')),
+              'uri'     => (c['sourceUri']        || c.dig('metadata','uri')),
+
               'score'   => (c['score'] || c['relevanceScore'] || 0.0).to_f,
               'metadata'=> c['metadata']
             }
@@ -764,13 +779,13 @@
             'maxOutputTokens'   => 1024,
             'responseMimeType'  => 'application/json',
             'responseSchema'    => {
-              'type' => 'object', 'additionalProperties' => false,
-              'properties' => {
+              'type'        => 'object', 'additionalProperties' => false,
+              'properties'  => {
                 'answer'    => { 'type' => 'string' },
                 'citations' => {
-                  'type'  => 'array',
-                  'items' => {
-                    'type' => 'object', 'additionalProperties' => false,
+                  'type'    => 'array',
+                  'items'   => {
+                    'type'  => 'object', 'additionalProperties' => false,
                     'properties' => {
                       'chunk_id' => { 'type' => 'string' },
                       'source'   => { 'type' => 'string' },
@@ -803,8 +818,10 @@
             'generationConfig'  => gen_cfg
           }
 
-          gen_url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
-          gen_resp = post(gen_url).payload(gen_payload)
+          gen_url   = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
+          gen_resp  = post(gen_url)
+                       .headers(call(:request_headers, corr))
+                       .payload(call(:json_compact, gen_payload))
 
           text = gen_resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
           parsed = call(:safe_parse_json, text)
@@ -902,8 +919,11 @@
 
         # Call endpoint
         loc = (connection['location'].presence || 'global').to_s.downcase
+        url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
         begin
-          resp = post(call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")).payload(payload)
+          resp = post(url)
+                  .headers(call(:request_headers, corr))
+                  .payload(call(:json_compact, payload))
           resp.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
         rescue => e
           {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
@@ -938,15 +958,17 @@
 
       input_fields: lambda do |object_definitions|
         [
+          { name: 'contents', type: 'array', of: 'object', properties: object_definitions['content'], optional: false },
           { name: 'model', label: 'Model', optional: false, control_type: 'select', pick_list: 'models_generative',
             toggle_hint: 'Use custom value', toggle_field: { name: 'model', label: 'Model', type: 'string', control_type: 'text' } },
           { name: 'grounding', control_type: 'select', pick_list: 'modes_grounding', optional: false },
 
           { name: 'vertex_ai_search_datastore', optional: true,
             hint: 'projects/.../locations/.../collections/default_collection/dataStores/...' },
-          { name: 'vertex_ai_search_engine', optional: true, hint: 'projects/.../locations/.../collections/.../engines/...' },
-          { name: 'contents', type: 'array', of: 'object',
-            properties: object_definitions['content'], optional: false },
+          { name: 'vertex_ai_search_serving_config', optional: true,
+            hint: 'projects/.../locations/.../collections/.../engines/.../servingConfigs/default_config' },
+          # Back-compat (deprecated):
+          { name: 'vertex_ai_search_engine', optional: true, hint: '(deprecated) use .../servingConfigs/... instead' },
 
           { name: 'system_preamble', label: 'System preamble (text)', optional: true },
 
@@ -979,13 +1001,19 @@
           if input['grounding'] == 'google_search'
             tools = [ { 'googleSearch' => {} } ]
           else
-            ds  = input['vertex_ai_search_datastore'].to_s
-            eng = input['vertex_ai_search_engine'].to_s
-            # Enforce XOR (exactly one)
-            error('Provide exactly one of vertex_ai_search_datastore OR vertex_ai_search_engine') if (ds.blank? && eng.blank?) || (ds.present? && eng.present?)
+            ds   = input['vertex_ai_search_datastore'].to_s
+            scfg = input['vertex_ai_search_serving_config'].to_s
+            # Back-compat: allow legacy 'engine' by mapping -> servingConfig
+            legacy_engine = input['vertex_ai_search_engine'].to_s
+            scfg = legacy_engine if scfg.blank? && legacy_engine.present?
+
+            # Enforce XOR
+            error('Provide exactly one of vertex_ai_search_datastore OR vertex_ai_search_serving_config') \
+              if (ds.blank? && scfg.blank?) || (ds.present? && scfg.present?)
+
             vas = {}
-            vas['datastore'] = ds unless ds.blank?
-            vas['engine']    = eng unless eng.blank?
+            vas['datastore']     = ds unless ds.blank?
+            vas['servingConfig'] = scfg unless scfg.blank?
             tools = [ { 'retrieval' => { 'vertexAiSearch' => vas } } ]
           end
 
@@ -1002,8 +1030,11 @@
 
         # Call endpoint
         loc = (connection['location'].presence || 'global').to_s.downcase
+        url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
         begin
-          resp = post(call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")).payload(payload)
+          resp = post(url)
+                  .headers(call(:request_headers, corr))
+                  .payload(call(:json_compact, payload))
           resp.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
         rescue => e
           {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
@@ -1142,10 +1173,15 @@
           }
 
           loc  = (connection['location'].presence || 'global').to_s.downcase
-          resp = post(call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")).payload(payload)
+          url  = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
+
+          resp = post(url)
+                   .headers(call(:request_headers, corr))
+                   .payload(call(:json_compact, payload))
 
           text = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
           parsed = call(:safe_parse_json, text)
+
           {
             'answer'     => parsed['answer'] || text,
             'citations'  => parsed['citations'] || [],
@@ -1215,8 +1251,20 @@
           texts = call(:safe_array, input['texts'])
           error("Too many texts (#{texts.length}). Max per request for this model is #{max_per_call}. Chunk upstream.") if texts.length > 0 && texts.length > max_per_call
 
+          allowed_tasks = %w[
+            RETRIEVAL_QUERY RETRIEVAL_DOCUMENT SEMANTIC_SIMILARITY
+            CLASSIFICATION CLUSTERING QUESTION_ANSWERING FACT_VERIFICATION
+            CODE_RETRIEVAL_QUERY
+          ]
+          task = input['task'].to_s.strip
+          task = nil if task.blank?
+          error("Invalid task_type: #{task}. Allowed: #{allowed_tasks.join(', ')}") \
+            if task && !allowed_tasks.include?(task)
+
           instances = call(:safe_array, input['texts']).map { |t|
-            { 'content' => t, 'task_type' => input['task'] }.delete_if { |_k, v| v.nil? }
+            h = { 'content' => t }
+            h['task_type'] = task if task
+            h
           }
 
           # Coerce/validate embedding parameters to correct JSON types
@@ -1277,13 +1325,15 @@
         call(:ensure_project_id!, connection)
         call(:ensure_regional_location!, connection) # require non-global
 
-        # Build URL
-        url = call(:endpoint_predict_url, connection, input['endpoint'])
+        # Build URL, payload
+        url     = call(:endpoint_predict_url, connection, input['endpoint'])
+        payload = { 'instances' => input['instances'], 'parameters' => input['parameters'] }
 
         # Call EP
         begin
           resp = post(url)
-            .payload({ 'instances' => input['instances'], 'parameters' => input['parameters'] }.delete_if { |_k, v| v.nil? })
+                   .headers(call(:request_headers, corr))
+                   .payload(call(:json_compact, payload))
           resp.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
         rescue => e
           {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
@@ -1347,12 +1397,16 @@
           'labels'          => input['labels']
         }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
 
-        loc  = connection['location']
-        path = "projects/#{connection['project_id']}/locations/#{loc}/batchPredictionJobs"
+        # Build the endpoint URL
+        loc         = connection['location']
+        path        = "projects/#{connection['project_id']}/locations/#{loc}/batchPredictionJobs"
+        url         = call(:aipl_v1_url, connection, loc, path)
 
         # Call ep
         begin
-          resp = post(call(:aipl_v1_url, connection, loc, path)).payload(payload)
+          resp = post(url)
+                   .headers(call(:request_headers, corr))
+                   .payload(call(:json_compact, payload))
           resp.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
         rescue => e
           {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
@@ -1398,14 +1452,16 @@
         call(:ensure_project_id!, connection)
         call(:ensure_regional_location!, connection)
 
+        # Build endpoint URL
         name = input['job_id'].to_s.start_with?('projects/') ?
           input['job_id'] :
           "projects/#{connection['project_id']}/locations/#{connection['location']}/batchPredictionJobs/#{input['job_id']}"
         loc = connection['location']
+        url  = call(:aipl_v1_url, connection, loc, name.sub(%r{^/v1/}, ''))
 
         # Call EP
         begin
-          resp = get(call(:aipl_v1_url, connection, loc, name.sub(%r{^/v1/}, '')))
+          resp = get(url).headers(call(:request_headers, corr))
           resp.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
         rescue => e
           {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
@@ -1462,11 +1518,13 @@
         sys_inst   = call(:system_instruction_from_text, input['system_preamble'])
 
         loc = (connection['location'].presence || 'global').to_s.downcase
+        aipl_v1_url = call(:aipl_v1_url, connection, loc, "#{model_path}:countTokens")
+
         begin
-          resp = post(call(:aipl_v1_url, connection, loc, "#{model_path}:countTokens")).payload({
-            'contents'          => contents,
-            'systemInstruction' => sys_inst
-          }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) })
+          resp = post(url)
+                   .headers(call(:request_headers, corr))
+                   .payload(call(:json_compact, {
+          }))
           resp.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
         rescue => e
           {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
@@ -1498,7 +1556,8 @@
       begin
         # v1beta1 publishers.models.list — global; no project/location.
         resp = get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models')
-                .params(pageSize: 200)
+                 .headers(call(:request_headers, call(:build_correlation_id)))
+                 .params(pageSize: 200)
 
         ids = call(:safe_array, resp['publisherModels'])
                 .map { |m| m['name'].to_s.split('/').last } # publishers/google/models/<id>
@@ -1518,7 +1577,8 @@
     models_generative: lambda do |connection|
       begin
         resp = get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models')
-                .params(pageSize: 200)
+                 .headers(call(:request_headers, call(:build_correlation_id)))
+                 .params(pageSize: 200)
         items = call(:safe_array, resp['publisherModels'])
                   .map { |m| m['name'].to_s.split('/').last }
                   .select { |id| id.start_with?('gemini-') }
@@ -1554,6 +1614,15 @@
     end,
 
     telemetry_parse_error_code: lambda do |err|
+      # Prefer Workato HTTP error objects first
+      begin
+        if err.respond_to?(:[])
+
+          code = err['status'] || err.dig('response', 'status') ||
+                 err.dig('response', 'status_code') || err.dig('error', 'code')
+          return code.to_i if code
+        end
+      rescue; end
       m = err.to_s.match(/\b(\d{3})\b/)
       m ? m[1].to_i : 500
     end,
@@ -1886,10 +1955,12 @@
 
       (instances || []).each_slice(max) do |slice|
         url  = call(:aipl_v1_url, connection, loc, "#{model_path}:predict")
-        resp = post(url).payload({
-                'instances'  => slice,
-                'parameters' => (params.presence || {})
-              }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) })
+        resp = post(url)
+                .headers(call(:request_headers, call(:build_correlation_id)))
+                .payload({
+                  'instances'  => slice,
+                  'parameters' => (params.presence || {})
+                }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) })
         preds.concat(resp['predictions'] || [])
         billable += resp.dig('metadata', 'billableCharacterCount').to_i
       end
@@ -2044,6 +2115,46 @@
     safe_map: lambda do |v|
       # Like Array#map but safe against nil/false/non-arrays.
       call(:safe_array, v).map { |x| yield(x) }
+    end.
+
+    request_headers: lambda do |correlation_id, extra=nil|
+      # Minimal, uniform request headers for observability
+      base = { 'X-Correlation-Id': correlation_id.to_s }
+      extra.is_a?(Hash) ? base.merge(extra) : base
+    end,
+
+    json_compact: lambda do |obj|
+      # Compact a JSON-able Hash/Array without mutating the caller:
+      # - Removes nil
+      # - Removes empty arrays/objects/strings
+      # - Preserves false/0
+      case obj
+      when Hash
+        obj.each_with_object({}) do |(k, v), h|
+          next if v.nil?
+          cv = call(:json_compact, v)
+          # keep false/0; drop only empty containers/strings
+          keep =
+            case cv
+            when String then !cv.empty?
+            when Array  then !cv.empty?
+            when Hash   then !cv.empty?
+            else true
+            end
+          h[k] = cv if keep
+        end
+      when Array
+        obj.map { |e| call(:json_compact, e) }.reject do |cv|
+          case cv
+          when String then cv.empty?
+          when Array  then cv.empty?
+          when Hash   then cv.empty?
+          else false
+          end
+        end
+      else
+        obj
+      end
     end
 
   },
