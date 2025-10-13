@@ -88,7 +88,10 @@
       url = call(:aipl_v1_url, connection, loc, "#{model_path}:countTokens")
       post(url)
         .headers(call(:request_headers, call(:build_correlation_id)))
-        .payload({ 'contents' => [{ 'role' => 'user', 'parts' => [{ 'text' => 'ping' }] }] })
+        .payload({
+          'contents' => [{ 'role' => 'user', 'parts' => [{ 'text' => 'ping' }] }],
+          'systemInstruction' => call(:system_instruction_from_text, 'Connection probe')
+        })
     else
       get('https://aiplatform.googleapis.com/v1beta1/publishers/google/models')
         .headers(call(:request_headers, call(:build_correlation_id)))
@@ -467,7 +470,7 @@
       title: 'RAG: Import files to corpus',
       subtitle: 'projects.locations.ragCorpora.ragFiles:import',
       display_priority: 9,
-      retry_on_request: ['GET','HEAD','POST'],
+      retry_on_request: ['GET','HEAD'], # removed "POST" to preserve idempotency, prevent duplication of jobs
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
 
@@ -519,6 +522,10 @@
         t0 = Time.now
         corr = call(:build_correlation_id)
         begin
+          url = nil
+          req_body = nil
+
+          # Validate inputs
           call(:ensure_project_id!, connection)
           call(:ensure_regional_location!, connection)
 
@@ -1775,6 +1782,7 @@
 
     build_endpoint_path: lambda do |connection, endpoint|
       ep = call(:normalize_endpoint_identifier, endpoint)
+      ep = ep.sub(%r{^/v1/}, '') # defensive
       ep.start_with?('projects/') ? ep :
         "projects/#{connection['project_id']}/locations/#{connection['location']}/endpoints/#{ep}"
     end,
@@ -1918,7 +1926,9 @@
       end
 
       # Keep only legal Drive ID charset
+      prior = v.dup
       v = v[/[A-Za-z0-9_-]+/].to_s
+      v = '' if v.length < 8 && prior.start_with?('http') # common bogus scrape from share links
       v
     end,
 
@@ -1938,8 +1948,9 @@
       ids     = call(:safe_array, restrict_ids).map { |x| call(:normalize_drive_file_id, x) }.reject(&:blank?)
       rag_res['ragFileIds'] = ids if ids.present?
       {
-        'query'      => { 'text' => question.to_s },
-        'dataSource' => { 'vertexRagStore' => { 'ragResources' => [rag_res] } }
+        'query'          => { 'text'          => question.to_s },
+        # NOTE: union member is supplied at top-level (not wrapped in "dataSource")
+        'vertexRagStore' => { 'ragResources'  => [rag_res] }
       }
     end,
 
@@ -2041,7 +2052,11 @@
       # Integers
       g['topK']            = call(:safe_integer,g['topK'])            if g.key?('topK')
       g['maxOutputTokens'] = call(:safe_integer,g['maxOutputTokens']) if g.key?('maxOutputTokens')
-      g['candidateCount']  = call(:safe_integer,g['candidateCount'])  if g.key?('candidateCount')
+      if g.key?('candidateCount')
+        c = call(:safe_integer, g['candidateCount'])
+        # Known safe window for Gemini text generation (defensive)
+        g['candidateCount'] = (c && c >= 1 && c <= 4) ? c : nil
+      end
       # Arrays
       g['stopSequences']   = call(:safe_array, g['stopSequences']).map(&:to_s) if g.key?('stopSequences')
       # Strip
@@ -2053,10 +2068,11 @@
       call(:safe_array, contents).map do |c|
         h = c.is_a?(Hash) ? c.transform_keys(&:to_s) : {}
         role = (h['role'] || 'user').to_s.downcase
+        next nil if role == 'system' # we move system text via systemInstruction
         error("Invalid role: #{role}") unless %w[user model].include?(role)
         h['role'] = role
         h
-      end
+      end.compact
     end,
 
     # --- Embeddings -------------------------------------------------------
@@ -2216,7 +2232,9 @@
 
       loc  = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
       url  = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
-      resp = post(url).payload(payload)
+      resp = post(url)
+               .headers(call(:request_headers, call(:build_correlation_id)))
+               .payload(call(:json_compact, payload))
 
       text   = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s.strip
       parsed = JSON.parse(text) rescue { 'category' => nil, 'confidence' => nil, 'reasoning' => nil, 'distribution' => [] }
