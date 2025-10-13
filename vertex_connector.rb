@@ -473,32 +473,31 @@
       retry_on_request: ['GET','HEAD'], # removed "POST" to preserve idempotency, prevent duplication of jobs
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
-      config_fields: [
-        { name: 'source_family', label: 'Source family', optional: false, control_type: 'select',
-          pick_list: 'rag_source_families', hint: 'Choose which source you are importing from (purely a UI gate; validation still enforced at runtime).' }
-      ],
 
       input_fields: lambda do
         [
-          { name: 'rag_corpus_resource_name', optional: false,
-            hint: 'Accepts either full resource name (e.g., "projects/{project}/locations/{region}/ragCorpora/{corpus}") or the "corpus"' },
+          { name: 'source_family', label: 'Source family', optional: false, control_type: 'select', extends_schema: true,
+            pick_list: 'rag_source_families', hint: 'Choose which source you are importing from (purely a UI gate; validation still enforced at runtime).' },
+          { name: 'rag_corpus_resource_name', optional: false, hint: 'Accepts either full resource name (e.g., "projects/{project}/locations/{region}/ragCorpora/{corpus}") or the "corpus"' },
 
           # Exactly one source family:
-          { name: 'gcs_uris', type: 'array', of: 'string', optional: true, ngIf: 'config.source_family == "gcs"',
+          { name: 'gcs_uris',         optional: true, ngIf: 'input.source_family == "gcs"',   type: 'array', of: 'string', 
             hint: 'Pass files or directory prefixes (e.g., gs://bucket/dir). Wildcards (*, **) are NOT supported.' },
-          { name: 'drive_folder_id', optional: true, ngIf: 'config.source_family == "drive"',
+          { name: 'drive_folder_id',  optional: true, ngIf: 'input.source_family == "drive"', 
             hint: 'Google Drive folder ID (share with Vertex RAG service agent)' },
-          { name: 'drive_file_ids', type: 'array', of: 'string', optional: true, ngIf: 'config.source_family == "drive"',
+          { name: 'drive_file_ids',   optional: true, ngIf: 'input.source_family == "drive"', type: 'array', of: 'string', 
             hint: 'Optional explicit file IDs if not using folder' },
 
           # Tuning / ops
           { name: 'maxEmbeddingRequestsPerMin', type: 'integer', optional: true },
-          { name: 'rebuildAnnIndex', type: 'boolean', optional: true, default: false,
-            hint: 'Set true after first large import to build ANN index' },
+          { name: 'rebuildAnnIndex', type: 'boolean', optional: true, default: false, hint: 'Set true after first large import to build ANN index' },
           { name: 'importResultGcsSink', type: 'object', optional: true, properties: [
               { name: 'outputUriPrefix', optional: false, hint: 'gs://bucket/prefix/' }
             ]},
-          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true, hint: 'Echo request URL/body and Google error body for troubleshooting' }
+          { name: 'show_debug', label: 'Show debug options', type: 'boolean', control_type: 'checkbox', optional: true, 
+            extends_schema: true, default: false },
+          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true, ngIf: 'input.show_debug == "true"',
+            hint: 'Echo request URL/body and Google error body for troubleshooting' }
         ]
       end,
 
@@ -833,26 +832,28 @@
 
       input_fields: lambda do |object_definitions|
         [
+          # Toggle for advanced fields
+          { name: 'show_advanced', label: 'Show advanced options', type: 'boolean', control_type: 'checkbox', optional: true, default: false },
+          # Model
           { name: 'model', label: 'Model', optional: false, control_type: 'select', pick_list: 'models_generative', hint: 'Select or use a custom value.',
             toggle_hint: 'Use custom value', toggle_field: { name: 'model', label: 'Model', type: 'string', control_type: 'text' } },
-          { name: 'contents', type: 'array', of: 'object',
-            properties: object_definitions['content'], optional: false },
+          # Content
+          { name: 'contents', type: 'array', of: 'object', properties: object_definitions['content'], optional: false },
 
           # Contract-friendly: accept plain text; connector will inject a proper systemInstruction
           { name: 'system_preamble', label: 'System preamble (text)', optional: true, hint: 'Optional system guidance.' },
 
-          { name: 'tools', type: 'array', of: 'object', properties: [
+          { name: 'tools', ngIf: 'input.show_advanced == "true"', type: 'array', of: 'object', properties: [
               { name: 'googleSearch', type: 'object' },
               { name: 'retrieval',    type: 'object' },
               { name: 'codeExecution', type: 'object' },
               { name: 'functionDeclarations', type: 'array', of: 'object' }
             ]
           },
-          { name: 'toolConfig', type: 'object' },
-          { name: 'safetySettings', type: 'array', of: 'object',
+          { name: 'toolConfig', ngIf: 'input.show_advanced == "true"', type: 'object' },
+          { name: 'safetySettings', ngIf: 'input.show_advanced == "true"', type: 'array', of: 'object',
             properties: object_definitions['safety_setting'] },
-
-          { name: 'generationConfig', type: 'object',
+          { name: 'generationConfig', ngIf: 'input.show_advanced == "true"', type: 'object',
             properties: object_definitions['generation_config'] }
         ]
       end,
