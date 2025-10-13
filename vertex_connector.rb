@@ -570,7 +570,8 @@
 
         rescue => e
           g = call(:extract_google_error, e)
-          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
+          vio = (g['violations'] || []).map { |x| "#{x['field']}: #{x['reason']}" }.join(' ; ')
+          msg = [e.to_s, (g['message'] || nil), (vio.presence)].compact.join(' | ')
           out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
           out['debug'] = call(:debug_pack, input['debug'], url, req_body, g)
           out
@@ -1668,6 +1669,23 @@
             'message' => json['error']['message'],
             'details' => json['error']['details'],
             'raw'     => json
+          }
+          det = json['error']['details'] || []
+          # Pull google.rpc.BadRequest violations, if present
+          bad = det.find { |d| (d['@type'] || '').end_with?('google.rpc.BadRequest') } || {}
+          vios = (bad['fieldViolations'] || bad['violations'] || []).map do |v|
+            # normalize field/message keys across variants
+            {
+              'field'   => v['field']   || v['fieldPath'] || v['subject'] || nil,
+              'reason'  => v['description'] || v['message'] || v['reason'] || nil
+            }
+          end.reject { |h| h['field'].nil? && h['reason'].nil? }
+          return {
+            'code'      => json['error']['code'],
+            'message'   => json['error']['message'],
+            'details'   => json['error']['details'],
+            'violations'=> vios,
+            'raw'       => json
           }
         end
         return { 'message' => json['message'], 'raw' => json } if json && json['message']
