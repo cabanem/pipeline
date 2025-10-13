@@ -473,6 +473,16 @@
       retry_on_request: ['GET','HEAD'], # removed "POST" to preserve idempotency, prevent duplication of jobs
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
+      config_fields: [
+        {
+          name: 'source_family',
+          label: 'Source family',
+          optional: false,
+          control_type: 'select',
+          pick_list: 'rag_source_families',
+          hint: 'Choose which source you are importing from (purely a UI gate; validation still enforced at runtime).'
+        }
+      ],
 
       input_fields: lambda do
         [
@@ -480,13 +490,11 @@
             hint: 'Accepts either full resource name (e.g., "projects/{project}/locations/{region}/ragCorpora/{corpus}") or the "corpus"' },
 
           # Exactly one source family:
-          { name: 'gcs_uris', type: 'array', of: 'string', optional: true,
+          { name: 'gcs_uris', type: 'array', of: 'string', optional: true, ngIf: 'config.source_family == "gcs"',
             hint: 'Pass files or directory prefixes (e.g., gs://bucket/dir). Wildcards (*, **) are NOT supported.' },
-
-
-          { name: 'drive_folder_id', optional: true,
+          { name: 'drive_folder_id', optional: true, ngIf: 'config.source_family == "drive"',
             hint: 'Google Drive folder ID (share with Vertex RAG service agent)' },
-          { name: 'drive_file_ids', type: 'array', of: 'string', optional: true,
+          { name: 'drive_file_ids', type: 'array', of: 'string', optional: true, ngIf: 'config.source_family == "drive"',
             hint: 'Optional explicit file IDs if not using folder' },
 
           # Tuning / ops
@@ -825,7 +833,7 @@
         { body: 'Provide a prompt to generate content from an LLM. Uses "POST :generateContent".'}
       end,
       display_priority: 8,
-      retry_on_request: ['GET', 'HEAD', 'POST'],
+      retry_on_request: ['GET','HEAD'], # removed "POST" to preserve idempotency, prevent duplication of jobs
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
 
@@ -918,7 +926,7 @@
       title: 'Generative: Generate (grounded)',
       subtitle: 'Generate with grounding via Google Search or Vertex AI Search',
       display_priority: 8,
-      retry_on_request: ['GET', 'HEAD', 'POST'],
+      retry_on_request: [ 'GET', 'HEAD' ],
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
 
@@ -935,13 +943,9 @@
             hint: 'projects/.../locations/.../collections/.../engines/.../servingConfigs/default_config' },
           # Back-compat (deprecated):
           { name: 'vertex_ai_search_engine', optional: true, hint: '(deprecated) use .../servingConfigs/... instead' },
-
           { name: 'system_preamble', label: 'System preamble (text)', optional: true },
-
           { name: 'toolConfig', type: 'object' },
-
           { name: 'generationConfig', type: 'object', properties: object_definitions['generation_config'] },
-
           { name: 'safetySettings',  type: 'array', of: 'object', properties: object_definitions['safety_setting'] }
         ]
       end,
@@ -1562,6 +1566,13 @@
     # Contract-conformant roles (system handled via system_preamble)
     roles: lambda do
       [['user','user'], ['model','model']]
+    end,
+
+    rag_source_families: lambda do
+      [
+        ['Google Cloud Storage', 'gcs'],
+        ['Google Drive', 'drive']
+      ]
     end
   },
 
