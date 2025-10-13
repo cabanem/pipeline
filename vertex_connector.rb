@@ -1655,20 +1655,44 @@
     end,
 
     extract_google_error: lambda do |err|
-      # Try to pull {error:{code,message,details}} from Workato HTTPError
       begin
         body = (err.respond_to?(:[]) && err.dig('response','body')).to_s
         json = JSON.parse(body) rescue nil
         if json && json['error']
-          code    = json['error']['code']
-          message = json['error']['message']
-          details = json['error']['details']
-          return { 'code' => code, 'message' => message, 'details' => details, 'raw' => json }
+          return {
+            'code'    => json['error']['code'],
+            'message' => json['error']['message'],
+            'details' => json['error']['details'],
+            'raw'     => json
+          }
         end
-        # Some services embed message at top-level
         return { 'message' => json['message'], 'raw' => json } if json && json['message']
       rescue; end
       {}
+    end,
+
+    redact_json: lambda do |obj|
+      # Shallow redaction of obvious secrets in request bodies; extend as needed
+      begin
+        j = obj.is_a?(String) ? JSON.parse(obj) : obj
+      rescue
+        return obj
+      end
+      if j.is_a?(Hash)
+        %w[access_token authorization api_key bearer token].each do |k|
+          j[k] = '[REDACTED]' if j.key?(k)
+        end
+      end
+      j
+    end,
+
+    debug_pack: lambda do |enabled, url, body, google_error|
+      return nil unless enabled
+      {
+        'request_url'  => url.to_s,
+        'request_body' => call(:redact_json, body),
+        'error_body'   => (google_error && google_error['raw']) || google_error
+      }
     end,
 
     # --- Auth (JWT → OAuth) -----------------------------------------------
@@ -2159,7 +2183,6 @@
     end,
 
     request_headers: lambda do |correlation_id, extra=nil|
-      # Uniform JSON headers for Vertex; keep Authorization from apply()
       base = {
         'X-Correlation-Id': correlation_id.to_s,
         'Content-Type':      'application/json',
