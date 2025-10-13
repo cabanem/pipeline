@@ -474,14 +474,8 @@
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
       config_fields: [
-        {
-          name: 'source_family',
-          label: 'Source family',
-          optional: false,
-          control_type: 'select',
-          pick_list: 'rag_source_families',
-          hint: 'Choose which source you are importing from (purely a UI gate; validation still enforced at runtime).'
-        }
+        { name: 'source_family', label: 'Source family', optional: false, control_type: 'select',
+          pick_list: 'rag_source_families', hint: 'Choose which source you are importing from (purely a UI gate; validation still enforced at runtime).' }
       ],
 
       input_fields: lambda do
@@ -1914,6 +1908,8 @@
         else
           raw
         end.to_s.strip
+      # Common placeholders → empty
+      return '' if v.empty? || %w[null nil none undefined - (blank)].include?(v.downcase)
 
       # Strip common Drive URL patterns
       if v.start_with?('http://', 'https://')
@@ -1939,7 +1935,8 @@
       # Keep only legal Drive ID charset
       prior = v.dup
       v = v[/[A-Za-z0-9_-]+/].to_s
-      v = '' if v.length < 8 && prior.start_with?('http') # common bogus scrape from share links
+      # If a link was provided but no usable token, treat as empty (forces upstream “invalid” logic)
+      v = '' if v.length < 8 && prior.start_with?('http')
       v
     end,
 
@@ -1956,7 +1953,7 @@
 
     build_rag_retrieve_payload: lambda do |question, rag_corpus, restrict_ids = []|
       rag_res = { 'ragCorpus' => rag_corpus }
-      ids     = call(:safe_array, restrict_ids).map { |x| call(:normalize_drive_file_id, x) }.reject(&:blank?)
+      ids     = call(:sanitize_drive_ids, restrict_ids, allow_empty: true, label: 'restrict_to_file_ids')
       rag_res['ragFileIds'] = ids if ids.present?
       {
         'query'          => { 'text'          => question.to_s },
@@ -1997,12 +1994,11 @@
           error('drive_folder_id is not a valid Drive ID') if folder_id.blank?
           res_ids << { 'resourceId' => folder_id, 'resourceType' => 'RESOURCE_TYPE_FOLDER' }
         end
-        call(:safe_array, input['drive_file_ids']).each do |fid|
-          file_id = call(:normalize_drive_file_id, fid)
-          error('drive_file_ids contains an invalid Drive ID') if file_id.blank?
-          res_ids << { 'resourceId' => file_id, 'resourceType' => 'RESOURCE_TYPE_FILE' }
+        drive_ids = call(:sanitize_drive_ids, input['drive_file_ids'], allow_empty: true, label: 'drive_file_ids')
+        drive_ids.each do |fid|
+          res_ids << { 'resourceId' => fid, 'resourceType' => 'RESOURCE_TYPE_FILE' }
         end
-        error('Provide drive_folder_id or drive_file_ids (and share with Vertex RAG Data Service Agent)') if res_ids.empty?
+        error('Provide drive_folder_id or non-empty drive_file_ids (share with the Vertex RAG Data Service Agent)') if res_ids.empty?
         cfg['googleDriveSource'] = { 'resourceIds' => res_ids }
       end
 
@@ -2084,6 +2080,20 @@
         h['role'] = role
         h
       end.compact
+    end,
+
+    sanitize_drive_ids: lambda do |raw_list, allow_empty: false, label: 'drive_file_ids'|
+      # 1) normalize → 2) drop empties → 3) de-dup
+      norm = call(:safe_array, raw_list)
+               .map { |x| call(:normalize_drive_file_id, x) }
+               .reject { |x| x.to_s.strip.empty? }
+               .uniq
+      return [] if norm.empty? && allow_empty
+      error("No valid Drive IDs found in #{label}. Remove empty entries or fix links.") if norm.empty?
+      # Validate basic length/pattern to catch obvious junk that isn’t empty
+      bad = norm.find { |id| id !~ /\A[A-Za-z0-9_-]{8,}\z/ }
+      error("Invalid Drive ID in #{label}: #{bad}") if bad
+      norm
     end,
 
     # --- Embeddings -------------------------------------------------------
