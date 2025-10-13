@@ -533,13 +533,17 @@
           if has_gcs
             import_cfg['gcsSource'] = { 'uris' => call(:safe_array, input['gcs_uris']) }
           else
-            # Map folder w/file IDs into the required resourceIDs[] array
+            # Map folder and/or file IDs into resourceIds[] with strict normalization
             res_ids = []
             if input['drive_folder_id'].present?
-              res_ids << { 'resourceId' => input['drive_folder_id'].to_s, 'resourceType' => 'RESOURCE_TYPE_FOLDER' }
+              folder_id = call(:normalize_drive_folder_id, input['drive_folder_id'])
+              error('drive_folder_id is not a valid Drive ID') if folder_id.blank?
+              res_ids << { 'resourceId' => folder_id, 'resourceType' => 'RESOURCE_TYPE_FOLDER' }
             end
             call(:safe_array, input['drive_file_ids']).each do |fid|
-              res_ids << { 'resourceId' => fid.to_s, 'resourceType' => 'RESOURCE_TYPE_FILE' }
+              file_id = call(:normalize_drive_file_id, fid)
+              error('drive_file_ids contains an invalid Drive ID') if file_id.blank?
+              res_ids << { 'resourceId' => file_id, 'resourceType' => 'RESOURCE_TYPE_FILE' }
             end
             error('Provide drive_folder_id or drive_file_ids') if res_ids.empty?
             import_cfg['googleDriveSource'] = { 'resourceIds' => res_ids }
@@ -638,7 +642,7 @@
           parent = "projects/#{connection['project_id']}/locations/#{loc}"
 
           rag_res = { 'ragCorpus' => corpus }
-          ids = call(:safe_array, input['restrict_to_file_ids'])
+          ids = call(:safe_array, input['restrict_to_file_ids']).map { |x| call(:normalize_drive_file_id, x) }.reject(&:blank?)
           rag_res['ragFileIds'] = ids if ids.present?
 
           payload = {
@@ -1915,6 +1919,54 @@
     normalize_input_keys: lambda do |input|
       (input || {}).to_h.transform_keys(&:to_s)
     end,
+
+    normalize_drive_resource_id: lambda do |raw|
+      # Accepts:
+      #   - raw ID strings: "1AbC_def-123"
+      #   - datapill Hashes: {id:"..."}, {fileId:"..."}, {value:"..."}, etc.
+      #   - full URLs: https://drive.google.com/file/d/<id>/..., ?id=<id>, /folders/<id>
+      # Returns bare ID: /[A-Za-z0-9_-]+/
+      return '' if raw.nil? || raw == false
+      v =
+        if raw.is_a?(Hash)
+          raw['id'] || raw[:id] ||
+          raw['fileId'] || raw[:fileId] ||
+          raw['value'] || raw[:value] ||
+          raw['name'] || raw[:name] ||
+          raw['path'] || raw[:path] ||
+          raw.to_s     # last resort (but avoid using this path)
+        else
+          raw
+        end.to_s.strip
+
+      # Strip common Drive URL patterns
+      if v.start_with?('http://', 'https://')
+        # /file/d/<id>/...   or   /folders/<id>
+        if (m = v.match(%r{/file/d/([^/?#]+)}))      then v = m[1]
+        elsif (m = v.match(%r{/folders/([^/?#]+)}))  then v = m[1]
+        elsif (m = v.match(/[?&]id=([^&#]+)/))       then v = m[1]
+        end
+        # Drop resourcekey etc.
+      end
+
+      # As a final guard, collapse any accidental Hash#to_s artifacts: {"id"=>"..."}
+      if v.include?('=>') || v.include?('{') || v.include?('}')
+        # Try to salvage with a simple JSON parse if it looks like a hash string
+        begin
+          j = JSON.parse(v) rescue nil
+          if j.is_a?(Hash)
+            v = j['id'] || j['fileId'] || j['value'] || ''
+          end
+        rescue; end
+      end
+
+      # Keep only legal Drive ID charset
+      v = v[/[A-Za-z0-9_-]+/].to_s
+      v
+    end,
+
+    normalize_drive_file_id:   lambda { |raw| call(:normalize_drive_resource_id, raw) },
+    normalize_drive_folder_id: lambda { |raw| call(:normalize_drive_resource_id, raw) },
 
     # --- Sanitizers and conversion ----------------------------------------
 
