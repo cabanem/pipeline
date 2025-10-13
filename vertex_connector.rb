@@ -491,8 +491,9 @@
             hint: 'Set true after first large import to build ANN index' },
           { name: 'importResultGcsSink', type: 'object', optional: true, properties: [
               { name: 'outputUriPrefix', optional: false, hint: 'gs://bucket/prefix/' }
-            ]
-          }
+            ]},
+          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true,
+            hint: 'Echo request URL/body and Google error body for troubleshooting' }
         ]
       end,
 
@@ -555,15 +556,20 @@
 
           loc = (connection['location'] || '').downcase
           url = call(:aipl_v1_url, connection, loc, "#{corpus}/ragFiles:import")
+          req_body = call(:json_compact, payload)
           resp = post(url)
                    .headers(call(:request_headers, corr))
-                   .payload(call(:json_compact, payload))
+                   .payload(req_body)
+          out = resp.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+          out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
+          out
 
-          resp.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
         rescue => e
           g = call(:extract_google_error, e)
           msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
+          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
+          out['debug'] = call(:debug_pack, input['debug'], url, req_body, g)
+          out
         end
       end,
 
@@ -2150,7 +2156,7 @@
     safe_map: lambda do |v|
       # Like Array#map but safe against nil/false/non-arrays.
       call(:safe_array, v).map { |x| yield(x) }
-    end.
+    end,
 
     request_headers: lambda do |correlation_id, extra=nil|
       # Uniform JSON headers for Vertex; keep Authorization from apply()
