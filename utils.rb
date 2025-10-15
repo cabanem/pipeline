@@ -352,7 +352,7 @@ require 'digest'
       fields: lambda do |_connection, _config, _object_definitions|
         [
           { name: 'batch_id' },
-          { name: 'chunks', type: 'array', of: 'object', object_definitions['chunk_object'] },
+          { name: 'chunks', type: 'array', of: 'object', properties: object_definitions['chunk_object'] },
           { name: 'document_count', type: 'integer' },
           { name: 'chunk_count', type: 'integer' },
           { name: 'batch_index', type: 'integer' }
@@ -562,7 +562,7 @@ require 'digest'
       output_fields: lambda do
         [
           { name: 'document_id' },
-          { name: 'chunks', type: 'array', of: 'object', properties: call('chunk_object') },
+          { name: 'chunks', type: 'array', of: 'object', properties: object_definitions['chunk_object'] },
           { name: 'document_metadata', type: 'object',
             properties: [
               { name: 'total_chunks', type: 'integer' },
@@ -748,7 +748,11 @@ require 'digest'
           { name: 'text', optional: false }
         ]
       end,
-      output_fields: lambda { call('document_metadata') },
+
+      output_fields: lambda do |_connection, _config, _object_definitions|
+        object_definitions['document_metadata']
+      end,
+
       execute: lambda do |input|
         started = Time.now
         txt = input['text'].to_s
@@ -771,13 +775,18 @@ require 'digest'
 
     check_document_changes: {
       title: 'Check document changes',
+
       input_fields: lambda do
         [
           { name: 'previous_text', optional: true },
           { name: 'current_text', optional: false }
         ]
       end,
-      output_fields: lambda { call('change_detection') },
+
+      output_fields: lambda do |_connection, _config, _object_definitions|
+        object_definitions['change_detection']
+      end,
+
       execute: lambda do |input|
         prev = input['previous_text'].to_s
         curr = input['current_text'].to_s
@@ -815,6 +824,7 @@ require 'digest'
     chunk_gcs_batch_for_embedding: {
       title: 'Chunk "GCS" batch (pass-in text) + make embedding batches',
       help: 'Minimal, side-effect free: pass objects with inline text to avoid GCS calls.',
+
       input_fields: lambda do
         [
           { name: 'objects', type: 'array', of: 'object', properties: [
@@ -828,7 +838,11 @@ require 'digest'
           { name: 'embed_batch_size', type: 'integer', optional: true }
         ]
       end,
-      output_fields: lambda { call('gcs_chunk_and_embed_result') },
+
+      output_fields: lambda do |_connection, _config, _object_definitions|
+        object_definitions['gcs_chunk_and_embed_result']
+      end,
+
       execute: lambda do |input|
         started = Time.now
         size    = call(:int, input['chunk_size'], 1200)
@@ -886,7 +900,7 @@ require 'digest'
     adapt_chunks_for_vertex: {
       title: 'Adapt chunks → Vertex records',
       input_fields: lambda do
-        [{ name: 'chunks', type: 'array', of: 'object', properties: call('chunk_object'), optional: false }]
+        [{ name: 'chunks', type: 'array', of: 'object', properties: object_definitions['chunk_object'], optional: false }]
       end,
       output_fields: lambda do
         [
