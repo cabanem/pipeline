@@ -5,12 +5,17 @@ require 'base64'
 {
   title: 'Vertex AI Adapter',
   version: '0.9.1',
-  description: 'Vertex AI (Gemini + Text Embeddings + Endpoints) via service account JWT',
+  description: 'Vertex AI via service account (JWT)',
+  help: {
+    body: 'cloud.google.com/vertex-ai/docs/vector-search/quick-start'
+  }
 
   # --------- CONNECTION ---------------------------------------------------
-
   connection: {
     fields: [
+      # Prod/Dev toggle
+      { name: 'prod_mode',                  optional: true,   control_type: 'checkbox', label: 'Production mode',
+        type: 'boolean',  default: true, extends_schema: true, hint: 'When enabled, suppresses debug echoes and enforces strict idempotency/retry rules.' },
       # Service account details
       { name: 'service_account_key_json',   optional: false,  control_type: 'text-area', 
         hint: 'Paste full JSON key' },
@@ -54,9 +59,9 @@ require 'base64'
 
       apply: lambda do |connection|
         # Keep headers minimal; envelope/correlation lives in actions
-        h   = { 'Authorization': "Bearer #{connection['access_token']}"}
-        up  = connection['user_project'].to_s.strip
-        h['x-goog-user-project'] = up if up.present?
+        h = { 'Authorization' => "Bearer #{connection['access_token']}" }
+        up = connection['user_project'].to_s.strip
+        h['x-goog-user-project'] = up unless up.empty?
         headers(h)
       end,
 
@@ -73,7 +78,6 @@ require 'base64'
   },
 
   # --------- CONNECTION TEST ----------------------------------------------
-
   test: lambda do |connection|
     # Fast path: if defaults provided, exercise a real, auth’d call to surface IAM/billing issues early.
     if %w[true 1 yes].include?(connection['set_defaults_for_probe'].to_s.downcase) && connection['default_probe_gen_model'].present?
@@ -102,8 +106,8 @@ require 'base64'
   end,
 
   # --------- OBJECT DEFINITIONS -------------------------------------------
-
   object_definitions: {
+
     content_part: {
       fields: lambda do
         [
@@ -129,9 +133,8 @@ require 'base64'
         ]
       end
     },
-
-    # Per contract: role ∈ {user, model}
     content: {
+      # Per contract: role ∈ {user, model}
       fields: lambda do |object_definitions|
         [
           { name: 'role', control_type: 'select', pick_list: 'roles', optional: false },
@@ -141,6 +144,42 @@ require 'base64'
       end
     },
 
+    gen_generate_content_input: {
+      fields: lambda do |_connection, config_fields, object_definitions|
+        show_adv = (config_fields['show_advanced'] == true)
+
+        base = [
+          # UX toggle
+          { name: 'show_advanced', label: 'Show advanced options',
+            type: 'boolean', control_type: 'checkbox', optional: true, default: false },
+          # Model (free-text only)
+          { name: 'model', label: 'Model', optional: false, control_type: 'text' },
+
+          # Contract-friendly content
+          { name: 'contents', type: 'array', of: 'object',
+            properties: object_definitions['content'], optional: false },
+          # Simple system text that we convert to systemInstruction object
+          { name: 'system_preamble', label: 'System preamble (text)', optional: true,
+            hint: 'Optional; becomes systemInstruction.parts[0].text' }
+        ]
+        adv = [
+          { name: 'tools', type: 'array', of: 'object', properties: [
+              { name: 'googleSearch',    type: 'object' },
+              { name: 'retrieval',       type: 'object' },
+              { name: 'codeExecution',   type: 'object' },
+              { name: 'functionDeclarations', type: 'array', of: 'object' }
+            ]
+          },
+          { name: 'toolConfig',      type: 'object' },
+          { name: 'safetySettings',  type: 'array', of: 'object',
+            properties: object_definitions['safety_setting'] },
+          { name: 'generationConfig', type: 'object',
+            properties: object_definitions['generation_config'] }
+        ]
+
+        show_adv ? (base + adv) : base
+      end
+    },
     generation_config: {
       fields: lambda do
         [
@@ -155,16 +194,6 @@ require 'base64'
         ]
       end
     },
-
-    safety_setting: {
-      fields: lambda do
-        [
-          { name: 'category'  },   # e.g., HARM_CATEGORY_*
-          { name: 'threshold' }    # e.g., BLOCK_LOW_AND_ABOVE
-        ]
-      end
-    },
-
     generate_content_output: {
       fields: lambda do
         [
@@ -197,8 +226,8 @@ require 'base64'
       end
     },
 
-    # Align to contract: embeddings object, not array
     embed_output: {
+      # Align to contract: embeddings object, not array
       fields: lambda do
         [
           { name: 'predictions', type: 'array', of: 'object', properties: [
@@ -221,7 +250,6 @@ require 'base64'
         ]
       end
     },
-
     predict_output: {
       fields: lambda do
         [
@@ -262,47 +290,18 @@ require 'base64'
       end
     },
 
-    gen_generate_content_input: {
-      fields: lambda do |_connection, config_fields, object_definitions|
-        show_adv = (config_fields['show_advanced'] == true)
-
-        base = [
-          # UX toggle
-          { name: 'show_advanced', label: 'Show advanced options',
-            type: 'boolean', control_type: 'checkbox', optional: true, default: false },
-          # Model (free-text only)
-          { name: 'model', label: 'Model', optional: false, control_type: 'text' },
-
-          # Contract-friendly content
-          { name: 'contents', type: 'array', of: 'object',
-            properties: object_definitions['content'], optional: false },
-          # Simple system text that we convert to systemInstruction object
-          { name: 'system_preamble', label: 'System preamble (text)', optional: true,
-            hint: 'Optional; becomes systemInstruction.parts[0].text' }
+    safety_setting: {
+      fields: lambda do
+        [
+          { name: 'category'  },   # e.g., HARM_CATEGORY_*
+          { name: 'threshold' }    # e.g., BLOCK_LOW_AND_ABOVE
         ]
-        adv = [
-          { name: 'tools', type: 'array', of: 'object', properties: [
-              { name: 'googleSearch',    type: 'object' },
-              { name: 'retrieval',       type: 'object' },
-              { name: 'codeExecution',   type: 'object' },
-              { name: 'functionDeclarations', type: 'array', of: 'object' }
-            ]
-          },
-          { name: 'toolConfig',      type: 'object' },
-          { name: 'safetySettings',  type: 'array', of: 'object',
-            properties: object_definitions['safety_setting'] },
-          { name: 'generationConfig', type: 'object',
-            properties: object_definitions['generation_config'] }
-        ]
-
-        show_adv ? (base + adv) : base
       end
     }
 
   },
 
   # --------- ACTIONS ------------------------------------------------------
-
   actions: {
 
     # 1) Email categorization
@@ -596,7 +595,11 @@ require 'base64'
           vio = (g['violations'] || []).map { |x| "#{x['field']}: #{x['reason']}" }.join(' ; ')
           msg = [e.to_s, (g['message'] || nil), (vio.presence)].compact.join(' | ')
           out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
-          out['debug'] = call(:debug_pack, input['debug'], url, req_body, g)
+          # Assess environment (dev/prod)
+          unless call(:normalize_boolean, connection['prod_mode'])
+            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
+          end
+          # Return
           out
         end
       end,
@@ -610,7 +613,6 @@ require 'base64'
         }
       end
     },
-
     rag_retrieve_contexts: {
       title: 'RAG: Retrieve contexts',
       subtitle: 'projects.locations:retrieveContexts (Vertex RAG Store)',
@@ -699,7 +701,6 @@ require 'base64'
         }
       end
     },
-
     rag_answer: {
       title: 'RAG: Retrieve + answer (one-shot)',
       subtitle: 'Retrieve contexts from a corpus and generate a cited answer',
@@ -861,7 +862,7 @@ require 'base64'
     indexes_upsert_datapoints: {
       title: 'Vector Index: Upsert datapoints',
       subtitle: 'indexes:upsertDatapoints (Matching Engine / Vector Search)',
-      display_priority: 6,
+      display_priority: 8,
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
@@ -919,6 +920,9 @@ require 'base64'
           # sanitize vectors → float[], preserve ids
           dps = call(:safe_array, input['datapoints']).map do |dp|
             h = (dp || {}).to_h
+            id = h['datapointId'].to_s.strip
+            error('datapointId is required for each datapoint') if id.empty?
+
             vec = call(:sanitize_feature_vector, h['featureVector'])
             error('featureVector must be a non-empty numeric array') if vec.empty?
             h.merge('featureVector' => vec)
@@ -930,13 +934,21 @@ require 'base64'
                    .payload(req_body)
           code = call(:telemetry_success_code, resp)
           out  = { 'ok' => true }.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-          out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
+          # Assess environment (dev/prod)
+          unless call(:normalize_boolean, connection['prod_mode'])
+            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
+          end
+          # Return
           out
         rescue => e
           g = call(:extract_google_error, e)
           msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
           out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
-          out['debug'] = call(:debug_pack, input['debug'], url, req_body, g) if call(:normalize_boolean, input['debug'])
+          # Assess environment (dev/prod)
+          unless call(:normalize_boolean, connection['prod_mode'])
+            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
+          end
+          # Return
           out
         end
       end,
@@ -948,11 +960,10 @@ require 'base64'
         }
       end
     },
-
     index_endpoints_find_neighbors: {
       title: 'Vector Search: Find neighbors',
       subtitle: 'indexEndpoints:findNeighbors (Matching Engine / Vector Search)',
-      display_priority: 6,
+      display_priority: 8,
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
@@ -1031,12 +1042,20 @@ require 'base64'
               dp = (h['datapoint'] || {}).to_h
               fv = call(:sanitize_feature_vector, dp['featureVector'])
               dp['featureVector'] = fv unless fv.empty?
+              # require either a datapointId or a non-empty featureVector
+              if (dp['datapointId'].to_s.strip.empty?) && fv.empty?
+                error('datapoint query must include datapointId or a non-empty featureVector')
+              end
               h['datapoint'] = call(:json_compact, dp)
             else
               error('Each query must include featureVector or datapoint')
             end
             if h['neighborCount']
               h['neighborCount'] = call(:clamp_int, h['neighborCount'], 1, 1000)
+            end
+            # forward distanceMeasure if provided
+            if h['distanceMeasure'].present?
+              h['distanceMeasure'] = h['distanceMeasure'].to_s
             end
             h
           end
@@ -1058,7 +1077,11 @@ require 'base64'
           g = call(:extract_google_error, e)
           msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
           out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
-          out['debug'] = call(:debug_pack, input['debug'], url, req_body, g) if call(:normalize_boolean, input['debug'])
+          # Assess environment (dev/prod)
+          unless call(:normalize_boolean, connection['prod_mode'])
+            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
+          end
+          # Return
           out
         end
       end,
@@ -1077,6 +1100,545 @@ require 'base64'
         }
       end
     },
+    indexes_create: {
+      title: 'Vector Index: Create index',
+      subtitle: 'indexes.create (Matching Engine / Vector Search)',
+      display_priority: 8,
+      retry_on_request: ['GET','HEAD'],
+      retry_on_response: [408,429,500,502,503,504],
+      max_retries: 3,
+
+      input_fields: lambda do |_|
+        [
+          { name: 'displayName', optional: false },
+          { name: 'description', optional: true },
+          { name: 'metadata', label: 'Index metadata (object)', type: 'object', optional: true },
+          # Optional: supply explicit indexId (kept as query in some APIs; here we fold into body id if present)
+          { name: 'indexId', optional: true },
+          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true },
+          { name: 'requestId', optional: true, hint: 'Optional idempotency token (RFC4122). If omitted we won’t send it.' }
+        ]
+      end,
+
+      output_fields: lambda do |_|
+        [
+          { name: 'name' }, { name: 'done', type: 'boolean' },
+          { name: 'metadata', type: 'object' }, { name: 'error', type: 'object' },
+          { name: 'ok', type: 'boolean' },
+          { name: 'telemetry', type: 'object', properties: [
+            { name: 'http_status', type: 'integer' }, { name: 'message' },
+            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
+          ]},
+          { name: 'debug', type: 'object' }
+        ]
+      end,
+
+      execute: lambda do |connection, input|
+        t0   = Time.now
+        corr = call(:build_correlation_id)
+        url = nil; req_body = nil
+        begin
+          call(:ensure_project_id!, connection)
+          call(:ensure_regional_location!, connection)
+          loc = connection['location'].to_s.downcase
+
+          path = "projects/#{connection['project_id']}/locations/#{loc}/indexes"
+          url  = call(:aipl_v1_url, connection, loc, path)
+
+          # Validation
+          display = input['displayName'].to_s.strip
+          error('displayName is required') if display.empty?
+          meta = input['metadata']
+          error('metadata must be an object') if !meta.nil? && !meta.is_a?(Hash)
+          idx_id = input['indexId'].to_s.strip
+          error('indexId cannot be empty') if input.key?('indexId') && idx_id.empty?
+
+          body = {
+            'displayName' => display,
+            'description' => input['description'],
+            'metadata'    => meta
+          }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
+
+          # Provide explicit indexId via query, not body
+          params = {}
+          req_id = input['requestId'].to_s.strip
+          params[:requestId] = req_id unless req_id.empty?
+          params[:indexId]   = idx_id unless idx_id.empty?
+
+          req_body = call(:json_compact, body)
+
+          resp = post(url).params(params).headers(call(:request_headers, corr)).payload(req_body)
+          code = call(:telemetry_success_code, resp)
+          out  = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          # Assess environment (dev/prod)
+          unless call(:normalize_boolean, connection['prod_mode'])
+            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
+          end
+          # Return
+          out
+        rescue => e
+          g   = call(:extract_google_error, e)
+          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
+          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
+          # Assess environment (dev/prod)
+          unless call(:normalize_boolean, connection['prod_mode'])
+            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
+          end
+          # Return
+          out
+        end
+      end,
+
+      sample_output: lambda do
+        { 'name' => 'projects/p/locations/us-central1/operations/123', 'done' => false,
+          'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 14, 'correlation_id' => 'sample' } }
+      end
+    },
+    indexes_delete: {
+      title: 'Vector Index: Delete index',
+      subtitle: 'indexes.delete (Matching Engine / Vector Search)',
+      display_priority: 8,
+      retry_on_request: ['GET','HEAD'],
+      retry_on_response: [408,429,500,502,503,504],
+      max_retries: 3,
+
+      input_fields: lambda do |_|
+        [
+          { name: 'index', optional: false, hint: 'indexes/{id} or full resource path' },
+          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
+        ]
+      end,
+
+      output_fields: lambda do |_|
+        [
+          { name: 'name' }, { name: 'done', type: 'boolean' },
+          { name: 'metadata', type: 'object' }, { name: 'error', type: 'object' },
+          { name: 'ok', type: 'boolean' },
+          { name: 'telemetry', type: 'object', properties: [
+            { name: 'http_status', type: 'integer' }, { name: 'message' },
+            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
+          ]},
+          { name: 'debug', type: 'object' }
+        ]
+      end,
+
+      execute: lambda do |connection, input|
+        t0 = Time.now
+        corr = call(:build_correlation_id)
+        url = nil
+        req_body = nil
+        begin
+          call(:ensure_project_id!, connection)
+          call(:ensure_regional_location!, connection)
+          idx_path = call(:build_index_path, connection, input['index'])
+          loc = connection['location'].to_s.downcase
+          url = call(:aipl_v1_url, connection, loc, idx_path)
+
+          resp = delete(url).headers(call(:request_headers, corr))
+          code = call(:telemetry_success_code, resp)
+          out  = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          # Assess environment (dev/prod)
+          unless call(:normalize_boolean, connection['prod_mode'])
+            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
+          end
+          # Return
+          out
+        rescue => e
+          g   = call(:extract_google_error, e)
+          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
+          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
+          # Assess environment (dev/prod)
+          unless call(:normalize_boolean, connection['prod_mode'])
+            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
+          end
+          # Return
+          out
+        end
+      end,
+
+      sample_output: lambda do
+        { 'name' => 'projects/p/locations/us-central1/operations/456', 'done' => false,
+          'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 9, 'correlation_id' => 'sample' } }
+      end
+    },
+    index_endpoints_create: {
+      title: 'Vector Search: Create index endpoint',
+      subtitle: 'indexEndpoints.create (Matching Engine / Vector Search)',
+      display_priority: 8,
+      retry_on_request: ['GET','HEAD'],
+      retry_on_response: [408,429,500,502,503,504],
+      max_retries: 3,
+
+      input_fields: lambda do |_|
+        [
+          { name: 'displayName', optional: false },
+          { name: 'description', optional: true },
+          { name: 'labels', type: 'object', optional: true },
+          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true },
+          { name: 'requestId', optional: true, hint: 'Optional idempotency token (RFC4122). If omitted we won’t send it.' }
+
+        ]
+      end,
+
+      output_fields: lambda do |_|
+        [
+          { name: 'name' }, { name: 'done', type: 'boolean' },
+          { name: 'metadata', type: 'object' }, { name: 'error', type: 'object' },
+          { name: 'ok', type: 'boolean' },
+          { name: 'telemetry', type: 'object', properties: [
+            { name: 'http_status', type: 'integer' }, { name: 'message' },
+            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
+          ]},
+          { name: 'debug', type: 'object' }
+        ]
+      end,
+
+      execute: lambda do |connection, input|
+        t0 = Time.now
+        corr = call(:build_correlation_id)
+        url = nil; req_body = nil
+        begin
+          call(:ensure_project_id!, connection)
+          call(:ensure_regional_location!, connection)
+          loc  = connection['location'].to_s.downcase
+          path = "projects/#{connection['project_id']}/locations/#{loc}/indexEndpoints"
+          url  = call(:aipl_v1_url, connection, loc, path)
+
+          # Validate
+          display = input['displayName'].to_s.strip
+          error('displayName is required') if display.empty?
+          labels = input['labels']
+          error('labels must be an object') if !labels.nil? && !labels.is_a?(Hash)
+
+          body = {
+            'displayName' => display,
+            'description' => input['description'],
+            'labels'      => labels
+          }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
+          req_body = call(:json_compact, body)
+
+          params = {}
+          req_id = input['requestId'].to_s.strip
+          params[:requestId] = req_id unless req_id.empty?
+
+          resp = post(url).params(params).headers(call(:request_headers, corr)).payload(req_body)
+          code = call(:telemetry_success_code, resp)
+          out  = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          # Assess environment (dev/prod)
+          unless call(:normalize_boolean, connection['prod_mode'])
+            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
+          end
+          # Return
+          out
+        rescue => e
+          g   = call(:extract_google_error, e)
+          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
+          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
+          # Assess environment (dev/prod)
+          unless call(:normalize_boolean, connection['prod_mode'])
+            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
+          end
+          # Return
+          out
+        end
+      end,
+
+      sample_output: lambda do
+        { 'name' => 'projects/p/locations/us-central1/operations/789', 'done' => false,
+          'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 11, 'correlation_id' => 'sample' } }
+      end
+    },
+    index_endpoints_delete: {
+      title: 'Vector Search: Delete index endpoint',
+      subtitle: 'indexEndpoints.delete (Matching Engine / Vector Search)',
+      display_priority: 8,
+      retry_on_request: ['GET','HEAD'],
+      retry_on_response: [408,429,500,502,503,504],
+      max_retries: 3,
+
+      input_fields: lambda do |_|
+        [
+          { name: 'indexEndpoint', optional: false, hint: 'indexEndpoints/{id} or full resource path' },
+          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
+        ]
+      end,
+
+      output_fields: lambda do |_|
+        [
+          { name: 'name' }, { name: 'done', type: 'boolean' },
+          { name: 'metadata', type: 'object' }, { name: 'error', type: 'object' },
+          { name: 'ok', type: 'boolean' },
+          { name: 'telemetry', type: 'object', properties: [
+            { name: 'http_status', type: 'integer' }, { name: 'message' },
+            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
+          ]},
+          { name: 'debug', type: 'object' }
+        ]
+      end,
+
+      execute: lambda do |connection, input|
+        t0 = Time.now
+        corr = call(:build_correlation_id)
+        url = nil
+        req_body = nil
+        begin
+          call(:ensure_project_id!, connection)
+          call(:ensure_regional_location!, connection)
+          ep_path = call(:build_index_endpoint_path, connection, input['indexEndpoint'])
+          loc = connection['location'].to_s.downcase
+          url = call(:aipl_v1_url, connection, loc, ep_path)
+
+          resp = delete(url).headers(call(:request_headers, corr))
+          code = call(:telemetry_success_code, resp)
+          out  = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          # Assess environment (dev/prod)
+          unless call(:normalize_boolean, connection['prod_mode'])
+            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
+          end
+          # Return
+          out
+        rescue => e
+          g   = call(:extract_google_error, e)
+          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
+          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
+          # Assess environment (dev/prod)
+          unless call(:normalize_boolean, connection['prod_mode'])
+            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
+          end
+          # Return
+          out
+        end
+      end,
+
+      sample_output: lambda do
+        { 'name' => 'projects/p/locations/us-central1/operations/987', 'done' => false,
+          'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 9, 'correlation_id' => 'sample' } }
+      end
+    },
+    index_endpoints_deploy: {
+      title: 'Vector Search: Deploy index to endpoint',
+      subtitle: 'indexEndpoints:deployIndex',
+      display_priority: 8,
+      retry_on_request: ['GET','HEAD'],
+      retry_on_response: [408,429,500,502,503,504],
+      max_retries: 3,
+
+      input_fields: lambda do |_|
+        [
+          { name: 'indexEndpoint', optional: false, hint: 'indexEndpoints/{id} or full resource path' },
+          { name: 'deployedIndexId', optional: false, hint: 'Name for the deployed index within the endpoint' },
+          { name: 'index', optional: false, hint: 'Index id or resource; short ids are expanded automatically' },
+          { name: 'displayName', optional: true },
+          { name: 'privateEndpoints', type: 'object', optional: true, hint: 'Optional network settings (object as-is)' },
+          { name: 'labels', type: 'object', optional: true },
+          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true },
+          { name: 'requestId', optional: true, hint: 'Optional idempotency token (RFC4122). If omitted we won’t send it.' }
+        ]
+      end,
+
+      output_fields: lambda do |_|
+        [
+          { name: 'name' }, { name: 'done', type: 'boolean' },
+          { name: 'metadata', type: 'object' }, { name: 'error', type: 'object' },
+          { name: 'ok', type: 'boolean' },
+          { name: 'telemetry', type: 'object', properties: [
+            { name: 'http_status', type: 'integer' }, { name: 'message' },
+            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
+          ]},
+          { name: 'debug', type: 'object' }
+        ]
+      end,
+
+      execute: lambda do |connection, input|
+        t0 = Time.now
+        corr = call(:build_correlation_id)
+        url = nil; req_body = nil
+        begin
+          call(:ensure_project_id!, connection)
+          call(:ensure_regional_location!, connection)
+          ep_path = call(:build_index_endpoint_path, connection, input['indexEndpoint'])
+          loc = connection['location'].to_s.downcase
+          url = call(:aipl_v1_url, connection, loc, "#{ep_path}:deployIndex")
+
+          # Validate and normalize
+          dep_id = input['deployedIndexId'].to_s.strip
+          error('deployedIndexId is required') if dep_id.empty?
+          idx_path = call(:build_index_path, connection, input['index'])
+          lbls = input['labels']
+          error('labels must be an object') if !lbls.nil? && !lbls.is_a?(Hash)
+          pe = input['privateEndpoints']
+          error('privateEndpoints must be an object') if !pe.nil? && !pe.is_a?(Hash)
+
+          deployed = {
+            'id'              => dep_id,
+            'index'           => idx_path,
+            'displayName'     => input['displayName'],
+            'privateEndpoints'=> pe,
+            'labels'          => lbls
+          }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
+
+          req_body = call(:json_compact, { 'deployedIndex' => deployed })
+
+          params = {}
+          req_id = input['requestId'].to_s.strip
+          params[:requestId] = req_id unless req_id.empty?
+
+          resp = post(url).params(params).headers(call(:request_headers, corr)).payload(req_body)
+          code = call(:telemetry_success_code, resp)
+          out  = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          # Assess environment (dev/prod)
+          unless call(:normalize_boolean, connection['prod_mode'])
+            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
+          end
+          # Return
+          out
+        rescue => e
+          g   = call(:extract_google_error, e)
+          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
+          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
+          # Assess environment (dev/prod)
+          unless call(:normalize_boolean, connection['prod_mode'])
+            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
+          end
+          # Return
+          out
+        end
+      end,
+
+      sample_output: lambda do
+        { 'name' => 'projects/p/locations/us-central1/operations/dep-1', 'done' => false,
+          'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 13, 'correlation_id' => 'sample' } }
+      end
+    },
+    index_endpoints_undeploy: {
+      title: 'Vector Search: Undeploy index from endpoint',
+      subtitle: 'indexEndpoints:undeployIndex',
+      display_priority: 8,
+      retry_on_request: ['GET','HEAD'],
+      retry_on_response: [408,429,500,502,503,504],
+      max_retries: 3,
+
+      input_fields: lambda do |_|
+        [
+          { name: 'indexEndpoint', optional: false, hint: 'indexEndpoints/{id} or full resource path' },
+          { name: 'deployedIndexId', optional: false, hint: 'Deployed index id to remove' },
+          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true },
+          { name: 'requestId', optional: true, hint: 'Optional idempotency token (RFC4122). If omitted we won’t send it.' }
+        ]
+      end,
+
+      output_fields: lambda do |_|
+        [
+          { name: 'name' }, { name: 'done', type: 'boolean' },
+          { name: 'metadata', type: 'object' }, { name: 'error', type: 'object' },
+          { name: 'ok', type: 'boolean' },
+          { name: 'telemetry', type: 'object', properties: [
+            { name: 'http_status', type: 'integer' }, { name: 'message' },
+            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
+          ]},
+          { name: 'debug', type: 'object' }
+        ]
+      end,
+
+      execute: lambda do |connection, input|
+        t0 = Time.now
+        corr = call(:build_correlation_id)
+        url = nil; req_body = nil
+        begin
+          call(:ensure_project_id!, connection)
+          call(:ensure_regional_location!, connection)
+          ep_path = call(:build_index_endpoint_path, connection, input['indexEndpoint'])
+          loc = connection['location'].to_s.downcase
+          url = call(:aipl_v1_url, connection, loc, "#{ep_path}:undeployIndex")
+
+          dep_id = input['deployedIndexId'].to_s.strip
+          error('deployedIndexId is required') if dep_id.empty?
+          req_body = call(:json_compact, { 'deployedIndexId' => dep_id })
+
+          params = {}
+          req_id = input['requestId'].to_s.strip
+          params[:requestId] = req_id unless req_id.empty?
+
+          resp = post(url).params(params).headers(call(:request_headers, corr)).payload(req_body)
+          code = call(:telemetry_success_code, resp)
+          out  = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          # Assess environment (dev/prod)
+          unless call(:normalize_boolean, connection['prod_mode'])
+            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
+          end
+          # Return
+          out
+        rescue => e
+          g   = call(:extract_google_error, e)
+          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
+          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
+          # Assess environment (dev/prod)
+          unless call(:normalize_boolean, connection['prod_mode'])
+            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
+          end
+          # Return
+          out
+        end
+      end,
+
+      sample_output: lambda do
+        { 'name' => 'projects/p/locations/us-central1/operations/dep-1', 'done' => false,
+          'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 10, 'correlation_id' => 'sample' } }
+      end
+    },
+    indexes_remove_datapoints: {
+      title: 'Vector Index: Remove datapoints',
+      subtitle: 'indexes:removeDatapoints (Matching Engine / Vector Search)',
+      display_priority: 8,
+      retry_on_request: ['GET','HEAD'],
+      retry_on_response: [408,429,500,502,503,504],
+      max_retries: 3,
+
+      input_fields: lambda do |_|
+        [
+          { name: 'index', optional: false,
+            hint: 'Index resource (projects/.../locations/.../indexes/{id}) or short ID' },
+          { name: 'datapointIds', type: 'array', of: 'string', optional: false }
+        ]
+      end,
+
+      output_fields: lambda do |_|
+        [
+          { name: 'ok', type: 'boolean' },
+          { name: 'telemetry', type: 'object', properties: [
+            { name: 'http_status', type: 'integer' }, { name: 'message' },
+            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
+          ]}
+        ]
+      end,
+
+      execute: lambda do |connection, input|
+        t0 = Time.now
+        corr = call(:build_correlation_id)
+        url = nil; req_body = nil
+        begin
+          call(:ensure_project_id!, connection)
+          call(:ensure_regional_location!, connection)
+          idx_path = call(:build_index_path, connection, input['index'])
+          loc = connection['location'].to_s.downcase
+          url = call(:aipl_v1_url, connection, loc, "#{idx_path}:removeDatapoints")
+
+          ids = call(:safe_array, input['datapointIds']).map(&:to_s).reject(&:empty?)
+          error('datapointIds must be a non-empty array of strings') if ids.empty?
+          req_body = call(:json_compact, { 'datapointIds' => ids })
+
+          resp = post(url).headers(call(:request_headers, corr)).payload(req_body)
+          code = call(:telemetry_success_code, resp)
+          { 'ok' => true }.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+        rescue => e
+          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
+        end
+      end,
+
+      sample_output: lambda do
+        { 'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 9, 'correlation_id' => 'sample' } }
+      end
+    },
 
     # 4) Generate content (Gemini)
     gen_generate_content: {
@@ -1090,7 +1652,7 @@ require 'base64'
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
 
-      input_fields: lambda do |connection, object_definitions|
+      input_fields: lambda do |connection, config_fields, object_definitions|
         object_definitions['gen_generate_content_input']
       end,
 
@@ -1153,7 +1715,6 @@ require 'base64'
         }
       end
     },
-
     gen_generate_grounded: {
       title: 'Generative: Generate (grounded)',
       subtitle: 'Generate with grounding via Google Search or Vertex AI Search',
@@ -1162,11 +1723,12 @@ require 'base64'
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
 
-      input_fields: lambda do |connection, object_definitions|
+      input_fields: lambda do |connection, _config_fields, object_definitions|
         [
           { name: 'contents', type: 'array', of: 'object', properties: object_definitions['content'], optional: false },
           { name: 'model', label: 'Model', optional: false, control_type: 'text' },
           { name: 'grounding', control_type: 'select', pick_list: 'modes_grounding', optional: false },
+          { name: 'system_preamble', optional: true, hint: 'Optional guardrails/system text.' },
           { name: 'vertex_ai_search_datastore', optional: true,
             hint: 'projects/.../locations/.../collections/default_collection/dataStores/...' },
           { name: 'vertex_ai_search_serving_config', optional: true,
@@ -1249,7 +1811,6 @@ require 'base64'
         }
       end
     },
-
     gen_answer_with_context: {
       title: 'Generative: Generate (use provided context chunks)',
       subtitle: '',
@@ -1517,7 +2078,9 @@ require 'base64'
 
         # Build URL, payload
         url     = call(:endpoint_predict_url, connection, input['endpoint'])
-        payload = { 'instances' => input['instances'], 'parameters' => input['parameters'] }
+        inst = call(:safe_array, input['instances'])
+        error('instances must be a non-empty array') if inst.empty?
+        payload = { 'instances' => inst, 'parameters' => input['parameters'] }
 
         # Call EP
         begin
@@ -1538,7 +2101,6 @@ require 'base64'
           'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr' } }
       end
     },
-
     batch_prediction_create: {
       title: 'Batch: Create prediction job',
       subtitle: 'Create projects.locations.batchPredictionJobs',
@@ -1620,7 +2182,6 @@ require 'base64'
         }
       end
     },
-
     batch_prediction_get: {
       title: 'Batch: Fetch prediction job (get)',
       subtitle: 'Get a batch prediction job by ID',
@@ -1680,7 +2241,7 @@ require 'base64'
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
 
-      input_fields: lambda do |connection, object_definitions|
+      input_fields: lambda do |connection, _config_fields, object_definitions|
         [
           { name: 'model', label: 'Model', optional: false, control_type: 'text' },
           { name: 'contents', type: 'array', of: 'object', properties: object_definitions['content'], optional: false },
@@ -1733,6 +2294,56 @@ require 'base64'
           'promptTokensDetails' => [ { 'modality' => 'TEXT', 'tokenCount' => 31 } ],
           'ok' => true,
           'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr' } }
+      end
+    },
+    operations_get: {
+      title: 'Operations: Get (poll LRO)',
+      subtitle: 'google.longrunning.operations.get',
+      display_priority: 5,
+      retry_on_request: ['GET','HEAD'],
+      retry_on_response: [408,429,500,502,503,504],
+      max_retries: 3,
+
+      input_fields: lambda do
+        [
+          { name: 'operation', optional: false,
+            hint: 'Operation name or full path, e.g., projects/{p}/locations/{l}/operations/{id}' }
+        ]
+      end,
+
+      output_fields: lambda do |_|
+        [
+          { name: 'name' }, { name: 'done', type: 'boolean' },
+          { name: 'metadata', type: 'object' }, { name: 'error', type: 'object' }
+        ] + [
+          { name: 'ok', type: 'boolean' },
+          { name: 'telemetry', type: 'object', properties: [
+            { name: 'http_status', type: 'integer' }, { name: 'message' },
+            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
+          ]}
+        ]
+      end,
+
+      execute: lambda do |connection, input|
+        t0 = Time.now
+        corr = call(:build_correlation_id)
+        begin
+          call(:ensure_project_id!, connection)
+          # Accept either full /v1/... or name-only
+          op = input['operation'].to_s.sub(%r{^/v1/}, '')
+          loc = (connection['location'].presence || 'us-central1').to_s.downcase
+          url = call(:aipl_v1_url, connection, loc, op.start_with?('projects/') ? op : "projects/#{connection['project_id']}/locations/#{loc}/operations/#{op}")
+          resp = get(url).headers(call(:request_headers, corr))
+          code = call(:telemetry_success_code, resp)
+          resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+        rescue => e
+          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
+        end
+      end,
+
+      sample_output: lambda do
+        { 'name' => 'projects/p/locations/us-central1/operations/123', 'done' => false,
+          'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 8, 'correlation_id' => 'sample' } }
       end
     }
 
@@ -1792,11 +2403,9 @@ require 'base64'
         }
       }
     end,
-
     telemetry_success_code: lambda do |resp|
       (resp['status'] || resp['status_code'] || 200).to_i
     end,
-
     telemetry_parse_error_code: lambda do |err|
       # Prefer Workato HTTP error objects first
       begin
@@ -1817,11 +2426,9 @@ require 'base64'
       m = err.to_s.match(/\b(\d{3})\b/)
       m ? m[1].to_i : 500
     end,
-
     build_correlation_id: lambda do
       SecureRandom.uuid
     end,
-
     extract_google_error: lambda do |err|
       begin
         body = (err.respond_to?(:[]) && err.dig('response','body')).to_s
@@ -1852,7 +2459,6 @@ require 'base64'
       end
       {}
     end,
-
     redact_json: lambda do |obj|
       # Shallow redaction of obvious secrets in request bodies; extend as needed
       begin
@@ -1861,13 +2467,12 @@ require 'base64'
         return obj
       end
       if j.is_a?(Hash)
-        %w[access_token authorization api_key bearer token].each do |k|
+        %w[access_token authorization api_key apiKey bearer token id_token refresh_token client_secret private_key].each do |k|
           j[k] = '[REDACTED]' if j.key?(k)
         end
       end
       j
     end,
-
     debug_pack: lambda do |enabled, url, body, google_error|
       return nil unless enabled
       {
@@ -1881,11 +2486,9 @@ require 'base64'
     const_default_scopes: lambda do
        [ 'https://www.googleapis.com/auth/cloud-platform' ]
     end,
-
     b64url: lambda do |bytes|
       Base64.urlsafe_encode64(bytes).gsub(/=+$/, '')
     end,
-
     jwt_sign_rs256: lambda do |claims, private_key_pem|
       header = { alg: 'RS256', typ: 'JWT' }
       enc_h  = call(:b64url, header.to_json)
@@ -1895,7 +2498,6 @@ require 'base64'
       sig = rsa.sign(OpenSSL::Digest::SHA256.new, input)
       "#{input}.#{call(:b64url, sig)}"
     end,
-
     auth_normalize_scopes: lambda do |scopes|
       arr = case scopes
             when nil    then ['https://www.googleapis.com/auth/cloud-platform']
@@ -1905,7 +2507,6 @@ require 'base64'
             end
       arr.map(&:to_s).reject(&:empty?).uniq
     end,
-
     auth_token_cache_get: lambda do |connection, scope_key|
       cache = (connection['__token_cache'] ||= {})
       tok   = cache[scope_key]
@@ -1914,13 +2515,11 @@ require 'base64'
       return nil unless exp && Time.now < (exp - 60)
       tok
     end,
-
     auth_token_cache_put: lambda do |connection, scope_key, token_hash|
       cache = (connection['__token_cache'] ||= {})
       cache[scope_key] = token_hash
       token_hash
     end,
-
     auth_issue_token!: lambda do |connection, scopes|
       # Safely parse sa key json
       key = JSON.parse(connection['service_account_key_json'].to_s)
@@ -1957,7 +2556,6 @@ require 'base64'
         'scope_key'    => scope_str
       }
     end,
-
     auth_build_access_token!: lambda do |connection, scopes: nil|
       set = call(:auth_normalize_scopes, scopes)
       scope_key = set.join(' ')
@@ -1973,11 +2571,9 @@ require 'base64'
       l = (loc || connection['location']).to_s.downcase
       (l.blank? || l == 'global') ? 'aiplatform.googleapis.com' : "#{l}-aiplatform.googleapis.com"
     end,
-
     aipl_v1_url: lambda do |connection, loc, path|
       "https://#{call(:aipl_service_host, connection, loc)}/v1/#{path}"
     end,
-
     endpoint_predict_url: lambda do |connection, endpoint|
       ep = call(:normalize_endpoint_identifier, endpoint).to_s
       # Allow fully-qualified dedicated endpoint URLs.
@@ -1991,14 +2587,12 @@ require 'base64'
       host = call(:aipl_service_host, connection, loc)
       "https://#{host}/v1/#{call(:build_endpoint_path, connection, ep)}:predict"
     end,
-
     build_endpoint_path: lambda do |connection, endpoint|
       ep = call(:normalize_endpoint_identifier, endpoint)
       ep = ep.sub(%r{^/v1/}, '') # defensive
       ep.start_with?('projects/') ? ep :
         "projects/#{connection['project_id']}/locations/#{connection['location']}/endpoints/#{ep}"
     end,
-
     build_model_path_with_global_preview: lambda do |connection, model|
       # Enforce project location (inference from connection)
       call(:ensure_project_id!, connection)
@@ -2025,7 +2619,6 @@ require 'base64'
         "projects/#{connection['project_id']}/locations/#{loc}/publishers/google/models/#{m}"
       end
     end,
-
     build_embedding_model_path: lambda do |connection, model|
       # Enforce project location (inference from connection)
       call(:ensure_project_id!, connection)
@@ -2059,17 +2652,14 @@ require 'base64'
       connection['project_id'] = pid
       pid
     end,
-
     ensure_regional_location!: lambda do |connection|
       loc = (connection['location'] || '').downcase
       error("This action requires a regional location (e.g., us-central1). Current location is '#{loc}'.") if loc.blank? || loc == 'global'
     end,
-
     embedding_region: lambda do |connection|
       loc = (connection['location'] || '').to_s.downcase
       loc.present? ? loc : 'global'
     end,
-
     normalize_endpoint_identifier: lambda do |raw|
       return '' if raw.nil? || raw == true || raw == false
       if raw.is_a?(Hash)
@@ -2077,7 +2667,6 @@ require 'base64'
         return v.to_s.strip
       end; raw.to_s.strip
     end,
-
     normalize_model_identifier: lambda do |raw|
       # Normalize a user-provided "model" into a String.
       # Accepts String or Hash (from datapills/pick lists). Prefers common keys.
@@ -2087,15 +2676,12 @@ require 'base64'
         return v.to_s.strip
       end; raw.to_s.strip
     end,
-
     normalize_boolean: lambda do |v|
       %w[true 1 yes on].include?(v.to_s.strip.downcase)
     end,
-
     normalize_input_keys: lambda do |input|
       (input || {}).to_h.transform_keys(&:to_s)
     end,
-
     normalize_drive_resource_id: lambda do |raw|
       # Accepts:
       #   - raw ID strings: "1AbC_def-123"
@@ -2145,7 +2731,6 @@ require 'base64'
       v = '' if v.length < 8 && prior.start_with?('http')
       v
     end,
-
     normalize_drive_file_id:   lambda { |raw| call(:normalize_drive_resource_id, raw) },
     normalize_drive_folder_id: lambda { |raw| call(:normalize_drive_resource_id, raw) },
     normalize_retrieve_contexts!: lambda do |raw_resp|
@@ -2156,17 +2741,14 @@ require 'base64'
       arr = arr['contexts'] if arr.is_a?(Hash) && arr.key?('contexts')
       Array(arr)
     end,
-
     normalize_index_endpoint_identifier: lambda do |raw|
       return '' if raw.nil? || raw == false
       raw.to_s.strip
     end,
-
     normalize_index_identifier: lambda do |raw|
       return '' if raw.nil? || raw == false
       raw.to_s.strip
     end,
-
     build_rag_retrieve_payload: lambda do |question, rag_corpus, restrict_ids = []|
       rag_res = { 'ragCorpus' => rag_corpus }
       ids     = call(:sanitize_drive_ids, restrict_ids, allow_empty: true, label: 'restrict_to_file_ids')
@@ -2177,7 +2759,6 @@ require 'base64'
         'vertexRagStore' => { 'ragResources'  => [rag_res] }
       }
     end,
-
     map_context_chunks: lambda do |raw_contexts, maxn = 20|
       call(:safe_array, raw_contexts).first(maxn).each_with_index.map do |c, i|
         {
@@ -2190,7 +2771,6 @@ require 'base64'
         }
       end
     end,
-
     build_rag_import_payload!: lambda do |input|
       # Validates XOR and constructs { importRagFilesConfig: { ... } }
       has_gcs   = call(:safe_array, input['gcs_uris']).present?
@@ -2230,7 +2810,6 @@ require 'base64'
 
       { 'importRagFilesConfig' => cfg }
     end,
-
     build_index_path: lambda do |connection, index|
       id = call(:normalize_index_identifier, index)
       return id.sub(%r{^/v1/}, '') if id.start_with?('projects/')
@@ -2239,7 +2818,6 @@ require 'base64'
       error("Index requires regional location; got '#{loc}'") if loc.blank? || loc == 'global'
       "projects/#{connection['project_id']}/locations/#{loc}/indexes/#{id}"
     end,
-
     build_index_endpoint_path: lambda do |connection, ep|
       v = call(:normalize_index_endpoint_identifier, ep)
       return v.sub(%r{^/v1/}, '') if v.start_with?('projects/')
@@ -2255,19 +2833,15 @@ require 'base64'
       return v  if v.is_a?(Array)
       [v]
     end,
-
     safe_integer: lambda do |v|
       return nil if v.nil?; Integer(v) rescue v.to_i
     end,
-
     safe_float: lambda do |v|
       return nil if v.nil?; Float(v)   rescue v.to_f
     end,
-
     clamp_int: lambda do |n, min, max|
       [[n.to_i, min].max, max].min
     end,
-
     sanitize_embedding_params: lambda do |raw|
       h = {}
       # Only include autoTruncate when explicitly true (keeps payload minimal)
@@ -2280,7 +2854,6 @@ require 'base64'
       end
       h
     end,
-  
     sanitize_generation_config: lambda do |cfg|
       return nil if cfg.nil? || (cfg.respond_to?(:empty?) && cfg.empty?)
       g = cfg.dup
@@ -2303,7 +2876,6 @@ require 'base64'
       g.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
       g
     end,
-
     sanitize_contents_roles: lambda do |contents|
       call(:safe_array, contents).map do |c|
         h = c.is_a?(Hash) ? c.transform_keys(&:to_s) : {}
@@ -2314,7 +2886,6 @@ require 'base64'
         h
       end.compact
     end,
-
     sanitize_drive_ids: lambda do |raw_list, allow_empty: false, label: 'drive_file_ids'|
       # 1) normalize → 2) drop empties → 3) de-dup
       norm = call(:safe_array, raw_list)
@@ -2328,7 +2899,6 @@ require 'base64'
       error("Invalid Drive ID in #{label}: #{bad}") if bad
       norm
     end,
-
     sanitize_feature_vector: lambda do |arr|
       call(:safe_array, arr).map { |x| call(:safe_float, x) }.reject { |x| x.nil? }
     end,
@@ -2342,7 +2912,6 @@ require 'base64'
       error('Embedding prediction missing values') if vec.blank?
       vec.map(&:to_f)
     end,
-
     vector_cosine_similarity: lambda do |a, b|
       return 0.0 if a.blank? || b.blank?
       error("Embedding dimensions differ: #{a.length} vs #{b.length}") if a.length != b.length
@@ -2354,7 +2923,6 @@ require 'base64'
       denom = Math.sqrt(sum_a) * Math.sqrt(sum_b)
       denom.zero? ? 0.0 : (dot / denom)
     end,
-
     embedding_max_instances: lambda do |model_path_or_id|
       id = model_path_or_id.to_s.split('/').last
       if id.start_with?('gemini-embedding-001')
@@ -2363,7 +2931,6 @@ require 'base64'
         250
       end
     end,
-
     predict_embeddings: lambda do |connection, model_path, instances, params={}|
       max  = call(:embedding_max_instances, model_path)
       preds = []
@@ -2392,7 +2959,6 @@ require 'base64'
       return nil if text.blank?
       { 'role' => 'system', 'parts' => [ { 'text' => text.to_s } ] }
     end,
-
     format_context_chunks: lambda do |chunks|
       # Stable, parseable layout the model can learn
       call(:safe_array, chunks).each_with_index.map { |c, i|
@@ -2412,11 +2978,9 @@ require 'base64'
         "#{header}\n#{body}#{meta_str}"
       }.join("\n\n---\n\n")
     end,
-
     safe_parse_json: lambda do |s|
       JSON.parse(s) rescue { 'answer' => s }
     end,
-
     llm_referee: lambda do |connection, model, email_text, shortlist_names, all_cats, fallback_category = nil|
       # Minimal, schema-constrained JSON referee using Gemini
       model_path = call(:build_model_path_with_global_preview, connection, model)
@@ -2507,8 +3071,7 @@ require 'base64'
       parsed
     end,
 
-    # --- RAG helpers ------------------------------------------------------
-
+    # --- RAG helpers ------------------------------------------------------\
     normalize_rag_corpus: lambda do |connection, raw|
       v = raw.to_s.strip
       return '' if v.blank?
@@ -2529,7 +3092,6 @@ require 'base64'
     end,
 
     # --- Miscellaneous ----------------------------------------------------
-    
     build_email_text: lambda do |subject, body|
       # Build a single email text body for classification
       s = subject.to_s.strip
@@ -2539,21 +3101,18 @@ require 'base64'
       parts << "Body:\n#{b}"    if b.present?
       parts.join("\n\n")
     end,
-
     safe_map: lambda do |v|
       # Like Array#map but safe against nil/false/non-arrays.
       call(:safe_array, v).map { |x| yield(x) }
     end,
-
     request_headers: lambda do |correlation_id, extra=nil|
       base = {
-        'X-Correlation-Id': correlation_id.to_s,
-        'Content-Type':      'application/json',
-        'Accept':            'application/json'
+        'X-Correlation-Id' => correlation_id.to_s,
+        'Content-Type'     => 'application/json',
+        'Accept'           => 'application/json'
       }
       extra.is_a?(Hash) ? base.merge(extra) : base
     end,
-
     json_compact: lambda do |obj|
       # Compact a JSON-able Hash/Array without mutating the caller:
       # - Removes nil
