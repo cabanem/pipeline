@@ -18,15 +18,6 @@
         hint: 'GCP project ID (inferred from key if blank)' },
       { name: 'user_project',               optional: true,   control_type: 'text',      label: 'User project for quota/billing',
         extends_schema: true, hint: 'Sets x-goog-user-project for billing/quota. Service account must have roles/serviceusage.serviceUsageConsumer on this project.' },
-      # Dynamic model listing
-      { name: 'dynamic_models',             optional: true,   control_type: 'checkbox',   label: 'Refresh model list from API (Model Garden)',
-        type: 'boolean',  default: false, hint: 'Keep OFF for Builder stability. Use manual entry or run a refresh action if you add one.' },
-      { name: 'include_preview_models',     optional: true,   control_type: 'checkbox',   label: 'Include preview/experimental models',
-        type: 'boolean',  default: false, sticky: true },
-      { name: 'validate_model_on_run',      optional: true,   control_type: 'checkbox',   label: 'Validate model before run',
-        type: 'boolean',  default: true, sticky: true },
-      { name: 'manual_model_entry_only',    optional: true,   control_type: 'checkbox',   label: 'Manual model entry only',
-        type: 'boolean', default: false, hint: 'Hide picklists in forms; require fully-qualified model paths.' },
 
       # Defaults for test probe
       { name: 'set_defaults_for_probe',     optional: false,  control_type: 'checkbox', 
@@ -99,11 +90,12 @@
           'systemInstruction' => call(:system_instruction_from_text, 'Connection probe')
         })
     else
-      loc  = (connection['location'].presence || 'global').to_s.downcase
-      host = call(:aipl_service_host, connection, loc)
-      get("https://#{host}/v1beta1/publishers/google/models")
+      # Fallback: verify access by listing locations for the project (no model catalog dependency).
+      call(:ensure_project_id!, connection)
+      pid = connection['project_id']
+      get("https://aiplatform.googleapis.com/v1/projects/#{pid}/locations")
         .headers(call(:request_headers, call(:build_correlation_id)))
-        .params(pageSize: 1, view: 'BASIC')
+        .params pageSize: 1
     end
   end,
 
@@ -276,24 +268,17 @@
           # UX toggle
           { name: 'show_advanced', label: 'Show advanced options',
             type: 'boolean', control_type: 'checkbox', optional: true, default: false },
-
-          # Model (unified picklist + custom toggle)
-          { name: 'model', label: 'Model', optional: false,
-            control_type: 'select', pick_list: :models_generative,
-            extends_schema: true, hint: 'Select or paste a fully-qualified model.',
-            toggle_hint: 'Use custom value',
-            toggle_field: { name: 'model', label: 'Model', type: 'string', control_type: 'text',
-                            hint: 'Format: publishers/{publisher}/models/{id}' } },
+          # Model (free-text only)
+          { name: 'model', label: 'Model', optional: false, control_type: 'text',
+            hint: call(:model_id_hint) },
 
           # Contract-friendly content
           { name: 'contents', type: 'array', of: 'object',
             properties: object_definitions['content'], optional: false },
-
           # Simple system text that we convert to systemInstruction object
           { name: 'system_preamble', label: 'System preamble (text)', optional: true,
             hint: 'Optional; becomes systemInstruction.parts[0].text' }
         ]
-
         adv = [
           { name: 'tools', type: 'array', of: 'object', properties: [
               { name: 'googleSearch',    type: 'object' },
@@ -726,8 +711,8 @@
 
       input_fields: lambda do |_|
         [
-          { name: 'model', label: 'Model', optional: false, control_type: 'select', pick_list: 'models_generative',
-            toggle_hint: 'Use custom value', toggle_field: { name: 'model', label: 'Model', type: 'string', control_type: 'text' } },
+          { name: 'model', label: 'Model', optional: false, control_type: 'text',
+            hint: call(:model_id_hint) },
           { name: 'rag_corpus', optional: false,
             hint: 'projects/{project}/locations/{region}/ragCorpora/{corpus}' },
           { name: 'question', optional: false },
@@ -886,19 +871,8 @@
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
 
-      config_fields: [
-        { name: 'refresh_model_catalog', type: 'boolean', control_type: 'checkbox', label: 'Refresh model catalog on open',
-          optional: true, default: true }
-      ]
-      input_fields: lambda do |object_definitions, connection, config_fields|
-        if connection['dynamic_models'] && config_fields['refresh_model_catalog'] == true
-          begin
-            call('fetch_publisher_models', connection, 'google') # warms
-          rescue => e
-            puts "Model catalog warmup skipped: #{e.message}"
-          end
-        end
-        object_definitions['gen_generate_content_imput']
+      input_fields: lambda do |object_definitions, _connection, _config_fields|
+        object_definitions['gen_generate_content_input']
       end,
 
       output_fields: lambda do |object_definitions|
@@ -909,11 +883,6 @@
         # Correlation id and duration for logs / analytics
         t0 = Time.now
         corr = call(:build_correlation_id)
-
-        # Validate selected model (region + GA/preview policy)
-        begin
-          call(:validate_publisher_model!, connection, call(:build_model_path_with_global_preview, connection, input['model']).sub(%r{\A.*/v1/}, ''))
-        rescue => e; end
 
         # Compute model path
         model_path = call(:build_model_path_with_global_preview, connection, input['model'])
@@ -977,10 +946,9 @@
       input_fields: lambda do |object_definitions|
         [
           { name: 'contents', type: 'array', of: 'object', properties: object_definitions['content'], optional: false },
-          { name: 'model', label: 'Model', optional: false, control_type: 'select', pick_list: :models_generative,
-            toggle_hint: 'Use custom value', toggle_field: { name: 'model', label: 'Model', type: 'string', control_type: 'text' } },
+          { name: 'model', label: 'Model', optional: false, control_type: 'text',
+            hint: call(:model_id_hint)},
           { name: 'grounding', control_type: 'select', pick_list: 'modes_grounding', optional: false },
-
           { name: 'vertex_ai_search_datastore', optional: true,
             hint: 'projects/.../locations/.../collections/default_collection/dataStores/...' },
           { name: 'vertex_ai_search_serving_config', optional: true,
@@ -1002,11 +970,6 @@
         # Correlation id and duration for logs / analytics
         t0 = Time.now
         corr = call(:build_correlation_id)
-
-        # Validate selected model (region + GA/preview policy)
-        begin
-          call(:validate_publisher_model!, connection, call(:build_model_path_with_global_preview, connection, input['model']).sub(%r{\A.*/v1/}, ''))
-        rescue => e; end
 
         # Compute model path
         model_path = call(:build_model_path_with_global_preview, connection, input['model'])
@@ -1088,8 +1051,8 @@
 
       input_fields: lambda do |_|
         [
-          { name: 'model', label: 'Model', optional: false, control_type: 'select', pick_list: 'models_generative',
-            toggle_hint: 'Use custom value', toggle_field: { name: 'model', label: 'Model', type: 'string', control_type: 'text' } },
+          { name: 'model', label: 'Model', optional: false, control_type: 'text',
+            hint: call(:model_id_hint) },
           { name: 'question', optional: false },
 
           { name: 'context_chunks', type: 'array', of: 'object', optional: false, properties: [
@@ -1134,11 +1097,6 @@
         # Correlation id and duration for logs/analytics
         t0 = Time.now
         corr = call(:build_correlation_id)
-
-        # Validate selected model (region + GA/preview policy)
-        begin
-          call(:validate_publisher_model!, connection, call(:build_model_path_with_global_preview, connection, input['model']).sub(%r{\A.*/v1/}, ''))
-        rescue => e; end
 
         begin
           model_path = call(:build_model_path_with_global_preview, connection, input['model'])
@@ -1232,7 +1190,7 @@
       end
     },
 
-    # 3) Embeddings
+    # 4) Embeddings
     embed_text: {
       title: 'Embeddings: Embed text',
       subtitle: 'Get embeddings from a publisher embedding model',
@@ -1246,14 +1204,11 @@
 
       input_fields: lambda do |_|
         [
-          { name: 'model', label: 'Embedding model', optional: false, control_type: 'select', pick_list: 'models_embedding', default: 'text-embedding-005',
-            hint: 'Select or use a custom value.', toggle_hint: 'Use custom value', toggle_field: { name: 'model', label: 'Embedding model', type: 'string', control_type: 'text' } },
+          { name: 'model', label: 'Embedding model', optional: false, control_type: 'text', default: 'text-embedding-005',
+            hint: call(:model_id_hint)},
           { name: 'texts', type: 'array', of: 'string', optional: false },
-
           { name: 'task', hint: 'Optional: RETRIEVAL_QUERY or RETRIEVAL_DOCUMENT' },
-
           { name: 'autoTruncate', type: 'boolean', hint: 'Truncate long inputs automatically' },
-
           { name: 'outputDimensionality', type: 'integer', optional: true, convert_input: 'integer_conversion',
             hint: 'Optional dimensionality reduction (see model docs).' }
         ]
@@ -1267,11 +1222,6 @@
         # Correlation id and duration for logs / analytics
         t0 = Time.now
         corr = call(:build_correlation_id)
-        
-        # Validate publisher model
-        begin
-          call(:validate_publisher_model!, connection, call(:build_embedding_model_path, connection, input['model']).sub(%r{\A.*/v1/}, ''))
-        rescue => e; end
 
         begin
           model_path = call(:build_embedding_model_path, connection, input['model'])
@@ -1325,7 +1275,7 @@
       end
     },
 
-    # 4) Predict
+    # 5) Predict
     endpoint_predict: {
       title: 'Prediction: Endpoint predict (custom model)',
       subtitle: 'POST :predict to a Vertex AI Endpoint',
@@ -1522,8 +1472,8 @@
 
       input_fields: lambda do |object_definitions|
         [
-          { name: 'model', label: 'Model', optional: false, control_type: 'select', pick_list: 'models_generative',
-            toggle_hint: 'Use custom value', toggle_field: { name: 'model', label: 'Model', type: 'string', control_type: 'text' } },
+          { name: 'model', label: 'Model', optional: false, control_type: 'text',
+            hint: call(:model_id_hint) },
           { name: 'contents', type: 'array', of: 'object', properties: object_definitions['content'], optional: false },
           { name: 'system_preamble', label: 'System preamble (text)', optional: true }
         ]
@@ -1541,11 +1491,6 @@
         # Correlation id and duration for logs / analytics
         t0 = Time.now
         corr = call(:build_correlation_id)
-
-        # Validate selected model (region + GA/preview policy)
-        begin
-          call(:validate_publisher_model!, connection, call(:build_model_path_with_global_preview, connection, input['model']).sub(%r{\A.*/v1/}, ''))
-        rescue => e; end
 
         # Compute model path
         model_path = call(:build_model_path_with_global_preview, connection, input['model'])
@@ -1580,48 +1525,6 @@
           'ok' => true,
           'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr' } }
       end
-    },
-
-    models_refresh_catalog: {
-      title: 'Model: Refresh live catalog',
-      subtitle: 'Fetch publisher models and cache for picklists',
-      display_priority: 10,
-      input_fields: lambda do |_|
-        [
-          { name: 'publisher', optional: true, default: 'google' },
-          { name: 'view', optional: true, default: 'BASIC', hint: 'BASIC or FULL' }
-        ]
-      end,
-      output_fields: lambda do |_|
-        [
-          { name: 'generative', type: 'array', of: 'string' },
-          { name: 'embedding',  type: 'array', of: 'string' },
-          { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object', properties: [
-            { name: 'http_status', type: 'integer' },
-            { name: 'message' }, { name: 'duration_ms', type: 'integer' },
-            { name: 'correlation_id' }
-          ]}
-        ]
-      end,
-      execute: lambda do |connection, input|
-        t0 = Time.now; corr = call(:build_correlation_id)
-        begin
-          ids = call(:list_publisher_models!, connection,
-                    publisher: (input['publisher'].presence || 'google'),
-                    view: (input['view'].presence || 'BASIC'))
-          gen = call(:filter_generative_models, ids).uniq.sort
-          emb = call(:filter_embedding_models,  ids).uniq.sort
-          # Write to connection-scoped cache (same pattern you use for tokens)
-          cache = (connection['__models_cache'] ||= {})
-          cache['cached|generative'] = { 'items' => gen, 'expires_at' => (Time.now + 3600).utc.iso8601 }
-          cache['cached|embedding']  = { 'items' => emb, 'expires_at' => (Time.now + 3600).utc.iso8601 }
-          { 'generative' => gen, 'embedding' => emb }
-            .merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
-        rescue => e
-          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
-        end
-      end
     }
 
   },
@@ -1635,23 +1538,6 @@
 
     modes_grounding: lambda do
       [%w[Google\ Search google_search], %w[Vertex\ AI\ Search vertex_ai_search]]
-    end,
-
-    models_embedding: lambda do |connection|
-      static = [
-        ['Text-embedding-005', 'publishers/google/models/text-embedding-005'],
-        ['Text-embedding-004', 'publishers/google/models/text-embedding-004']
-      ]
-      call('dynamic_model_picklist', connection, :embedding, static)
-    end,
-
-    models_generative: lambda do |connection|
-      static = [
-        ['Gemini 2.5 Pro',  'publishers/google/models/gemini-2.5-pro'],
-        ['Gemini 2.5 Flash','publishers/google/models/gemini-2.5-flash'],
-        ['Gemini 2.0 Flash','publishers/google/models/gemini-2.0-flash-001']
-      ]
-      call('dynamic_model_picklist', connection, :text, static)
     end,
 
     # Contract-conformant roles (system handled via system_preamble)
@@ -1949,160 +1835,6 @@
         "projects/#{connection['project_id']}/locations/#{loc}/#{m}"
       else
         "projects/#{connection['project_id']}/locations/#{loc}/publishers/google/models/#{m}"
-      end
-    end,
-
-    list_publisher_models!: lambda do |connection, publisher: 'google', view: 'BASIC'|
-      # Cache key per host + view
-      cache = (connection['__models_cache'] ||= {})
-      loc   = (connection['location'].presence || 'global').to_s.downcase
-      hosts = [call(:aipl_service_host, connection, loc), 'aiplatform.googleapis.com'].uniq
-
-      models = []
-      hosts.each do |host|
-        ckey = "#{host}|#{publisher}|#{view}"
-        entry = cache[ckey]
-        if entry && entry['expires_at'] && Time.parse(entry['expires_at']) > Time.now
-          models.concat(entry['items'])
-          next
-        end
-
-        # Page through results
-        parent = "publishers/#{publisher}"
-        url    = "https://#{host}/v1beta1/#{parent}/models"
-        token  = nil
-        items  = []
-
-        begin
-          loop do
-            resp = get(url)
-                    .headers(call(:request_headers, call(:build_correlation_id)))
-                    .params({ pageSize: 200, pageToken: token, view: view }.compact)
-
-            items.concat(call(:safe_array, resp['publisherModels']))
-            token = resp['nextPageToken']
-            break if token.to_s.empty?
-          end
-        rescue => _e
-          # If this host fails (e.g., blocked global), move on to next host
-          items = []
-        end
-
-        ids = items.map { |m| m['name'].to_s.split('/').last }.reject(&:blank?).uniq
-        # Cache ~15 minutes
-        cache[ckey] = { 'items' => ids, 'expires_at' => (Time.now + 900).utc.iso8601 }
-        models.concat(ids)
-      end
-
-      models.uniq
-    end,
-
-    filter_embedding_models: lambda do |ids|
-      # Heuristics that age better than `^gemini-`
-      ids.select { |id| id =~ /(embedding|embed)/i }
-    end,
-
-    filter_generative_models: lambda do |ids|
-      # Keep Gemini and friends; avoid stable-diffusion etc for text generation pickers
-      ids.select { |id| id =~ /\Agemini[-\w]*/i || id =~ /(flash|pro|ultra)/i }
-    end,
-
-    fetch_publisher_models: lambda do |connection, publisher = 'google'|
-      region = (connection['location'].presence || 'us-central1').to_s
-      include_preview = !!connection['include_preview_models']
-      cache_key = "models|#{region}|#{publisher}|preview=#{include_preview}"
-      begin
-        cached = workato.cache.get(cache_key)
-        if cached.is_a?(Hash)
-          ts = Time.parse(cached['cached_at']) rescue nil
-          return cached['models'] if ts && ts > (Time.now - 3600)
-        end
-      rescue; end
-      models = call(:fetch_fresh_publisher_models, connection, publisher, region)
-      begin
-        workato.cache.set(cache_key, { 'models' => models, 'cached_at' => Time.now.utc.iso8601 }, 3600) if models.present?
-      rescue; end
-      models
-    end,
-
-    fetch_fresh_publisher_models: lambda do |connection, publisher, region|
-      host = "https://#{region}-aiplatform.googleapis.com"
-      url  = "#{host}/v1beta1/publishers/#{publisher}/models"
-      items, token, pages = [], nil, 0
-      begin
-        loop do
-          resp = get(url)
-                   .headers(call(:request_headers, call(:build_correlation_id)))
-                   .params(page_size: 500, page_token: token, view: 'PUBLISHER_MODEL_VIEW_BASIC')
-          items.concat(Array(resp['publisherModels']))
-          token = resp['nextPageToken']
-          pages += 1
-          break if token.to_s.empty? || pages >= 5
-        end
-      rescue
-        return []
-      end
-      items
-    end,
-
-    vertex_model_bucket: lambda do |model_id|
-      id = model_id.to_s.downcase
-      return :embedding if id =~ /(embedding|embed)/
-      return :image     if id =~ /(vision|image|imagen)/
-      :text
-    end,
-
-    to_model_options: lambda do |models, bucket:, include_preview: false|
-      return [] if models.blank?
-      retired = /(^|-)1\.0-|text-bison|chat-bison/
-      seen = {}
-      models.filter_map do |m|
-        name = m['name'].to_s # publishers/google/models/<id>
-        id   = name.split('/').last
-        next if id.blank? || id =~ retired
-        next unless call(:vertex_model_bucket, id) == bucket
-        stage = m['launchStage'].to_s
-        next if !include_preview && stage.present? && stage != 'GA'
-        next if seen[id]; seen[id] = true
-        label = id.gsub('-', ' ').split.map { |w| w =~ /^\d/ ? w : w.capitalize }.join(' ')
-        [label, "publishers/google/models/#{id}"]
-      end
-    end,
-
-    dynamic_model_picklist: lambda do |connection, bucket, static_fallback|
-      # Honor manual-only mode: no picklist options → forces “custom value” path
-      if connection['manual_model_entry_only'] == true
-        return []
-      end
-      # Never block Builder: only fetch live if explicitly enabled; otherwise return static.
-      unless connection['dynamic_models']
-        return static_fallback
-      end
-      begin
-        models = call(:fetch_publisher_models, connection, 'google')
-        opts   = call(:to_model_options, models,
-                      bucket: bucket,
-                      include_preview: !!connection['include_preview_models'])
-        (opts.presence || static_fallback)
-      rescue
-        static_fallback
-      end
-    end,
-
-    # Validate selected model at run time (region + GA/preview policy)
-    validate_publisher_model!: lambda do |connection, model_name|
-      return if model_name.to_s.empty? || connection['validate_model_on_run'] != true
-      unless model_name =~ %r{\Apublishers/[^/]+/models/[^/]+\z}
-        error("Invalid model: #{model_name}. Expected: publishers/{publisher}/models/{id}")
-      end
-      region = (connection['location'].presence || 'us-central1').to_s
-      url = "https://#{region}-aiplatform.googleapis.com/v1/#{model_name}"
-      resp = get(url)
-               .headers(call(:request_headers, call(:build_correlation_id)))
-               .params(view: 'PUBLISHER_MODEL_VIEW_BASIC')
-      if !connection['include_preview_models']
-        stage = resp['launchStage'].to_s
-        error("Model is #{stage} (not GA) in #{region}. Enable preview models to proceed.") if stage.present? && stage != 'GA'
       end
     end,
 
@@ -2545,6 +2277,14 @@
       loc = (connection['location'] || '').to_s.downcase
       error("RAG corpus requires regional location; got '#{loc}'") if loc.blank? || loc == 'global'
       "projects/#{connection['project_id']}/locations/#{loc}/ragCorpora/#{v}"
+    end,
+
+    # --- Hints ------------------------------------------------------------
+    model_id_hint: lambda do
+      'Free-text model id. Short: "gemini-2.5-pro" or "text-embedding-005". ' \
+      'Publisher form: "publishers/google/models/{id}". ' \
+      'Full: "projects/{project}/locations/{region}/publishers/google/models/{id}".' \
+      'Tip: find ids in Vertex Model Garden or via REST GET v1/projects/{project}/locations/{region}/publishers/google/models/*.'
     end,
 
     # --- Miscellaneous ----------------------------------------------------
