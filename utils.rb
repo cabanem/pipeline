@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'json'
+require 'time'
 require 'securerandom'
 require 'digest'
 
@@ -130,7 +131,7 @@ require 'digest'
   object_definitions: {
 
     chunk_object: {
-      fields: lambda do
+      fields: lambda do |_connection, _config, _object_definitions|
         [
           { name: 'chunk_id' },
           { name: 'chunk_index', type: 'integer' },
@@ -144,11 +145,11 @@ require 'digest'
     },
 
     chunking_result: {
-      fields: lambda do
+      fields: lambda do |_connection, _config, _object_definitions|
         [
           { name: 'chunks_count', type: 'integer' },
-          { name: 'chunks', type: 'array', of: 'object', properties: call('chunk_object') },
-          { name: 'first_chunk', type: 'object', properties: call('chunk_object') },
+          { name: 'chunks', type: 'array', of: 'object', properties: object_definitions['chunk_object'] },
+          { name: 'first_chunk', type: 'object', properties: object_definitions['chunk_object'] },
           { name: 'chunks_json' },
           { name: 'total_chunks', type: 'integer' },
           { name: 'total_tokens', type: 'integer' },
@@ -230,13 +231,13 @@ require 'digest'
     },
 
     classification_result: {
-      fields: lambda do
+      fields: lambda do |_connection, _config, _object_definitions|
         [
           { name: 'pattern_match', type: 'boolean' },
           { name: 'rule_source' },
           { name: 'selected_action' },
-          { name: 'top_match', type: 'object', properties: call('classification_rules_row') },
-          { name: 'matches', type: 'array', of: 'object', properties: call('classification_rules_row') },
+          { name: 'top_match', type: 'object', properties: object_definitions['classification_rules_row'] },
+          { name: 'matches', type: 'array', of: 'object', properties: object_definitions['classification_rules_row'] },
           { name: 'standard_signals', type: 'object',
             properties: [
               { name: 'sender_flags', type: 'array', of: 'string' },
@@ -348,10 +349,10 @@ require 'digest'
     },
 
     batch_of_chunks: {
-      fields: lambda do
+      fields: lambda do |_connection, _config, _object_definitions|
         [
           { name: 'batch_id' },
-          { name: 'chunks', type: 'array', of: 'object', properties: call('chunk_object') },
+          { name: 'chunks', type: 'array', of: 'object', object_definitions['chunk_object'] },
           { name: 'document_count', type: 'integer' },
           { name: 'chunk_count', type: 'integer' },
           { name: 'batch_index', type: 'integer' }
@@ -360,9 +361,9 @@ require 'digest'
     },
 
     prepare_document_batch_result: {
-      fields: lambda do
+      fields: lambda do |_connection, _config, _object_definitions|
         [
-          { name: 'batches', type: 'array', of: 'object', properties: call('batch_of_chunks') },
+          { name: 'batches', type: 'array', of: 'object', properties: object_definitions['batch_of_chunks'] },
           { name: 'summary', type: 'object',
             properties: [
               { name: 'total_documents', type: 'integer' },
@@ -396,9 +397,9 @@ require 'digest'
     },
 
     gcs_chunk_and_embed_result: {
-      fields: lambda do
+      fields: lambda do |_connection, _config, _object_definitions|
         [
-          { name: 'chunks', type: 'array', of: 'object', properties: call('chunk_object') },
+          { name: 'chunks', type: 'array', of: 'object', properties: object_definitions['chunk_object'] },
           { name: 'chunk_count', type: 'integer' },
           { name: 'objects_processed', type: 'integer' },
           { name: 'skipped_objects', type: 'array', of: 'object',
@@ -406,7 +407,7 @@ require 'digest'
               { name: 'bucket' }, { name: 'name' }, { name: 'reason' }
             ]
           },
-          { name: 'embedding', type: 'object', properties: call('embedding_batch_result') },
+          { name: 'embedding', type: 'object', properties: object_definitions['embedding_batch_result'] },
           { name: 'telemetry', type: 'object',
             properties: [
               { name: 'success', type: 'boolean' },
