@@ -1838,6 +1838,164 @@ require 'securerandom'
                                       true)
         }
       end
+    },
+    # --- 19. Compare tabular data and emit deltas --------------------------
+    delta_compare_sheets_vs_datatable: {
+      title: 'Delta: Sheets → Data Table',
+      subtitle: 'Compare two lists of records by key and compute creates/updates/deletes',
+      help: lambda do |_|
+        { body: 'Provide a primary key and two arrays of records (from Google Sheets and from Data Tables). Returns creates, updates (with diffs), deletes, unchanged, and a summary.' }
+      end,
+      display_priority: 2,
+
+      config_fields: [
+        { name: 'primary_key', optional: false, hint: 'Field name used as the unique key (e.g., "id" or "email")' },
+        { name: 'ignore_fields', optional: true, type: 'array', of: 'string',
+          hint: 'Fields to ignore during comparison (e.g., ["updated_at","_rowNumber"])' },
+        { name: 'case_insensitive_keys', type: 'boolean', control_type: 'checkbox', optional: true,
+          hint: 'Normalize primary key compare using String#downcase' },
+        { name: 'blank_as_nil', type: 'boolean', control_type: 'checkbox', optional: true,
+          hint: 'Treat "", "  ", and nil as equivalent (nil) when comparing values' },
+        { name: 'include_unchanged', type: 'boolean', control_type: 'checkbox', optional: true,
+          hint: 'Include unchanged records in the output' }
+      ],
+
+      input_fields: lambda do |_|
+        [
+          { name: 'source_rows', label: 'Source rows (Google Sheets)', type: 'array', of: 'object', optional: false,
+            hint: 'Typically map from Google Sheets → "List rows" or "Read range" output' },
+          { name: 'target_rows', label: 'Target rows (Data Table)', type: 'array', of: 'object', optional: false,
+            hint: 'Map from Data Tables → "List rows" or HTTP Data Tables API call' }
+        ]
+      end,
+
+      output_fields: lambda do |_|
+        [
+          { name: 'summary', type: 'object', properties: [
+            { name: 'primary_key' }, { name: 'source_count', type: 'integer' },
+            { name: 'target_count', type: 'integer' }, { name: 'creates', type: 'integer' },
+            { name: 'updates', type: 'integer' }, { name: 'deletes', type: 'integer' },
+            { name: 'unchanged', type: 'integer' }
+          ]},
+          { name: 'creates', type: 'array', of: 'object' },
+          { name: 'updates', type: 'array', of: 'object', properties: [
+            { name: 'key' },
+            { name: 'before', type: 'object' },
+            { name: 'after',  type: 'object' },
+            { name: 'diff',   type: 'array', of: 'object', properties: [
+              { name: 'field' }, { name: 'before' }, { name: 'after' }
+            ]}
+          ]},
+          { name: 'deletes', type: 'array', of: 'object' },
+          { name: 'unchanged', type: 'array', of: 'object' }
+        ]
+      end,
+
+      execute: lambda do |connection, input|
+        # -------- helpers (pure functions) -----------------------------------
+        deep_copy = lambda { |obj| JSON.parse(JSON.dump(obj)) }
+
+        normalize_key = lambda do |v, case_insensitive|
+          return nil if v.nil?
+          return v.to_s.strip.downcase if case_insensitive && v.is_a?(String)
+          v.is_a?(String) ? v.strip : v
+        end
+
+        blank_to_nil = lambda do |v|
+          return nil if v.nil?
+          return nil if v.is_a?(String) && v.strip == ''
+          v
+        end
+
+        normalize_value = lambda do |v, blank_as_nil|
+          v = blank_to_nil.call(v) if blank_as_nil
+          # Coerce numbers that are stringified (common from Sheets)
+          if v.is_a?(String)
+            if v =~ /\A-?\d+\z/
+              v = v.to_i
+            elsif v =~ /\A-?\d+\.\d+\z/
+              v = v.to_f
+            end
+          end
+          v
+        end
+
+        # Compare two records excluding ignore_fields; returns diff list
+        record_diff = lambda do |before, after, ignore_fields, opts|
+          diffs = []
+          all_fields = (before.keys + after.keys).uniq - ignore_fields
+          all_fields.each do |f|
+            b = normalize_value.call(before[f], opts[:blank_as_nil])
+            a = normalize_value.call(after[f],  opts[:blank_as_nil])
+            diffs << { 'field' => f, 'before' => b, 'after' => a } unless b == a
+          end
+          diffs
+        end
+
+        # -------- inputs & normalization -------------------------------------
+        pk              = input['primary_key'] || raise('primary_key is required')
+        ignore_fields   = Array(input['ignore_fields']).map(&:to_s)
+        case_ins_keys   = !!input['case_insensitive_keys']
+        blank_as_nil    = !!input['blank_as_nil']
+        include_unch    = !!input['include_unchanged']
+
+        src_rows = deep_copy.call(input['source_rows'] || [])
+        tgt_rows = deep_copy.call(input['target_rows'] || [])
+
+        # Hash index by primary key
+        index_by = lambda do |rows|
+          rows.each_with_object({}) do |r, h|
+            key = normalize_key.call(r[pk], case_ins_keys)
+            next if key.nil? # skip rows without key
+            h[key] ||= r
+          end
+        end
+
+        src_index = index_by.call(src_rows)
+        tgt_index = index_by.call(tgt_rows)
+
+        # -------- delta computation ------------------------------------------
+        creates   = []
+        updates   = []
+        deletes   = []
+        unchanged = []
+
+        # Creates/Updates/Unchanged (iterate source of truth: Sheets)
+        src_index.each do |k, src|
+          if !tgt_index.key?(k)
+            creates << src
+          else
+            tgt = tgt_index[k]
+            diffs = record_diff.call(tgt, src, ignore_fields, { blank_as_nil: blank_as_nil })
+            if diffs.empty?
+              unchanged << src if include_unch
+            else
+              updates << { 'key' => k, 'before' => tgt, 'after' => src, 'diff' => diffs }
+            end
+          end
+        end
+
+        # Deletes (in target but not in source)
+        (tgt_index.keys - src_index.keys).each do |k|
+          deletes << tgt_index[k]
+        end
+
+        {
+          summary: {
+            primary_key: pk,
+            source_count: src_rows.length,
+            target_count: tgt_rows.length,
+            creates: creates.length,
+            updates: updates.length,
+            deletes: deletes.length,
+            unchanged: unchanged.length
+          },
+          creates: creates,
+          updates: updates,
+          deletes: deletes,
+          unchanged: unchanged
+        }
+      end
     }
 
   },
