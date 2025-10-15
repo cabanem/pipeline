@@ -331,12 +331,11 @@
             ],
             hint: 'At least 2. You can also pass simple strings (names only).' },
 
-          { name: 'embedding_model', label: 'Embedding model', control_type: 'select', pick_list: 'models_embedding', optional: true,
-            default: 'text-embedding-005', hint: 'Used in embedding or hybrid modes.' },
+          { name: 'embedding_model', label: 'Embedding model', control_type: 'text', optional: true,
+            default: 'text-embedding-005', hint: call(:model_id_hint) + ' Used in embedding or hybrid modes.' },
 
-          { name: 'generative_model', label: 'Generative model',
-            control_type: 'select', pick_list: 'models_generative', optional: true,
-            hint: 'Required for generative mode. Optional in hybrid (for explanation).' },
+          { name: 'generative_model', label: 'Generative model', control_type: 'text', optional: true,
+            hint: call(:model_id_hint) + ' Required for generative mode. Optional in hybrid (for explanation).' },
 
           { name: 'min_confidence', type: 'number', optional: true, default: 0.25,
             hint: '0–1. If top score falls below this, fallback is used.' },
