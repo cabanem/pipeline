@@ -1,9 +1,3 @@
-require 'digest'
-require 'time'
-require 'json'
-require 'csv'
-require 'securerandom'
-
 # frozen_string_literal: true
 
 require 'json'
@@ -73,11 +67,11 @@ require 'digest'
 
         # prefer paragraph break, then sentence break, near the end
         if tentative_end < text.length
-          para_rel = call(:util_last_boundary_end, segment, /\n{2,}/)
+          para_rel = call(:util_last_boundary_end, segment, %r{(?:\r?\n){2,}})
           chunk_end = i + para_rel if para_rel
         end
         if chunk_end == tentative_end && tentative_end < text.length
-          sent_rel = call(:util_last_boundary_end, segment, /[.!?]["')\]]?\s/)
+          sent_rel = call(:util_last_boundary_end, segment, %r{[.!?](?:"|'|\)|\])?\s})
           chunk_end = i + sent_rel if sent_rel
         end
 
@@ -452,10 +446,10 @@ require 'digest'
 
         # Remove common noise: signatures, quoted replies, html-ish tags
         cleaned = raw
-          .gsub(/(?mi)^>.*$/, '')                    # strip quoted lines
-          .gsub(/(?mi)^On .* wrote:.*\z/m, '')       # strip “On X wrote”
-          .gsub(/<[^>]+>/, '')                       # strip html-ish tags
-          .gsub(/(?mi)^\s*--\s*$.*\z/, '')           # strip signature block from delimiter
+          .gsub(%r{(?mi)^>.*$}, '')                    # strip quoted lines
+          .gsub(%r{(?mi)^On .* wrote:.*\z}m, '')       # strip “On X wrote”
+          .gsub(%r{<[^>]+>}, '')                       # strip html-ish tags
+          .gsub(%r{(?mi)^\s*--\s*$.*\z}, '')           # strip signature block from delimiter
           .strip
         ops << 'strip_html' if cleaned.length != raw.length
 
@@ -498,10 +492,10 @@ require 'digest'
         started = Time.now
         raw = input['text'].to_s
         cleaned = raw
-          .gsub(/(?mi)^>.*$/, '')                    # strip quoted lines
-          .gsub(/(?mi)^On .* wrote:.*\z/m, '')       # strip “On X wrote”
-          .gsub(/<[^>]+>/, '')                       # strip html-ish tags
-          .gsub(/(?mi)^\s*--\s*$.*\z/, '')           # strip signature block from delimiter
+          .gsub(%r{(?mi)^>.*$}, '')                    # strip quoted lines
+          .gsub(%r{(?mi)^On .* wrote:.*\z}m, '')       # strip “On X wrote”
+          .gsub(%r{<[^>]+>}, '')                       # strip html-ish tags
+          .gsub(%r{(?mi)^\s*--\s*$.*\z}, '')           # strip signature block from delimiter
           .strip
         urls = cleaned.scan(%r{https?://\S+})
         removed = raw.scan(/(?mi)^>.*$/)
@@ -589,7 +583,7 @@ require 'digest'
         {
           'document_id'         => (input['document_id'] || call(:generate_document_id, 
                                                               input.dig('file_metadata','file_name') || 'doc',
-                                                              input.dig('file_metadata','checksum') || 'no_checksum'))
+                                                              input.dig('file_metadata','checksum') || 'no_checksum')),
           'chunks'              => chunks,
           'document_metadata'   => {
             'total_chunks' => chunks.size,
