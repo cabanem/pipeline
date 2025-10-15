@@ -1093,11 +1093,11 @@ require 'base64'
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
 
-      input_fields: lambda do |connection, config_fields, object_definitions|
+      input_fields: lambda do |connection, object_definitions|
         object_definitions['gen_generate_content_input']
       end,
 
-      output_fields: lambda do |object_definitions|
+      output_fields: lambda do |connection, object_definitions|
          Array(object_definitions['generate_content_output']) + Array(object_definitions['envelope_fields'])
       end,
 
@@ -1165,7 +1165,7 @@ require 'base64'
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
 
-      input_fields: lambda do |object_definitions, config_fields, object_definitions|
+      input_fields: lambda do |connection, object_definitions|
         [
           { name: 'contents', type: 'array', of: 'object', properties: object_definitions['content'], optional: false },
           { name: 'model', label: 'Model', optional: false, control_type: 'text',
@@ -1686,7 +1686,7 @@ require 'base64'
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
 
-      input_fields: lambda do |object_definitions, config_fields, object_definitions|
+      input_fields: lambda do |connection, object_definitions|
         [
           { name: 'model', label: 'Model', optional: false, control_type: 'text',
             hint: call(:model_id_hint) },
