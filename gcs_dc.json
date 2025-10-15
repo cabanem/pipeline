@@ -1,0 +1,682 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Drive Utilities – Upstream Endpoint Contracts",
+    "version": "0.2.1",
+    "description": "Per-endpoint/method contracts for Google Drive, Google Cloud Storage, and OAuth/OIDC interactions used by the connector."
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": { "type": "http", "scheme": "bearer" }
+    },
+    "parameters": {
+      "XCorrelationId": {
+        "name": "X-Correlation-Id",
+        "in": "header",
+        "required": false,
+        "schema": { "type": "string" },
+        "description": "Workato correlation id; added by connector."
+      },
+      "DriveSupportsAllDrives": {
+        "name": "supportsAllDrives",
+        "in": "query",
+        "required": false,
+        "schema": { "type": "boolean", "default": false }
+      },
+      "DriveIncludeItemsFromAllDrives": {
+        "name": "includeItemsFromAllDrives",
+        "in": "query",
+        "required": false,
+        "schema": { "type": "boolean", "default": false }
+      },
+      "DriveFields": {
+        "name": "fields",
+        "in": "query",
+        "required": false,
+        "schema": { "type": "string" },
+        "description": "Partial response selector."
+      }
+    },
+    "schemas": {
+      "GoogleJsonError": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": { "type": "integer" },
+              "message": { "type": "string" },
+              "status": { "type": "string" },
+              "errors": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "reason": { "type": "string" },
+                    "message": { "type": "string" },
+                    "location": { "type": "string" },
+                    "locationType": { "type": "string" }
+                  }
+                }
+              }
+            },
+            "required": ["code", "message"]
+          }
+        },
+        "required": ["error"]
+      },
+      "DriveOwner": {
+        "type": "object",
+        "properties": {
+          "displayName": { "type": "string" },
+          "emailAddress": { "type": "string" }
+        }
+      },
+      "DriveFile": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "mimeType": { "type": "string" },
+          "size": { "type": ["string", "integer"] },
+          "modifiedTime": { "type": "string" },
+          "md5Checksum": { "type": "string" },
+          "owners": { "type": "array", "items": { "$ref": "#/components/schemas/DriveOwner" } },
+          "shortcutDetails": {
+            "type": "object",
+            "properties": {
+              "targetId": { "type": "string" },
+              "targetMimeType": { "type": "string" }
+            }
+          },
+          "trashed": { "type": "boolean" },
+          "parents": { "type": "array", "items": { "type": "string" } }
+        },
+        "required": ["id", "name", "mimeType"]
+      },
+      "DriveListResponse": {
+        "type": "object",
+        "properties": {
+          "files": { "type": "array", "items": { "$ref": "#/components/schemas/DriveFile" } },
+          "nextPageToken": { "type": "string" },
+          "kind": { "type": "string" },
+          "incompleteSearch": { "type": "boolean" }
+        },
+        "required": ["files"]
+      },
+      "DriveChange": {
+        "type": "object",
+        "properties": {
+          "changeType": { "type": "string" },
+          "time": { "type": "string" },
+          "removed": { "type": "boolean" },
+          "fileId": { "type": "string" },
+          "file": { "$ref": "#/components/schemas/DriveFile" }
+        },
+        "required": ["changeType", "time", "removed"]
+      },
+      "DriveChangesResponse": {
+        "type": "object",
+        "properties": {
+          "changes": { "type": "array", "items": { "$ref": "#/components/schemas/DriveChange" } },
+          "nextPageToken": { "type": "string" },
+          "newStartPageToken": { "type": "string" },
+          "kind": { "type": "string" }
+        },
+        "required": ["changes"]
+      },
+      "DriveStartPageToken": {
+        "type": "object",
+        "properties": {
+          "startPageToken": { "type": "string" },
+          "kind": { "type": "string" }
+        },
+        "required": ["startPageToken"]
+      },
+      "GcsObject": {
+        "type": "object",
+        "properties": {
+          "bucket": { "type": "string" },
+          "name": { "type": "string" },
+          "size": { "type": ["string", "integer"] },
+          "contentType": { "type": "string" },
+          "updated": { "type": "string" },
+          "generation": { "type": "string" },
+          "md5Hash": { "type": "string" },
+          "crc32c": { "type": "string" },
+          "metadata": { "type": "object", "additionalProperties": { "type": "string" } }
+        },
+        "required": ["bucket", "name"]
+      },
+      "GcsListResponse": {
+        "type": "object",
+        "properties": {
+          "items": { "type": "array", "items": { "$ref": "#/components/schemas/GcsObject" } },
+          "nextPageToken": { "type": "string" },
+          "prefixes": { "type": "array", "items": { "type": "string" } },
+          "kind": { "type": "string" }
+        }
+      },
+      "OAuthTokenResponse": {
+        "type": "object",
+        "properties": {
+          "access_token": { "type": "string" },
+          "expires_in": { "type": "integer" },
+          "token_type": { "type": "string" },
+          "refresh_token": { "type": "string" },
+          "scope": { "type": "string" }
+        },
+        "required": ["access_token", "expires_in", "token_type"]
+      },
+      "OidcUserInfo": {
+        "type": "object",
+        "properties": {
+          "sub": { "type": "string" },
+          "name": { "type": "string" },
+          "email": { "type": "string" },
+          "picture": { "type": "string" }
+        },
+        "required": ["sub"]
+      },
+      "StreamingPredictResponse": {
+        "type": "object",
+        "properties": {
+          "outputs": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+          "parameters": { "type": "object", "additionalProperties": true }
+        },
+        "additionalProperties": true
+      },
+      "UploadMultipartMetadata": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "contentType": { "type": "string" },
+          "metadata": { "type": "object", "additionalProperties": { "type": "string" } }
+        },
+        "required": ["name"]
+      },
+      "Content": { "type": "object", "additionalProperties": true },
+      "Tool": { "type": "object", "additionalProperties": true },
+      "SafetySetting": { "type": "object", "additionalProperties": true },
+      "GenerationConfig": { "type": "object", "additionalProperties": true },
+      "GenerateContentResponse": { "type": "object", "additionalProperties": true }
+
+    }
+  },
+  "paths": {
+    "/drive/v3/about": {
+      "servers": [{ "url": "https://www.googleapis.com" }],
+      "get": {
+        "operationId": "drive.about.get",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "$ref": "#/components/parameters/DriveFields" },
+          { "$ref": "#/components/parameters/XCorrelationId" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Subset used by connector",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "user": { "type": "object" },
+                    "storageQuota": { "type": "object" }
+                  }
+                }
+              }
+            }
+          },
+          "default": { "description": "Error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GoogleJsonError" } } } }
+        },
+        "x-used-by": ["test() probe"]
+      }
+    },
+
+    "/drive/v3/files": {
+      "servers": [{ "url": "https://www.googleapis.com" }],
+      "get": {
+        "operationId": "drive.files.list",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "q", "in": "query", "required": false, "schema": { "type": "string" }, "description": "Query built by build_drive_query()" },
+          { "name": "pageSize", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 1000 } },
+          {
+            "name": "orderBy",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "description": "Comma-separated sort keys. Valid: createdTime, folder, modifiedByMeTime, modifiedTime, name, name_natural, quotaBytesUsed, recency, sharedWithMeTime, starred, viewedByMeTime; each key may be suffixed with ' desc'."
+            }
+          },
+          { "name": "pageToken", "in": "query", "schema": { "type": "string" } },
+          { "name": "spaces", "in": "query", "schema": { "type": "string", "enum": ["drive", "appDataFolder"] } },
+          { "name": "corpora", "in": "query", "schema": { "type": "string", "enum": ["user", "domain", "drive", "allDrives"] } },
+          { "name": "driveId", "in": "query", "schema": { "type": "string" } },
+          { "$ref": "#/components/parameters/DriveSupportsAllDrives" },
+          { "$ref": "#/components/parameters/DriveIncludeItemsFromAllDrives" },
+          { "$ref": "#/components/parameters/DriveFields" },
+          { "$ref": "#/components/parameters/XCorrelationId" },
+          { "name": "includePermissionsForView", "in": "query", "required": false, "schema": { "type": "string", "enum": ["published"] } },
+          { "name": "includeLabels", "in": "query", "required": false, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Drive file list", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DriveListResponse" } } } },
+          "default": { "description": "Error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GoogleJsonError" } } } }
+        },
+        "x-used-by": ["list_drive_files.execute"]
+      }
+    },
+
+    "/drive/v3/files/{fileId}": {
+      "servers": [{ "url": "https://www.googleapis.com" }],
+      "get": {
+        "operationId": "drive.files.get",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "fileId", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "$ref": "#/components/parameters/DriveSupportsAllDrives" },
+          { "$ref": "#/components/parameters/DriveFields" },
+          { "name": "alt", "in": "query", "required": false, "schema": { "type": "string", "enum": ["json", "media"] }, "description": "media = download bytes" },
+          { "$ref": "#/components/parameters/XCorrelationId" },
+          { "name": "acknowledgeAbuse", "in": "query", "required": false, "schema": { "type": "boolean", "default": false }, "description": "Acknowledge risk to download abusive content when alt=media." },
+          { "name": "includePermissionsForView", "in": "query", "required": false, "schema": { "type": "string", "enum": ["published"] } },
+          { "name": "includeLabels", "in": "query", "required": false, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "JSON metadata or media bytes",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/DriveFile" } },
+              "*/*": { "schema": { "type": "string", "description": "Raw bytes; UTF‑8 text for text/*, CSV, JSON, XML, SVG, else binary." } }
+            }
+          },
+          "default": { "description": "Error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GoogleJsonError" } } } }
+        },
+        "x-used-by": ["fetch_drive_file", "batch_fetch_drive_files", "transfer_drive_to_gcs (when non-Editors)", "monitor_drive_changes (follow-ups)"]
+      }
+    },
+
+    "/drive/v3/files/{fileId}/export": {
+      "servers": [{ "url": "https://www.googleapis.com" }],
+      "get": {
+        "operationId": "drive.files.export",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "fileId", "in": "path", "required": true, "schema": { "type": "string" } },
+          {
+            "name": "mimeType",
+            "in": "query",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "Required. Export MIME type. See Google’s export matrix. (Export responses are limited to ~10MB.)"
+          },
+          { "$ref": "#/components/parameters/DriveSupportsAllDrives" },
+          { "$ref": "#/components/parameters/XCorrelationId" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Exported file bytes (type depends on mimeType)",
+            "content": {
+              "text/plain": { "schema": { "type": "string" } },
+              "text/csv": { "schema": { "type": "string" } },
+              "image/svg+xml": { "schema": { "type": "string" } },
+              "*/*": { "schema": { "type": "string" } }
+            }
+          },
+          "default": { "description": "Error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GoogleJsonError" } } } }
+        },
+        "x-used-by": ["fetch_drive_file (Editors)", "transfer_drive_to_gcs (Editors)"]
+      }
+    },
+
+    "/drive/v3/changes": {
+      "servers": [{ "url": "https://www.googleapis.com" }],
+      "get": {
+        "operationId": "drive.changes.list",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "pageToken", "in": "query", "required": true, "schema": { "type": "string" } },
+          { "name": "pageSize", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 1000 } },
+          { "name": "includeRemoved", "in": "query", "schema": { "type": "boolean", "default": false } },
+          { "$ref": "#/components/parameters/DriveSupportsAllDrives" },
+          { "name": "fields", "in": "query", "schema": { "type": "string", "example": "nextPageToken,newStartPageToken,changes(changeType,time,removed,fileId,file(id,name,mimeType,modifiedTime,size,md5Checksum,trashed,parents))" } },
+          { "$ref": "#/components/parameters/XCorrelationId" },
+          { "name": "driveId", "in": "query", "required": false, "schema": { "type": "string" } },
+          { "name": "includeCorpusRemovals", "in": "query", "required": false, "schema": { "type": "boolean", "default": false } },
+          { "name": "includeItemsFromAllDrives", "in": "query", "required": false, "schema": { "type": "boolean", "default": false } },
+          { "name": "restrictToMyDrive", "in": "query", "required": false, "schema": { "type": "boolean", "default": false } },
+          { "name": "spaces", "in": "query", "required": false, "schema": { "type": "string", "enum": ["drive", "appDataFolder"] } },
+          { "name": "includePermissionsForView", "in": "query", "required": false, "schema": { "type": "string", "enum": ["published"] } },
+          { "name": "includeLabels", "in": "query", "required": false, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Changes page", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DriveChangesResponse" } } } },
+          "default": { "description": "Error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GoogleJsonError" } } } }
+        },
+        "x-used-by": ["monitor_drive_changes"]
+      }
+    },
+
+    "/drive/v3/changes/startPageToken": {
+      "servers": [{ "url": "https://www.googleapis.com" }],
+      "get": {
+        "operationId": "drive.changes.getStartPageToken",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "$ref": "#/components/parameters/DriveSupportsAllDrives" },
+          { "$ref": "#/components/parameters/XCorrelationId" },
+          { "name": "driveId", "in": "query", "required": false, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Start page token", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DriveStartPageToken" } } } },
+          "default": { "description": "Error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GoogleJsonError" } } } }
+        },
+        "x-used-by": ["monitor_drive_changes (initial run)"]
+      }
+    },
+
+    "/storage/v1/b/{bucket}/o": {
+      "servers": [{ "url": "https://storage.googleapis.com" }],
+      "get": {
+        "operationId": "storage.objects.list",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "bucket", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "prefix", "in": "query", "schema": { "type": "string" } },
+          { "name": "delimiter", "in": "query", "schema": { "type": "string" }, "description": "Use \"/\" to emulate folders" },
+          { "name": "pageToken", "in": "query", "schema": { "type": "string" } },
+          { "name": "maxResults", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000 } },
+          { "name": "versions", "in": "query", "schema": { "type": "boolean", "default": false } },
+          { "name": "fields", "in": "query", "schema": { "type": "string", "example": "items(bucket,name,size,contentType,updated,generation,md5Hash,crc32c,metadata),nextPageToken,prefixes" } },
+          { "$ref": "#/components/parameters/XCorrelationId" },
+          { "name": "startOffset", "in": "query", "schema": { "type": "string" } },
+          { "name": "endOffset", "in": "query", "schema": { "type": "string" } },
+          { "name": "includeTrailingDelimiter", "in": "query", "schema": { "type": "boolean", "default": false } },
+          { "name": "matchGlob", "in": "query", "schema": { "type": "string" }, "description": "Glob filter (requires delimiter='/' when listing prefixes)." },
+          { "name": "includeFoldersAsPrefixes", "in": "query", "schema": { "type": "boolean", "default": false }, "description": "Return empty folders and managed folders as prefixes (requires delimiter='/')." },
+          { "name": "projection", "in": "query", "schema": { "type": "string", "enum": ["full", "noAcl"] } },
+          { "name": "softDeleted", "in": "query", "schema": { "type": "boolean", "default": false }, "description": "List only soft-deleted objects (requires bucket with soft delete policy; mutually exclusive with versions=true)." }
+        ],
+        "responses": {
+          "200": { "description": "Object list", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GcsListResponse" } } } },
+          "default": { "description": "Error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GoogleJsonError" } } } }
+        },
+        "x-used-by": ["gcs_list_objects", "test() smoke probe (different bucket)"]
+      }
+    },
+
+    "/storage/v1/b/{bucket}/o/{object}": {
+      "servers": [{ "url": "https://storage.googleapis.com" }],
+      "get": {
+        "operationId": "storage.objects.get",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "bucket", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "object", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "alt", "in": "query", "required": false, "schema": { "type": "string", "enum": ["json", "media"] } },
+          { "$ref": "#/components/parameters/XCorrelationId" },
+          { "name": "generation", "in": "query", "schema": { "type": ["integer", "string"] }, "description": "Select a specific object generation." },
+          { "name": "ifGenerationMatch", "in": "query", "schema": { "type": ["integer", "string"] } },
+          { "name": "ifGenerationNotMatch", "in": "query", "schema": { "type": ["integer", "string"] } },
+          { "name": "ifMetagenerationMatch", "in": "query", "schema": { "type": ["integer", "string"] } },
+          { "name": "ifMetagenerationNotMatch", "in": "query", "schema": { "type": ["integer", "string"] } },
+          { "name": "projection", "in": "query", "schema": { "type": "string", "enum": ["full", "noAcl"] } },
+          { "name": "softDeleted", "in": "query", "schema": { "type": "boolean", "default": false }, "description": "Get metadata for a soft-deleted object (requires generation; alt=media not supported when softDeleted=true)." },
+          { "name": "restoreToken", "in": "query", "schema": { "type": "string" }, "description": "Disambiguate soft-deleted objects when name+generation do not uniquely identify." }
+        ],
+        "responses": {
+          "200": {
+            "description": "Metadata (JSON) or media bytes (alt=media)",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/GcsObject" } },
+              "*/*": { "schema": { "type": "string", "description": "Raw bytes; UTF‑8 text when content-type is textual." } }
+            }
+          },
+          "default": { "description": "Error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GoogleJsonError" } } } }
+        },
+        "x-used-by": ["gcs_get_metadata (alt=json)", "gcs_download_text (alt=media)", "gcs_fetch_object"]
+      }
+    },
+
+    "/upload/storage/v1/b/{bucket}/o": {
+      "servers": [
+        { "url": "https://www.googleapis.com" },
+        { "url": "https://storage.googleapis.com" }
+      ],
+      "post": {
+        "operationId": "storage.objects.insert",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "bucket", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "uploadType", "in": "query", "required": true, "schema": { "type": "string", "enum": ["media", "multipart", "resumable"] } },
+          { "name": "name", "in": "query", "required": false, "schema": { "type": "string" }, "description": "Required for uploadType=media" },
+          { "name": "ifGenerationMatch", "in": "query", "schema": { "type": ["integer", "string"] } },
+          { "name": "ifMetagenerationMatch", "in": "query", "schema": { "type": ["integer", "string"] } },
+          { "$ref": "#/components/parameters/XCorrelationId" },
+          { "name": "X-Upload-Content-Type", "in": "header", "required": false, "schema": { "type": "string" }, "description": "Resumable uploads: content type of the object being uploaded." },
+          { "name": "X-Upload-Content-Length", "in": "header", "required": false, "schema": { "type": ["integer", "string"] }, "description": "Resumable uploads: size in bytes of the object being uploaded." }
+        ],
+        "requestBody": {
+          "required": true,
+          "description": "For uploadType=media: raw bytes required (application/octet-stream) and 'name' query param required. For uploadType=multipart: multipart/related with JSON metadata + media. For uploadType=resumable: this POST initiates a session; body may be a JSON metadata object or empty; use the 'Location' session URI for subsequent PUTs.",
+          "content": {
+            "application/octet-stream": {
+              "schema": { "type": "string", "description": "Raw bytes", "format": "binary" }
+            },
+            "multipart/related": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "metadata": { "$ref": "#/components/schemas/UploadMultipartMetadata" },
+                  "media": { "type": "string", "format": "binary" }
+                },
+                "required": ["metadata", "media"]
+              }
+            },
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/UploadMultipartMetadata" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Created object", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GcsObject" } } } },
+          "default": { "description": "Error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GoogleJsonError" } } } }
+        },
+        "x-used-by": ["gcs_media_upload (uploadType=media)", "gcs_multipart_upload (uploadType=multipart)", "gcs_write_object", "gcs_batch_write_objects", "transfer_drive_to_gcs"]
+      }
+    },
+
+    "/o/oauth2/v2/auth": {
+      "servers": [{ "url": "https://accounts.google.com" }],
+      "get": {
+        "operationId": "oauth2.authorize",
+        "parameters": [
+          { "name": "client_id", "in": "query", "required": true, "schema": { "type": "string" } },
+          { "name": "response_type", "in": "query", "required": true, "schema": { "type": "string", "enum": ["code"] } },
+          { "name": "scope", "in": "query", "required": true, "schema": { "type": "string" } },
+          { "name": "access_type", "in": "query", "schema": { "type": "string", "enum": ["offline"] } },
+          { "name": "include_granted_scopes", "in": "query", "schema": { "type": "string", "enum": ["true"] } },
+          { "name": "prompt", "in": "query", "schema": { "type": "string", "enum": ["consent"] } },
+          { "name": "redirect_uri", "in": "query", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "302": { "description": "Redirect to consent/login" }
+        },
+        "x-used-by": ["connection.authorization.options.oauth2.authorization_url"]
+      }
+    },
+
+    "/token": {
+      "servers": [{ "url": "https://oauth2.googleapis.com" }],
+      "post": {
+        "operationId": "oauth2.token",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "title": "authorization_code",
+                    "type": "object",
+                    "properties": {
+                      "client_id": { "type": "string" },
+                      "client_secret": { "type": "string" },
+                      "grant_type": { "type": "string", "const": "authorization_code" },
+                      "code": { "type": "string" },
+                      "redirect_uri": { "type": "string" }
+                    },
+                    "required": ["client_id", "client_secret", "grant_type", "code", "redirect_uri"]
+                  },
+                  {
+                    "title": "refresh_token",
+                    "type": "object",
+                    "properties": {
+                      "client_id": { "type": "string" },
+                      "client_secret": { "type": "string" },
+                      "grant_type": { "type": "string", "const": "refresh_token" },
+                      "refresh_token": { "type": "string" }
+                    },
+                    "required": ["client_id", "client_secret", "grant_type", "refresh_token"]
+                  },
+                  {
+                    "title": "jwt-bearer (service account)",
+                    "type": "object",
+                    "properties": {
+                      "grant_type": { "type": "string", "const": "urn:ietf:params:oauth:grant-type:jwt-bearer" },
+                      "assertion": { "type": "string" }
+                    },
+                    "required": ["grant_type", "assertion"]
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Access token", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OAuthTokenResponse" } } } },
+          "default": { "description": "Error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GoogleJsonError" } } } }
+        },
+        "x-used-by": ["oauth2.acquire", "oauth2.refresh", "custom.acquire (JWT)"]
+      }
+    },
+
+    "/v1/userinfo": {
+      "servers": [{ "url": "https://openidconnect.googleapis.com" }],
+      "get": {
+        "operationId": "oidc.userinfo",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": { "description": "OIDC userinfo", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OidcUserInfo" } } } },
+          "default": { "description": "Error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GoogleJsonError" } } } }
+        },
+        "x-used-by": ["connection.authorization.identity (OAuth2 mode)"]
+      }
+    },
+
+    "/v1/{endpoint}:serverStreamingPredict": {
+      "servers": [{ "url": "https://aiplatform.googleapis.com" }],
+      "post": {
+        "operationId": "aiplatform.endpoints.serverStreamingPredict",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "endpoint",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "projects/{project}/locations/{location}/endpoints/{endpointId}"
+          },
+          { "$ref": "#/components/parameters/XCorrelationId" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "inputs": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+                  "parameters": { "type": "object", "additionalProperties": true }
+                },
+                "required": ["inputs"],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Server streams multiple StreamingPredictResponse JSON objects.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/StreamingPredictResponse" }
+              }
+            }
+          },
+          "default": {
+            "description": "Error",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GoogleJsonError" } } }
+          }
+        },
+        "x-used-by": ["vertex.endpoints.server_streaming_predict"]
+      }
+    },
+
+    "/v1/{model}:streamGenerateContent": {
+      "servers": [{ "url": "https://aiplatform.googleapis.com" }],
+      "post": {
+        "operationId": "aiplatform.models.streamGenerateContent",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "model",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "Publisher model or tuned endpoint. E.g. projects/{project}/locations/{location}/publishers/google/models/{modelId} OR projects/{project}/locations/{location}/endpoints/{endpointId}"
+          },
+          { "$ref": "#/components/parameters/XCorrelationId" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "contents": { "type": "array", "items": { "$ref": "#/components/schemas/Content" } },
+                  "systemInstruction": { "$ref": "#/components/schemas/Content" },
+                  "tools": { "type": "array", "items": { "$ref": "#/components/schemas/Tool" } },
+                  "toolConfig": { "type": "object", "additionalProperties": true },
+                  "safetySettings": { "type": "array", "items": { "$ref": "#/components/schemas/SafetySetting" } },
+                  "generationConfig": { "$ref": "#/components/schemas/GenerationConfig" },
+                  "cachedContent": { "type": "string" }
+                },
+                "required": ["contents"],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Server streams multiple GenerateContentResponse JSON objects.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/GenerateContentResponse" }
+              }
+            }
+          },
+          "default": {
+            "description": "Error",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GoogleJsonError" } } }
+          }
+        },
+        "x-used-by": ["vertex.generate_content.stream"]
+      }
+    }
+  }
+}
