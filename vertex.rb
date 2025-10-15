@@ -26,7 +26,7 @@
       { name: 'validate_model_on_run',      optional: true,   control_type: 'checkbox',   label: 'Validate model before run',
         type: 'boolean',  default: true, sticky: true },
       { name: 'manual_model_entry_only',    optional: true,   control_type: 'checkbox',   label: 'Manual model entry only',
-        type: 'boolean', default: false, hint: 'Hide picklists in forms; require fully-qualified model paths.' }
+        type: 'boolean', default: false, hint: 'Hide picklists in forms; require fully-qualified model paths.' },
 
       # Defaults for test probe
       { name: 'set_defaults_for_probe',     optional: false,  control_type: 'checkbox', 
@@ -265,6 +265,51 @@
             { name: 'correlation_id', type: 'string' }
           ] }
         ]
+      end
+    },
+
+    gen_generate_content_input: {
+      fields: lambda do |_connection, config_fields, object_definitions|
+        show_adv = (config_fields['show_advanced'] == true)
+
+        base = [
+          # UX toggle
+          { name: 'show_advanced', label: 'Show advanced options',
+            type: 'boolean', control_type: 'checkbox', optional: true, default: false },
+
+          # Model (unified picklist + custom toggle)
+          { name: 'model', label: 'Model', optional: false,
+            control_type: 'select', pick_list: :models_generative,
+            extends_schema: true, hint: 'Select or paste a fully-qualified model.',
+            toggle_hint: 'Use custom value',
+            toggle_field: { name: 'model', label: 'Model', type: 'string', control_type: 'text',
+                            hint: 'Format: publishers/{publisher}/models/{id}' } },
+
+          # Contract-friendly content
+          { name: 'contents', type: 'array', of: 'object',
+            properties: object_definitions['content'], optional: false },
+
+          # Simple system text that we convert to systemInstruction object
+          { name: 'system_preamble', label: 'System preamble (text)', optional: true,
+            hint: 'Optional; becomes systemInstruction.parts[0].text' }
+        ]
+
+        adv = [
+          { name: 'tools', type: 'array', of: 'object', properties: [
+              { name: 'googleSearch',    type: 'object' },
+              { name: 'retrieval',       type: 'object' },
+              { name: 'codeExecution',   type: 'object' },
+              { name: 'functionDeclarations', type: 'array', of: 'object' }
+            ]
+          },
+          { name: 'toolConfig',      type: 'object' },
+          { name: 'safetySettings',  type: 'array', of: 'object',
+            properties: object_definitions['safety_setting'] },
+          { name: 'generationConfig', type: 'object',
+            properties: object_definitions['generation_config'] }
+        ]
+
+        show_adv ? (base + adv) : base
       end
     }
 
@@ -841,32 +886,19 @@
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
 
-      input_fields: lambda do |object_definitions|
-        [
-          # Toggle for advanced fields
-          { name: 'show_advanced', label: 'Show advanced options', type: 'boolean', control_type: 'checkbox', optional: true, default: false },
-          # Model
-          { name: 'model', label: 'Model', optional: false, control_type: 'select', pick_list: 'models_generative', hint: 'Select or use a custom value.',
-            extends_schema: true, toggle_hint: 'Use custom value', toggle_field: { name: 'model', label: 'Model', type: 'string', control_type: 'text' } },
-          # Content
-          { name: 'contents', type: 'array', of: 'object', properties: object_definitions['content'], optional: false },
-
-          # Contract-friendly: accept plain text; connector will inject a proper systemInstruction
-          { name: 'system_preamble', label: 'System preamble (text)', optional: true, hint: 'Optional system guidance.' },
-
-          { name: 'tools', ngIf: 'input.show_advanced == "true"', type: 'array', of: 'object', properties: [
-              { name: 'googleSearch', type: 'object' },
-              { name: 'retrieval',    type: 'object' },
-              { name: 'codeExecution', type: 'object' },
-              { name: 'functionDeclarations', type: 'array', of: 'object' }
-            ]
-          },
-          { name: 'toolConfig', ngIf: 'input.show_advanced == "true"', type: 'object' },
-          { name: 'safetySettings', ngIf: 'input.show_advanced == "true"', type: 'array', of: 'object',
-            properties: object_definitions['safety_setting'] },
-          { name: 'generationConfig', ngIf: 'input.show_advanced == "true"', type: 'object',
-            properties: object_definitions['generation_config'] }
-        ]
+      config_fields: [
+        { name: 'refresh_model_catalog', type: 'boolean', control_type: 'checkbox', label: 'Refresh model catalog on open',
+          optional: true, default: true }
+      ]
+      input_fields: lambda do |object_definitions, connection, config_fields|
+        if connection['dynamic_models'] && config_fields['refresh_model_catalog'] == true
+          begin
+            call('fetch_publisher_models', connection, 'google') # warms
+          rescue => e
+            puts "Model catalog warmup skipped: #{e.message}"
+          end
+        end
+        object_definitions['gen_generate_content_imput']
       end,
 
       output_fields: lambda do |object_definitions|
@@ -889,9 +921,9 @@
         # Build payload
         contents = call(:sanitize_contents_roles, input['contents'])
         error('At least one non-system message is required in contents') if contents.blank?
-        sys_inst = call(:system_instruction_from_text, input['system_preamble'])
 
-        gen_cfg = call(:sanitize_generation_config, input['generationConfig'])
+        sys_inst  = call(:system_instruction_from_text, input['system_preamble'])
+        gen_cfg   = call(:sanitize_generation_config, input['generationConfig'])
 
         payload = {
           'contents'          => contents,
@@ -945,7 +977,7 @@
       input_fields: lambda do |object_definitions|
         [
           { name: 'contents', type: 'array', of: 'object', properties: object_definitions['content'], optional: false },
-          { name: 'model', label: 'Model', optional: false, control_type: 'select', pick_list: 'models_generative',
+          { name: 'model', label: 'Model', optional: false, control_type: 'select', pick_list: :models_generative,
             toggle_hint: 'Use custom value', toggle_field: { name: 'model', label: 'Model', type: 'string', control_type: 'text' } },
           { name: 'grounding', control_type: 'select', pick_list: 'modes_grounding', optional: false },
 
@@ -1610,7 +1642,7 @@
         ['Text-embedding-005', 'publishers/google/models/text-embedding-005'],
         ['Text-embedding-004', 'publishers/google/models/text-embedding-004']
       ]
-      call(:dynamic_model_picklist, connection, :embedding, static)
+      call('dynamic_model_picklist', connection, :embedding, static)
     end,
 
     models_generative: lambda do |connection|
@@ -1619,7 +1651,7 @@
         ['Gemini 2.5 Flash','publishers/google/models/gemini-2.5-flash'],
         ['Gemini 2.0 Flash','publishers/google/models/gemini-2.0-flash-001']
       ]
-      call(:dynamic_model_picklist, connection, :text, static)
+      call('dynamic_model_picklist', connection, :text, static)
     end,
 
     # Contract-conformant roles (system handled via system_preamble)
@@ -2038,6 +2070,10 @@
     end,
 
     dynamic_model_picklist: lambda do |connection, bucket, static_fallback|
+      # Honor manual-only mode: no picklist options → forces “custom value” path
+      if connection['manual_model_entry_only'] == true
+        return []
+      end
       # Never block Builder: only fetch live if explicitly enabled; otherwise return static.
       unless connection['dynamic_models']
         return static_fallback
