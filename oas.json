@@ -1,0 +1,94 @@
+{
+  "openapi": "3.1.0",
+  "info": { "title": "Model Catalog", "version": "1.0.0" },
+  "paths": {
+    "/models": {
+      "get": {
+        "summary": "List models (cached)",
+        "parameters": [
+          { "name": "region", "in": "query", "required": false, "schema": { "type": "string", "default": "us-central1" } },
+          { "name": "publisher", "in": "query", "required": false, "schema": { "type": "string", "default": "google" } },
+          { "name": "includePreview", "in": "query", "required": false, "schema": { "type": "boolean", "default": false } }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["generatedAt","region","publisher","includePreview","models"],
+                  "properties": {
+                    "generatedAt": { "type": "string", "format": "date-time" },
+                    "region":       { "type": "string" },
+                    "publisher":    { "type": "string" },
+                    "includePreview": { "type": "boolean" },
+                    "models": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": ["label","value"],
+                        "properties": {
+                          "label": { "type": "string" },
+                          "value": { "type": "string" }
+                        }
+                      }
+                    },
+                    "source": { "type": "string", "description": "cache|refreshed" }
+                  }
+                },
+                "examples": {
+                  "ok": {
+                    "value": {
+                      "generatedAt": "2025-10-15T02:12:09Z",
+                      "region": "us-central1",
+                      "publisher": "google",
+                      "includePreview": false,
+                      "models": [
+                        { "label": "Gemini 2.5 Pro",   "value": "publishers/google/models/gemini-2.5-pro" },
+                        { "label": "Gemini 2.5 Flash", "value": "publishers/google/models/gemini-2.5-flash" }
+                      ],
+                      "source": "cache"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/models/refresh": {
+      "post": {
+        "summary": "Refresh model catalog",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "region": { "type": "string", "default": "us-central1" },
+                  "publisher": { "type": "string", "default": "google" },
+                  "includePreview": { "type": "boolean", "default": false }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Refreshed",
+            "content": { "application/json": { "schema": { "$ref": "#/paths/~1models/get/responses/200/content/application~1json/schema" } } }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "apiKey": { "type": "apiKey", "in": "header", "name": "x-api-key" }
+    }
+  },
+  "security": [{ "apiKey": [] }]
+}
