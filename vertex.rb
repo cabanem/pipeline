@@ -1,4 +1,6 @@
 # frozen_string_literal: true
+require 'openssl'
+require 'base64'
 
 {
   title: 'Vertex AI Adapter',
@@ -312,7 +314,7 @@
         { body: 'Classify an email into one of the provided categories using embeddings (default) or a generative referee.'}
       end,
       display_priority: 10,
-      retry_on_request: ['GET', 'HEAD', 'POST'],
+      retry_on_request: ['GET', 'HEAD'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
 
@@ -502,7 +504,7 @@
       end
     },
 
-    # 2) RAG engine (Vertex AI)
+    # 2) RAG store engine (Vertex AI)
     rag_files_import: {
       title: 'RAG: Import files to corpus',
       subtitle: 'projects.locations.ragCorpora.ragFiles:import',
@@ -615,7 +617,7 @@
       title: 'RAG: Retrieve contexts',
       subtitle: 'projects.locations:retrieveContexts (Vertex RAG Store)',
       display_priority: 9,
-      retry_on_request: ['GET','HEAD','POST'],
+      retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
 
@@ -704,7 +706,7 @@
       title: 'RAG: Retrieve + answer (one-shot)',
       subtitle: 'Retrieve contexts from a corpus and generate a cited answer',
       display_priority: 9,
-      retry_on_request: ['GET','HEAD','POST'],
+      retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
 
@@ -858,7 +860,228 @@
       end
     },
 
-    # 3) Generate content (Gemini)
+    # 3) Vector search
+    indexes_upsert_datapoints: {
+      title: 'Vector Index: Upsert datapoints',
+      subtitle: 'indexes:upsertDatapoints (Matching Engine / Vector Search)',
+      display_priority: 6,
+      retry_on_request: ['GET','HEAD'],
+      retry_on_response: [408,429,500,502,503,504],
+      max_retries: 3,
+
+      input_fields: lambda do |_|
+        [
+          { name: 'index', optional: false,
+            hint: 'Index resource (projects/.../locations/.../indexes/ID) or short ID (e.g., "my-index")' },
+          { name: 'datapoints', type: 'array', of: 'object', optional: false, properties: [
+              { name: 'datapointId', optional: false },
+              { name: 'featureVector', type: 'array', of: 'number', optional: false,
+                hint: 'Embedding vector (float array). Length must match index config.' },
+              { name: 'restricts', type: 'array', of: 'object', properties: [
+                  { name: 'namespace' },
+                  { name: 'allowTokens', type: 'array', of: 'string' },
+                  { name: 'denyTokens',  type: 'array', of: 'string' }
+                ]
+              },
+              { name: 'crowdingTag' },
+              { name: 'labels',   type: 'object' },
+              { name: 'metadata', type: 'object' }
+            ],
+            hint: 'Upsert is idempotent by datapointId.'
+          },
+          # Debug
+          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true,
+            hint: 'Echo request URL/body and Google error body for troubleshooting' }
+        ]
+      end,
+
+      output_fields: lambda do |_|
+        [
+          { name: 'ok', type: 'boolean' },
+          { name: 'telemetry', type: 'object', properties: [
+            { name: 'http_status', type: 'integer' },
+            { name: 'message' }, { name: 'duration_ms', type: 'integer' },
+            { name: 'correlation_id' }
+          ]},
+          { name: 'debug', type: 'object' }
+        ]
+      end,
+
+      execute: lambda do |connection, input|
+        t0 = Time.now
+        corr = call(:build_correlation_id)
+        url = nil; req_body = nil
+        begin
+          call(:ensure_project_id!, connection)
+          call(:ensure_regional_location!, connection)
+
+          index_path = call(:build_index_path, connection, input['index'])
+          loc = connection['location'].to_s.downcase
+          url = call(:aipl_v1_url, connection, loc, "#{index_path}:upsertDatapoints")
+
+          # sanitize vectors → float[], preserve ids
+          dps = call(:safe_array, input['datapoints']).map do |dp|
+            h = (dp || {}).to_h
+            vec = call(:sanitize_feature_vector, h['featureVector'])
+            error('featureVector must be a non-empty numeric array') if vec.empty?
+            h.merge('featureVector' => vec)
+          end
+
+          req_body = call(:json_compact, { 'datapoints' => dps })
+          resp = post(url)
+                   .headers(call(:request_headers, corr))
+                   .payload(req_body)
+          code = call(:telemetry_success_code, resp)
+          out  = { 'ok' => true }.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
+          out
+        rescue => e
+          g = call(:extract_google_error, e)
+          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
+          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
+          out['debug'] = call(:debug_pack, input['debug'], url, req_body, g) if call(:normalize_boolean, input['debug'])
+          out
+        end
+      end,
+
+      sample_output: lambda do
+        {
+          'ok' => true,
+          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 11, 'correlation_id' => 'sample' }
+        }
+      end
+    },
+
+    index_endpoints_find_neighbors: {
+      title: 'Vector Search: Find neighbors',
+      subtitle: 'indexEndpoints:findNeighbors (Matching Engine / Vector Search)',
+      display_priority: 6,
+      retry_on_request: ['GET','HEAD'],
+      retry_on_response: [408,429,500,502,503,504],
+      max_retries: 3,
+
+      input_fields: lambda do |_|
+        [
+          { name: 'indexEndpoint', optional: false,
+            hint: 'IndexEndpoint resource (projects/.../locations/.../indexEndpoints/ID) or short ID' },
+          { name: 'deployedIndexId', optional: false,
+            hint: 'The deployed index ID on the endpoint' },
+          { name: 'queries', type: 'array', of: 'object', optional: false, properties: [
+              # Either featureVector OR datapoint
+              { name: 'featureVector', type: 'array', of: 'number',
+                hint: 'Query vector; alternative to providing datapoint' },
+              { name: 'datapoint', type: 'object', properties: [
+                  { name: 'datapointId' },
+                  { name: 'featureVector', type: 'array', of: 'number' }
+                ]
+              },
+              { name: 'neighborCount', type: 'integer', optional: true, hint: 'Default 10' },
+              { name: 'perCrowdingAttributeNeighborCount', type: 'integer', optional: true },
+              { name: 'stringFilters', type: 'array', of: 'object', properties: [
+                  { name: 'namespace' },
+                  { name: 'allowTokens', type: 'array', of: 'string' },
+                  { name: 'denyTokens',  type: 'array', of: 'string' }
+                ]
+              },
+              { name: 'distanceMeasure', control_type: 'select', pick_list: 'distance_measures', optional: true,
+                hint: 'If omitted, uses index default' }
+            ],
+            hint: 'Each query can specify either featureVector or datapoint.'
+          },
+          # Debug
+          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
+        ]
+      end,
+
+      output_fields: lambda do |_|
+        [
+          { name: 'nearestNeighbors', type: 'array', of: 'object', properties: [
+              { name: 'neighbors', type: 'array', of: 'object', properties: [
+                  { name: 'datapoint', type: 'object' },
+                  { name: 'distance',  type: 'number' },
+                  { name: 'crowdingTagCount', type: 'integer' }
+                ]
+              }
+            ]
+          },
+          { name: 'ok', type: 'boolean' },
+          { name: 'telemetry', type: 'object', properties: [
+            { name: 'http_status', type: 'integer' },
+            { name: 'message' }, { name: 'duration_ms', type: 'integer' },
+            { name: 'correlation_id' }
+          ]},
+          { name: 'debug', type: 'object' }
+        ]
+      end,
+
+      execute: lambda do |connection, input|
+        t0 = Time.now
+        corr = call(:build_correlation_id)
+        url = nil; req_body = nil
+        begin
+          call(:ensure_project_id!, connection)
+          call(:ensure_regional_location!, connection)
+          loc = connection['location'].to_s.downcase
+
+          ep_path = call(:build_index_endpoint_path, connection, input['indexEndpoint'])
+          url = call(:aipl_v1_url, connection, loc, "#{ep_path}:findNeighbors")
+
+          queries = call(:safe_array, input['queries']).map do |q|
+            h = (q || {}).to_h
+            if h['featureVector'].present?
+              h['featureVector'] = call(:sanitize_feature_vector, h['featureVector'])
+            elsif h['datapoint'].present?
+              dp = (h['datapoint'] || {}).to_h
+              fv = call(:sanitize_feature_vector, dp['featureVector'])
+              dp['featureVector'] = fv unless fv.empty?
+              h['datapoint'] = call(:json_compact, dp)
+            else
+              error('Each query must include featureVector or datapoint')
+            end
+            if h['neighborCount']
+              h['neighborCount'] = call(:clamp_int, h['neighborCount'], 1, 1000)
+            end
+            h
+          end
+
+          req = {
+            'deployedIndexId' => input['deployedIndexId'].to_s,
+            'queries'         => queries
+          }
+          req_body = call(:json_compact, req)
+
+          resp = post(url)
+                   .headers(call(:request_headers, corr))
+                   .payload(req_body)
+          code = call(:telemetry_success_code, resp)
+          resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK')).merge(
+            call(:normalize_boolean, input['debug']) ? { 'debug' => call(:debug_pack, true, url, req_body, nil) } : {}
+          )
+        rescue => e
+          g = call(:extract_google_error, e)
+          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
+          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
+          out['debug'] = call(:debug_pack, input['debug'], url, req_body, g) if call(:normalize_boolean, input['debug'])
+          out
+        end
+      end,
+
+      sample_output: lambda do
+        {
+          'nearestNeighbors' => [
+            { 'neighbors' => [
+                { 'datapoint' => { 'datapointId' => 'doc-123' }, 'distance' => 0.12 },
+                { 'datapoint' => { 'datapointId' => 'doc-987' }, 'distance' => 0.19 }
+              ]
+            }
+          ],
+          'ok' => true,
+          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 15, 'correlation_id' => 'sample' }
+        }
+      end
+    },
+
+    # 4) Generate content (Gemini)
     gen_generate_content: {
       title: 'Generative: Generate content (Gemini)',
       subtitle: 'Generate content from a prompt',
@@ -870,7 +1093,7 @@
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
 
-      input_fields: lambda do |object_definitions, _connection, _config_fields|
+      input_fields: lambda do |connection, config_fields, object_definitions|
         object_definitions['gen_generate_content_input']
       end,
 
@@ -942,7 +1165,7 @@
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
 
-      input_fields: lambda do |object_definitions|
+      input_fields: lambda do |object_definitions, config_fields, object_definitions|
         [
           { name: 'contents', type: 'array', of: 'object', properties: object_definitions['content'], optional: false },
           { name: 'model', label: 'Model', optional: false, control_type: 'text',
@@ -951,13 +1174,7 @@
           { name: 'vertex_ai_search_datastore', optional: true,
             hint: 'projects/.../locations/.../collections/default_collection/dataStores/...' },
           { name: 'vertex_ai_search_serving_config', optional: true,
-            hint: 'projects/.../locations/.../collections/.../engines/.../servingConfigs/default_config' },
-          # Back-compat (deprecated):
-          { name: 'vertex_ai_search_engine', optional: true, hint: '(deprecated) use .../servingConfigs/... instead' },
-          { name: 'system_preamble', label: 'System preamble (text)', optional: true },
-          { name: 'toolConfig', type: 'object' },
-          { name: 'generationConfig', type: 'object', properties: object_definitions['generation_config'] },
-          { name: 'safetySettings',  type: 'array', of: 'object', properties: object_definitions['safety_setting'] }
+            hint: 'projects/.../locations/.../collections/.../engines/.../servingConfigs/default_config' }
         ]
       end,
 
@@ -980,7 +1197,7 @@
 
         tools =
           if input['grounding'] == 'google_search'
-            tools = [ { 'googleSearch' => {} } ]
+            [ { 'googleSearch' => {} } ]
           else
             ds   = input['vertex_ai_search_datastore'].to_s
             scfg = input['vertex_ai_search_serving_config'].to_s
@@ -995,7 +1212,7 @@
             vas = {}
             vas['datastore']     = ds unless ds.blank?
             vas['servingConfig'] = scfg unless scfg.blank?
-            tools = [ { 'retrieval' => { 'vertexAiSearch' => vas } } ]
+            [ { 'retrieval' => { 'vertexAiSearch' => vas } } ]
           end
 
         gen_cfg = call(:sanitize_generation_config, input['generation_config'])
@@ -1044,7 +1261,7 @@
         { body: 'Answer a question using caller-supplied context chunks (RAG-lite). Returns structured JSON with citations.' }
       end,
       display_priority: 8,
-      retry_on_request: ['GET', 'HEAD', 'POST'],
+      retry_on_request: ['GET', 'HEAD'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
 
@@ -1189,7 +1406,7 @@
       end
     },
 
-    # 4) Embeddings
+    # 5) Embeddings
     embed_text: {
       title: 'Embeddings: Embed text',
       subtitle: 'Get embeddings from a publisher embedding model',
@@ -1197,7 +1414,7 @@
         { body: 'POST :predict on a publisher embedding model' }
       end,
       display_priority: 7,
-      retry_on_request: ['GET', 'HEAD', 'POST'],
+      retry_on_request: ['GET', 'HEAD'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
 
@@ -1274,12 +1491,12 @@
       end
     },
 
-    # 5) Predict
+    # 6) Predict
     endpoint_predict: {
       title: 'Prediction: Endpoint predict (custom model)',
       subtitle: 'POST :predict to a Vertex AI Endpoint',
       display_priority: 6,
-      retry_on_request: ['GET', 'HEAD', 'POST'],
+      retry_on_request: ['GET', 'HEAD'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
 
@@ -1460,16 +1677,16 @@
       end
     },
 
-    # 6) Utility
+    # 7) Utility
     count_tokens: {
       title: 'Utility: Count tokens',
       description: 'POST :countTokens on a publisher model',
       display_priority: 5,
-      retry_on_request: ['GET', 'HEAD', 'POST'],
+      retry_on_request: ['GET', 'HEAD'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
 
-      input_fields: lambda do |object_definitions|
+      input_fields: lambda do |object_definitions, config_fields, object_definitions|
         [
           { name: 'model', label: 'Model', optional: false, control_type: 'text',
             hint: call(:model_id_hint) },
@@ -1529,7 +1746,6 @@
   },
 
   # --------- PICK LISTS ---------------------------------------------------
-
   pick_lists: {
     modes_classification: lambda do
       [%w[Embedding embedding], %w[Generative generative], %w[Hybrid hybrid]]
@@ -1539,8 +1755,8 @@
       [%w[Google\ Search google_search], %w[Vertex\ AI\ Search vertex_ai_search]]
     end,
 
-    # Contract-conformant roles (system handled via system_preamble)
     roles: lambda do
+      # Contract-conformant roles (system handled via system_preamble)
       [['user','user'], ['model','model']]
     end,
 
@@ -1556,6 +1772,14 @@
         ['Drive Files', 'files'],
         ['Drive Folder', 'folder']
       ]
+    end,
+
+    distance_measures: lambda do
+      [
+        ['Cosine distance', 'COSINE_DISTANCE'],
+        ['Dot product',     'DOT_PRODUCT'],
+        ['Euclidean',       'EUCLIDEAN_DISTANCE']
+      ]
     end
   },
 
@@ -1563,7 +1787,6 @@
   methods: {
 
     # --- Telemetry and resilience -----------------------------------------
-
     telemetry_envelope: lambda do |started_at, correlation_id, ok, code, message|
       dur = ((Time.now - started_at) * 1000.0).to_i
       {
@@ -1662,7 +1885,6 @@
     end,
 
     # --- Auth (JWT → OAuth) -----------------------------------------------
-
     const_default_scopes: lambda do
        [ 'https://www.googleapis.com/auth/cloud-platform' ]
     end,
@@ -1754,7 +1976,6 @@
     end,
 
     # --- URL and resource building ----------------------------------------
-
     aipl_service_host: lambda do |connection, loc=nil|
       l = (loc || connection['location']).to_s.downcase
       (l.blank? || l == 'global') ? 'aiplatform.googleapis.com' : "#{l}-aiplatform.googleapis.com"
@@ -1838,7 +2059,6 @@
     end,
 
     # --- Guards, normalization --------------------------------------------
-
     ensure_project_id!: lambda do |connection|
       pid = (connection['project_id'].presence ||
               (JSON.parse(connection['service_account_key_json'].to_s)['project_id'] rescue nil)).to_s
@@ -1944,6 +2164,16 @@
       Array(arr)
     end,
 
+    normalize_index_endpoint_identifier: lambda do |raw|
+      return '' if raw.nil? || raw == false
+      raw.to_s.strip
+    end,
+
+    normalize_index_identifier: lambda do |raw|
+      return '' if raw.nil? || raw == false
+      raw.to_s.strip
+    end,
+
     build_rag_retrieve_payload: lambda do |question, rag_corpus, restrict_ids = []|
       rag_res = { 'ragCorpus' => rag_corpus }
       ids     = call(:sanitize_drive_ids, restrict_ids, allow_empty: true, label: 'restrict_to_file_ids')
@@ -2008,8 +2238,25 @@
       { 'importRagFilesConfig' => cfg }
     end,
 
-    # --- Sanitizers and conversion ----------------------------------------
+    build_index_path: lambda do |connection, index|
+      id = call(:normalize_index_identifier, index)
+      return id.sub(%r{^/v1/}, '') if id.start_with?('projects/')
+      call(:ensure_project_id!, connection)
+      loc = (connection['location'] || '').to_s.downcase
+      error("Index requires regional location; got '#{loc}'") if loc.blank? || loc == 'global'
+      "projects/#{connection['project_id']}/locations/#{loc}/indexes/#{id}"
+    end,
 
+    build_index_endpoint_path: lambda do |connection, ep|
+      v = call(:normalize_index_endpoint_identifier, ep)
+      return v.sub(%r{^/v1/}, '') if v.start_with?('projects/')
+      call(:ensure_project_id!, connection)
+      loc = (connection['location'] || '').to_s.downcase
+      error("IndexEndpoint requires regional location; got '#{loc}'") if loc.blank? || loc == 'global'
+      "projects/#{connection['project_id']}/locations/#{loc}/indexEndpoints/#{v}"
+    end,
+
+    # --- Sanitizers and conversion ----------------------------------------
     safe_array: lambda do |v|
       return [] if v.nil? || v == false
       return v  if v.is_a?(Array)
@@ -2089,8 +2336,11 @@
       norm
     end,
 
-    # --- Embeddings -------------------------------------------------------
+    sanitize_feature_vector: lambda do |arr|
+      call(:safe_array, arr).map { |x| call(:safe_float, x) }.reject { |x| x.nil? }
+    end,
 
+    # --- Embeddings -------------------------------------------------------
     extract_embedding_vector: lambda do |pred|
       # Extracts float vector from embedding prediction (both shapes supported)
       vec = pred.dig('embeddings', 'values') ||
@@ -2145,7 +2395,6 @@
     end,
 
     # --- Generative -------------------------------------------------------
-
     system_instruction_from_text: lambda do |text|
       return nil if text.blank?
       { 'role' => 'system', 'parts' => [ { 'text' => text.to_s } ] }
@@ -2280,9 +2529,9 @@
 
     # --- Hints ------------------------------------------------------------
     model_id_hint: lambda do
-      'Free-text model id. Short: "gemini-2.5-pro" or "text-embedding-005". ' \
-      'Publisher form: "publishers/google/models/{id}". ' \
-      'Full: "projects/{project}/locations/{region}/publishers/google/models/{id}".' \
+      'Free-text model id. Short: "gemini-2.5-pro" or "text-embedding-005". ' +
+      'Publisher form: "publishers/google/models/{id}". ' +
+      'Full: "projects/{project}/locations/{region}/publishers/google/models/{id}". ' +
       'Tip: find ids in Vertex Model Garden or via REST GET v1/projects/{project}/locations/{region}/publishers/google/models/*.'
     end,
 
@@ -2345,7 +2594,6 @@
         obj
       end
     end
-
   },
 
   # --------- TRIGGERS -----------------------------------------------------
