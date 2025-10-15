@@ -112,7 +112,7 @@
           { name: 'modified_time', type: 'date_time' },
           { name: 'checksum', type: 'string' },
           { name: 'web_view_url', type: 'string', hint: 'Open in Drive' },
-          { name: 'owners', type: 'array', of: 'object', properties: [{ name: 'display_name' }, { name: 'email' }] }
+          { name: 'owners', type: 'array', of: 'object', properties: call(:schema_owner_fields) }
         ]
       end
     },
@@ -154,7 +154,6 @@
     },
 
     # --- Composite definitions
-    # Call other object definitions
     drive_file_min: {
       fields: lambda do |_|
         [
@@ -249,6 +248,7 @@
     envelope_fields: {
       fields: lambda do |_|
         [
+          { name: 'error', type: 'object', optional: true, properties: call(:schema_error_fields) },
           { name: 'ok',         type: 'boolean' },
           { name: 'telemetry',  type: 'object', properties: [
             { name: 'http_status', type: 'integer' },
@@ -317,6 +317,7 @@
 
         # Normalize folder id (accepts ID or full url)
         folder_id = call(:util_extract_drive_id, input['folder_id_or_url'])
+        strict = !!input['strict_on_access_errors']
         q = ["trashed=false"]
 
         filters = input['filters'] || {}
@@ -349,6 +350,23 @@
         # Restrict to parent folder if requested
         if folder_id.present?
           q << "'#{folder_id}' in parents"
+        end
+
+        # Preflight: if a folder is specified, verify access and that it's actually a folder
+        if folder_id.present?
+          begin
+            fmeta = get("https://www.googleapis.com/drive/v3/files/#{folder_id}")
+                    .params(supportsAllDrives: true, fields: 'id,mimeType')
+            unless fmeta['mimeType'] == 'application/vnd.google-apps.folder'
+              error('400 Bad Request - Provided ID is not a folder (mimeType=' + fmeta['mimeType'].to_s + ').') if strict
+            end
+          rescue => e
+            details = call(:google_error_extract, e)
+            if strict
+              error("#{(details['code'] || 403)} #{(details['status'] || 'Forbidden')} - #{(details['message'] || e.to_s)}")
+            end
+            # non-strict: fall through; the main list will handle and return stable empty result
+          end
         end
 
         # Corpora/driveId are critical for correctness across My Drive vs Shared
@@ -428,18 +446,24 @@
         end
       rescue => e
         # Predictable empty page on failure, plus telemetry. Keeps data pills stable.
-        details = call(:google_error_extract, e)
-        {}.merge(
-          'files'            => [],
-          'file_ids'         => [],
+        details   = call(:google_error_extract, e)
+        err_pills = call(:normalize_error_for_pills, details, 'drive', 'files.list')
+        response  = {}.merge(
+          'files'              => [],
+          'file_ids'           => [],
           'items_for_transfer' => [],
-          'count'            => 0,
-          'has_more'         => false,
-          'next_page_token'  => nil,
-          'debug'            => (debug_block || {})
-        ).merge(
-          call(:telemetry_envelope, t0, corr, false, (details['code'] || 0), details['message'] || e.to_s, details)
-        )
+          'count'              => 0,
+          'has_more'           => false,
+          'next_page_token'    => nil,
+          'debug'              => (debug_block || {}),
+          'error'              => err_pills
+        ).merge(call(:telemetry_envelope, t0, corr, false, (details['code'] || 0), details['message'] || e.to_s, details))
+        # If strict flag is enabled, raise instead of swallowing
+        if strict
+          error("#{(details['code'] || 500)} #{(details['status'] || 'DriveError')} - #{(details['message'] || e.to_s)}")
+        end
+        response
+
       end,
 
       sample_output: lambda do
@@ -484,9 +508,7 @@
       subtitle: 'Fetch Drive file metadata and content',
       display_priority: 10,
       help: lambda do |_|
-        {
-          body: 'Fetch Drive file metadata and optionally content (text or bytes). Shortcuts are resolved once.'
-        }
+        { body: 'Fetch Drive file metadata and optionally content (text or bytes). Shortcuts are resolved once.' }
       end,
 
       input_fields: lambda do |_obj, _conn, config_fields|
@@ -564,6 +586,7 @@
       rescue => e
         details = call(:google_error_extract, e)
         {}.merge(
+          'error' => call(:normalize_error_for_pills, details, 'drive', (mode == 'bytes' ? 'files.get(media)' : 'files.get|export'))
           call(:telemetry_envelope, t0, corr, false, (details['code'] || 0), details['message'] || e.to_s, details)
         )
       end
@@ -639,6 +662,7 @@
           'has_more'        => false,
           'next_page_token' => nil
         ).merge(
+          'error' => call(:normalize_error_for_pills, details, 'gcs', 'objects.list'),
           call(:telemetry_envelope, t0, corr, false, (details['code'] || 0), details['message'] || e.to_s, details)
         )
       end,
@@ -752,7 +776,10 @@
         end
       rescue => e
         details = call(:google_error_extract, e)
-        {}.merge(call(:telemetry_envelope, t0, corr, false, (details['code'] || 0), details['message'] || e.to_s, details))
+        {}.merge(
+          'error' => call(:normalize_error_for_pills, details, 'gcs',
+                          (mode == 'bytes' ? 'objects.get(media)' : (mode == 'text' ? 'objects.get(media)' : 'objects.get')))
+        ).merge(call(:telemetry_envelope, t0, corr, false, (details['code'] || 0), details['message'] || e.to_s, details))
       end,
 
       sample_output: lambda do
@@ -868,7 +895,9 @@
           .merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
       rescue => e
         details = call(:google_error_extract, e)
-        {}.merge(call(:telemetry_envelope, t0, corr, false, (details['code'] || 0), details['message'] || e.to_s, details))
+        {}.merge(
+          'error' => call(:normalize_error_for_pills, details, 'gcs', 'objects.insert(upload)')
+        ).merge(call(:telemetry_envelope, t0, corr, false, (details['code'] || 0), details['message'] || e.to_s, details))
       end,
 
       sample_output: lambda do
@@ -969,6 +998,7 @@
           'failed'   => [],
           'summary'  => { 'total' => 0, 'success' => 0, 'failed' => 0 }
         }.merge(
+          'error' => call(:normalize_error_for_pills, details, 'drive|gcs', 'transfer.single'),
           call(:telemetry_envelope, t0, corr, false, (details['code'] || 0), details['message'] || e.to_s, details)
         )
       end,
@@ -1079,6 +1109,7 @@
           'failed'   => [],
           'summary'  => { 'total' => 0, 'success' => 0, 'failed' => 0 }
         }.merge(
+          'error' => call(:normalize_error_for_pills, details, 'drive|gcs', 'transfer.batch'),
           call(:telemetry_envelope, t0, corr, false, (details['code'] || 0), details['message'] || e.to_s, details)
         )
       end,
@@ -1127,7 +1158,9 @@
           { name: 'drive_canary_folder_id_or_url', label: 'Drive canary folder (ID/URL)', optional: true,
             hint: 'Defaults to connection.canary_drive_folder_id_or_url' },
           { name: 'drive_id', label: 'Shared drive ID', optional: true,
-            hint: 'Defaults to connection.canary_shared_drive_id' }
+            hint: 'Defaults to connection.canary_shared_drive_id' },
+          { name: 'strict', type: 'boolean', control_type: 'checkbox', label: 'Fail on access errors',
+            optional: true, default: false }
         ]
       end,
       output_fields: lambda do |object_definitions|
@@ -1151,8 +1184,15 @@
         prefix   = (input['gcs_prefix'].presence || 'probes/')
         folder   = (input['drive_canary_folder_id_or_url'].presence || connection['canary_drive_folder_id_or_url'])
         drive_id = (input['drive_id'].presence || connection['canary_shared_drive_id'])
+
+        strict   = !!input['strict']
         # Delegate to shared method used by connection test for single-source of truth
-        call(:do_permission_probe, connection, bucket, folder, drive_id, prefix)
+        res = call(:do_permission_probe, connection, bucket, folder, drive_id, prefix)
+        if strict && res['upstream'].is_a?(Hash) && res['upstream']['drive_error'].is_a?(Hash)
+          de = res['upstream']['drive_error']
+          error("#{(de['code'] || 403)} #{(de['status'] || 'Forbidden')} - #{(de['message'] || 'Drive access failed')}")
+        end
+        res
       end
     }
   },
@@ -1357,7 +1397,6 @@
         'metadata'     => o['metadata'] || {}
       }
     end,
-
     map_drive_meta: lambda do |f|
       {
         'id'            => f['id'],
@@ -1378,7 +1417,6 @@
         'web_view_url' => (f['id'].present? ? "https://drive.google.com/file/d/#{f['id']}/view" : nil)
       }
     end,
-
     do_permission_probe: lambda do |connection, bucket, canary_folder_id_or_url, canary_drive_id, gcs_prefix|
       # Core probe used by connection test and action
       # Returns the full spec'd object (merged with telemetry by the caller when appropriate),
@@ -1408,6 +1446,7 @@
       supports = true
       include_items = true
       drive_list = []
+      drive_err = nil
       begin
         q = ["trashed=false"]
         folder_id = call(:util_extract_drive_id, canary_folder_id_or_url)
@@ -1434,8 +1473,8 @@
         (res['files'] || []).first(3).each do |f|
           drive_list << call(:map_drive_min_for_probe, f)
         end
-      rescue => _e
-        # Leave empty; Drive might be disabled or no visibility
+      rescue => e
+        drive_err = call(:google_error_extract, e)
       end
 
       # 3) GCS access: first 3 under gs://bucket/prefix
@@ -1487,7 +1526,7 @@
         # Ignore; gcs_list stays empty
       end
 
-      ok = (who.present?) # “ok” is heuristic; identity is the baseline signal
+      ok = (who.present? && drive_err.nil?)
       res = {
         'ok' => !!ok,
         'whoami' => who,
@@ -1497,7 +1536,13 @@
         'drive_access' => drive_list,
         'gcs_access' => gcs_list
       }
-      res.merge(call(:telemetry_envelope, t0, corr, ok, ok ? 200 : 207, ok ? 'OK' : 'Partial'))
+      # On Drive fail, carry the error in upstream.drive_error and set http_status from it
+      if drive_err
+        res = res.merge('upstream' => { 'drive_error' => drive_err })
+      end
+      http_code = drive_err ? (drive_err['code'] || 207) : (ok ? 200 : 207)
+      msg = drive_err ? (drive_err['message'] || 'Partial') : (ok ? 'OK' : 'Partial')
+      res.merge(call(:telemetry_envelope, t0, corr, ok, http_code, msg))
     end,
 
     # --- 5. AUTH HELPERS -----------------
@@ -1505,7 +1550,6 @@
       # Base64url without padding
       Base64.urlsafe_encode64(bytes).gsub(/=+$/, '')
     end,
-
     jwt_sign_rs256: lambda do |claims, private_key_pem|
       # Sign a JWT (RS256) using the service account private key
       header = { alg: 'RS256', typ: 'JWT' }
@@ -1530,7 +1574,6 @@
         end
       arr.map(&:to_s).reject(&:empty?).uniq
     end,
-
     auth_token_cache_get: lambda do |connection, scope_key|
       cache = (connection['__token_cache'] ||= {})
       tok   = cache[scope_key]
@@ -1542,13 +1585,11 @@
       return nil unless exp && Time.now < (exp - 60) # valid until exp-60s
       tok
     end,
-
     auth_token_cache_put: lambda do |connection, scope_key, token_hash|
       cache = (connection['__token_cache'] ||= {})
       cache[scope_key] = token_hash
       token_hash
     end,
-
     auth_issue_token!: lambda do |connection, scopes|
       key = JSON.parse(connection['service_account_key_json'].to_s)
       token_url = (key['token_uri'].presence || 'https://oauth2.googleapis.com/token')
@@ -1580,7 +1621,6 @@
         'scope_key'    => scope_str
       }
     end,
-
     auth_build_access_token!: lambda do |connection, scopes: nil|
       # Public surface: returns *string* access token, cached by scope set
       set = call(:auth_normalize_scopes, scopes)
@@ -1704,7 +1744,6 @@
         meta
       end
     end,
-
     safe_string_object_metadata: lambda do |meta|
       return {} unless meta.is_a?(Hash)
       meta.transform_values { |v| v.nil? ? nil : v.to_s }
@@ -1730,7 +1769,6 @@
               )
       [res['files'] || [], res['nextPageToken']]
     end,
-
     drive_bfs_collect_files!: lambda do |root_id, filters, corpora, drive_id, overall_limit, max_depth|
       # Breadth-first traversal from root_id.
       # Returns array of mapped file metas (not including folders when filters['exclude_folders'] is true).
@@ -1800,57 +1838,28 @@
         hint: 'Switch to reveal relevant inputs.'
       }
     end,
-   
     ui_write_body_fields: lambda do |mode|
       # For PUT (write): either text content + postprocess, or base64 bytes
-      if mode == 'bytes'
-        [
-          { name: 'content_bytes', optional: false, label: 'Content (Base64)',
-            hint: 'Required when mode is bytes.' }
-        ]
-      else
-        [
-          { name: 'text_content', optional: false, label: 'Content (text)',
-            control_type: 'text-area',
-            hint: 'Required when mode is text.' },
-          { name: 'postprocess', type: 'object', optional: true, label: 'Post-process',
-            properties: [
-              { name: 'util_strip_urls', type: 'boolean', control_type: 'checkbox',
-                label: 'Strip URLs from text', default: false }
-            ] }
-        ]
-      end
+      # Text or bytes body + optional postprocess (text only)
+      fields = (mode == 'bytes') ? call(:schema_write_bytes_fields) : call(:schema_write_text_fields)
+      postprocess = (mode == 'text') ? [
+        { name: 'postprocess', type: 'object', optional: true, label: 'Post-process',
+          properties: call(:schema_postprocess_fields) }
+      ] : []
+      fields + postprocess
     end,
-
     ui_read_postprocess_if_text: lambda do |mode|
       # For GET (read): show postprocess only for text mode
       return [] unless mode == 'text'
-      [{
-        name: 'postprocess', type: 'object', optional: true, label: 'Post-process',
-        properties: [
-          { name: 'util_strip_urls', type: 'boolean', control_type: 'checkbox',
-            label: 'Strip URLs from text', default: false }
-        ]
-      }]
+      [{ name: 'postprocess', type: 'object', optional: true, label: 'Post-process',
+         properties: call(:schema_postprocess_fields) }]
     end,
 
     ui_gcs_advanced: lambda do
       # Advanced drawer shared by actions that talk to GCS
-      [{
-        name: 'advanced', type: 'object', optional: true, label: 'Advanced',
-        properties: [
-          { name: 'content_type', optional: true, label: 'Content-Type',
-            hint: 'Defaults: text/plain; charset=UTF-8 (text), application/octet-stream (bytes).' },
-          { name: 'custom_metadata', type: 'object', optional: true, label: 'Custom metadata' },
-          { name: 'preconditions', type: 'object', optional: true, label: 'Preconditions',
-            properties: [
-              { name: 'if_generation_match', optional: true, label: 'If-Generation-Match' },
-              { name: 'if_metageneration_match', optional: true, label: 'If-Metageneration-Match' }
-            ] }
-        ]
-      }]
+      [{ name: 'advanced', type: 'object', optional: true, label: 'Advanced',
+         properties: call(:schema_gcs_advanced_fields) }]
     end,
-
     ui_gcs_put_inputs: lambda do |config_fields|
       # Assemble inputs for GCS PUT
       mode = (config_fields['content_mode'] || 'text').to_s
@@ -1861,7 +1870,6 @@
       ]
       base + call(:ui_write_body_fields, mode) + call(:ui_gcs_advanced)
     end,
-
     ui_gcs_get_inputs: lambda do |config_fields|
       # Assemble inputs for GCS GET
       mode = (config_fields['content_mode'] || 'none').to_s
@@ -1871,6 +1879,21 @@
         call(:ui_content_mode_field, 'content_modes', 'none')
       ]
       base + call(:ui_read_postprocess_if_text, mode)
+    end,
+    ui_gcs_list_inputs: lambda do |_config_fields|
+      # Assemble inputs for GCS LIST
+      [
+        { name: 'bucket', optional: false, label: 'Bucket' },
+        { name: 'filters', type: 'object', optional: true, label: 'Filters',
+          properties: [
+            { name: 'prefix', optional: true, label: 'Prefix' },
+            { name: 'delimiter', optional: true, label: 'Delimiter',
+              hint: 'Use "/" to emulate folders.' },
+            { name: 'include_versions', type: 'boolean', control_type: 'checkbox',
+              optional: true, default: false, label: 'Include noncurrent versions' } ] },
+        { name: 'paging', type: 'object', optional: true, label: 'Paging',
+          properties: call(:schema_paging_fields, '1–1000, default 100') }
+      ]
     end,
 
     ui_drive_get_inputs: lambda do |config_fields|
@@ -1892,62 +1915,29 @@
         end
       base + extra
     end,
- 
     ui_drive_list_inputs: lambda do |_config_fields|
       # Assemble inputs for Drive LIST
       [
         { name: 'folder_id_or_url', label: 'Folder ID or URL', optional: true, hint: 'Leave blank to search My Drive / corpus.' },
-        { name: 'drive_id', label: 'Shared drive ID', optional: true },
+        { name: 'drive_id',         label: 'Shared drive ID', optional: true },
+        { name: 'strict_on_access_errors', type: 'boolean', control_type: 'checkbox', label: 'Fail on access errors (403/404)', optional: true,
+          default: true, hint: 'If enabled and the folder is inaccessible or not a folder, the step fails instead of returning an empty page.' },
         { name: 'recursive', type: 'boolean', control_type: 'checkbox', label: 'Recurse into subfolders',
           optional: true, default: false, hint: 'When enabled and a Folder is provided, lists files in the entire subtree.' },
         { name: 'max_depth', type: 'integer', optional: true, label: 'Maximum depth',
           hint: '0 or blank = unlimited. Depth 1 = just the folder itself, 2 = its subfolders, etc.' },
         { name: 'overall_limit', type: 'integer', optional: true, label: 'Overall result limit',
           hint: 'Hard cap across the whole subtree. Default 1000. Upper bound 10000.' },
-        {
-          name: 'filters', type: 'object', optional: true, label: 'Filters',
+        { name: 'filters', type: 'object', optional: true, label: 'Filters',
           properties: [
             { name: 'modified_after', type: 'date_time', optional: true, label: 'Modified after' },
             { name: 'modified_before', type: 'date_time', optional: true, label: 'Modified before' },
             { name: 'mime_types', type: 'array', of: 'string', optional: true,
               hint: 'Exact mimeType values (OR).' },
             { name: 'exclude_folders', type: 'boolean', control_type: 'checkbox',
-              optional: true, default: false, label: 'Exclude folders' }
-          ]
-        },
-        {
-          name: 'paging', type: 'object', optional: true, label: 'Paging',
-          properties: [
-            { name: 'max_results', type: 'integer', optional: true, label: 'Max results',
-              hint: '1–1000, default 100' },
-            { name: 'page_token', type: 'string', optional: true }
-          ]
-        }
-      ]
-    end,
-
-    ui_gcs_list_inputs: lambda do |_config_fields|
-      # Assemble inputs for GCS LIST
-      [
-        { name: 'bucket', optional: false, label: 'Bucket' },
-        {
-          name: 'filters', type: 'object', optional: true, label: 'Filters',
-          properties: [
-            { name: 'prefix', optional: true, label: 'Prefix' },
-            { name: 'delimiter', optional: true, label: 'Delimiter',
-              hint: 'Use "/" to emulate folders.' },
-            { name: 'include_versions', type: 'boolean', control_type: 'checkbox',
-              optional: true, default: false, label: 'Include noncurrent versions' }
-          ]
-        },
-        {
-          name: 'paging', type: 'object', optional: true, label: 'Paging',
-          properties: [
-            { name: 'max_results', type: 'integer', optional: true, label: 'Max results',
-              hint: '1–1000, default 1000' },
-            { name: 'page_token', optional: true, label: 'Page token' }
-          ]
-        }
+              optional: true, default: false, label: 'Exclude folders' } ] },
+        { name: 'paging', type: 'object', optional: true, label: 'Paging',
+          properties: call(:schema_paging_fields, '1–1000, default 100') }
       ]
     end,
 
@@ -1965,7 +1955,6 @@
           control_type: 'select', pick_list: 'editors_export_formats', optional: true }
       ]
     end,
-
     ui_transfer_batch_inputs: lambda do |_config_fields|
       # Assemble inputs for batch Drive -> GCS transfer
       [
@@ -1997,7 +1986,77 @@
         { name: 'content_type', label: 'Content-Type override', optional: true },
         { name: 'custom_metadata', label: 'Custom metadata (override)', type: 'object', optional: true }
       ]
+    end,
+    schema_owner_fields: lambda do
+      [
+        { name: 'display_name' },
+        { name: 'email' }
+      ]
+    end,
+    schema_postprocess_fields: lambda do
+      [
+        { name: 'util_strip_urls', type: 'boolean', control_type: 'checkbox',
+          label: 'Strip URLs from text', default: false }
+      ]
+    end,
+    schema_gcs_advanced_fields: lambda do
+      [
+        { name: 'content_type', optional: true, label: 'Content-Type',
+          hint: 'Defaults: text/plain; charset=UTF-8 (text), application/octet-stream (bytes).' },
+        { name: 'custom_metadata', type: 'object', optional: true, label: 'Custom metadata' },
+        { name: 'preconditions', type: 'object', optional: true, label: 'Preconditions',
+          properties: [
+            { name: 'if_generation_match', optional: true, label: 'If-Generation-Match' },
+            { name: 'if_metageneration_match', optional: true, label: 'If-Metageneration-Match' }
+          ] }
+      ]
+    end,
+    schema_write_text_fields: lambda do
+      [
+        { name: 'text_content', optional: false, label: 'Content (text)',
+          control_type: 'text-area',
+          hint: 'Required when mode is text.' }
+      ]
+    end,
+    schema_write_bytes_fields: lambda do
+      [
+        { name: 'content_bytes', optional: false, label: 'Content (Base64)',
+          hint: 'Required when mode is bytes.' }
+      ]
+    end,
+    schema_paging_fields: lambda do |max_label_hint|
+      [
+        { name: 'max_results', type: 'integer', optional: true, label: 'Max results',
+          hint: max_label_hint.to_s },
+        { name: 'page_token', type: 'string', optional: true, label: 'Page token' }
+      ]
+    end,
+    schema_error_fields: lambda do
+      # Canonical error schema for data pills
+      [
+        { name: 'code', type: 'integer', hint: 'HTTP/status code when known' },
+        { name: 'status', type: 'string' },
+        { name: 'reason', type: 'string' },
+        { name: 'domain', type: 'string' },
+        { name: 'location', type: 'string' },
+        { name: 'message', type: 'string' },
+        { name: 'service', type: 'string', hint: 'drive | gcs | oauth | unknown' },
+        { name: 'operation', type: 'string', hint: 'what we were calling (e.g., files.get)' }
+      ]
+    end,
+    normalize_error_for_pills: lambda do |details, service, operation|
+      # Normalize extractor output into the canonical error shape
+      d = details.is_a?(Hash) ? details.dup : {}
+      {
+        'code'      => (d['code'] || d[:code]),
+        'status'    => (d['status'] || d[:status]).to_s.presence,
+        'reason'    => (d['reason'] || d[:reason]).to_s.presence,
+        'domain'    => (d['domain'] || d[:domain]).to_s.presence,
+        'location'  => (d['location'] || d[:location]).to_s.presence,
+        'message'   => (d['message'] || d[:message] || d['error'] || d[:error]).to_s.presence,
+        'service'   => service.to_s,
+        'operation' => operation.to_s
+      }.compact
     end
-
   }
 }
