@@ -1,2388 +1,1225 @@
-# frozen_string_literal: true
-require 'openssl'
-require 'base64'
-
 {
-  title: 'Vertex AI Adapter',
-  version: '0.9.1',
-  description: 'Vertex AI via service account (JWT)',
-  help: {
-    body: 'cloud.google.com/vertex-ai/docs/vector-search/quick-start'
-  }
+  title: 'Google Drive with Cloud Storage',
+  version: '1.0.0',
 
   # --------- CONNECTION ---------------------------------------------------
   connection: {
     fields: [
-      # Prod/Dev toggle
-      { name: 'prod_mode',                  optional: true,   control_type: 'checkbox', label: 'Production mode',
-        type: 'boolean',  default: true, extends_schema: true, hint: 'When enabled, suppresses debug echoes and enforces strict idempotency/retry rules.' },
-      # Service account details
-      { name: 'service_account_key_json',   optional: false,  control_type: 'text-area', 
-        hint: 'Paste full JSON key' },
-      { name: 'location',                   optional: false,  control_type: 'text',
-        hint: 'e.g., global, us-central1, us-east4' },
-      { name: 'project_id',                 optional: true,   control_type: 'text',
-        hint: 'GCP project ID (inferred from key if blank)' },
-      { name: 'user_project',               optional: true,   control_type: 'text',      label: 'User project for quota/billing',
-        extends_schema: true, hint: 'Sets x-goog-user-project for billing/quota. Service account must have roles/serviceusage.serviceUsageConsumer on this project.' },
-
-      # Defaults for test probe
-      { name: 'set_defaults_for_probe',     optional: false,  control_type: 'checkbox', 
-        extends_schema: true, type: 'boolean', default: false, hint: 'Optionally set default model(s) for connection test' },
-      { name: 'default_probe_gen_model',    optional: true,
-        ngIf: 'input.set_defaults_for_probe == "true"', hint: 'e.g., gemini-2.0-flash' },
-      { name: 'default_probe_embed_model',  optional: true,
-        ngIf: 'input.set_defaults_for_probe == "true"', hint: 'e.g., text-embedding-005' }
+      {
+        name: 'service_account_key_json',
+        label: 'Service account JSON key',
+        control_type: 'text-area',
+        optional: false,
+        hint: 'Paste the full JSON from Google Cloud (includes client_email, private_key, token_uri).'
+      },
+      {
+        name: 'user_project',
+        label: 'User project for requester-pays (optional)',
+        hint: 'Project ID for billing (userProject)',
+        optional: true
+      },
+      {
+        name: 'set_defaults_for_probe', type: 'boolean', control_type: 'checkbox',
+        extends_schema: true, optional: false,
+        hint: 'Optionally set default bucket and Drive folder for connection test'
+      },
+      {
+        name: 'default_probe_bucket',
+        label: 'Default probe bucket (GCS)',
+        hint: 'Used by connection test + Permission probe when no bucket is provided.',
+        optional: true, ngIf: 'input.set_defaults_for_probe == "true"'
+      },
+      {
+        name: 'canary_drive_folder_id_or_url',
+        label: 'Canary Drive folder (ID or URL)',
+        hint: 'Probe lists files here (first 3). Leave blank to probe corpus without parent filter.',
+        optional: true, ngIf: 'input.set_defaults_for_probe == "true"'
+      },
+      {
+        name: 'canary_shared_drive_id',
+        label: 'Canary shared drive ID (optional)',
+        hint: 'If set, probe uses corpora=drive and this driveId.',
+        optional: true, ngIf: 'input.set_defaults_for_probe == "true"'
+       }
     ],
 
     authorization: {
       # Custom JWT-bearer --> OAuth access token exchange
       type: 'custom',
 
+      # Attach the access token to every request
+      apply: lambda do |connection|
+        headers('Authorization': "Bearer #{connection['access_token']}")
+      end,
+
+      # Obtain/refresh the access token
       acquire: lambda do |connection|
-        # Build token via cache-aware helper
-        scopes   = call(:const_default_scopes) # ['https://www.googleapis.com/auth/cloud-platform']
-        token    = call(:auth_build_access_token!, connection, scopes: scopes)
-        scope_key = scopes.join(' ')
+        # Use default superset (Drive + GCS). Cached per scope set.
+        token_str = call(:auth_build_access_token!, connection, scopes: call(:const_default_scopes))
+        # Build a stable shape for Workato’s connection store.
+        # Pull from cache so we have expires_in/at without re-exchanging:
+        scope_key = call(:const_default_scopes).join(' ')
+        cached = (connection['__token_cache'] ||= {})[scope_key]
 
-        # Pull metadata from the cache written by auth_build_access_token!
-        cached   = (connection['__token_cache'] ||= {})[scope_key]
-
-        # Build payload
         {
-          access_token: token,
+          access_token: token_str,
           token_type:   'Bearer',
           expires_in:   (cached && cached['expires_in']) || 3600,
           expires_at:   (cached && cached['expires_at']) || (Time.now + 3600 - 60).utc.iso8601
         }
       end,
 
-      apply: lambda do |connection|
-        # Keep headers minimal; envelope/correlation lives in actions
-        h = { 'Authorization' => "Bearer #{connection['access_token']}" }
-        up = connection['user_project'].to_s.strip
-        h['x-goog-user-project'] = up unless up.empty?
-        headers(h)
-      end,
-
+      # URL: token
       token_url: 'https://oauth2.googleapis.com/token',
-
-      # Let Workato trigger re-acquire on auth errors
+      
+      # Refresh rules
       refresh_on: [401],
-      detect_on:  [/UNAUTHENTICATED/i, /invalid[_-]?token/i, /expired/i, /insufficient/i]
-    },
 
-    base_uri: lambda do |_connection|
-      'https://aiplatform.googleapis.com'
-    end
+      detect_on: [/UNAUTHENTICATED/i, /invalid[_-]?token/i, /expired/i, /insufficient/i]
+    }
   },
 
   # --------- CONNECTION TEST ----------------------------------------------
   test: lambda do |connection|
-    # Fast path: if defaults provided, exercise a real, auth’d call to surface IAM/billing issues early.
-    if %w[true 1 yes].include?(connection['set_defaults_for_probe'].to_s.downcase) && connection['default_probe_gen_model'].present?
-      # Evaluate connection fields
-      call(:ensure_project_id!, connection)
-      # Build model path (global preview)
-      model_path = call(:build_model_path_with_global_preview, connection, connection['default_probe_gen_model'])
-      # Define location (prefer connection, fallback to global)
-      loc = (connection['location'].presence || 'global').to_s.downcase
-      # POST to endpoint
-      url = call(:aipl_v1_url, connection, loc, "#{model_path}:countTokens")
-      post(url)
-        .headers(call(:request_headers, call(:build_correlation_id)))
-        .payload({
-          'contents' => [{ 'role' => 'user', 'parts' => [{ 'text' => 'ping' }] }],
-          'systemInstruction' => call(:system_instruction_from_text, 'Connection probe')
-        })
-    else
-      # Fallback: verify access by listing locations for the project (no model catalog dependency).
-      call(:ensure_project_id!, connection)
-      pid = connection['project_id']
-      get("https://aiplatform.googleapis.com/v1/projects/#{pid}/locations")
-        .headers(call(:request_headers, call(:build_correlation_id)))
-        .params pageSize: 1
-    end
+    # Leverage the same probe logic as the action.
+    bucket   = connection['default_probe_bucket']
+    folder   = connection['canary_drive_folder_id_or_url']
+    drive_id = connection['canary_shared_drive_id']
+    res = call(:do_permission_probe, connection, bucket, folder, drive_id, 'probes/')
+    # A non-200 probe still returns JSON; Workato considers any returned
+    # object a "pass" unless you raise. We intentionally do NOT raise,
+    # so users see structured hints in the test result.
+    # Return a slim object so the UI shows something human-readable.
+    {
+      ok: res['ok'],
+      whoami: res['whoami'],
+      drive_ok: Array(res['drive_access']).any?,
+      gcs_ok: Array(res['gcs_access']).any?,
+      requester_pays_detected: !!res['requester_pays_detected']
+    }
   end,
 
   # --------- OBJECT DEFINITIONS -------------------------------------------
   object_definitions: {
-
-    content_part: {
-      fields: lambda do
+    # --- Base definitions
+    drive_file_base_fields: {
+      fields: lambda do |_connection|
         [
-          { name: 'text' },
-          { name: 'inlineData', type: 'object', properties: [
-              { name: 'mimeType' }, { name: 'data', hint: 'Base64' }
-          ]},
-          { name: 'fileData', type: 'object', properties: [
-              { name: 'mimeType' }, { name: 'fileUri' }
-          ]},
-          { name: 'functionCall', type: 'object', properties: [
-              { name: 'name' }, { name: 'args', type: 'object' }
-          ]},
-          { name: 'functionResponse', type: 'object', properties: [
-              { name: 'name' }, { name: 'response', type: 'object' }
-          ]},
-          { name: 'executableCode', type: 'object', properties: [
-              { name: 'language' }, { name: 'code' }
-          ]},
-          { name: 'codeExecutionResult', type: 'object', properties: [
-              { name: 'outcome' }, { name: 'stdout' }, { name: 'stderr' }
-          ]}
+          { name: 'id', type: 'string' },
+          { name: 'name', type: 'string' },
+          { name: 'mime_type', type: 'string' },
+          { name: 'size', type: 'integer' },
+          { name: 'modified_time', type: 'date_time' },
+          { name: 'checksum', type: 'string' },
+          { name: 'web_view_url', type: 'string', hint: 'Open in Drive' },
+          { name: 'owners', type: 'array', of: 'object', properties: [{ name: 'display_name' }, { name: 'email' }] }
         ]
       end
     },
-    content: {
-      # Per contract: role ∈ {user, model}
+    gcs_object_base_fields: {
+      fields: lambda do |_connection|
+        [
+          { name: 'bucket', type: 'string' },
+          { name: 'name', type: 'string' },
+          { name: 'size', type: 'integer' },
+          { name: 'content_type', type: 'string' },
+          { name: 'updated', type: 'date_time' },
+          { name: 'generation', type: 'string' },
+          { name: 'md5_hash', type: 'string' },
+          { name: 'crc32c', type: 'string' },
+          { name: 'metadata', type: 'object' }
+        ]
+      end
+    },
+
+    # --- Full composite definitions
+    # Prefer full composite over pass-through (pt via concat can
+    # fail to resolve at runtime).
+    gcs_object_with_content: {
       fields: lambda do |object_definitions|
-        [
-          { name: 'role', control_type: 'select', pick_list: 'roles', optional: false },
-          { name: 'parts', type: 'array', of: 'object',
-            properties: object_definitions['content_part'], optional: false }
-        ]
+        Array(object_definitions['gcs_object_base_fields']) + [
+          { name: 'text_content', type: 'string' },
+          { name: 'content_bytes', type: 'string', hint: 'Base64' },
+          { name: 'content_md5', type: 'string', hint: 'Computed from fetched content' },
+          { name: 'content_sha256', type: 'string', hint: 'Computed from fetched content' }
+        ] + Array(object_definitions['envelope_fields'])
+      end
+    },
+    gcs_object_with_bytes_uploaded: {
+      fields: lambda do |object_definitions|
+        Array(object_definitions['gcs_object_base_fields']) + [
+          { name: 'bytes_uploaded', type: 'integer' }
+        ] + Array(object_definitions['envelope_fields'])
       end
     },
 
-    gen_generate_content_input: {
-      fields: lambda do |_connection, config_fields, object_definitions|
-        show_adv = (config_fields['show_advanced'] == true)
-
-        base = [
-          # UX toggle
-          { name: 'show_advanced', label: 'Show advanced options',
-            type: 'boolean', control_type: 'checkbox', optional: true, default: false },
-          # Model (free-text only)
-          { name: 'model', label: 'Model', optional: false, control_type: 'text' },
-
-          # Contract-friendly content
-          { name: 'contents', type: 'array', of: 'object',
-            properties: object_definitions['content'], optional: false },
-          # Simple system text that we convert to systemInstruction object
-          { name: 'system_preamble', label: 'System preamble (text)', optional: true,
-            hint: 'Optional; becomes systemInstruction.parts[0].text' }
-        ]
-        adv = [
-          { name: 'tools', type: 'array', of: 'object', properties: [
-              { name: 'googleSearch',    type: 'object' },
-              { name: 'retrieval',       type: 'object' },
-              { name: 'codeExecution',   type: 'object' },
-              { name: 'functionDeclarations', type: 'array', of: 'object' }
-            ]
-          },
-          { name: 'toolConfig',      type: 'object' },
-          { name: 'safetySettings',  type: 'array', of: 'object',
-            properties: object_definitions['safety_setting'] },
-          { name: 'generationConfig', type: 'object',
-            properties: object_definitions['generation_config'] }
-        ]
-
-        show_adv ? (base + adv) : base
-      end
-    },
-    generation_config: {
-      fields: lambda do
-        [
-          { name: 'temperature',       type: 'number'  },
-          { name: 'topP',              type: 'number'  },
-          { name: 'topK',              type: 'integer' },
-          { name: 'maxOutputTokens',   type: 'integer' },
-          { name: 'candidateCount',    type: 'integer' },
-          { name: 'stopSequences',     type: 'array', of: 'string' },
-          { name: 'responseMimeType' },
-          { name: 'responseSchema',    type: 'object' } # structured output
-        ]
-      end
-    },
-    generate_content_output: {
-      fields: lambda do
-        [
-          { name: 'responseId' },
-          { name: 'modelVersion' },
-          { name: 'usageMetadata', type: 'object', properties: [
-              { name: 'promptTokenCount',     type: 'integer' },
-              { name: 'candidatesTokenCount', type: 'integer' },
-              { name: 'totalTokenCount',      type: 'integer' }
-            ]
-          },
-          { name: 'candidates', type: 'array', of: 'object', properties: [
-            { name: 'finishReason' },
-            { name: 'safetyRatings', type: 'array', of: 'object', properties: [
-                { name: 'category' }, { name: 'probability' }, { name: 'blocked', type: 'boolean' }
-            ]},
-            { name: 'groundingMetadata', type: 'object', properties: [
-                { name: 'citationSources', type: 'array', of: 'object', properties: [
-                    { name: 'uri' }, { name: 'license' }, { name: 'title' }, { name: 'publicationDate' }
-                ]}
-            ]},
-            { name: 'content', type: 'object', properties: [
-                { name: 'role' },
-                { name: 'parts', type: 'array', of: 'object', properties: [
-                    { name: 'text' }, { name: 'inlineData', type: 'object' }, { name: 'fileData', type: 'object' }
-                ]}
-            ]}
-          ]}
-        ]
-      end
-    },
-
-    embed_output: {
-      # Align to contract: embeddings object, not array
-      fields: lambda do
-        [
-          { name: 'predictions', type: 'array', of: 'object', properties: [
-              { name: 'embeddings', type: 'object', properties: [
-                  { name: 'values', type: 'array', of: 'number' },
-                  { name: 'statistics', type: 'object', properties: [
-                      { name: 'truncated',   type: 'boolean' },
-                      { name: 'token_count', type: 'number' } # sometimes returned as decimal place, e.g., 7.0
-                    ]
-                  }
-                ]
-              }
-            ]
-          },
-          # NEW: surface billing metadata from the REST response
-          { name: 'metadata', type: 'object', properties: [
-              { name: 'billableCharacterCount', type: 'integer' }
-            ]
-          }
-        ]
-      end
-    },
-    predict_output: {
-      fields: lambda do
-        [
-          { name: 'predictions', type: 'array', of: 'object' },
-          { name: 'deployedModelId' }
-        ]
-      end
-    },
-
-    batch_job: {
+    # --- Composite definitions
+    # Call other object definitions
+    drive_file_min: {
       fields: lambda do |_|
         [
-          { name: 'name' },
-          { name: 'displayName' },
-          { name: 'state' },
-          { name: 'model' },
-          { name: 'modelVersionId' },
-          { name: 'error', type: 'object' },
-          { name: 'outputInfo', type: 'object' },
-          { name: 'resourcesConsumed', type: 'object' },
-          { name: 'partialFailures', type: 'array', of: 'object' },
-          { name: 'labels', type: 'object' }
+          { name: 'id', type: 'string' },
+          { name: 'name', type: 'string' }
         ]
       end
     },
-
+    drive_file_full: {
+      fields: lambda do |object_definitions|
+        Array(object_definitions['drive_file_base_fields']) + [
+          { name: 'exported_as', type: 'string' },
+          { name: 'text_content', type: 'string' },
+          { name: 'content_bytes', type: 'string', hint: 'Base64' },
+          { name: 'content_md5', type: 'string', hint: 'Computed from fetched content' },
+          { name: 'content_sha256', type: 'string', hint: 'Computed from fetched content' }
+        ] + Array(object_definitions['envelope_fields'])
+      end
+    },
+    gcs_list_page: {
+      fields: lambda do |object_definitions|
+        base = Array(object_definitions['list_page_meta'])
+        ([
+          { name: 'objects', type: 'array', of: 'object',
+            properties: object_definitions['gcs_object_base_fields'] },
+          { name: 'prefixes', type: 'array', of: 'string' },
+          { name: 'object_names', type: 'array', of: 'string', hint: 'Convenience: names from objects[].name' }
+        ] + base + Array(object_definitions['envelope_fields']))
+      end
+    },
+    drive_list_page: {
+      fields: lambda do |object_definitions|
+        base = Array(object_definitions['list_page_meta'])
+        ([
+          { name: 'files',              type: 'array', of: 'object',
+            properties: object_definitions['drive_file_base_fields']  },
+          { name: 'file_ids',           type: 'array', of: 'string', 
+            hint: 'Convenience: IDs extracted from files[].id' },
+          { name: 'items_for_transfer', type: 'array', of: 'object',
+            properties: call(:schema_transfer_batch_plan_item_fields),  hint: 'Directly map into Transfer (batch) → items' },
+          { name: 'debug',              type: 'object', optional: true, properties: [
+              { name: 'q' }, { name: 'corpora' }, { name: 'drive_id' },
+              { name: 'page_size', type: 'integer' },
+              { name: 'supportsAllDrives', type: 'boolean' },
+              { name: 'includeItemsFromAllDrives', type: 'boolean' },
+              { name: 'folder_id' } ] }
+        ] + base + Array(object_definitions['envelope_fields']))
+      end
+    },
+    # --- Schema
+    transfer_result: {
+      fields: lambda do |object_definitions|
+        ([
+          { name: 'uploaded', type: 'array', of: 'object', properties: [
+            { name: 'drive_file_id' }, { name: 'drive_name' }, { name: 'bucket' }, { name: 'gcs_object_name' },
+            { name: 'bytes_uploaded', type: 'integer' }, { name: 'content_type' },
+            { name: 'content_md5', type: 'string' }, { name: 'content_sha256', type: 'string' }
+          ]},
+          { name: 'failed', type: 'array', of: 'object', properties: [
+            { name: 'drive_file_id' }, { name: 'drive_name' }, { name: 'bucket' }, { name: 'gcs_object_name' },
+            { name: 'error_code' }, { name: 'error_message' }
+          ]},
+          { name: 'summary', type: 'object', properties: [
+            { name: 'total', type: 'integer' }, { name: 'success', type: 'integer' }, { name: 'failed', type: 'integer' }
+          ]}
+        ] + Array(object_definitions['envelope_fields']))
+      end
+    },
+    transfer_batch_plan_item: {
+      fields: lambda do |_|
+        call(:schema_transfer_batch_plan_item_fields)
+      end
+    },
+    transfer_batch_result: {
+      fields: lambda do |object_definitions|
+        ([
+          { name: 'uploaded', type: 'array', of: 'object', properties: [
+            { name: 'drive_file_id' }, { name: 'drive_name' }, { name: 'bucket' }, { name: 'gcs_object_name' },
+            { name: 'bytes_uploaded', type: 'integer' }, { name: 'content_type' },
+            { name: 'content_md5', type: 'string' }, { name: 'content_sha256', type: 'string' }
+          ]},
+          { name: 'failed', type: 'array', of: 'object', properties: [
+            { name: 'drive_file_id' }, { name: 'drive_name' }, { name: 'bucket' }, { name: 'gcs_object_name' },
+            { name: 'error_code' }, { name: 'error_message' }
+          ]},
+          { name: 'summary', type: 'object', properties: [
+            { name: 'total', type: 'integer' }, { name: 'success', type: 'integer' }, { name: 'failed', type: 'integer' }
+          ]}
+        ] + Array(object_definitions['envelope_fields']))
+      end
+    },
     envelope_fields: {
       fields: lambda do |_|
         [
-          { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object', properties: [
+          { name: 'ok',         type: 'boolean' },
+          { name: 'telemetry',  type: 'object', properties: [
             { name: 'http_status', type: 'integer' },
             { name: 'message', type: 'string' },
             { name: 'duration_ms', type: 'integer' },
-            { name: 'correlation_id', type: 'string' }
-          ] }
+            { name: 'correlation_id', type: 'string' } ] },
+          { name: 'upstream',   type: 'object', optional: true, properties: [
+            { name: 'code', type: 'integer' },
+            { name: 'status', type: 'string' },
+            { name: 'reason', type: 'string' },
+            { name: 'domain', type: 'string' },
+            { name: 'location', type: 'string' },
+            { name: 'message', type: 'string' } ] }
         ]
       end
     },
-
-    safety_setting: {
-      fields: lambda do
+    list_page_meta: {
+      fields: lambda do |_connection|
         [
-          { name: 'category'  },   # e.g., HARM_CATEGORY_*
-          { name: 'threshold' }    # e.g., BLOCK_LOW_AND_ABOVE
+          { name: 'count', type: 'integer' },
+          { name: 'has_more', type: 'boolean' },
+          { name: 'next_page_token', type: 'string' }
         ]
       end
     }
-
   },
 
   # --------- ACTIONS ------------------------------------------------------
   actions: {
 
-    # 1) Email categorization
-    gen_categorize_email: {
-      title: 'Categorize email',
-      subtitle: 'Classify an email into a category',
-      help: lambda do |_|
-        { body: 'Classify an email into one of the provided categories using embeddings (default) or a generative referee.'}
-      end,
+    # 1) drive_list_files
+    drive_list_files: {
+      title: 'Drive: List files',
+      subtitle: 'List files in Drive',
       display_priority: 10,
-      retry_on_request: ['GET', 'HEAD'],
-      retry_on_response: [408, 429, 500, 502, 503, 504],
-      max_retries: 3,
+      help: lambda do |_|
+        {
+          body: 'Return a page of Drive files with minimal metadata (newest first).'
+        }
+      end,
 
-      input_fields: lambda do |_|
-        [
-          { name: 'mode', control_type: 'select', pick_list: 'modes_classification', optional: false, default: 'embedding',
-            hint: 'embedding (deterministic), generative (LLM-only), or hybrid (embeddings + LLM referee).' },
+      # PURPOSE
+      #   Fetch Drive file metadata and, optionally, content as text or bytes.
+      #   Google Editors files are exported when `content_mode=text` with a sensible default/override.
+      #
+      # CONTENT RULES
+      #   - Editors types (Docs/Sheets/Slides/Drawings) cannot be downloaded via `alt=media` → must export.
+      #   - Non-text binaries reject `content_mode=text` with 415 (guardrail to avoid mojibake).
+      #
+      # OUTPUT STABILITY
+      #   Uses drive_file_full schema (adds text_content/content_bytes and checksums) for consistent data pills.
 
-          { name: 'subject', optional: true },
-          { name: 'body',    optional: true },
 
-          { name: 'categories', optional: false, type: 'array', of: 'object', properties: [
-              { name: 'name',      optional: false },
-              { name: 'description' },
-              { name: 'examples',  type: 'array', of: 'string' }
-            ],
-            hint: 'At least 2. You can also pass simple strings (names only).' },
-
-          { name: 'embedding_model', label: 'Embedding model', control_type: 'text', optional: true,
-            default: 'text-embedding-005', },
-
-          { name: 'generative_model', label: 'Generative model', control_type: 'text', optional: true },
-
-          { name: 'min_confidence', type: 'number', optional: true, default: 0.25,
-            hint: '0–1. If top score falls below this, fallback is used.' },
-
-          { name: 'fallback_category', optional: true, default: 'Other' },
-
-          { name: 'top_k', type: 'integer', optional: true, default: 3,
-            hint: 'In hybrid mode, pass top-K candidates to the LLM referee.' },
-
-          { name: 'return_explanation', type: 'boolean', optional: true, default: false,
-            hint: 'If true and a generative model is provided, returns a short reasoning + distribution.' }
-        ]
+      input_fields: lambda do |_obj, _conn, config_fields|
+        call(:ui_drive_list_inputs, config_fields)
       end,
 
       output_fields: lambda do |object_definitions|
-        [
-          { name: 'mode' },
-          { name: 'chosen' },
-          { name: 'confidence', type: 'number' },
-          { name: 'scores', type: 'array', of: 'object', properties: [
-              { name: 'category' }, { name: 'score', type: 'number' }, { name: 'cosine', type: 'number' }
-            ]
-          },
-          { name: 'referee', type: 'object', properties: [
-              { name: 'category' }, { name: 'confidence', type: 'number' }, { name: 'reasoning' },
-              { name: 'distribution', type: 'array', of: 'object', properties: [
-                  { name: 'category' }, { name: 'prob', type: 'number' }
-                ]
-              }
-            ]
-          }
-        ] + Array(object_definitions['envelope_fields'])
+        object_definitions['drive_list_page']
       end,
 
-      execute: lambda do |connection, input|
-        # Build correlation ID, now (for traceability)
-        t0   = Time.now
-        corr = call(:build_correlation_id)
-        begin
-          subj = (input['subject'] || '').to_s.strip
-          body = (input['body']    || '').to_s.strip
-          email_text = call(:build_email_text, subj, body)
-          error('Provide subject and/or body') if email_text.blank?
+      execute: lambda do |_connection, input|
+        # Correlation id and duration for logs / analytics
+        t0 = Time.now
+        corr = SecureRandom.uuid
 
-          # Normalize categories
-          raw_cats = input['categories']
-          cats = call(:safe_array, raw_cats).map { |c|
-            if c.is_a?(String)
-              { 'name' => c, 'description' => nil, 'examples' => [] }
-            else
-              { 'name' => c['name'] || c[:name],
-                'description' => c['description'] || c[:description],
-                'examples' => call(:safe_array, (c['examples'] || c[:examples])) }
+        # Normalize folder id (accepts ID or full url)
+        folder_id = call(:util_extract_drive_id, input['folder_id_or_url'])
+        strict = !!input['strict_on_access_errors']
+        q = ["trashed=false"]
+
+        filters = input['filters'] || {}
+        paging  = input['paging']  || {}
+        recursive = !!input['recursive']
+        max_depth = (input['max_depth'].to_i rescue 0)
+        overall_limit = (input['overall_limit'].presence || 1000).to_i
+
+        # Enforce Drive pageSize bounds (1..1000)
+        page_size     = [[(paging['max_results'] || 100).to_i, 1].max, 1000].min
+        supports      = true
+        include_items = true
+
+        # Date filters (Google expects RFC3339/ISO-8601 UTC)
+        if filters['modified_after'].present?
+          q << "modifiedTime >= '#{call(:util_to_iso8601_utc, filters['modified_after'])}'"
+        end
+        if filters['modified_before'].present?
+          q << "modifiedTime <= '#{call(:util_to_iso8601_utc, filters['modified_before'])}'"
+        end
+        # MIME filters or group. Caller provides exact mimeType vals
+        if filters['mime_types'].present?
+          ors = filters['mime_types'].map { |mt| "mimeType='#{mt}'" }.join(' or ')
+          q << "(#{ors})"
+        end
+        # Folder filters - exclude folders when caller declines them (folders have special MIME)
+        if !!filters['exclude_folders']
+          q << "mimeType != 'application/vnd.google-apps.folder'"
+        end
+        # Restrict to parent folder if requested
+        if folder_id.present?
+          q << "'#{folder_id}' in parents"
+        end
+
+        # Preflight: if a folder is specified, verify access and that it's actually a folder
+        if folder_id.present?
+          begin
+            fmeta = get("https://www.googleapis.com/drive/v3/files/#{folder_id}")
+                    .params(supportsAllDrives: true, fields: 'id,mimeType')
+            unless fmeta['mimeType'] == 'application/vnd.google-apps.folder'
+              error('400 Bad Request - Provided ID is not a folder (mimeType=' + fmeta['mimeType'].to_s + ').') if strict
             end
-          }.select { |c| c['name'].present? }
-          error('At least 2 categories are required') if cats.length < 2
-
-          mode      = (input['mode'] || 'embedding').to_s.downcase
-          min_conf  = (input['min_confidence'].presence || 0.25).to_f
-
-          # Embedding/hybrid
-          if %w[embedding hybrid].include?(mode)
-            emb_model      = (input['embedding_model'].presence || 'text-embedding-005')
-            emb_model_path = call(:build_embedding_model_path, connection, emb_model)
-
-            email_inst = { 'content' => email_text, 'task_type' => 'RETRIEVAL_QUERY' }
-            cat_insts  = cats.map do |c|
-              txt = [c['name'], c['description'], *(c['examples'] || [])].compact.join("\n")
-              { 'content' => txt, 'task_type' => 'RETRIEVAL_DOCUMENT' }
+          rescue => e
+            details = call(:google_error_extract, e)
+            if strict
+              error("#{(details['code'] || 403)} #{(details['status'] || 'Forbidden')} - #{(details['message'] || e.to_s)}")
             end
+            # non-strict: fall through; the main list will handle and return stable empty result
+          end
+        end
 
-            emb_resp = call(:predict_embeddings, connection, emb_model_path, [email_inst] + cat_insts)
-            preds    = call(:safe_array, emb_resp && emb_resp['predictions'])
-            error('Embedding model returned no predictions') if preds.empty?
-
-            email_vec = call(:extract_embedding_vector, preds.first)
-            cat_vecs  = preds.drop(1).map { |p| call(:extract_embedding_vector, p) }
-
-            sims = cat_vecs.each_with_index.map { |v, i| [i, call(:vector_cosine_similarity, email_vec, v)] }
-            sims.sort_by! { |(_i, s)| -s }
-
-            scores     = sims.map { |(i, s)| { 'category' => cats[i]['name'], 'score' => (((s + 1.0) / 2.0).round(6)), 'cosine' => s.round(6) } }
-            top        = scores.first
-            chosen     = top['category']
-            confidence = top['score']
-
-            chosen = input['fallback_category'] if confidence < min_conf && input['fallback_category'].present?
-
-            result = {
-              'mode'       => mode,
-              'chosen'     => chosen,
-              'confidence' => confidence.round(4),
-              'scores'     => scores
+        # Corpora/driveId are critical for correctness across My Drive vs Shared
+        corpora, drive_id = if input['drive_id'].present?
+                              ['drive', input['drive_id']]
+                            elsif folder_id.present?
+                              ['allDrives', nil]
+                            else
+                              ['user', nil]
+                            end
+        debug_block = {
+          'q' => nil, 'corpora' => corpora, 'drive_id' => drive_id,
+          'page_size' => page_size, 'supportsAllDrives' => supports,
+          'includeItemsFromAllDrives' => include_items, 'folder_id' => folder_id
+        }
+        if recursive && folder_id.present?
+          # BFS over the subtree rooted at folder_id (returns a single combined result (not paginated))
+          # Honors filters and caps result w/ 'overall_limit', 'max_depth'
+          files = call(:drive_bfs_collect_files!, folder_id, filters, corpora, drive_id, overall_limit, max_depth)
+          # Prep read-to-map batch transfer plan items (aligns w/recipe UI)
+          items_for_transfer = files.map { |f|
+            {
+              'drive_file_id_or_url' => f['id'],
+              'target_object_name'   => nil,
+              'editors_mode'         => nil,
+              'content_type'         => nil,
+              'custom_metadata'      => nil
             }
-
-            if (mode == 'hybrid' || input['return_explanation']) && input['generative_model'].present?
-              top_k     = [[(input['top_k'] || 3).to_i, 1].max, cats.length].min
-              shortlist = scores.first(top_k).map { |h| h['category'] }
-              referee   = call(:llm_referee, connection, input['generative_model'], email_text, shortlist, cats, input['fallback_category'])
-              result['referee'] = referee
-
-              if referee['category'].present? && shortlist.include?(referee['category'])
-                result['chosen']     = referee['category']
-                result['confidence'] = [result['confidence'], referee['confidence']].compact.max
-              end
-              if result['confidence'].to_f < min_conf && input['fallback_category'].present?
-                result['chosen'] = input['fallback_category']
-              end
-
-            end
-
-            result.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
-
-          elsif mode == 'generative'
-            error('generative_model is required when mode=generative') if input['generative_model'].blank?
-            referee = call(:llm_referee, connection, input['generative_model'], email_text, cats.map { |c| c['name'] }, cats, input['fallback_category'])
-            chosen =
-              if referee['confidence'].to_f < min_conf && input['fallback_category'].present?
-                input['fallback_category']
-              else
-                referee['category']
-              end
-
-            result = { 
-              'mode' => mode,
-              'chosen' => chosen,
-              'confidence' => referee['confidence'],
-              'referee' => referee 
+          }
+          base = {
+            'files'               => files,
+            'file_ids'            => files.map { |f| f['id'] }.compact,
+            'items_for_transfer'  => items_for_transfer,
+            'count'               => files.length,
+            'has_more'            => false,
+            'next_page_token'      => nil,
+            'debug'                => debug_block.merge('q' => q.join(' and '))
+          }
+          base.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+        else
+          # Single page list (caller may iterate using next_page_token)
+          res = get('https://www.googleapis.com/drive/v3/files')
+                .params(
+                  q: q.join(' and '),
+                  pageSize: page_size,
+                  pageToken: paging['page_token'],
+                  orderBy: 'modifiedTime desc',
+                  spaces: 'drive',
+                  corpora: corpora,
+                  driveId: drive_id,
+                  supportsAllDrives: true,
+                  includeItemsFromAllDrives: include_items,
+                  fields: 'files(id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress)),nextPageToken'
+                )
+          # Map upstream → schema: coerces size, derives web_view_url, normalizes owners[].
+          files = (res['files'] || []).map { |f| call(:map_drive_meta, f) }
+          items_for_transfer = files.map do |f|
+            {
+              'drive_file_id_or_url' => f['id'],
+              'target_object_name'   => nil,
+              'editors_mode'         => nil,
+              'content_type'         => nil,
+              'custom_metadata'      => nil
             }
+          end
+          next_token = res['nextPageToken']
+          base = {
+            'files'               => files,
+            'file_ids'            => files.map { |f| f['id'] }.compact,
+            'items_for_transfer'  => items_for_transfer,
+            'count'               => files.length,
+            'has_more'            => next_token.present?,
+            'next_page_token'     => next_token,
+            'debug'               => debug_block.merge('q' => q.join(' and '))
+          }
+          base.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+        end
+      rescue => e
+        # Predictable empty page on failure, plus telemetry. Keeps data pills stable.
+        details   = call(:google_error_extract, e)
+        response  = {}.merge(
+          'files'            => [],
+          'file_ids'         => [],
+          'items_for_transfer' => [],
+          'count'            => 0,
+          'has_more'         => false,
+          'next_page_token'  => nil,
+          'debug'            => (debug_block || {})
+        ).merge(call(:telemetry_envelope, t0, corr, false, (details['code'] || 0), details['message'] || e.to_s, details))
+        # If strict flag is enabled, raise instead of swallowing
+        if strict
+          error("#{(details['code'] || 500)} #{(details['status'] || 'DriveError')} - #{(details['message'] || e.to_s)}")
+        end
+        response
 
-            result.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+      end,
+
+      sample_output: lambda do
+        {
+          'files' => [
+            {
+              'id'            => '1AbCdEfGhIjK',
+              'name'          => 'example.txt',
+              'mime_type'     => 'text/plain',
+              'size'          => 42,
+              'modified_time' => '2024-01-01T12:00:00Z',
+              'checksum'      => 'd41d8cd98f00b204e9800998ecf8427e',
+              'web_view_url'  => 'https://drive.google.com/file/d/1AbCdEfGhIjK/view',
+              'owners'        => [{ 'display_name' => 'Drive Bot', 'email' => 'bot@example.com' }]
+            }
+          ],
+          'file_ids' => ['1AbCdEfGhIjK'],
+          'items_for_transfer' => [
+            {
+              'drive_file_id_or_url' => '1AbCdEfGhIjK',
+              'target_object_name'   => nil,
+              'editors_mode'         => nil,
+              'content_type'         => nil,
+              'custom_metadata'      => nil
+            }
+          ],
+          'count'           => 1,
+          'has_more'        => false,
+          'next_page_token' => nil,
+          'debug'           => { 'q' => "trashed=false", 'corpora' => 'user', 'drive_id' => nil,
+                                'page_size' => 100, 'supportsAllDrives' => true,
+                                'includeItemsFromAllDrives' => true, 'folder_id' => nil },
+          'ok'              => true,
+          'telemetry'       => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 1, 'correlation_id' => 'sample' }
+        }
+      end
+    },
+
+    # 2) drive_get_file
+    drive_get_file: {
+      title: 'Drive: Get file',
+      subtitle: 'Fetch Drive file metadata and content',
+      display_priority: 10,
+      help: lambda do |_|
+        {
+          body: 'Fetch Drive file metadata and optionally content (text or bytes). Shortcuts are resolved once.'
+        }
+      end,
+
+      input_fields: lambda do |_obj, _conn, config_fields|
+        call(:ui_drive_get_inputs, config_fields)
+      end,
+
+      output_fields: lambda do |object_definitions|
+        object_definitions['drive_file_full']
+      end,
+
+      execute: lambda do |_connection, input|
+        # Correlation id and duration for logs / analytics
+        t0 = Time.now
+        corr = SecureRandom.uuid
+
+        # Normalize folder id (shortcuts resolved 1x via meta_get_resolve_shortcut)
+        file_id = call(:util_extract_drive_id, input['file_id_or_url'])
+        meta = call(:meta_get_resolve_shortcut, file_id)
+        result = call(:map_drive_meta, meta)
+
+        # Eval content mode, url processing behavior
+        mode = (input['content_mode'] || 'none').to_s
+        strip = input.dig('postprocess', 'util_strip_urls') ? true : false
+
+        # No mode specified on input
+        if mode == 'none'
+          result.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+
+        elsif mode == 'text'
+          # Editors branch → export to requested/compat MIME
+          if call(:util_is_google_editors_mime?, meta['mimeType'])
+            export_mime = call(:util_editors_export_mime, meta['mimeType'], input['editors_export_format'])
+            bytes = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}/export")
+                    .params(mimeType: export_mime, supportsAllDrives: true)
+                    .response_format_raw # treat response as new
+            raw  = bytes.to_s
+            text = call(:util_force_utf8, raw)
+            text = call(:util_strip_urls, text) if strip
+            cs = call(:util_compute_checksums, raw)
+            result.merge(exported_as: export_mime, text_content: text, content_md5: cs['md5'], content_sha256: cs['sha256'])
+                  .merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
 
           else
-            error("Unknown mode: #{mode}")
-          end
-        rescue => e
-          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
-        end
-      end,
-
-      sample_output: lambda do
-        {
-          'mode' => 'embedding',
-          'chosen' => 'Billing',
-          'confidence' => 0.91,
-          'scores' => [
-            { 'category' => 'Billing', 'score' => 0.91, 'cosine' => 0.82 },
-            { 'category' => 'Tech Support', 'score' => 0.47, 'cosine' => -0.06 },
-            { 'category' => 'Sales', 'score' => 0.41, 'cosine' => -0.18 }
-          ],
-          'referee' => {
-            'category' => 'Billing',
-            'confidence' => 0.86,
-            'reasoning' => 'Mentions invoice #4411, past‑due payment, and refund request.',
-            'distribution' => [
-              { 'category' => 'Billing', 'prob' => 0.86 },
-              { 'category' => 'Tech Support', 'prob' => 0.10 },
-              { 'category' => 'Sales', 'prob' => 0.04 }
-            ]
-          },
-          'ok' => true,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr' }
-        }
-      end
-    },
-
-    # 2) RAG store engine (Vertex AI)
-    rag_files_import: {
-      title: 'RAG: Import files to corpus',
-      subtitle: 'projects.locations.ragCorpora.ragFiles:import',
-      display_priority: 9,
-      retry_on_request: ['GET','HEAD'], # removed "POST" to preserve idempotency, prevent duplication of jobs
-      retry_on_response: [408,429,500,502,503,504],
-      max_retries: 3,
-
-      input_fields: lambda do
-        [
-          { name: 'rag_corpus_resource_name', optional: false, hint: 'Accepts either full resource name (e.g., "projects/{project}/locations/{region}/ragCorpora/{corpus}") or the "corpus"' },
-
-          # Exactly one source family:
-          { name: 'source_family', label: 'Source family', optional: false, control_type: 'select', extends_schema: true,
-            pick_list: 'rag_source_families', hint: 'Choose which source you are importing from (purely a UI gate; validation still enforced at runtime).' },
-          { name: 'gcs_uris',         optional: true, ngIf: 'input.source_family == "gcs"',   type: 'array', of: 'string', 
-            hint: 'Pass files or directory prefixes (e.g., gs://bucket/dir). Wildcards (*, **) are NOT supported.' },
-          { name: 'folder_or_files', label: 'Drive input type', optional: true, ngIf: 'input.source_family == "drive"', control_type: 'select', extends_schema: true,
-            pick_list: 'drive_input_type' },
-          { name: 'drive_folder_id',  optional: true, ngIf: 'input.folder_or_files == "folder"', 
-            hint: 'Google Drive folder ID (share with Vertex RAG service agent)' },
-          { name: 'drive_file_ids',   optional: true, ngIf: 'input.folder_or_files == "files"', type: 'array', of: 'string', 
-            hint: 'Optional explicit file IDs if not using folder' },
-
-          # Tuning / ops
-          { name: 'maxEmbeddingRequestsPerMin', type: 'integer', optional: true },
-          { name: 'rebuildAnnIndex', type: 'boolean', optional: true, default: false, hint: 'Set true after first large import to build ANN index' },
-          { name: 'importResultGcsSink', type: 'object', optional: true, properties: [
-              { name: 'outputUriPrefix', optional: false, hint: 'gs://bucket/prefix/' }
-            ]},
-          # Debug
-          { name: 'show_debug', label: 'Show debug options', type: 'boolean', control_type: 'checkbox', optional: true, 
-            extends_schema: true, default: false },
-          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true, ngIf: 'input.show_debug == "true"',
-            hint: 'Echo request URL/body and Google error body for troubleshooting' }
-        ]
-      end,
-
-      output_fields: lambda do |_|
-        [
-          { name: 'name' },           # LRO: projects/.../operations/...
-          { name: 'done', type: 'boolean' },
-          { name: 'metadata', type: 'object' },
-          { name: 'error', type: 'object' }
-        ] + [
-          { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object', properties: [
-            { name: 'http_status', type: 'integer' },
-            { name: 'message' }, { name: 'duration_ms', type: 'integer' },
-            { name: 'correlation_id' }
-          ]}
-        ]
-      end,
-
-      execute: lambda do |connection, input|
-        # Build correlation ID, now (for traceability)
-        t0 = Time.now
-        corr = call(:build_correlation_id)
-        begin
-          url = nil
-          req_body = nil
-
-          # Validate inputs
-          call(:ensure_project_id!, connection)
-          call(:ensure_regional_location!, connection)
-
-          corpus = call(:normalize_rag_corpus, connection, input['rag_corpus_resource_name'])
-          error('rag_corpus_resource_name is required') if corpus.blank?
-
-          # Build payload
-          payload  = call(:build_rag_import_payload!, input)
-
-          loc = (connection['location'] || '').downcase
-          url = call(:aipl_v1_url, connection, loc, "#{corpus}/ragFiles:import")
-          req_body = call(:json_compact, payload)
-          resp = post(url)
-                   .headers(call(:request_headers, corr))
-                   .payload(req_body)
-          code = call(:telemetry_success_code, resp)
-          out = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-          if call(:normalize_boolean, input['debug'])
-            ops_root = "https://#{call(:aipl_service_host, connection, loc)}/v1/projects/#{connection['project_id']}/locations/#{loc}/operations"
-            dbg = call(:debug_pack, true, url, req_body, nil) || {}
-            dbg['ops_list_url'] = ops_root
-            out['debug'] = dbg
-          end
-          out
-
-        rescue => e
-          g = call(:extract_google_error, e)
-          vio = (g['violations'] || []).map { |x| "#{x['field']}: #{x['reason']}" }.join(' ; ')
-          msg = [e.to_s, (g['message'] || nil), (vio.presence)].compact.join(' | ')
-          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
-          # Assess environment (dev/prod)
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
-          end
-          # Return
-          out
-        end
-      end,
-
-      sample_output: lambda do
-        {
-          'name' => 'projects/p/locations/us-central1/operations/1234567890',
-          'done' => false,
-          'ok' => true,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 18, 'correlation_id' => 'sample' }
-        }
-      end
-    },
-    rag_retrieve_contexts: {
-      title: 'RAG: Retrieve contexts',
-      subtitle: 'projects.locations:retrieveContexts (Vertex RAG Store)',
-      display_priority: 9,
-      retry_on_request: ['GET','HEAD'],
-      retry_on_response: [408,429,500,502,503,504],
-      max_retries: 3,
-
-      input_fields: lambda do
-        [
-          { name: 'rag_corpus', optional: false,
-            hint: 'Accepts either full resource name (e.g., "projects/{project}/locations/{region}/ragCorpora/{corpus}") or the "corpus"' },
-          { name: 'question', optional: false },
-          { name: 'restrict_to_file_ids', type: 'array', of: 'string', optional: true },
-          { name: 'max_contexts', type: 'integer', optional: true, default: 20 }
-        ]
-      end,
-
-      output_fields: lambda do |_|
-        [
-          { name: 'question' },
-          { name: 'contexts', type: 'array', of: 'object', properties: [
-              { name: 'id' },
-              { name: 'text' },
-              { name: 'score', type: 'number' },
-              { name: 'source' },
-              { name: 'uri' },
-              { name: 'metadata', type: 'object' }
-            ]
-          }
-        ] + [
-          { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object', properties: [
-            { name: 'http_status', type: 'integer' },
-            { name: 'message' }, { name: 'duration_ms', type: 'integer' },
-            { name: 'correlation_id' }
-          ]}
-        ]
-      end,
-
-      execute: lambda do |connection, input|
-        # Build correlation ID, now (for traceability)
-        t0 = Time.now
-        corr = call(:build_correlation_id)
-        begin
-          call(:ensure_project_id!, connection)
-          call(:ensure_regional_location!, connection)
-
-          corpus = call(:normalize_rag_corpus, connection, input['rag_corpus'])
-          error('rag_corpus is required') if corpus.blank?
-
-          loc = (connection['location'] || '').downcase
-          parent = "projects/#{connection['project_id']}/locations/#{loc}"
-
-          payload = call(:build_rag_retrieve_payload, input['question'], corpus, input['restrict_to_file_ids'])
-
-          url  = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
-          resp = post(url)
-                   .headers(call(:request_headers, corr))
-                   .payload(call(:json_compact, payload))
-
-          raw   = call(:normalize_retrieve_contexts!, resp)
-          maxn  = call(:clamp_int, (input['max_contexts'] || 20), 1, 200)
-          mapped = call(:map_context_chunks, raw, maxn)
-
-          {
-            'question' => input['question'],
-            'contexts' => mapped
-          }.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
-        rescue => e
-          g = call(:extract_google_error, e)
-          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
-        end
-      end,
-
-      sample_output: lambda do
-        {
-          'question' => 'What is the PTO carryover policy?',
-          'contexts' => [
-            { 'id' => 'doc-42#c3', 'text' => 'Employees may carry over up to 40 hours...', 'score' => 0.91,
-              'source' => 'handbook', 'uri' => 'https://drive.google.com/file/d/abc...', 'metadata' => { 'page' => 7 } }
-          ],
-          'ok' => true,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 22, 'correlation_id' => 'sample' }
-        }
-      end
-    },
-    rag_answer: {
-      title: 'RAG: Retrieve + answer (one-shot)',
-      subtitle: 'Retrieve contexts from a corpus and generate a cited answer',
-      display_priority: 9,
-      retry_on_request: ['GET','HEAD'],
-      retry_on_response: [408,429,500,502,503,504],
-      max_retries: 3,
-
-      input_fields: lambda do |_|
-        [
-          { name: 'model', label: 'Model', optional: false, control_type: 'text' },
-          { name: 'rag_corpus', optional: false,
-            hint: 'projects/{project}/locations/{region}/ragCorpora/{corpus}' },
-          { name: 'question', optional: false },
-
-          { name: 'restrict_to_file_ids', type: 'array', of: 'string', optional: true },
-          { name: 'max_contexts', type: 'integer', optional: true, default: 12 },
-
-          { name: 'system_preamble', optional: true,
-            hint: 'e.g., Only answer from retrieved contexts; say “I don’t know” otherwise.' },
-          { name: 'temperature', type: 'number', optional: true, hint: 'Default 0' }
-        ]
-      end,
-
-      output_fields: lambda do |_|
-        [
-          { name: 'answer' },
-          { name: 'citations', type: 'array', of: 'object', properties: [
-              { name: 'chunk_id' }, { name: 'source' }, { name: 'uri' }, { name: 'score', type: 'number' }
-            ]
-          },
-          { name: 'responseId' },
-          { name: 'usage', type: 'object', properties: [
-              { name: 'promptTokenCount', type: 'integer' },
-              { name: 'candidatesTokenCount', type: 'integer' },
-              { name: 'totalTokenCount', type: 'integer' }
-            ]
-          },
-          { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object', properties: [
-            { name: 'http_status', type: 'integer' },
-            { name: 'message' }, { name: 'duration_ms', type: 'integer' },
-            { name: 'correlation_id' }
-          ]}
-        ]
-      end,
-
-      execute: lambda do |connection, input|
-        # Build correlation id and now (logging)
-        t0 = Time.now
-        corr = call(:build_correlation_id)
-        begin
-          # Validate inputs
-          call(:ensure_project_id!, connection)
-          call(:ensure_regional_location!, connection)
-
-          # 1) Retrieve contexts (inline call to same API used by rag_retrieve_contexts)
-          corpus = call(:normalize_rag_corpus, connection, input['rag_corpus'])
-          error('rag_corpus is required') if corpus.blank?
-
-          loc    = (connection['location'] || '').downcase
-          parent = "projects/#{connection['project_id']}/locations/#{loc}"
-
-          retrieve_payload = call(:build_rag_retrieve_payload, input['question'], corpus, input['restrict_to_file_ids'])
-
-          retr_url  = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
-          retr_resp = post(retr_url)
-                        .headers(call(:request_headers, corr))
-                        .payload(call(:json_compact, retrieve_payload))
-          raw_ctxs = call(:normalize_retrieve_contexts!, retr_resp)
-
-          maxn  = call(:clamp_int, (input['max_contexts'] || 12), 1, 100)
-          chunks = call(:map_context_chunks, raw_ctxs, maxn)
-          error('No contexts retrieved; check corpus/permissions/region') if chunks.empty?
-
-          # 2) Generate structured answer with your existing schema pattern
-          model_path = call(:build_model_path_with_global_preview, connection, input['model'])
-
-          gen_cfg = {
-            'temperature'       => (input['temperature'].present? ? call(:safe_float, input['temperature']) : 0),
-            'maxOutputTokens'   => 1024,
-            'responseMimeType'  => 'application/json',
-            'responseSchema'    => {
-              'type'        => 'object', 'additionalProperties' => false,
-              'properties'  => {
-                'answer'    => { 'type' => 'string' },
-                'citations' => {
-                  'type'    => 'array',
-                  'items'   => {
-                    'type'  => 'object', 'additionalProperties' => false,
-                    'properties' => {
-                      'chunk_id' => { 'type' => 'string' },
-                      'source'   => { 'type' => 'string' },
-                      'uri'      => { 'type' => 'string' },
-                      'score'    => { 'type' => 'number' }
-                    }
-                  }
-                }
-              },
-              'required' => ['answer']
-            }
-          }
-
-          sys_text = (input['system_preamble'].presence ||
-            'Answer using ONLY the retrieved context chunks. If the context is insufficient, reply with “I don’t know.” '\
-            'Keep answers concise and include citations with chunk_id, source, uri, and score.')
-          sys_inst = { 'role' => 'system', 'parts' => [ { 'text' => sys_text } ] }
-
-          ctx_blob = call(:format_context_chunks, chunks)
-          contents = [
-            { 'role' => 'user', 'parts' => [
-                { 'text' => "Question:\n#{input['question']}\n\nContext:\n#{ctx_blob}" }
-              ]
-            }
-          ]
-
-          gen_payload = {
-            'contents'          => contents,
-            'systemInstruction' => sys_inst,
-            'generationConfig'  => gen_cfg
-          }
-
-          gen_url   = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
-          gen_resp  = post(gen_url)
-                       .headers(call(:request_headers, corr))
-                       .payload(call(:json_compact, gen_payload))
-
-          text = gen_resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
-          parsed = call(:safe_parse_json, text)
-
-          {
-            'answer'     => (parsed['answer'] || text),
-            'citations'  => (parsed['citations'] || []),
-            'responseId' => gen_resp['responseId'],
-            'usage'      => gen_resp['usageMetadata']
-          }.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
-        rescue => e
-          g = call(:extract_google_error, e)
-          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
-        end
-      end,
-
-      sample_output: lambda do
-        {
-          'answer' => 'Employees may carry over up to 40 hours of PTO.',
-          'citations' => [
-            { 'chunk_id' => 'doc-42#c3', 'source' => 'handbook', 'uri' => 'https://drive.google.com/file/d/abc...', 'score' => 0.91 }
-          ],
-          'responseId' => 'resp-123',
-          'usage' => { 'promptTokenCount' => 298, 'candidatesTokenCount' => 156, 'totalTokenCount' => 454 },
-          'ok' => true,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 44, 'correlation_id' => 'sample' }
-        }
-      end
-    },
-
-    # 3) Vector search
-    indexes_upsert_datapoints: {
-      title: 'Vector Index: Upsert datapoints',
-      subtitle: 'indexes:upsertDatapoints (Matching Engine / Vector Search)',
-      display_priority: 8,
-      retry_on_request: ['GET','HEAD'],
-      retry_on_response: [408,429,500,502,503,504],
-      max_retries: 3,
-
-      input_fields: lambda do |_|
-        [
-          { name: 'index', optional: false,
-            hint: 'Index resource (projects/.../locations/.../indexes/ID) or short ID (e.g., "my-index")' },
-          { name: 'datapoints', type: 'array', of: 'object', optional: false, properties: [
-              { name: 'datapointId', optional: false },
-              { name: 'featureVector', type: 'array', of: 'number', optional: false,
-                hint: 'Embedding vector (float array). Length must match index config.' },
-              { name: 'restricts', type: 'array', of: 'object', properties: [
-                  { name: 'namespace' },
-                  { name: 'allowTokens', type: 'array', of: 'string' },
-                  { name: 'denyTokens',  type: 'array', of: 'string' }
-                ]
-              },
-              { name: 'crowdingTag' },
-              { name: 'labels',   type: 'object' },
-              { name: 'metadata', type: 'object' }
-            ],
-            hint: 'Upsert is idempotent by datapointId.'
-          },
-          # Debug
-          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true,
-            hint: 'Echo request URL/body and Google error body for troubleshooting' }
-        ]
-      end,
-
-      output_fields: lambda do |_|
-        [
-          { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object', properties: [
-            { name: 'http_status', type: 'integer' },
-            { name: 'message' }, { name: 'duration_ms', type: 'integer' },
-            { name: 'correlation_id' }
-          ]},
-          { name: 'debug', type: 'object' }
-        ]
-      end,
-
-      execute: lambda do |connection, input|
-        t0 = Time.now
-        corr = call(:build_correlation_id)
-        url = nil; req_body = nil
-        begin
-          call(:ensure_project_id!, connection)
-          call(:ensure_regional_location!, connection)
-
-          index_path = call(:build_index_path, connection, input['index'])
-          loc = connection['location'].to_s.downcase
-          url = call(:aipl_v1_url, connection, loc, "#{index_path}:upsertDatapoints")
-
-          # sanitize vectors → float[], preserve ids
-          dps = call(:safe_array, input['datapoints']).map do |dp|
-            h = (dp || {}).to_h
-            id = h['datapointId'].to_s.strip
-            error('datapointId is required for each datapoint') if id.empty?
-
-            vec = call(:sanitize_feature_vector, h['featureVector'])
-            error('featureVector must be a non-empty numeric array') if vec.empty?
-            h.merge('featureVector' => vec)
-          end
-
-          req_body = call(:json_compact, { 'datapoints' => dps })
-          resp = post(url)
-                   .headers(call(:request_headers, corr))
-                   .payload(req_body)
-          code = call(:telemetry_success_code, resp)
-          out  = { 'ok' => true }.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-          # Assess environment (dev/prod)
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
-          end
-          # Return
-          out
-        rescue => e
-          g = call(:extract_google_error, e)
-          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
-          # Assess environment (dev/prod)
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
-          end
-          # Return
-          out
-        end
-      end,
-
-      sample_output: lambda do
-        {
-          'ok' => true,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 11, 'correlation_id' => 'sample' }
-        }
-      end
-    },
-    index_endpoints_find_neighbors: {
-      title: 'Vector Search: Find neighbors',
-      subtitle: 'indexEndpoints:findNeighbors (Matching Engine / Vector Search)',
-      display_priority: 8,
-      retry_on_request: ['GET','HEAD'],
-      retry_on_response: [408,429,500,502,503,504],
-      max_retries: 3,
-
-      input_fields: lambda do |_|
-        [
-          { name: 'indexEndpoint', optional: false,
-            hint: 'IndexEndpoint resource (projects/.../locations/.../indexEndpoints/ID) or short ID' },
-          { name: 'deployedIndexId', optional: false,
-            hint: 'The deployed index ID on the endpoint' },
-          { name: 'queries', type: 'array', of: 'object', optional: false, properties: [
-              # Either featureVector OR datapoint
-              { name: 'featureVector', type: 'array', of: 'number',
-                hint: 'Query vector; alternative to providing datapoint' },
-              { name: 'datapoint', type: 'object', properties: [
-                  { name: 'datapointId' },
-                  { name: 'featureVector', type: 'array', of: 'number' }
-                ]
-              },
-              { name: 'neighborCount', type: 'integer', optional: true, hint: 'Default 10' },
-              { name: 'perCrowdingAttributeNeighborCount', type: 'integer', optional: true },
-              { name: 'stringFilters', type: 'array', of: 'object', properties: [
-                  { name: 'namespace' },
-                  { name: 'allowTokens', type: 'array', of: 'string' },
-                  { name: 'denyTokens',  type: 'array', of: 'string' }
-                ]
-              },
-              { name: 'distanceMeasure', control_type: 'select', pick_list: 'distance_measures', optional: true,
-                hint: 'If omitted, uses index default' }
-            ],
-            hint: 'Each query can specify either featureVector or datapoint.'
-          },
-          # Debug
-          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
-        ]
-      end,
-
-      output_fields: lambda do |_|
-        [
-          { name: 'nearestNeighbors', type: 'array', of: 'object', properties: [
-              { name: 'neighbors', type: 'array', of: 'object', properties: [
-                  { name: 'datapoint', type: 'object' },
-                  { name: 'distance',  type: 'number' },
-                  { name: 'crowdingTagCount', type: 'integer' }
-                ]
-              }
-            ]
-          },
-          { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object', properties: [
-            { name: 'http_status', type: 'integer' },
-            { name: 'message' }, { name: 'duration_ms', type: 'integer' },
-            { name: 'correlation_id' }
-          ]},
-          { name: 'debug', type: 'object' }
-        ]
-      end,
-
-      execute: lambda do |connection, input|
-        t0 = Time.now
-        corr = call(:build_correlation_id)
-        url = nil; req_body = nil
-        begin
-          call(:ensure_project_id!, connection)
-          call(:ensure_regional_location!, connection)
-          loc = connection['location'].to_s.downcase
-
-          ep_path = call(:build_index_endpoint_path, connection, input['indexEndpoint'])
-          url = call(:aipl_v1_url, connection, loc, "#{ep_path}:findNeighbors")
-
-          queries = call(:safe_array, input['queries']).map do |q|
-            h = (q || {}).to_h
-            if h['featureVector'].present?
-              h['featureVector'] = call(:sanitize_feature_vector, h['featureVector'])
-            elsif h['datapoint'].present?
-              dp = (h['datapoint'] || {}).to_h
-              fv = call(:sanitize_feature_vector, dp['featureVector'])
-              dp['featureVector'] = fv unless fv.empty?
-              # require either a datapointId or a non-empty featureVector
-              if (dp['datapointId'].to_s.strip.empty?) && fv.empty?
-                error('datapoint query must include datapointId or a non-empty featureVector')
-              end
-              h['datapoint'] = call(:json_compact, dp)
+            # Regular file (only allow textual MIME in this case)
+            if call(:util_is_textual_mime?, meta['mimeType'])
+              bytes = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}")
+                      .params(alt: 'media', supportsAllDrives: true)
+                      .response_format_raw
+              raw  = bytes.to_s
+              text = call(:util_force_utf8, raw)
+              text = call(:util_strip_urls, text) if strip
+              cs = call(:util_compute_checksums, raw)
+              result.merge(text_content: text, content_md5: cs['md5'], content_sha256: cs['sha256'])
+                    .merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
             else
-              error('Each query must include featureVector or datapoint')
+              # Guardrail: caller likely wanted bytes for binaries
+              error('415 Unsupported Media Type - Non-text file; use content_mode=bytes or none.')
             end
-            if h['neighborCount']
-              h['neighborCount'] = call(:clamp_int, h['neighborCount'], 1, 1000)
-            end
-            # forward distanceMeasure if provided
-            if h['distanceMeasure'].present?
-              h['distanceMeasure'] = h['distanceMeasure'].to_s
-            end
-            h
           end
-
-          req = {
-            'deployedIndexId' => input['deployedIndexId'].to_s,
-            'queries'         => queries
-          }
-          req_body = call(:json_compact, req)
-
-          resp = post(url)
-                   .headers(call(:request_headers, corr))
-                   .payload(req_body)
-          code = call(:telemetry_success_code, resp)
-          resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK')).merge(
-            call(:normalize_boolean, input['debug']) ? { 'debug' => call(:debug_pack, true, url, req_body, nil) } : {}
-          )
-        rescue => e
-          g = call(:extract_google_error, e)
-          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
-          # Assess environment (dev/prod)
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
+        elsif mode == 'bytes'
+          # Editors cannot be downloaded as bytes; force export via text
+          if call(:util_is_google_editors_mime?, meta['mimeType'])
+            error('400 Bad Request - Editors files require content_mode=text (export).')
           end
-          # Return
-          out
+          bytes = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}")
+                  .params(alt: 'media', supportsAllDrives: true, acknowledgeAbuse: false)
+                  .response_format_raw
+          raw = bytes.to_s
+          cs  = call(:util_compute_checksums, raw)
+          result.merge(content_bytes: Base64.strict_encode64(raw), content_md5: cs['md5'], content_sha256: cs['sha256'])
+                .merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+        else
+          error("400 Bad Request - Unknown content_mode: #{mode}")
         end
-      end,
-
-      sample_output: lambda do
-        {
-          'nearestNeighbors' => [
-            { 'neighbors' => [
-                { 'datapoint' => { 'datapointId' => 'doc-123' }, 'distance' => 0.12 },
-                { 'datapoint' => { 'datapointId' => 'doc-987' }, 'distance' => 0.19 }
-              ]
-            }
-          ],
-          'ok' => true,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 15, 'correlation_id' => 'sample' }
-        }
-      end
-    },
-    indexes_create: {
-      title: 'Vector Index: Create index',
-      subtitle: 'indexes.create (Matching Engine / Vector Search)',
-      display_priority: 8,
-      retry_on_request: ['GET','HEAD'],
-      retry_on_response: [408,429,500,502,503,504],
-      max_retries: 3,
-
-      input_fields: lambda do |_|
-        [
-          { name: 'displayName', optional: false },
-          { name: 'description', optional: true },
-          { name: 'metadata', label: 'Index metadata (object)', type: 'object', optional: true },
-          # Optional: supply explicit indexId (kept as query in some APIs; here we fold into body id if present)
-          { name: 'indexId', optional: true },
-          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true },
-          { name: 'requestId', optional: true, hint: 'Optional idempotency token (RFC4122). If omitted we won’t send it.' }
-        ]
-      end,
-
-      output_fields: lambda do |_|
-        [
-          { name: 'name' }, { name: 'done', type: 'boolean' },
-          { name: 'metadata', type: 'object' }, { name: 'error', type: 'object' },
-          { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object', properties: [
-            { name: 'http_status', type: 'integer' }, { name: 'message' },
-            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
-          ]},
-          { name: 'debug', type: 'object' }
-        ]
-      end,
-
-      execute: lambda do |connection, input|
-        t0   = Time.now
-        corr = call(:build_correlation_id)
-        url = nil; req_body = nil
-        begin
-          call(:ensure_project_id!, connection)
-          call(:ensure_regional_location!, connection)
-          loc = connection['location'].to_s.downcase
-
-          path = "projects/#{connection['project_id']}/locations/#{loc}/indexes"
-          url  = call(:aipl_v1_url, connection, loc, path)
-
-          # Validation
-          display = input['displayName'].to_s.strip
-          error('displayName is required') if display.empty?
-          meta = input['metadata']
-          error('metadata must be an object') if !meta.nil? && !meta.is_a?(Hash)
-          idx_id = input['indexId'].to_s.strip
-          error('indexId cannot be empty') if input.key?('indexId') && idx_id.empty?
-
-          body = {
-            'displayName' => display,
-            'description' => input['description'],
-            'metadata'    => meta
-          }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
-
-          # Provide explicit indexId via query, not body
-          params = {}
-          req_id = input['requestId'].to_s.strip
-          params[:requestId] = req_id unless req_id.empty?
-          params[:indexId]   = idx_id unless idx_id.empty?
-
-          req_body = call(:json_compact, body)
-
-          resp = post(url).params(params).headers(call(:request_headers, corr)).payload(req_body)
-          code = call(:telemetry_success_code, resp)
-          out  = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-          # Assess environment (dev/prod)
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
-          end
-          # Return
-          out
-        rescue => e
-          g   = call(:extract_google_error, e)
-          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
-          # Assess environment (dev/prod)
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
-          end
-          # Return
-          out
-        end
-      end,
-
-      sample_output: lambda do
-        { 'name' => 'projects/p/locations/us-central1/operations/123', 'done' => false,
-          'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 14, 'correlation_id' => 'sample' } }
-      end
-    },
-    indexes_delete: {
-      title: 'Vector Index: Delete index',
-      subtitle: 'indexes.delete (Matching Engine / Vector Search)',
-      display_priority: 8,
-      retry_on_request: ['GET','HEAD'],
-      retry_on_response: [408,429,500,502,503,504],
-      max_retries: 3,
-
-      input_fields: lambda do |_|
-        [
-          { name: 'index', optional: false, hint: 'indexes/{id} or full resource path' },
-          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
-        ]
-      end,
-
-      output_fields: lambda do |_|
-        [
-          { name: 'name' }, { name: 'done', type: 'boolean' },
-          { name: 'metadata', type: 'object' }, { name: 'error', type: 'object' },
-          { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object', properties: [
-            { name: 'http_status', type: 'integer' }, { name: 'message' },
-            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
-          ]},
-          { name: 'debug', type: 'object' }
-        ]
-      end,
-
-      execute: lambda do |connection, input|
-        t0 = Time.now
-        corr = call(:build_correlation_id)
-        url = nil
-        req_body = nil
-        begin
-          call(:ensure_project_id!, connection)
-          call(:ensure_regional_location!, connection)
-          idx_path = call(:build_index_path, connection, input['index'])
-          loc = connection['location'].to_s.downcase
-          url = call(:aipl_v1_url, connection, loc, idx_path)
-
-          resp = delete(url).headers(call(:request_headers, corr))
-          code = call(:telemetry_success_code, resp)
-          out  = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-          # Assess environment (dev/prod)
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
-          end
-          # Return
-          out
-        rescue => e
-          g   = call(:extract_google_error, e)
-          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
-          # Assess environment (dev/prod)
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
-          end
-          # Return
-          out
-        end
-      end,
-
-      sample_output: lambda do
-        { 'name' => 'projects/p/locations/us-central1/operations/456', 'done' => false,
-          'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 9, 'correlation_id' => 'sample' } }
-      end
-    },
-    index_endpoints_create: {
-      title: 'Vector Search: Create index endpoint',
-      subtitle: 'indexEndpoints.create (Matching Engine / Vector Search)',
-      display_priority: 8,
-      retry_on_request: ['GET','HEAD'],
-      retry_on_response: [408,429,500,502,503,504],
-      max_retries: 3,
-
-      input_fields: lambda do |_|
-        [
-          { name: 'displayName', optional: false },
-          { name: 'description', optional: true },
-          { name: 'labels', type: 'object', optional: true },
-          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true },
-          { name: 'requestId', optional: true, hint: 'Optional idempotency token (RFC4122). If omitted we won’t send it.' }
-
-        ]
-      end,
-
-      output_fields: lambda do |_|
-        [
-          { name: 'name' }, { name: 'done', type: 'boolean' },
-          { name: 'metadata', type: 'object' }, { name: 'error', type: 'object' },
-          { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object', properties: [
-            { name: 'http_status', type: 'integer' }, { name: 'message' },
-            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
-          ]},
-          { name: 'debug', type: 'object' }
-        ]
-      end,
-
-      execute: lambda do |connection, input|
-        t0 = Time.now
-        corr = call(:build_correlation_id)
-        url = nil; req_body = nil
-        begin
-          call(:ensure_project_id!, connection)
-          call(:ensure_regional_location!, connection)
-          loc  = connection['location'].to_s.downcase
-          path = "projects/#{connection['project_id']}/locations/#{loc}/indexEndpoints"
-          url  = call(:aipl_v1_url, connection, loc, path)
-
-          # Validate
-          display = input['displayName'].to_s.strip
-          error('displayName is required') if display.empty?
-          labels = input['labels']
-          error('labels must be an object') if !labels.nil? && !labels.is_a?(Hash)
-
-          body = {
-            'displayName' => display,
-            'description' => input['description'],
-            'labels'      => labels
-          }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
-          req_body = call(:json_compact, body)
-
-          params = {}
-          req_id = input['requestId'].to_s.strip
-          params[:requestId] = req_id unless req_id.empty?
-
-          resp = post(url).params(params).headers(call(:request_headers, corr)).payload(req_body)
-          code = call(:telemetry_success_code, resp)
-          out  = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-          # Assess environment (dev/prod)
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
-          end
-          # Return
-          out
-        rescue => e
-          g   = call(:extract_google_error, e)
-          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
-          # Assess environment (dev/prod)
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
-          end
-          # Return
-          out
-        end
-      end,
-
-      sample_output: lambda do
-        { 'name' => 'projects/p/locations/us-central1/operations/789', 'done' => false,
-          'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 11, 'correlation_id' => 'sample' } }
-      end
-    },
-    index_endpoints_delete: {
-      title: 'Vector Search: Delete index endpoint',
-      subtitle: 'indexEndpoints.delete (Matching Engine / Vector Search)',
-      display_priority: 8,
-      retry_on_request: ['GET','HEAD'],
-      retry_on_response: [408,429,500,502,503,504],
-      max_retries: 3,
-
-      input_fields: lambda do |_|
-        [
-          { name: 'indexEndpoint', optional: false, hint: 'indexEndpoints/{id} or full resource path' },
-          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
-        ]
-      end,
-
-      output_fields: lambda do |_|
-        [
-          { name: 'name' }, { name: 'done', type: 'boolean' },
-          { name: 'metadata', type: 'object' }, { name: 'error', type: 'object' },
-          { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object', properties: [
-            { name: 'http_status', type: 'integer' }, { name: 'message' },
-            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
-          ]},
-          { name: 'debug', type: 'object' }
-        ]
-      end,
-
-      execute: lambda do |connection, input|
-        t0 = Time.now
-        corr = call(:build_correlation_id)
-        url = nil
-        req_body = nil
-        begin
-          call(:ensure_project_id!, connection)
-          call(:ensure_regional_location!, connection)
-          ep_path = call(:build_index_endpoint_path, connection, input['indexEndpoint'])
-          loc = connection['location'].to_s.downcase
-          url = call(:aipl_v1_url, connection, loc, ep_path)
-
-          resp = delete(url).headers(call(:request_headers, corr))
-          code = call(:telemetry_success_code, resp)
-          out  = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-          # Assess environment (dev/prod)
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
-          end
-          # Return
-          out
-        rescue => e
-          g   = call(:extract_google_error, e)
-          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
-          # Assess environment (dev/prod)
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
-          end
-          # Return
-          out
-        end
-      end,
-
-      sample_output: lambda do
-        { 'name' => 'projects/p/locations/us-central1/operations/987', 'done' => false,
-          'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 9, 'correlation_id' => 'sample' } }
-      end
-    },
-    index_endpoints_deploy: {
-      title: 'Vector Search: Deploy index to endpoint',
-      subtitle: 'indexEndpoints:deployIndex',
-      display_priority: 8,
-      retry_on_request: ['GET','HEAD'],
-      retry_on_response: [408,429,500,502,503,504],
-      max_retries: 3,
-
-      input_fields: lambda do |_|
-        [
-          { name: 'indexEndpoint', optional: false, hint: 'indexEndpoints/{id} or full resource path' },
-          { name: 'deployedIndexId', optional: false, hint: 'Name for the deployed index within the endpoint' },
-          { name: 'index', optional: false, hint: 'Index id or resource; short ids are expanded automatically' },
-          { name: 'displayName', optional: true },
-          { name: 'privateEndpoints', type: 'object', optional: true, hint: 'Optional network settings (object as-is)' },
-          { name: 'labels', type: 'object', optional: true },
-          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true },
-          { name: 'requestId', optional: true, hint: 'Optional idempotency token (RFC4122). If omitted we won’t send it.' }
-        ]
-      end,
-
-      output_fields: lambda do |_|
-        [
-          { name: 'name' }, { name: 'done', type: 'boolean' },
-          { name: 'metadata', type: 'object' }, { name: 'error', type: 'object' },
-          { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object', properties: [
-            { name: 'http_status', type: 'integer' }, { name: 'message' },
-            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
-          ]},
-          { name: 'debug', type: 'object' }
-        ]
-      end,
-
-      execute: lambda do |connection, input|
-        t0 = Time.now
-        corr = call(:build_correlation_id)
-        url = nil; req_body = nil
-        begin
-          call(:ensure_project_id!, connection)
-          call(:ensure_regional_location!, connection)
-          ep_path = call(:build_index_endpoint_path, connection, input['indexEndpoint'])
-          loc = connection['location'].to_s.downcase
-          url = call(:aipl_v1_url, connection, loc, "#{ep_path}:deployIndex")
-
-          # Validate and normalize
-          dep_id = input['deployedIndexId'].to_s.strip
-          error('deployedIndexId is required') if dep_id.empty?
-          idx_path = call(:build_index_path, connection, input['index'])
-          lbls = input['labels']
-          error('labels must be an object') if !lbls.nil? && !lbls.is_a?(Hash)
-          pe = input['privateEndpoints']
-          error('privateEndpoints must be an object') if !pe.nil? && !pe.is_a?(Hash)
-
-          deployed = {
-            'id'              => dep_id,
-            'index'           => idx_path,
-            'displayName'     => input['displayName'],
-            'privateEndpoints'=> pe,
-            'labels'          => lbls
-          }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
-
-          req_body = call(:json_compact, { 'deployedIndex' => deployed })
-
-          params = {}
-          req_id = input['requestId'].to_s.strip
-          params[:requestId] = req_id unless req_id.empty?
-
-          resp = post(url).params(params).headers(call(:request_headers, corr)).payload(req_body)
-          code = call(:telemetry_success_code, resp)
-          out  = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-          # Assess environment (dev/prod)
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
-          end
-          # Return
-          out
-        rescue => e
-          g   = call(:extract_google_error, e)
-          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
-          # Assess environment (dev/prod)
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
-          end
-          # Return
-          out
-        end
-      end,
-
-      sample_output: lambda do
-        { 'name' => 'projects/p/locations/us-central1/operations/dep-1', 'done' => false,
-          'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 13, 'correlation_id' => 'sample' } }
-      end
-    },
-    index_endpoints_undeploy: {
-      title: 'Vector Search: Undeploy index from endpoint',
-      subtitle: 'indexEndpoints:undeployIndex',
-      display_priority: 8,
-      retry_on_request: ['GET','HEAD'],
-      retry_on_response: [408,429,500,502,503,504],
-      max_retries: 3,
-
-      input_fields: lambda do |_|
-        [
-          { name: 'indexEndpoint', optional: false, hint: 'indexEndpoints/{id} or full resource path' },
-          { name: 'deployedIndexId', optional: false, hint: 'Deployed index id to remove' },
-          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true },
-          { name: 'requestId', optional: true, hint: 'Optional idempotency token (RFC4122). If omitted we won’t send it.' }
-        ]
-      end,
-
-      output_fields: lambda do |_|
-        [
-          { name: 'name' }, { name: 'done', type: 'boolean' },
-          { name: 'metadata', type: 'object' }, { name: 'error', type: 'object' },
-          { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object', properties: [
-            { name: 'http_status', type: 'integer' }, { name: 'message' },
-            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
-          ]},
-          { name: 'debug', type: 'object' }
-        ]
-      end,
-
-      execute: lambda do |connection, input|
-        t0 = Time.now
-        corr = call(:build_correlation_id)
-        url = nil; req_body = nil
-        begin
-          call(:ensure_project_id!, connection)
-          call(:ensure_regional_location!, connection)
-          ep_path = call(:build_index_endpoint_path, connection, input['indexEndpoint'])
-          loc = connection['location'].to_s.downcase
-          url = call(:aipl_v1_url, connection, loc, "#{ep_path}:undeployIndex")
-
-          dep_id = input['deployedIndexId'].to_s.strip
-          error('deployedIndexId is required') if dep_id.empty?
-          req_body = call(:json_compact, { 'deployedIndexId' => dep_id })
-
-          params = {}
-          req_id = input['requestId'].to_s.strip
-          params[:requestId] = req_id unless req_id.empty?
-
-          resp = post(url).params(params).headers(call(:request_headers, corr)).payload(req_body)
-          code = call(:telemetry_success_code, resp)
-          out  = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-          # Assess environment (dev/prod)
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
-          end
-          # Return
-          out
-        rescue => e
-          g   = call(:extract_google_error, e)
-          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
-          # Assess environment (dev/prod)
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
-          end
-          # Return
-          out
-        end
-      end,
-
-      sample_output: lambda do
-        { 'name' => 'projects/p/locations/us-central1/operations/dep-1', 'done' => false,
-          'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 10, 'correlation_id' => 'sample' } }
-      end
-    },
-    indexes_remove_datapoints: {
-      title: 'Vector Index: Remove datapoints',
-      subtitle: 'indexes:removeDatapoints (Matching Engine / Vector Search)',
-      display_priority: 8,
-      retry_on_request: ['GET','HEAD'],
-      retry_on_response: [408,429,500,502,503,504],
-      max_retries: 3,
-
-      input_fields: lambda do |_|
-        [
-          { name: 'index', optional: false,
-            hint: 'Index resource (projects/.../locations/.../indexes/{id}) or short ID' },
-          { name: 'datapointIds', type: 'array', of: 'string', optional: false }
-        ]
-      end,
-
-      output_fields: lambda do |_|
-        [
-          { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object', properties: [
-            { name: 'http_status', type: 'integer' }, { name: 'message' },
-            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
-          ]}
-        ]
-      end,
-
-      execute: lambda do |connection, input|
-        t0 = Time.now
-        corr = call(:build_correlation_id)
-        url = nil; req_body = nil
-        begin
-          call(:ensure_project_id!, connection)
-          call(:ensure_regional_location!, connection)
-          idx_path = call(:build_index_path, connection, input['index'])
-          loc = connection['location'].to_s.downcase
-          url = call(:aipl_v1_url, connection, loc, "#{idx_path}:removeDatapoints")
-
-          ids = call(:safe_array, input['datapointIds']).map(&:to_s).reject(&:empty?)
-          error('datapointIds must be a non-empty array of strings') if ids.empty?
-          req_body = call(:json_compact, { 'datapointIds' => ids })
-
-          resp = post(url).headers(call(:request_headers, corr)).payload(req_body)
-          code = call(:telemetry_success_code, resp)
-          { 'ok' => true }.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-        rescue => e
-          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
-        end
-      end,
-
-      sample_output: lambda do
-        { 'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 9, 'correlation_id' => 'sample' } }
+      rescue => e
+        details = call(:google_error_extract, e)
+        {}.merge(
+          call(:telemetry_envelope, t0, corr, false, (details['code'] || 0), details['message'] || e.to_s, details)
+        )
       end
     },
 
-    # 4) Generate content (Gemini)
-    gen_generate_content: {
-      title: 'Generative: Generate content (Gemini)',
-      subtitle: 'Generate content from a prompt',
+    # 3) gcs_list_objects
+    gcs_list_objects: {
+      title: 'GCS: List objects',
+      subtitle: 'List objects in Google Cloud Storage bucket',
+      display_priority: 10,
       help: lambda do |_|
-        { body: 'Provide a prompt to generate content from an LLM. Uses "POST :generateContent".'}
-      end,
-      display_priority: 8,
-      retry_on_request: ['GET','HEAD'], # removed "POST" to preserve idempotency, prevent duplication of jobs
-      retry_on_response: [408, 429, 500, 502, 503, 504],
-      max_retries: 3,
-
-      input_fields: lambda do |connection, config_fields, object_definitions|
-        object_definitions['gen_generate_content_input']
-      end,
-
-      output_fields: lambda do |connection, object_definitions|
-         Array(object_definitions['generate_content_output']) + Array(object_definitions['envelope_fields'])
-      end,
-
-      execute: lambda do |connection, input|
-        # Correlation id and duration for logs / analytics
-        t0 = Time.now
-        corr = call(:build_correlation_id)
-
-        # Compute model path
-        model_path = call(:build_model_path_with_global_preview, connection, input['model'])
-
-        # Build payload
-        contents = call(:sanitize_contents_roles, input['contents'])
-        error('At least one non-system message is required in contents') if contents.blank?
-
-        sys_inst  = call(:system_instruction_from_text, input['system_preamble'])
-        gen_cfg   = call(:sanitize_generation_config, input['generation_config'])
-
-        payload = {
-          'contents'          => contents,
-          'systemInstruction' => sys_inst,
-          'tools'             => input['tools'],
-          'toolConfig'        => input['toolConfig'],
-          'safetySettings'    => input['safetySettings'],
-          'generationConfig'  => gen_cfg
-        }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
-
-        # Call endpoint
-        loc = (connection['location'].presence || 'global').to_s.downcase
-        url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
-        begin
-          resp = post(url)
-                  .headers(call(:request_headers, corr))
-                  .payload(call(:json_compact, payload))
-          code = call(:telemetry_success_code, resp)
-          resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-        rescue => e
-          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
-        end
-
-
-      end,
-
-      sample_output: lambda do
         {
-          'responseId' => 'resp-123',
-          'modelVersion' => 'gemini-2.5-pro',
-          'usageMetadata' => { 'promptTokenCount' => 42, 'candidatesTokenCount' => 128, 'totalTokenCount' => 170 },
-          'candidates' => [
-            { 'finishReason' => 'STOP',
-              'content' => { 'role' => 'model', 'parts' => [ { 'text' => 'Hello, world.' } ] },
-              'groundingMetadata' => { 'citationSources' => [ { 'uri' => 'https://example.com' } ] } }
-          ],
-          'ok' => true,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr' }
+          body: 'List objects in a bucket, optionally using prefix and delimiter.'
         }
-      end
-    },
-    gen_generate_grounded: {
-      title: 'Generative: Generate (grounded)',
-      subtitle: 'Generate with grounding via Google Search or Vertex AI Search',
-      display_priority: 8,
-      retry_on_request: [ 'GET', 'HEAD' ],
-      retry_on_response: [408, 429, 500, 502, 503, 504],
-      max_retries: 3,
+      end,
 
-      input_fields: lambda do |connection, _config_fields, object_definitions|
-        [
-          { name: 'contents', type: 'array', of: 'object', properties: object_definitions['content'], optional: false },
-          { name: 'model', label: 'Model', optional: false, control_type: 'text' },
-          { name: 'grounding', control_type: 'select', pick_list: 'modes_grounding', optional: false },
-          { name: 'system_preamble', optional: true, hint: 'Optional guardrails/system text.' },
-          { name: 'vertex_ai_search_datastore', optional: true,
-            hint: 'projects/.../locations/.../collections/default_collection/dataStores/...' },
-          { name: 'vertex_ai_search_serving_config', optional: true,
-            hint: 'projects/.../locations/.../collections/.../engines/.../servingConfigs/default_config' }
-        ]
+      # PURPOSE
+      #   List a page of objects and common prefixes from a GCS bucket.
+      #   Mirrors GCS list API while returning a Workato-friendly shape for mapping + paging.
+      #
+      # REQUESTER-PAYS
+      #   `userProject` is forwarded from the connection when set, avoiding 403s on RP buckets.
+
+
+      input_fields: lambda do |_obj, _conn, config_fields|
+        call(:ui_gcs_list_inputs, config_fields)
       end,
 
       output_fields: lambda do |object_definitions|
-        Array(object_definitions['generate_content_output']) + Array(object_definitions['envelope_fields'])
+        object_definitions['gcs_list_page']
       end,
 
       execute: lambda do |connection, input|
         # Correlation id and duration for logs / analytics
         t0 = Time.now
-        corr = call(:build_correlation_id)
+        corr = SecureRandom.uuid
+        filters = input['filters'] || {}
+        paging  = input['paging']  || {}
 
-        # Compute model path
-        model_path = call(:build_model_path_with_global_preview, connection, input['model'])
+        # Enforce GCS maxResults bounds (1..1000)
+        page_size = [[(paging['max_results'] || 1000).to_i, 1].max, 1000].min
 
-        # Build payload
-        contents   = call(:sanitize_contents_roles, input['contents'])
-        error('At least one non-system message is required in contents') if contents.blank?
-        sys_inst   = call(:system_instruction_from_text, input['system_preamble'])
+        # Use fields projection for lean response, faster UI
+        res = get("https://storage.googleapis.com/storage/v1/b/#{URI.encode_www_form_component(input['bucket'])}/o")
+              .params(
+                prefix: filters['prefix'],
+                delimiter: filters['delimiter'],
+                pageToken: paging['page_token'],
+                maxResults: page_size,
+                versions: !!filters['include_versions'],
+                fields: 'items(bucket,name,size,contentType,updated,generation,md5Hash,crc32c,metadata),nextPageToken,prefixes',
+                userProject: connection['user_project']
+              )
 
-        tools =
-          if input['grounding'] == 'google_search'
-            [ { 'googleSearch' => {} } ]
+        # Map upstream → schema, surface flat list of names for easy mapping
+        items = (res['items'] || []).map { |o| call(:map_gcs_meta, o) }
+        next_token = res['nextPageToken']
+        base = {
+          'objects'         => items,
+          'prefixes'        => res['prefixes'] || [],
+          'object_names'    => items.map { |o| o['name'] }.compact,
+          'count'           => items.length,
+          'has_more'        => next_token.present?,
+          'next_page_token' => next_token
+        }
+        base.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+      rescue => e
+        details = call(:google_error_extract, e)
+        {}.merge(
+          'objects'         => [],
+          'prefixes'        => [],
+          'count'           => 0,
+          'has_more'        => false,
+          'next_page_token' => nil
+        ).merge(
+          call(:telemetry_envelope, t0, corr, false, (details['code'] || 0), details['message'] || e.to_s, details)
+        )
+      end,
+
+      sample_output: lambda do
+        {
+          'objects' => [
+            {
+              'bucket' => 'my-bucket',
+              'name' => 'path/to/file.txt',
+              'size' => 123,
+              'content_type' => 'text/plain',
+              'updated' => '2025-01-01T00:00:00Z',
+              'generation' => '1735689600000000',
+              'md5_hash' => '1B2M2Y8AsgTpgAmY7PhCfg==',
+              'crc32c' => 'AAAAAA==',
+              'metadata' => { 'source' => 'ingest' }
+            }
+          ],
+          'prefixes' => ['path/to/'],
+          'count' => 1,
+          'has_more' => false,
+          'next_page_token' => nil,
+          'ok' => true,
+          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 1, 'correlation_id' => 'sample' }
+        }
+      end
+    },
+
+    # 4) gcs_get_object
+    gcs_get_object: {
+      title: 'GCS: Get object',
+      subtitle: 'Fetch an object from Google Cloud Storage bucket',
+      display_priority: 10,
+      help: lambda do |_|
+        {
+          body: 'Fetch GCS object metadata and optionally content (text or bytes).'
+        }
+      end,
+
+      # PURPOSE
+      #   Fetch GCS object metadata and optionally its content as text (UTF-8) or bytes (Base64),
+      #   with MD5/SHA-256 checksums for integrity/traceability.
+      #
+      # CONTENT RULES
+      #   - `content_mode=text` allowed only for textual MIME; otherwise 415 to prevent garbage text.
+
+      input_fields: lambda do |_obj, _conn, config_fields|
+        call(:ui_gcs_get_inputs, config_fields)
+      end,
+
+      output_fields: lambda do |object_definitions|
+        object_definitions['gcs_object_with_content']
+      end,
+
+      execute: lambda do |connection, input|
+        # Correlation id and duration for logs / analytics
+        t0 = Time.now
+        corr = SecureRandom.uuid
+
+        bucket = input['bucket']
+        name = input['object_name']
+        
+        # Fetch metadata first (derive contentType for branch decisions)
+        meta = get("https://storage.googleapis.com/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o/#{ERB::Util.url_encode(name)}")
+               .params(alt: 'json', userProject: connection['user_project'])
+        base = call(:map_gcs_meta, meta)
+        mode = (input['content_mode'] || 'none').to_s
+        strip = input.dig('postprocess', 'util_strip_urls') ? true : false
+        ctype = meta['contentType']
+        # Branched execution
+
+        # - None
+        if mode == 'none'
+          base.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+
+        # - Text
+        elsif mode == 'text'
+          # Guardrail: only textual MIME types → decode to UTF-8 (optionally strip URLs)
+          unless call(:util_is_textual_mime?, ctype)
+            error('415 Unsupported Media Type - Non-text object; use content_mode=bytes or none.')
+          end
+          bytes = get("https://storage.googleapis.com/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o/#{ERB::Util.url_encode(name)}")
+                  .params(alt: 'media', userProject: connection['user_project'])
+                  .response_format_raw
+          raw  = bytes.to_s
+          text = call(:util_force_utf8, raw)
+          text = call(:util_strip_urls, text) if strip
+          cs = call(:util_compute_checksums, raw)
+          base.merge(
+            'text_content'    => text,
+            'content_md5'     => cs['md5'],
+            'content_sha256'  => cs['sha256']
+          ).merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+
+        # - Bytes
+        elsif mode == 'bytes'
+          # Always allowed, returns Base64 plus checksums
+          bytes = get("https://storage.googleapis.com/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o/#{ERB::Util.url_encode(name)}")
+                  .params(alt: 'media', userProject: connection['user_project'])
+                  .response_format_raw
+          raw = bytes.to_s
+          cs  = call(:util_compute_checksums, raw)
+          base.merge(
+            'content_bytes'   => Base64.strict_encode64(raw),
+            'content_md5'     => cs['md5'],
+            'content_sha256'  => cs['sha256']
+          ).merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+        else
+          error("400 Bad Request - Unknown content_mode: #{mode}")
+        end
+      rescue => e
+        details = call(:google_error_extract, e)
+        {}.merge(call(:telemetry_envelope, t0, corr, false, (details['code'] || 0), details['message'] || e.to_s, details))
+      end,
+
+      sample_output: lambda do
+        {
+          'bucket' => 'my-bucket',
+          'name' => 'path/to/file.txt',
+          'size' => 123,
+          'content_type' => 'text/plain',
+          'updated' => '2025-01-01T00:00:00Z',
+          'generation' => '1735689600000000',
+          'md5_hash' => '1B2M2Y8AsgTpgAmY7PhCfg==',
+          'crc32c' => 'AAAAAA==',
+          'metadata' => { 'source' => 'ingest' },
+          'text_content' => 'hello world',
+          'content_bytes' => nil,
+          'content_md5' => 'd41d8cd98f00b204e9800998ecf8427e',
+          'content_sha256' => 'e3b0c44298fc1c149afbf4c8996fb924...',
+          'ok' => true,
+          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 1, 'correlation_id' => 'sample' }
+        }
+      end
+    },
+
+    # 5) gcs_put_object
+    gcs_put_object: {
+      title: 'GCS: Put object',
+      subtitle: 'Upload an object to Google Cloud Storage bucket',
+      display_priority: 10,
+      help: lambda do |_|
+        {
+          body: 'Upload text or bytes to GCS. Returns created object metadata and bytes_uploaded.'
+        }
+      end,
+
+      # PURPOSE
+      #   Upload text or bytes to GCS with optional Content-Type, metadata, and preconditions.
+      #   Calculates `bytes_uploaded` and returns canonical object metadata for mapping.
+      #
+      # MULTIPART VS MEDIA
+      #   - If caller supplies custom metadata → use multipart upload so meta + content are atomic.
+      #   - Else → media upload with `name` query param.
+
+      input_fields: lambda do |_obj, _conn, config_fields|
+        call(:ui_gcs_put_inputs, config_fields)
+      end,
+
+      output_fields: lambda do |object_definitions|
+        object_definitions['gcs_object_with_bytes_uploaded']
+      end,
+
+      execute: lambda do |connection, input|
+        # Correlation ID and duration for logs/analytics
+        t0 = Time.now
+        corr = SecureRandom.uuid
+
+        bucket  = input['bucket']
+        name    = input['object_name']
+        mode    = input['content_mode']
+        strip   = input.dig('postprocess', 'util_strip_urls') ? true : false
+        adv     = input['advanced'] || {}
+        meta    = adv['custom_metadata']
+        meta    = meta.transform_values { |v| v.nil? ? nil : v.to_s } if meta.present?
+
+        # Branched execution
+        body_bytes, ctype =
+
+          # - Text
+          if mode == 'text'
+            # Guardrail: text_content is required; optionally strip URLs
+            text = input['text_content']
+            error('400 Bad Request - text_content is required when content_mode=text.') if text.nil?
+            text = call(:util_strip_urls, text) if strip
+            [text.to_s.dup.force_encoding('UTF-8'), (adv['content_type'].presence || 'text/plain; charset=UTF-8')]
+          elsif mode == 'bytes'
+            # Guardrail: content_bytes required; decode Base64 and default to octet stream
+            b64 = input['content_bytes']
+            error('400 Bad Request - content_bytes is required when content_mode=bytes.') if b64.nil?
+            [Base64.decode64(b64.to_s), (adv['content_type'].presence || 'application/octet-stream')]
           else
-            ds   = input['vertex_ai_search_datastore'].to_s
-            scfg = input['vertex_ai_search_serving_config'].to_s
-            # Back-compat: allow legacy 'engine' by mapping -> servingConfig
-            legacy_engine = input['vertex_ai_search_engine'].to_s
-            scfg = legacy_engine if scfg.blank? && legacy_engine.present?
-
-            # Enforce XOR
-            error('Provide exactly one of vertex_ai_search_datastore OR vertex_ai_search_serving_config') \
-              if (ds.blank? && scfg.blank?) || (ds.present? && scfg.present?)
-
-            vas = {}
-            vas['datastore']     = ds unless ds.blank?
-            vas['servingConfig'] = scfg unless scfg.blank?
-            [ { 'retrieval' => { 'vertexAiSearch' => vas } } ]
+            error("400 Bad Request - Unknown content_mode: #{mode}")
           end
+        bytes_uploaded = body_bytes.bytesize
+        # Preconditions + requester-pays (userProject) forwarded to server
+        q = {
+          ifGenerationMatch: adv.dig('preconditions', 'if_generation_match'),
+          ifMetagenerationMatch: adv.dig('preconditions', 'if_metageneration_match'),
 
-        gen_cfg = call(:sanitize_generation_config, input['generation_config'])
-
-        payload = {
-          'contents'          => contents,
-          'systemInstruction' => sys_inst,
-          'tools'             => tools,
-          'toolConfig'        => input['toolConfig'],
-          'safetySettings'    => input['safetySettings'],
-          'generationConfig'  => gen_cfg
-        }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
-
-        # Call endpoint
-        loc = (connection['location'].presence || 'global').to_s.downcase
-        url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
-        begin
-          resp = post(url)
-                  .headers(call(:request_headers, corr))
-                  .payload(call(:json_compact, payload))
-          code = call(:telemetry_success_code, resp)
-          resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-        rescue => e
-          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
-        end
+          userProject: connection['user_project']
+        }.compact
+        created =
+          if meta.present?
+            # Multipart upload: sets metadata and content in one request
+            boundary = "workato-multipart-#{SecureRandom.hex(8)}"
+            meta_json = { name: name, contentType: ctype, metadata: meta }.to_json
+            multipart =
+              "--#{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n#{meta_json}\r\n" \
+              "--#{boundary}\r\nContent-Type: #{ctype}\r\nContent-Transfer-Encoding: binary\r\n\r\n#{body_bytes}\r\n" \
+              "--#{boundary}--\r\n"
+            post("https://www.googleapis.com/upload/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o")
+              .params(q.merge(uploadType: 'multipart'))
+              .headers('Content-Type': "multipart/related; boundary=#{boundary}")
+              .request_body(multipart)
+          else
+            # Media upload: simplest path when no custom metadata is needed
+            post("https://www.googleapis.com/upload/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o")
+              .params(q.merge(uploadType: 'media', name: name))
+              .headers('Content-Type': ctype)
+              .request_body(body_bytes)
+          end
+        # Return normalized metadata and bytes_uploaded for downstream mapping
+        call(:map_gcs_meta, created)
+          .merge('bytes_uploaded' => bytes_uploaded)
+          .merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+      rescue => e
+        details = call(:google_error_extract, e)
+        {}.merge(call(:telemetry_envelope, t0, corr, false, (details['code'] || 0), details['message'] || e.to_s, details))
       end,
 
       sample_output: lambda do
         {
-          'responseId' => 'resp-456',
-          'modelVersion' => 'gemini-2.5-pro',
-          'candidates' => [
-            { 'content' => { 'role' => 'model', 'parts' => [ { 'text' => 'Grounded answer...' } ] },
-              'groundingMetadata' => { 'citationSources' => [ { 'uri' => 'https://en.wikipedia.org/wiki/...' } ] } }
-          ],
+          'bucket' => 'my-bucket',
+          'name' => 'path/to/file.txt',
+          'size' => 123,
+          'content_type' => 'text/plain',
+          'updated' => '2025-01-01T00:00:00Z',
+          'generation' => '1735689600000000',
+          'md5_hash' => '1B2M2Y8AsgTpgAmY7PhCfg==',
+          'crc32c' => 'AAAAAA==',
+          'metadata' => { 'source' => 'ingest' },
+          'bytes_uploaded' => 123,
           'ok' => true,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr' }
+          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 1, 'correlation_id' => 'sample' }
         }
       end
     },
-    gen_answer_with_context: {
-      title: 'Generative: Generate (use provided context chunks)',
-      subtitle: '',
-      help: lambda do |_|
-        { body: 'Answer a question using caller-supplied context chunks (RAG-lite). Returns structured JSON with citations.' }
-      end,
-      display_priority: 8,
-      retry_on_request: ['GET', 'HEAD'],
-      retry_on_response: [408, 429, 500, 502, 503, 504],
-      max_retries: 3,
 
+    # 6) transfer_drive_to_gcs
+    transfer_drive_to_gcs: {
+      title: 'Transfer: Drive → GCS',
+      subtitle: 'Transfer a single file from Drive to Cloud Storage bucket',
+      display_priority: 10,
+      help: lambda do |_|
+        { body: 'For each Drive file ID, fetch content (export Editors to text if selected) and upload to GCS under a prefix.' }
+      end,
+
+      # PURPOSE
+      #   Transfer one or more Drive files by ID/URL into a GCS bucket/prefix.
+      #   Editors files are exported (default `text`) unless caller sets `skip`.
+      #
+      # OBJECT NAMING
+      #   Uses Drive file name by default; optional `gcs_prefix` prepended for folder-like organization.
+      #
+      # PARTIALS & TELEMETRY
+      #   Returns uploaded[] & failed[] arrays with a summary; http_status=207 when any item fails.
+
+      input_fields: lambda do |_obj, _conn, config_fields|
+        call(:ui_transfer_inputs, config_fields)
+      end,
+
+      output_fields: lambda do |object_definitions|
+        object_definitions['transfer_result']
+      end,
+
+      execute: lambda do |connection, input|
+        # Correlation id, duration for logging/analytics
+        t0 = Time.now
+        corr = SecureRandom.uuid
+
+        bucket       = input['bucket']
+        prefix       = call(:util_normalize_prefix, input['gcs_prefix'])
+        editors_mode = (input['content_mode_for_editors'] || 'text').to_s
+        editors_fmt  = input['editors_export_format']
+
+        uploaded, failed = [], []
+        # Accepts IDs or URLs (splits on whitespace, commas for ui)
+        drive_files = Array(input['drive_file_ids']).map(&:to_s).flat_map { |s| s.split(/[\s,]+/) }
+                        .map(&:strip).reject(&:blank?)
+
+        drive_files.each do |raw|
+          file_id = call(:util_extract_drive_id, raw)
+          next if file_id.blank?
+
+          # Core transfer - handles errors vs binary, metadata propogation, checksums, RP buckets
+          res = call(:transfer_one_drive_to_gcs, connection, file_id, bucket, "#{prefix}", editors_mode, editors_fmt, nil, nil)
+          if res['ok']
+            ok = res['ok']
+            # Ensure returned object_name reflects prefix (cosmetic)
+            ok[:gcs_object_name] = "#{prefix}#{ok[:gcs_object_name]}" if prefix.present? && !ok[:gcs_object_name].to_s.start_with?(prefix)
+            uploaded << ok
+          else
+            failed << res['error']
+          end
+        end
+
+        # Summarize for dashboard-style analytics, recipe guardrails
+        summary = {
+          'total'   => (uploaded.length + failed.length),
+          'success' => uploaded.length,
+          'failed'  => failed.length
+        }
+        base = {
+          'uploaded' => uploaded,
+          'failed'   => failed,
+          'summary'  => summary
+        }
+        ok = failed.empty?
+        code = ok ? 200 : 207
+        msg  = ok ? 'OK' : 'Partial'
+        base.merge(call(:telemetry_envelope, t0, corr, ok, code, msg))
+      rescue => e
+        details = call(:google_error_extract, e)
+        {
+          'uploaded' => [],
+          'failed'   => [],
+          'summary'  => { 'total' => 0, 'success' => 0, 'failed' => 0 }
+        }.merge(
+          call(:telemetry_envelope, t0, corr, false, (details['code'] || 0), details['message'] || e.to_s, details)
+        )
+      end,
+
+      sample_output: lambda do
+        {
+          'uploaded' => [
+            {
+              'drive_file_id' => '1AbCd',
+              'drive_name' => 'foo.txt',
+              'bucket' => 'my-bucket',
+              'gcs_object_name' => 'prefix/foo.txt',
+              'bytes_uploaded' => 42,
+              'content_type' => 'text/plain',
+              'content_md5' => 'd41d8cd98f00b204e9800998ecf8427e',
+              'content_sha256' => 'e3b0c44298fc1c149afbf4c8996fb924...'
+            }
+          ],
+          'failed' => [],
+          'summary' => { 'total' => 1, 'success' => 1, 'failed' => 0 },
+          'ok' => true,
+          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 1, 'correlation_id' => 'sample' }
+        }
+      end
+    },
+
+    # 7) transfer_drive_to_gcs_batch
+    transfer_drive_to_gcs_batch: {
+      title: 'Transfer: Drive → GCS',
+      subtitle: 'Transfer multiple items from Drive to Cloud Storage bucket',
+      display_priority: 10,
+      help: lambda do |_|
+        { body: 'Upload many Drive files to GCS in one run, with optional per-item overrides (name, Editors mode, content-type, metadata). Partial success is returned.' }
+      end,
+      batch: true,
+
+      # PURPOSE
+      #   Batch version of Drive→GCS transfer. Each item may override Editors handling,
+      #   Content-Type, metadata, and target object name. Partial success is allowed.
+      #
+      # STOP-ON-ERROR
+      #   Optional boolean to fail fast for strict workflows; otherwise continues and returns 207.
+
+      input_fields: lambda do |_obj, _conn, config_fields|
+        call(:ui_transfer_batch_inputs, config_fields)
+      end,
+
+      output_fields: lambda do |object_definitions|
+        object_definitions['transfer_batch_result']
+      end,
+
+      execute: lambda do |connection, input|
+        # Correlation ID, duration
+        t0 = Time.now
+        corr = SecureRandom.uuid
+
+        bucket       = input['bucket']
+        prefix   = call(:util_normalize_prefix, input['gcs_prefix'])
+        def_mode = (input['default_editors_mode'] || 'text').to_s
+        def_fmt  = input['default_editors_export_format']
+        def_ct   = input['default_content_type']
+        def_meta = input['default_custom_metadata']
+        stop_on_error = !!input['stop_on_error']
+
+        uploaded, failed = [], []
+        Array(input['items']).each_with_index do |it, idx|
+          # Normalize per-item overrides; fall back to defaults where absent
+          file_id = call(:util_extract_drive_id, it['drive_file_id_or_url'])
+          next if file_id.blank?
+          editors_mode = (it['editors_mode'].presence || def_mode).to_s
+          ctype        = (it['content_type'].presence || def_ct)
+          meta         = (it['custom_metadata'].presence || def_meta)
+          target_name  = (it['target_object_name'].presence || nil)
+          object_name  = target_name.present? ? "#{prefix}#{target_name}" : nil
+
+          editors_fmt  = (it['editors_export_format'].presence || def_fmt)
+          # Single file transfer core (editors/binary branches, RP via userProject)
+          res = call(:transfer_one_drive_to_gcs, connection, file_id, bucket, (object_name || ''), editors_mode, editors_fmt, ctype, meta)
+          if res['ok']
+            ok = res['ok']
+            ok[:gcs_object_name] = (object_name.presence || "#{prefix}#{ok[:gcs_object_name]}")
+            uploaded << ok
+          else
+            failed << res['error']
+            break if stop_on_error
+          end
+        end
+
+        # Return both success/failure lanes and computed summary
+        summary = {
+          'total'   => (uploaded.length + failed.length),
+          'success' => uploaded.length,
+          'failed'  => failed.length
+        }
+        base = {
+          'uploaded' => uploaded,
+          'failed'   => failed,
+          'summary'  => summary
+        }
+        ok = failed.empty?
+        code = ok ? 200 : 207
+        msg  = ok ? 'OK' : 'Partial'
+        base.merge(call(:telemetry_envelope, t0, corr, ok, code, msg))
+      rescue => e
+        details = call(:google_error_extract, e)
+        {
+          'uploaded' => [],
+          'failed'   => [],
+          'summary'  => { 'total' => 0, 'success' => 0, 'failed' => 0 }
+        }.merge(
+          call(:telemetry_envelope, t0, corr, false, (details['code'] || 0), details['message'] || e.to_s, details)
+        )
+      end,
+
+      sample_output: lambda do
+        {
+          'uploaded' => [
+            {
+              'drive_file_id' => '1AbCd',
+              'drive_name' => 'foo.txt',
+              'bucket' => 'my-bucket',
+              'gcs_object_name' => 'prefix/foo.txt',
+              'bytes_uploaded' => 42,
+              'content_type' => 'text/plain',
+              'content_md5' => 'd41d8cd98f00b204e9800998ecf8427e',
+              'content_sha256' => 'e3b0c44298fc1c149afbf4c8996fb924...'
+            }
+          ],
+          'failed' => [],
+          'summary' => { 'total' => 1, 'success' => 1, 'failed' => 0 },
+          'ok' => true,
+          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 1, 'correlation_id' => 'sample' }
+        }
+      end
+    },
+
+    # 8) permission_probe
+    permission_probe: {
+      title: 'Permission probe (Drive & GCS)',
+      subtitle: 'Verify token identity, Drive visibility, GCS access, and requester-pays',
+      display_priority: 1,
+      # PURPOSE
+      #   One-shot diagnostic to verify:
+      #     1) Token identity (email)
+      #     2) Drive visibility (first 3 files in canary folder or corpus)
+      #     3) GCS access to gs://bucket/prefix (first 3 objects)
+      #     4) Requester-pays detection (auto retries with userProject if configured)
+      #
+      # SHAPE
+      #   Returns a human-readable summary plus telemetry, so connection test and recipes
+      #   can surface actionable hints without raising (reduces setup friction).
       input_fields: lambda do |_|
         [
-          { name: 'model', label: 'Model', optional: false, control_type: 'text' },
-          { name: 'question', optional: false },
-
-          { name: 'context_chunks', type: 'array', of: 'object', optional: false, properties: [
-              { name: 'id' },
-              { name: 'text', optional: false },
-              { name: 'source' },              # e.g., dataset, email, kb
-              { name: 'uri', label: 'URI' },  # link to doc if any
-              { name: 'score', type: 'number' },
-              { name: 'metadata', type: 'object' }
-            ],
-            hint: 'Pass the top-N chunks from your retriever / process.'
-          },
-
-          { name: 'max_chunks', type: 'integer', optional: true, default: 20,
-            hint: 'Hard cap to avoid overlong prompts.' },
-
-          { name: 'system_preamble', optional: true,
-            hint: 'Optional guardrails (e.g., “only answer from context; say I don’t know otherwise”).' },
-
-          { name: 'temperature', type: 'number', optional: true, hint: 'Override temperature (default 0).' }
+          { name: 'bucket', label: 'GCS bucket', optional: true, hint: 'Defaults to connection.default_probe_bucket' },
+          { name: 'gcs_prefix', label: 'Probe prefix', optional: true, hint: 'Defaults to "probes/"' },
+          { name: 'drive_canary_folder_id_or_url', label: 'Drive canary folder (ID/URL)', optional: true,
+            hint: 'Defaults to connection.canary_drive_folder_id_or_url' },
+          { name: 'drive_id', label: 'Shared drive ID', optional: true,
+            hint: 'Defaults to connection.canary_shared_drive_id' },
+          { name: 'strict', type: 'boolean', control_type: 'checkbox', label: 'Fail on access errors',
+            optional: true, default: false }
         ]
       end,
-      
       output_fields: lambda do |object_definitions|
+        # Spec-compliant shape
         [
-          { name: 'answer' },
-          { name: 'citations', type: 'array', of: 'object', properties: [
-              { name: 'chunk_id' }, { name: 'source' }, { name: 'uri' }, { name: 'score', type: 'number' }
-            ]
-          },
-          { name: 'responseId' },
-          { name: 'usage', type: 'object', properties: [
-              { name: 'promptTokenCount', type: 'integer' },
-              { name: 'candidatesTokenCount', type: 'integer' },
-              { name: 'totalTokenCount', type: 'integer' }
-            ]
-          }
-        ] + Array(object_definitions['envelope_fields'])
-      end,
-
-      execute: lambda do |connection, input|
-        # Correlation id and duration for logs/analytics
-        t0 = Time.now
-        corr = call(:build_correlation_id)
-
-        begin
-          model_path = call(:build_model_path_with_global_preview, connection, input['model'])
-
-          max_chunks = call(:clamp_int, (input['max_chunks'] || 20), 1, 100)
-          chunks     = call(:safe_array, input['context_chunks']).first(max_chunks)
-
-
-          error('context_chunks must be a non-empty array') if chunks.blank?
-
-          # Build a deterministic, schema-ed JSON response
-          gen_cfg = {
-            'temperature'      => (input['temperature'].present? ? call(:safe_float, input['temperature']) : 0),
-            'maxOutputTokens'   => 1024,
-            'responseMimeType'  => 'application/json',
-            'responseSchema'    => {
-              'type'  => 'object',
-              'additionalProperties' => false,
-              'properties' => {
-                'answer'     => { 'type' => 'string' },
-                'citations'  => {
-                  'type'  => 'array',
-                  'items' => {
-                    'type' => 'object',
-                    'additionalProperties' => false,
-                    'properties' => {
-                      'chunk_id' => { 'type' => 'string' },
-                      'source'   => { 'type' => 'string' },
-                      'uri'      => { 'type' => 'string' },
-                      'score'    => { 'type' => 'number' }
-                    }
-                  }
-                }
-              },
-              'required' => ['answer']
-            }
-          }
-
-          sys_inst = call(:system_instruction_from_text,
-            input['system_preamble'].presence ||
-              'Answer using ONLY the provided context chunks. ' \
-              'If the context is insufficient, reply with “I don’t know.” Keep answers concise and cite chunk IDs.')
-
-          # Format a single USER message containing the question + all chunks
-          context_blob = call(:format_context_chunks, chunks)
-          contents = [
-            { 'role' => 'user', 'parts' => [
-                { 'text' => "Question:\n#{input['question']}\n\nContext:\n#{context_blob}" }
-              ]
-            }
-          ]
-
-          payload = {
-            'contents'          => contents,
-            'systemInstruction' => sys_inst,
-            'generationConfig'  => gen_cfg
-          }
-
-          loc  = (connection['location'].presence || 'global').to_s.downcase
-          url  = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
-
-          resp = post(url)
-                   .headers(call(:request_headers, corr))
-                   .payload(call(:json_compact, payload))
-
-          text = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
-          parsed = call(:safe_parse_json, text)
-
-          {
-            'answer'     => parsed['answer'] || text,
-            'citations'  => parsed['citations'] || [],
-            'responseId' => resp['responseId'],
-            'usage'      => resp['usageMetadata']
-          }.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
-        rescue => e
-          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
-        end
-      end,
-
-      sample_output: lambda do
-        {
-          'answer' => 'The outage began at 09:12 UTC due to a misconfigured firewall rule.',
-          'citations' => [
-            { 'chunk_id' => 'doc-42#p3', 'source' => 'postmortem', 'uri' => 'https://kb/acme/pm-42#p3', 'score' => 0.89 }
-          ],
-          'responseId' => 'resp-789',
-          'usage' => { 'promptTokenCount' => 311, 'candidatesTokenCount' => 187, 'totalTokenCount' => 498 },
-          'ok' => true,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr' }
-        }
-      end
-    },
-
-    # 5) Embeddings
-    embed_text: {
-      title: 'Embeddings: Embed text',
-      subtitle: 'Get embeddings from a publisher embedding model',
-      help: lambda do |_|
-        { body: 'POST :predict on a publisher embedding model' }
-      end,
-      display_priority: 7,
-      retry_on_request: ['GET', 'HEAD'],
-      retry_on_response: [408, 429, 500, 502, 503, 504],
-      max_retries: 3,
-
-      input_fields: lambda do |_|
-        [
-          { name: 'model', label: 'Embedding model', optional: false, control_type: 'text', default: 'text-embedding-005' },
-          { name: 'texts', type: 'array', of: 'string', optional: false },
-          { name: 'task', hint: 'Optional: RETRIEVAL_QUERY or RETRIEVAL_DOCUMENT' },
-          { name: 'autoTruncate', type: 'boolean', hint: 'Truncate long inputs automatically' },
-          { name: 'outputDimensionality', type: 'integer', optional: true, convert_input: 'integer_conversion',
-            hint: 'Optional dimensionality reduction (see model docs).' }
-        ]
-      end,
-
-      output_fields: lambda do |object_definitions|
-        Array(object_definitions['embed_output']) + Array(object_definitions['envelope_fields'])
-      end,
-
-      execute: lambda do |connection, input|
-        # Correlation id and duration for logs / analytics
-        t0 = Time.now
-        corr = call(:build_correlation_id)
-
-        begin
-          model_path = call(:build_embedding_model_path, connection, input['model'])
-
-          # Guard: texts length cannot exceed model batch limit (friendly message)
-          max_per_call = call(:embedding_max_instances, model_path)
-          texts = call(:safe_array, input['texts'])
-          error("Too many texts (#{texts.length}). Max per request for this model is #{max_per_call}. Chunk upstream.") if texts.length > 0 && texts.length > max_per_call
-
-          allowed_tasks = %w[
-            RETRIEVAL_QUERY RETRIEVAL_DOCUMENT SEMANTIC_SIMILARITY
-            CLASSIFICATION CLUSTERING QUESTION_ANSWERING FACT_VERIFICATION
-            CODE_RETRIEVAL_QUERY
-          ]
-          task = input['task'].to_s.strip
-          task = nil if task.blank?
-          error("Invalid task_type: #{task}. Allowed: #{allowed_tasks.join(', ')}") \
-            if task && !allowed_tasks.include?(task)
-
-          instances = call(:safe_array, input['texts']).map { |t|
-            h = { 'content' => t }
-            h['task_type'] = task if task
-            h
-          }
-
-          # Coerce/validate embedding parameters to correct JSON types
-          params = call(:sanitize_embedding_params, {
-            'autoTruncate'         => input['autoTruncate'],
-            'outputDimensionality' => input['outputDimensionality']
-          })
-
-          call(:predict_embeddings, connection, model_path, instances, params)
-            .merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
-        rescue => e
-          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
-        end
-      end,
-
-      sample_output: lambda do
-        {
-          'predictions' => [
-            { 'embeddings' => { 'values' => [0.012, -0.034, 0.056],
-              'statistics' => { 'truncated' => false, 'token_count' => 21 } } },
-            { 'embeddings' => { 'values' => [0.023, -0.045, 0.067],
-              'statistics' => { 'truncated' => false, 'token_count' => 18 } } }
-          ],
-          'metadata' => { 'billableCharacterCount' => 230 },
-          'ok' => true,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr' }
-        }
-      end
-    },
-
-    # 6) Predict
-    endpoint_predict: {
-      title: 'Prediction: Endpoint predict (custom model)',
-      subtitle: 'POST :predict to a Vertex AI Endpoint',
-      display_priority: 6,
-      retry_on_request: ['GET', 'HEAD'],
-      retry_on_response: [408, 429, 500, 502, 503, 504],
-      max_retries: 3,
-
-      input_fields: lambda do
-        [
-          { name: 'endpoint',   optional: false, hint: 'Endpoint ID or full resource path' },
-          { name: 'instances',  type: 'array', of: 'object', optional: false },
-          { name: 'parameters', type: 'object' }
-        ]
-      end,
-
-      output_fields: lambda do |object_definitions|
-        Array(object_definitions['predict_output']) + Array(object_definitions['envelope_fields'])
-      end,
-
-      execute: lambda do |connection, input|
-        # Correlation id and duration for logs / analytics
-        t0 = Time.now
-        corr = call(:build_correlation_id)
-
-        # Evaluate connection fields
-        call(:ensure_project_id!, connection)
-        call(:ensure_regional_location!, connection) # require non-global
-
-        # Build URL, payload
-        url     = call(:endpoint_predict_url, connection, input['endpoint'])
-        inst = call(:safe_array, input['instances'])
-        error('instances must be a non-empty array') if inst.empty?
-        payload = { 'instances' => inst, 'parameters' => input['parameters'] }
-
-        # Call EP
-        begin
-          resp = post(url)
-                   .headers(call(:request_headers, corr))
-                   .payload(call(:json_compact, payload))
-          code = call(:telemetry_success_code, resp)
-          resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-        rescue => e
-          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
-        end
-      end,
-
-      sample_output: lambda do
-        { 'predictions' => [ { 'score' => 0.92, 'label' => 'positive' } ],
-          'deployedModelId' => '1234567890',
-          'ok' => true,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr' } }
-      end
-    },
-    batch_prediction_create: {
-      title: 'Batch: Create prediction job',
-      subtitle: 'Create projects.locations.batchPredictionJobs',
-      batch: true,
-      display_priority: 6,
-
-      input_fields: lambda do
-        [
-          { name: 'displayName', optional: false },
-          { name: 'model',       optional: false, hint: 'Full model resource or publisher model' },
-          { name: 'gcsInputUris', type: 'array', of: 'string', optional: false },
-          { name: 'instancesFormat',   optional: false, hint: 'jsonl,csv,bigquery,tf-record,file-list' },
-          { name: 'predictionsFormat', optional: false, hint: 'jsonl,csv,bigquery' },
-          { name: 'gcsOutputUriPrefix', optional: false, hint: 'gs://bucket/path/' },
-          { name: 'modelParameters', type: 'object' },
-          { name: 'labels', type: 'object', optional: true, hint: 'Key/Value labels for traceability' }
-
-        ]
-      end,
-
-      output_fields: lambda do |object_definitions|
-        Array(object_definitions['batch_job']) + Array(object_definitions['envelope_fields'])
-      end,
-
-      execute: lambda do |connection, input|
-        # Correlation id and duration for logs / analytics
-        t0 = Time.now
-        corr = call(:build_correlation_id)
-
-        # Evaluate connection fields
-        call(:ensure_project_id!, connection)
-        call(:ensure_regional_location!, connection)
-
-        # Build the payload
-        payload = {
-          'displayName'  => input['displayName'],
-          'model'        => input['model'],
-          'inputConfig'  => {
-            'instancesFormat' => input['instancesFormat'],
-            'gcsSource'       => { 'uris' => input['gcsInputUris'] }
-          },
-          'outputConfig' => {
-            'predictionsFormat' => input['predictionsFormat'],
-            'gcsDestination'    => { 'outputUriPrefix' => input['gcsOutputUriPrefix'] }
-          },
-          'modelParameters' => input['modelParameters'],
-          'labels'          => input['labels']
-        }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
-
-        # Build the endpoint URL
-        loc         = connection['location']
-        path        = "projects/#{connection['project_id']}/locations/#{loc}/batchPredictionJobs"
-        url         = call(:aipl_v1_url, connection, loc, path)
-
-        # Call ep
-        begin
-          resp = post(url)
-                   .headers(call(:request_headers, corr))
-                   .payload(call(:json_compact, payload))
-          code = call(:telemetry_success_code, resp)
-          resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-        rescue => e
-          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
-        end
-      end,
-
-      sample_output: lambda do
-        { 'name'        => 'projects/p/locations/us-central1/batchPredictionJobs/123',
-          'displayName' => 'batch-2025-10-06',
-          'state'       => 'JOB_STATE_PENDING',
-          'model'       => 'projects/p/locations/us-central1/models/456',
-          'ok'          => true,
-          'telemetry'   => { 
-            'http_status'     => 200,
-            'message'         => 'OK',
-            'duration_ms'     => 12,
-            'correlation_id'  => 'sample-corr'
-          }
-        }
-      end
-    },
-    batch_prediction_get: {
-      title: 'Batch: Fetch prediction job (get)',
-      subtitle: 'Get a batch prediction job by ID',
-      batch: true,
-      display_priority: 6,
-
-      input_fields: lambda do
-        [ { name: 'job_id', optional: false } ]
-      end,
-
-      output_fields: lambda do |object_definitions|
-        Array(object_definitions['batch_job']) + Array(object_definitions['envelope_fields'])
-      end,
-
-      execute: lambda do |connection, input|
-        # Correlation id and duration for logs / analytics
-        t0 = Time.now
-        corr = call(:build_correlation_id)
-
-        # Evaluate connection fields
-        call(:ensure_project_id!, connection)
-        call(:ensure_regional_location!, connection)
-
-        # Build endpoint URL
-        name = input['job_id'].to_s.start_with?('projects/') ?
-          input['job_id'] :
-          "projects/#{connection['project_id']}/locations/#{connection['location']}/batchPredictionJobs/#{input['job_id']}"
-        loc = connection['location']
-        url  = call(:aipl_v1_url, connection, loc, name.sub(%r{^/v1/}, ''))
-
-        # Call EP
-        begin
-          resp = get(url).headers(call(:request_headers, corr))
-          code = call(:telemetry_success_code, resp)
-          resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-        rescue => e
-          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
-        end
-      end,
-
-      sample_output: lambda do
-        { 'name' => 'projects/p/locations/us-central1/batchPredictionJobs/123',
-          'displayName' => 'batch-2025-10-06',
-          'state' => 'JOB_STATE_SUCCEEDED',
-          'outputInfo' => { 'gcsOutputDirectory' => 'gs://my-bucket/prediction-...' },
-          'ok' => true,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr' } }
-      end
-    },
-
-    # 7) Utility
-    count_tokens: {
-      title: 'Utility: Count tokens',
-      description: 'POST :countTokens on a publisher model',
-      display_priority: 5,
-      retry_on_request: ['GET', 'HEAD'],
-      retry_on_response: [408, 429, 500, 502, 503, 504],
-      max_retries: 3,
-
-      input_fields: lambda do |connection, _config_fields, object_definitions|
-        [
-          { name: 'model', label: 'Model', optional: false, control_type: 'text' },
-          { name: 'contents', type: 'array', of: 'object', properties: object_definitions['content'], optional: false },
-          { name: 'system_preamble', label: 'System preamble (text)', optional: true }
-        ]
-      end,
-
-      output_fields: lambda do |object_definitions|
-        [
-          { name: 'totalTokens', type: 'integer' },
-          { name: 'totalBillableCharacters', type: 'integer' },
-          { name: 'promptTokensDetails', type: 'array', of: 'object' }
-        ] + Array(object_definitions['envelope_fields'])
-      end,
-
-      execute:  lambda do |connection, input|
-        # Correlation id and duration for logs / analytics
-        t0 = Time.now
-        corr = call(:build_correlation_id)
-
-        # Compute model path
-        model_path = call(:build_model_path_with_global_preview, connection, input['model'])
-
-        # Build payload
-        contents   = call(:sanitize_contents_roles, input['contents'])
-        error('At least one non-system message is required in contents') if contents.blank?
-        sys_inst   = call(:system_instruction_from_text, input['system_preamble'])
-
-        loc = (connection['location'].presence || 'global').to_s.downcase
-        url = call(:aipl_v1_url, connection, loc, "#{model_path}:countTokens")
-
-        begin
-          resp = post(url)
-                    .headers(call(:request_headers, corr))
-                    .payload(call(:json_compact, {
-                      'contents'          => contents,
-                      'systemInstruction' => sys_inst
-                    }))
-          code = call(:telemetry_success_code, resp)
-          resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-        rescue => e
-          g = call(:extract_google_error, e)
-          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
-        end
-      end,
-
-      sample_output: lambda do
-        { 'totalTokens' => 31, 'totalBillableCharacters' => 96,
-          'promptTokensDetails' => [ { 'modality' => 'TEXT', 'tokenCount' => 31 } ],
-          'ok' => true,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr' } }
-      end
-    },
-    operations_get: {
-      title: 'Operations: Get (poll LRO)',
-      subtitle: 'google.longrunning.operations.get',
-      display_priority: 5,
-      retry_on_request: ['GET','HEAD'],
-      retry_on_response: [408,429,500,502,503,504],
-      max_retries: 3,
-
-      input_fields: lambda do
-        [
-          { name: 'operation', optional: false,
-            hint: 'Operation name or full path, e.g., projects/{p}/locations/{l}/operations/{id}' }
-        ]
-      end,
-
-      output_fields: lambda do |_|
-        [
-          { name: 'name' }, { name: 'done', type: 'boolean' },
-          { name: 'metadata', type: 'object' }, { name: 'error', type: 'object' }
-        ] + [
           { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object', properties: [
-            { name: 'http_status', type: 'integer' }, { name: 'message' },
-            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
+          { name: 'whoami', type: 'string', hint: 'Token principal (email)' },
+          { name: 'supportsAllDrives', type: 'boolean' },
+          { name: 'includeItemsFromAllDrives', type: 'boolean' },
+          { name: 'requester_pays_detected', type: 'boolean' },
+          { name: 'drive_access', type: 'array', of: 'object', properties: [
+              { name: 'id' }, { name: 'name' }, { name: 'web_view_url' }
+          ]},
+          { name: 'gcs_access', type: 'array', of: 'object', properties: [
+              { name: 'name' }, { name: 'size', type: 'integer' }, { name: 'updated', type: 'date_time' }
           ]}
-        ]
+        ] + Array(object_definitions['envelope_fields'])
       end,
-
       execute: lambda do |connection, input|
-        t0 = Time.now
-        corr = call(:build_correlation_id)
-        begin
-          call(:ensure_project_id!, connection)
-          # Accept either full /v1/... or name-only
-          op = input['operation'].to_s.sub(%r{^/v1/}, '')
-          loc = (connection['location'].presence || 'us-central1').to_s.downcase
-          url = call(:aipl_v1_url, connection, loc, op.start_with?('projects/') ? op : "projects/#{connection['project_id']}/locations/#{loc}/operations/#{op}")
-          resp = get(url).headers(call(:request_headers, corr))
-          code = call(:telemetry_success_code, resp)
-          resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-        rescue => e
-          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
-        end
-      end,
+        bucket   = (input['bucket'].presence || connection['default_probe_bucket'])
+        prefix   = (input['gcs_prefix'].presence || 'probes/')
+        folder   = (input['drive_canary_folder_id_or_url'].presence || connection['canary_drive_folder_id_or_url'])
+        drive_id = (input['drive_id'].presence || connection['canary_shared_drive_id'])
 
-      sample_output: lambda do
-        { 'name' => 'projects/p/locations/us-central1/operations/123', 'done' => false,
-          'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 8, 'correlation_id' => 'sample' } }
+        strict   = !!input['strict']
+        # Delegate to shared method used by connection test for single-source of truth
+        res = call(:do_permission_probe, connection, bucket, folder, drive_id, prefix)
+        if strict && res['upstream'].is_a?(Hash) && res['upstream']['drive_error'].is_a?(Hash)
+          de = res['upstream']['drive_error']
+          error("#{(de['code'] || 403)} #{(de['status'] || 'Forbidden')} - #{(de['message'] || 'Drive access failed')}")
+        end
+        res
       end
     }
-
   },
 
   # --------- PICK LISTS ---------------------------------------------------
   pick_lists: {
-    modes_classification: lambda do
-      [%w[Embedding embedding], %w[Generative generative], %w[Hybrid hybrid]]
-    end,
-
-    modes_grounding: lambda do
-      [%w[Google\ Search google_search], %w[Vertex\ AI\ Search vertex_ai_search]]
-    end,
-
-    roles: lambda do
-      # Contract-conformant roles (system handled via system_preamble)
-      [['user','user'], ['model','model']]
-    end,
-
-    rag_source_families: lambda do
+    content_modes: lambda do |_|
       [
-        ['Google Cloud Storage', 'gcs'],
-        ['Google Drive', 'drive']
+        %w[none none],
+        %w[text text],
+        %w[bytes bytes]
       ]
     end,
-
-    drive_input_type: lambda do
+    content_modes_write: lambda do |_|
       [
-        ['Drive Files', 'files'],
-        ['Drive Folder', 'folder']
+        %w[text text],
+        %w[bytes bytes]
       ]
     end,
-
-    distance_measures: lambda do
+    editors_modes: lambda do |_|
       [
-        ['Cosine distance', 'COSINE_DISTANCE'],
-        ['Dot product',     'DOT_PRODUCT'],
-        ['Euclidean',       'EUCLIDEAN_DISTANCE']
+        ['text (export Editors to plain/csv/svg per mapping)', 'text'],
+        ['skip (do not transfer Editors files)', 'skip']
+      ]
+    end,
+    editors_export_formats: lambda do |_|
+      # The value is the MIME we will pass to files.export.
+      [
+        ['Docs → PDF',  'application/pdf'],
+        ['Docs → DOCX', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
+        ['Sheets → CSV (first sheet)', 'text/csv'],
+        ['Sheets → XLSX', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'],
+        ['Slides → PDF', 'application/pdf'],
+        ['Slides → TXT (speaker notes omitted)', 'text/plain'],
+        ['Drawings → SVG', 'image/svg+xml'],
+        ['Drawings → PNG', 'image/png']
       ]
     end
   },
@@ -2390,10 +1227,117 @@ require 'base64'
   # --------- METHODS ------------------------------------------------------
   methods: {
 
-    # --- Telemetry and resilience -----------------------------------------
-    telemetry_envelope: lambda do |started_at, correlation_id, ok, code, message|
-      dur = ((Time.now - started_at) * 1000.0).to_i
-      {
+    # --- 1. URL BUILDERS + CONSTS --------
+    const_default_scopes: -> { [
+      'https://www.googleapis.com/auth/drive',
+      'https://www.googleapis.com/auth/devstorage.read_write'
+      #'https://www.googleapis.com/auth/cloud-platform`', # n/a in our tenant
+    ] },
+    const_drive_scope: -> { [ 'https://www.googleapis.com/auth/drive' ] },
+    const_gcs_scope: -> { [ 'https://www.googleapis.com/auth/devstorage.read_write' ] },
+
+    # --- 2. UTILITIES (PURE) -------------
+    util_extract_drive_id: lambda do |str|
+      s = (str || '').to_s.strip
+      return nil if s.empty?
+      m = s.match(%r{/d/([a-zA-Z0-9_-]+)}) ||
+          s.match(%r{/folders/([a-zA-Z0-9_-]+)}) ||
+          s.match(/[?&]id=([a-zA-Z0-9_-]+)/)
+      m ? m[1] : s
+    end,
+
+    util_to_iso8601_utc: lambda do |t|
+      Time.parse(t.to_s).utc.iso8601
+    rescue
+      t
+    end,
+
+    util_to_int_or_nil: lambda do |val|
+      v = val.to_s
+      v.empty? ? nil : v.to_i
+    end,
+
+    util_is_textual_mime?: lambda do |mime|
+      m = (mime || '').downcase
+      m.start_with?('text/') || %w[application/json application/xml image/svg+xml].include?(m)
+    end,
+
+    util_is_google_editors_mime?: lambda do |mime|
+      (mime || '').start_with?('application/vnd.google-apps.')
+    end,
+
+    util_editors_export_mime: lambda do |source_mime, preferred_export_mime|
+      # Choose the export MIME for Google Drive files
+      # If caller provides preferred_export_mime, use it *when compatible* with the source type,
+      # otherwise fall back to a sensible default that Google accepts.
+      src = (source_mime || '')
+      pref = preferred_export_mime.to_s
+
+      case src
+      when 'application/vnd.google-apps.document'
+        allowed = %w[
+          application/pdf
+          application/vnd.openxmlformats-officedocument.wordprocessingml.document
+          text/plain
+        ]
+        allowed.include?(pref) ? pref : 'application/pdf'
+
+      when 'application/vnd.google-apps.spreadsheet'
+        allowed = %w[
+          text/csv
+          application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+        ]
+        allowed.include?(pref) ? pref : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+
+      when 'application/vnd.google-apps.presentation'
+        allowed = %w[
+          application/pdf
+          text/plain
+        ]
+        allowed.include?(pref) ? pref : 'application/pdf'
+
+      when 'application/vnd.google-apps.drawing'
+        allowed = %w[
+          image/svg+xml
+          image/png
+        ]
+        allowed.include?(pref) ? pref : 'image/svg+xml'
+
+      else
+        # Non-editors or unknown → caller should not invoke export.
+        pref.presence || 'application/octet-stream'
+      end
+    end,
+
+    util_strip_urls: lambda do |text|
+      text.to_s.gsub(%r{https?://\S+|www\.\S+}, '')
+    end,
+
+    util_force_utf8: lambda do |bytes|
+      s = bytes.to_s
+      s.force_encoding('UTF-8')
+      s.valid_encoding? ? s : s.encode('UTF-8', invalid: :replace, undef: :replace, replace: '')
+    end,
+
+    util_compute_checksums: lambda do |raw|
+      # Compute MD5 and SHA-256 from raw bytes
+      s = raw.to_s
+      md5 = OpenSSL::Digest::MD5.hexdigest(s)
+      sha = OpenSSL::Digest::SHA256.hexdigest(s)
+      { 'md5' => md5, 'sha256' => sha }
+    end,
+
+    util_normalize_prefix: lambda do |prefix|
+      p = (prefix || '').to_s
+      return '' if p.empty?
+      p.end_with?('/') ? p : "#{p}/"
+    end,
+
+    # --- 3. TELEMETRY --------------------
+    telemetry_envelope: lambda do |started_at, correlation_id, ok, code, message, upstream_details=nil|
+      # Build base telemetry data
+      dur   = ((Time.now - started_at) * 1000.0).to_i
+      base  = {
         'ok' => !!ok,
         'telemetry' => {
           'http_status'    => code.to_i,
@@ -2402,152 +1346,270 @@ require 'base64'
           'correlation_id' => correlation_id
         }
       }
+      # Append available error/upstream data
+      upstream_details.present? ? base.merge('upstream' => upstream_details) : base
     end,
-    telemetry_success_code: lambda do |resp|
-      (resp['status'] || resp['status_code'] || 200).to_i
-    end,
-    telemetry_parse_error_code: lambda do |err|
-      # Prefer Workato HTTP error objects first
-      begin
-        if err.respond_to?(:[])
 
-          code = err['status'] || err.dig('response', 'status') ||
-                 err.dig('response', 'status_code') || err.dig('error', 'code')
-          return code.to_i if code
-        end
-      rescue; end
-      # Try JSON body error.code
+    google_error_extract: lambda do |err|
+      # Extract structured Google error details from Workato exceptions
+      s = err.to_s
+      code = (s[/\b(\d{3})\b/, 1] || nil)
+      blob = nil
       begin
-        body = (err.respond_to?(:[]) && err.dig('response','body')).to_s
-        j = JSON.parse(body) rescue nil
-        c = j && j.dig('error','code')
-        return c.to_i if c
-      rescue; end
-      m = err.to_s.match(/\b(\d{3})\b/)
-      m ? m[1].to_i : 500
-    end,
-    build_correlation_id: lambda do
-      SecureRandom.uuid
-    end,
-    extract_google_error: lambda do |err|
-      begin
-        body = (err.respond_to?(:[]) && err.dig('response','body')).to_s
-        json = JSON.parse(body) rescue nil
-        if json
-          # google.rpc.Status shape
-          if json['error']
-            det   = json['error']['details'] || []
-            bad   = det.find { |d| (d['@type'] || '').end_with?('google.rpc.BadRequest') } || {}
-            vlist = (bad['fieldViolations'] || bad['violations'] || []).map do |v|
-              {
-                'field'  => v['field'] || v['fieldPath'] || v['subject'],
-                'reason' => v['description'] || v['message'] || v['reason']
-              }.compact
-            end.reject(&:empty?)
-            return {
-              'code'       => json['error']['code'],
-              'message'    => json['error']['message'],
-              'details'    => json['error']['details'],
-              'violations' => vlist,
-              'raw'        => json
-            }
-          end
-          # some endpoints return {message:"..."} at top level
-          return { 'message' => json['message'], 'raw' => json } if json['message']
-        end
+        # Look for a JSON object containing "error": { ... }
+        json_str = s[s.index('{') || 0, s.length]
+        blob = JSON.parse(json_str) rescue nil
       rescue
+        blob = nil
       end
-      {}
-    end,
-    redact_json: lambda do |obj|
-      # Shallow redaction of obvious secrets in request bodies; extend as needed
-      begin
-        j = obj.is_a?(String) ? JSON.parse(obj) : obj
-      rescue
-        return obj
-      end
-      if j.is_a?(Hash)
-        %w[access_token authorization api_key apiKey bearer token id_token refresh_token client_secret private_key].each do |k|
-          j[k] = '[REDACTED]' if j.key?(k)
-        end
-      end
-      j
-    end,
-    debug_pack: lambda do |enabled, url, body, google_error|
-      return nil unless enabled
+      e = blob.is_a?(Hash) ? blob['error'] : nil
+      first = (e && e['errors'].is_a?(Array) && e['errors'].first) || {}
       {
-        'request_url'  => url.to_s,
-        'request_body' => call(:redact_json, body),
-        'error_body'   => (google_error && google_error['raw']) || google_error
+        'code'     => (e && e['code']) || (code && code.to_i),
+        'status'   => e && e['status'],
+        'reason'   => first['reason'],
+        'domain'   => first['domain'],
+        'location' => first['location'],
+        'message'  => (e && e['message']) || s
+      }.compact
+    end,
+
+    # --- 4. MAPPERS (UPSTREAM → SCHEMA) --
+    map_gcs_meta: lambda do |o|
+      {
+        'bucket'       => o['bucket'],
+        'name'         => o['name'],
+        'size'         => call(:util_to_int_or_nil, o['size']),
+        'content_type' => o['contentType'],
+        'updated'      => o['updated'],
+        'generation'   => o['generation'].to_s,
+        'md5_hash'     => o['md5Hash'],
+        'crc32c'       => o['crc32c'],
+        'metadata'     => o['metadata'] || {}
       }
     end,
 
-    # --- Auth (JWT → OAuth) -----------------------------------------------
-    const_default_scopes: lambda do
-       [ 'https://www.googleapis.com/auth/cloud-platform' ]
+    map_drive_meta: lambda do |f|
+      {
+        'id'            => f['id'],
+        'name'          => f['name'],
+        'mime_type'     => f['mimeType'],
+        'size'          => call(:util_to_int_or_nil, f['size']),
+        'modified_time' => f['modifiedTime'],
+        'checksum'      => f['md5Checksum'],
+        'web_view_url'  => (f['id'].present? ? "https://drive.google.com/file/d/#{f['id']}/view" : nil),
+        'owners'        => (f['owners'] || []).map { |o| { 'display_name' => o['displayName'], 'email' => o['emailAddress'] } }
+      }
     end,
+
+    map_drive_min_for_probe: lambda do |f|
+      {
+        'id' => f['id'],
+        'name' => f['name'],
+        'web_view_url' => (f['id'].present? ? "https://drive.google.com/file/d/#{f['id']}/view" : nil)
+      }
+    end,
+
+    do_permission_probe: lambda do |connection, bucket, canary_folder_id_or_url, canary_drive_id, gcs_prefix|
+      # Core probe used by connection test and action
+      # Returns the full spec'd object (merged with telemetry by the caller when appropriate),
+      # but here we also add telemetry to keep it symmetrical with actions that expect it.
+      t0 = Time.now
+      corr = SecureRandom.uuid
+
+      # 1) whoami via tokeninfo (fallback to Drive about user)
+      who = nil
+      begin
+        tok = call(:auth_build_access_token!, connection, scopes: call(:const_default_scopes))
+        ti  = get('https://oauth2.googleapis.com/tokeninfo').params(access_token: tok)
+        who = ti['email'].to_s.presence
+      rescue => _e
+        # ignore; fallback below
+      end
+      if who.blank?
+        begin
+          about = get('https://www.googleapis.com/drive/v3/about').params(fields: 'user')
+          who = about.dig('user','emailAddress').to_s.presence
+        rescue => _e
+          # leave nil
+        end
+      end
+
+      # 2) Drive access: first 3 files in canary (if provided) or corpus
+      supports = true
+      include_items = true
+      drive_list = []
+      drive_err = nil
+      begin
+        q = ["trashed=false"]
+        folder_id = call(:util_extract_drive_id, canary_folder_id_or_url)
+        corpora, drive_id = if canary_drive_id.present?
+                              ['drive', canary_drive_id]
+                            elsif folder_id.present?
+                              ['allDrives', nil]
+                            else
+                              ['user', nil]
+                            end
+        q << "'#{folder_id}' in parents" if folder_id.present?
+        res = get('https://www.googleapis.com/drive/v3/files')
+              .params(
+                q: q.join(' and '),
+                pageSize: 3,
+                orderBy: 'modifiedTime desc',
+                spaces: 'drive',
+                corpora: corpora,
+                driveId: drive_id,
+                supportsAllDrives: supports,
+                includeItemsFromAllDrives: include_items,
+                fields: 'files(id,name)'
+              )
+        (res['files'] || []).first(3).each do |f|
+          drive_list << call(:map_drive_min_for_probe, f)
+        end
+      rescue => e
+        drive_err = call(:google_error_extract, e)
+      end
+
+      # 3) GCS access: first 3 under gs://bucket/prefix
+      gcs_list = []
+      requester_pays_detected = false
+      begin
+        if bucket.present?
+          # First try WITHOUT userProject to detect requester-pays via 403 body
+          begin
+            r = get("https://storage.googleapis.com/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o")
+                .params(prefix: (gcs_prefix.presence || 'probes/'), maxResults: 3,
+                        fields: 'items(name,size,updated)')
+            (r['items'] || []).first(3).each do |o|
+              gcs_list << {
+                'name' => o['name'],
+                'size' => call(:util_to_int_or_nil, o['size']),
+                'updated' => o['updated']
+              }
+            end
+          rescue => e1
+            text = e1.to_s
+            # Detect requester-pays phrases in 403 body text
+            if text =~ /(requester[- ]pays|user\s*project|User\s*project)/i
+              # Retry WITH userProject if configured
+              up = connection['user_project']
+              if up.present?
+                begin
+                  r2 = get("https://storage.googleapis.com/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o")
+                        .params(prefix: (gcs_prefix.presence || 'probes/'), maxResults: 3,
+                                fields: 'items(name,size,updated)', userProject: up)
+                  requester_pays_detected = true
+                  (r2['items'] || []).first(3).each do |o|
+                    gcs_list << {
+                      'name' => o['name'],
+                      'size' => call(:util_to_int_or_nil, o['size']),
+                      'updated' => o['updated']
+                    }
+                  end
+                rescue => _e2
+                  # keep detection true; list may remain empty on perms issues
+                end
+              else
+                requester_pays_detected = true
+              end
+            end
+          end
+        end
+      rescue => _e
+        # Ignore; gcs_list stays empty
+      end
+
+      ok = (who.present? && drive_err.nil?)
+      res = {
+        'ok' => !!ok,
+        'whoami' => who,
+        'supportsAllDrives' => supports,
+        'includeItemsFromAllDrives' => include_items,
+        'requester_pays_detected' => !!requester_pays_detected,
+        'drive_access' => drive_list,
+        'gcs_access' => gcs_list
+      }
+      # On Drive fail, carry the error in upstream.drive_error and set http_status from it
+      if drive_err
+        res = res.merge('upstream' => { 'drive_error' => drive_err })
+      end
+      http_code = drive_err ? (drive_err['code'] || 207) : (ok ? 200 : 207)
+      msg = drive_err ? (drive_err['message'] || 'Partial') : (ok ? 'OK' : 'Partial')
+      res.merge(call(:telemetry_envelope, t0, corr, ok, http_code, msg))
+    end,
+
+    # --- 5. AUTH HELPERS -----------------
     b64url: lambda do |bytes|
+      # Base64url without padding
       Base64.urlsafe_encode64(bytes).gsub(/=+$/, '')
     end,
+
     jwt_sign_rs256: lambda do |claims, private_key_pem|
+      # Sign a JWT (RS256) using the service account private key
       header = { alg: 'RS256', typ: 'JWT' }
-      enc_h  = call(:b64url, header.to_json)
-      enc_p  = call(:b64url, claims.to_json)
-      input  = "#{enc_h}.#{enc_p}"
+
+      encoded_header  = call(:b64url, header.to_json)
+      encoded_payload = call(:b64url, claims.to_json)
+      signing_input   = "#{encoded_header}.#{encoded_payload}"
+
       rsa = OpenSSL::PKey::RSA.new(private_key_pem.to_s)
-      sig = rsa.sign(OpenSSL::Digest::SHA256.new, input)
-      "#{input}.#{call(:b64url, sig)}"
+      signature = rsa.sign(OpenSSL::Digest::SHA256.new, signing_input)
+
+      "#{signing_input}.#{call(:b64url, signature)}"
     end,
+
     auth_normalize_scopes: lambda do |scopes|
-      arr = case scopes
-            when nil    then ['https://www.googleapis.com/auth/cloud-platform']
-            when String then scopes.split(/\s+/)
-            when Array  then scopes
-            else              ['https://www.googleapis.com/auth/cloud-platform']
-            end
+      arr =
+        case scopes
+        when nil    then call(:const_default_scopes)
+        when String then scopes.split(/\s+/)
+        when Array  then scopes
+        else              call(:const_default_scopes)
+        end
       arr.map(&:to_s).reject(&:empty?).uniq
     end,
+
     auth_token_cache_get: lambda do |connection, scope_key|
       cache = (connection['__token_cache'] ||= {})
       tok   = cache[scope_key]
+
       return nil unless tok.is_a?(Hash) && tok['access_token'].present? && tok['expires_at'].present?
-      exp = Time.parse(tok['expires_at']) rescue nil
-      return nil unless exp && Time.now < (exp - 60)
+      
+      exp   = Time.parse(tok['expires_at']) rescue nil
+      
+      return nil unless exp && Time.now < (exp - 60) # valid until exp-60s
       tok
     end,
+
     auth_token_cache_put: lambda do |connection, scope_key, token_hash|
       cache = (connection['__token_cache'] ||= {})
       cache[scope_key] = token_hash
       token_hash
     end,
+
     auth_issue_token!: lambda do |connection, scopes|
-      # Safely parse sa key json
       key = JSON.parse(connection['service_account_key_json'].to_s)
-      # Guard for sa key exists
-      error('Invalid service account key: missing client_email') if key['client_email'].to_s.strip.empty?
-      error('Invalid service account key: missing private_key') if key['private_key'].to_s.strip.empty?
-      # Normalize pk newlines to satisfy OpenSSL
-      pk = key['private_key'].to_s.gsub(/\\n/, "\n")
       token_url = (key['token_uri'].presence || 'https://oauth2.googleapis.com/token')
       now = Time.now.to_i
+
       scope_str = scopes.join(' ')
       payload = {
         iss:   key['client_email'],
         scope: scope_str,
         aud:   token_url,
         iat:   now,
-        exp:   now + 3600
+        exp:   now + 3600 # Google max 1h
       }
 
-      # Build assertion
-      assertion = call(:jwt_sign_rs256, payload, pk)
+      assertion = call(:jwt_sign_rs256, payload, key['private_key'])
 
-      # POST to ep
       res = post(token_url)
-              .payload(grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion: assertion)
+              .payload(
+                grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+                assertion:  assertion
+              )
               .request_format_www_form_urlencoded
 
-      # Parse response
       {
         'access_token' => res['access_token'],
         'token_type'   => res['token_type'],
@@ -2556,7 +1618,9 @@ require 'base64'
         'scope_key'    => scope_str
       }
     end,
+
     auth_build_access_token!: lambda do |connection, scopes: nil|
+      # Public surface: returns *string* access token, cached by scope set
       set = call(:auth_normalize_scopes, scopes)
       scope_key = set.join(' ')
       if (cached = call(:auth_token_cache_get, connection, scope_key))
@@ -2566,594 +1630,414 @@ require 'base64'
       call(:auth_token_cache_put, connection, scope_key, fresh)['access_token']
     end,
 
-    # --- URL and resource building ----------------------------------------
-    aipl_service_host: lambda do |connection, loc=nil|
-      l = (loc || connection['location']).to_s.downcase
-      (l.blank? || l == 'global') ? 'aiplatform.googleapis.com' : "#{l}-aiplatform.googleapis.com"
-    end,
-    aipl_v1_url: lambda do |connection, loc, path|
-      "https://#{call(:aipl_service_host, connection, loc)}/v1/#{path}"
-    end,
-    endpoint_predict_url: lambda do |connection, endpoint|
-      ep = call(:normalize_endpoint_identifier, endpoint).to_s
-      # Allow fully-qualified dedicated endpoint URLs.
-      return (ep.include?(':predict') ? ep : "#{ep}:predict") if ep.start_with?('http')
+    # --- 6. CORE WORKFLOWS ---------------
+    transfer_one_drive_to_gcs: lambda do |connection, file_id, bucket, object_name, editors_mode, editors_export_format, global_content_type, global_metadata|
+      # transfer one Drive file to GCS. Returns {:ok=>hash} or {:error=>hash}.
+      user_project = connection['user_project']
+      begin
+        meta = call(:meta_get_resolve_shortcut, file_id)
+        fname = meta['name'].to_s
+        oname = (object_name.presence || fname)
 
-      # Prefer region from the resource name; fallback to connection.
-      m   = ep.match(%r{^projects/[^/]+/locations/([^/]+)/endpoints/})
-      loc = (m && m[1]) || (connection['location'] || '').to_s.downcase
-      error("This action requires a regional location. Current location is '#{loc}'.") if loc.blank? || loc == 'global'
+        # Editors branch
+        if call(:util_is_google_editors_mime?, meta['mimeType'])
+          # Skipped editors
+          if editors_mode == 'skip'
+            return { 'error' => {
+              'drive_file_id'  => file_id,
+              'drive_name'     => fname,
+              'gcs_object_name'=> oname,
+              'error_code'     => 'SKIPPED',
+              'error_message'  => 'Skipped Editors file (set editors to text to export).'
+            } }
+          end
+          export_mime = call(:util_editors_export_mime, meta['mimeType'], editors_export_format)
+          body = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}/export")
+                .params(mimeType: export_mime, supportsAllDrives: true)
+                .response_format_raw
+                .to_s
+          cs = call(:util_compute_checksums, body)
+          created = post("https://www.googleapis.com/upload/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o")
+                    .params(uploadType: 'media', name: oname, userProject: user_project)
+                    .headers('Content-Type': (global_content_type.presence || export_mime))
+                    .request_body(body)
+          return { 'ok' => {
+            'drive_file_id'  => file_id,
+            'drive_name'     => fname,
+            'bucket'         => created['bucket'],
+            'gcs_object_name'=> created['name'],
+            'bytes_uploaded' => body.bytesize,
+            'content_type'   => (global_content_type.presence || export_mime),
+            'content_md5'    => cs['md5'],
+            'content_sha256' => cs['sha256']
+          } }
 
-      host = call(:aipl_service_host, connection, loc)
-      "https://#{host}/v1/#{call(:build_endpoint_path, connection, ep)}:predict"
-    end,
-    build_endpoint_path: lambda do |connection, endpoint|
-      ep = call(:normalize_endpoint_identifier, endpoint)
-      ep = ep.sub(%r{^/v1/}, '') # defensive
-      ep.start_with?('projects/') ? ep :
-        "projects/#{connection['project_id']}/locations/#{connection['location']}/endpoints/#{ep}"
-    end,
-    build_model_path_with_global_preview: lambda do |connection, model|
-      # Enforce project location (inference from connection)
-      call(:ensure_project_id!, connection)
-
-      # Normalize model identifier
-      m = call(:normalize_model_identifier, model)
-      error('Model is required') if m.blank?
-      return m if m.start_with?('projects/')
-
-      # Accept common short forms
-      if m.start_with?('models/')
-        m = m.split('/', 2).last # drop leading "models/"
-      end
-      if m.start_with?('google/models/')
-        m = "publishers/#{m}"
-      end
-
-      # Respect caller's location; default to global, which is widely supported for Gemini
-      loc = (connection['location'].presence || 'global').to_s.downcase
-
-      if m.start_with?('publishers/')
-        "projects/#{connection['project_id']}/locations/#{loc}/#{m}"
-      else
-        "projects/#{connection['project_id']}/locations/#{loc}/publishers/google/models/#{m}"
-      end
-    end,
-    build_embedding_model_path: lambda do |connection, model|
-      # Enforce project location (inference from connection)
-      call(:ensure_project_id!, connection)
-
-      # Normalize model identifier
-      m = call(:normalize_model_identifier, model)
-      error('Embedding model is required') if m.blank?
-      return m if m.start_with?('projects/')
-
-      # Accept common short forms
-      if m.start_with?('models/')
-        m = m.split('/', 2).last
-      end
-      if m.start_with?('google/models/')
-        m = "publishers/#{m}"
-      end
-
-      loc = call(:embedding_region, connection)
-      if m.start_with?('publishers/')
-        "projects/#{connection['project_id']}/locations/#{loc}/#{m}"
-      else
-        "projects/#{connection['project_id']}/locations/#{loc}/publishers/google/models/#{m}"
-      end
-    end,
-
-    # --- Guards, normalization --------------------------------------------
-    ensure_project_id!: lambda do |connection|
-      pid = (connection['project_id'].presence ||
-              (JSON.parse(connection['service_account_key_json'].to_s)['project_id'] rescue nil)).to_s
-      error('Project ID is required (not found in connection or key)') if pid.blank?
-      connection['project_id'] = pid
-      pid
-    end,
-    ensure_regional_location!: lambda do |connection|
-      loc = (connection['location'] || '').downcase
-      error("This action requires a regional location (e.g., us-central1). Current location is '#{loc}'.") if loc.blank? || loc == 'global'
-    end,
-    embedding_region: lambda do |connection|
-      loc = (connection['location'] || '').to_s.downcase
-      loc.present? ? loc : 'global'
-    end,
-    normalize_endpoint_identifier: lambda do |raw|
-      return '' if raw.nil? || raw == true || raw == false
-      if raw.is_a?(Hash)
-        v = raw['value'] || raw[:value] || raw['id'] || raw[:id] || raw['path'] || raw[:path] || raw['name'] || raw[:name] || raw.to_s
-        return v.to_s.strip
-      end; raw.to_s.strip
-    end,
-    normalize_model_identifier: lambda do |raw|
-      # Normalize a user-provided "model" into a String.
-      # Accepts String or Hash (from datapills/pick lists). Prefers common keys.
-      return '' if raw.nil? || raw == true || raw == false
-      if raw.is_a?(Hash)
-        v = raw['value'] || raw[:value] || raw['id'] || raw[:id] || raw['path'] || raw[:path] || raw['name'] || raw[:name] || raw.to_s
-        return v.to_s.strip
-      end; raw.to_s.strip
-    end,
-    normalize_boolean: lambda do |v|
-      %w[true 1 yes on].include?(v.to_s.strip.downcase)
-    end,
-    normalize_input_keys: lambda do |input|
-      (input || {}).to_h.transform_keys(&:to_s)
-    end,
-    normalize_drive_resource_id: lambda do |raw|
-      # Accepts:
-      #   - raw ID strings: "1AbC_def-123"
-      #   - datapill Hashes: {id:"..."}, {fileId:"..."}, {value:"..."}, etc.
-      #   - full URLs: https://drive.google.com/file/d/<id>/..., ?id=<id>, /folders/<id>
-      # Returns bare ID: /[A-Za-z0-9_-]+/
-      return '' if raw.nil? || raw == false
-      v =
-        if raw.is_a?(Hash)
-          raw['id'] || raw[:id] ||
-          raw['fileId'] || raw[:fileId] ||
-          raw['value'] || raw[:value] ||
-          raw['name'] || raw[:name] ||
-          raw['path'] || raw[:path] ||
-          raw.to_s     # last resort (but avoid using this path)
+        # Non-editors branch
         else
-          raw
-        end.to_s.strip
-      # Common placeholders → empty
-      return '' if v.empty? || %w[null nil none undefined - (blank)].include?(v.downcase)
+          ctype = (global_content_type.presence || meta['mimeType'])
+          body = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}")
+                .params(alt: 'media', supportsAllDrives: true)
+                .response_format_raw
+                .to_s
+          cs = call(:util_compute_checksums, body)
 
-      # Strip common Drive URL patterns
-      if v.start_with?('http://', 'https://')
-        # /file/d/<id>/...   or   /folders/<id>
-        if (m = v.match(%r{/file/d/([^/?#]+)}))      then v = m[1]
-        elsif (m = v.match(%r{/folders/([^/?#]+)}))  then v = m[1]
-        elsif (m = v.match(/[?&]id=([^&#]+)/))       then v = m[1]
-        end
-        # Drop resourcekey etc.
-      end
-
-      # As a final guard, collapse any accidental Hash#to_s artifacts: {"id"=>"..."}
-      if v.include?('=>') || v.include?('{') || v.include?('}')
-        # Try to salvage with a simple JSON parse if it looks like a hash string
-        begin
-          j = JSON.parse(v) rescue nil
-          if j.is_a?(Hash)
-            v = j['id'] || j['fileId'] || j['value'] || ''
-          end
-        rescue; end
-      end
-
-      # Keep only legal Drive ID charset
-      prior = v.dup
-      v = v[/[A-Za-z0-9_-]+/].to_s
-      # If a link was provided but no usable token, treat as empty (forces upstream “invalid” logic)
-      v = '' if v.length < 8 && prior.start_with?('http')
-      v
-    end,
-    normalize_drive_file_id:   lambda { |raw| call(:normalize_drive_resource_id, raw) },
-    normalize_drive_folder_id: lambda { |raw| call(:normalize_drive_resource_id, raw) },
-    normalize_retrieve_contexts!: lambda do |raw_resp|
-      # Accept both shapes:
-      #   { "contexts": [ {...}, {...} ] }
-      #   { "contexts": { "contexts": [ ... ] } }  # some beta responses
-      arr = raw_resp['contexts']
-      arr = arr['contexts'] if arr.is_a?(Hash) && arr.key?('contexts')
-      Array(arr)
-    end,
-    normalize_index_endpoint_identifier: lambda do |raw|
-      return '' if raw.nil? || raw == false
-      raw.to_s.strip
-    end,
-    normalize_index_identifier: lambda do |raw|
-      return '' if raw.nil? || raw == false
-      raw.to_s.strip
-    end,
-    build_rag_retrieve_payload: lambda do |question, rag_corpus, restrict_ids = []|
-      rag_res = { 'ragCorpus' => rag_corpus }
-      ids     = call(:sanitize_drive_ids, restrict_ids, allow_empty: true, label: 'restrict_to_file_ids')
-      rag_res['ragFileIds'] = ids if ids.present?
-      {
-        'query'          => { 'text'          => question.to_s },
-        # NOTE: union member is supplied at top-level (not wrapped in "dataSource")
-        'vertexRagStore' => { 'ragResources'  => [rag_res] }
-      }
-    end,
-    map_context_chunks: lambda do |raw_contexts, maxn = 20|
-      call(:safe_array, raw_contexts).first(maxn).each_with_index.map do |c, i|
-        {
-          'id'       => (c['chunkId'] || "ctx-#{i+1}"),
-          'text'     => c['text'].to_s,
-          'score'    => (c['score'] || c['relevanceScore'] || 0.0).to_f,
-          'source'   => (c['sourceDisplayName'] || c.dig('metadata','source')),
-          'uri'      => (c['sourceUri']        || c.dig('metadata','uri')),
-          'metadata' => c['metadata']
-        }
-      end
-    end,
-    build_rag_import_payload!: lambda do |input|
-      # Validates XOR and constructs { importRagFilesConfig: { ... } }
-      has_gcs   = call(:safe_array, input['gcs_uris']).present?
-      has_drive = input['drive_folder_id'].present? || call(:safe_array, input['drive_file_ids']).present?
-      error('Provide exactly one source family: GCS or Drive') if (has_gcs && has_drive) || (!has_gcs && !has_drive)
-
-      cfg = {}
-      if has_gcs
-        uris = call(:safe_array, input['gcs_uris']).map(&:to_s)
-        bad  = uris.find { |u| u.include?('*') }
-        error("gcs_uris does not support wildcards; got: #{bad}") if bad
-        cfg['gcsSource'] = { 'uris' => uris }
-      else
-        res_ids = []
-        if input['drive_folder_id'].present?
-          folder_id = call(:normalize_drive_folder_id, input['drive_folder_id'])
-          error('drive_folder_id is not a valid Drive ID') if folder_id.blank?
-          res_ids << { 'resourceId' => folder_id, 'resourceType' => 'RESOURCE_TYPE_FOLDER' }
-        end
-        drive_ids = call(:sanitize_drive_ids, input['drive_file_ids'], allow_empty: true, label: 'drive_file_ids')
-        drive_ids.each do |fid|
-          res_ids << { 'resourceId' => fid, 'resourceType' => 'RESOURCE_TYPE_FILE' }
-        end
-        error('Provide drive_folder_id or non-empty drive_file_ids (share with the Vertex RAG Data Service Agent)') if res_ids.empty?
-        cfg['googleDriveSource'] = { 'resourceIds' => res_ids }
-      end
-
-      # Optional knobs
-      if input.key?('maxEmbeddingRequestsPerMin')
-        cfg['maxEmbeddingRequestsPerMin'] = call(:safe_integer, input['maxEmbeddingRequestsPerMin'])
-      end
-      cfg['rebuildAnnIndex'] = true if input['rebuildAnnIndex'] == true
-      sink = input['importResultGcsSink']
-      if sink.is_a?(Hash) && sink['outputUriPrefix'].present?
-        cfg['importResultGcsSink'] = { 'outputUriPrefix' => sink['outputUriPrefix'].to_s }
-      end
-
-      { 'importRagFilesConfig' => cfg }
-    end,
-    build_index_path: lambda do |connection, index|
-      id = call(:normalize_index_identifier, index)
-      return id.sub(%r{^/v1/}, '') if id.start_with?('projects/')
-      call(:ensure_project_id!, connection)
-      loc = (connection['location'] || '').to_s.downcase
-      error("Index requires regional location; got '#{loc}'") if loc.blank? || loc == 'global'
-      "projects/#{connection['project_id']}/locations/#{loc}/indexes/#{id}"
-    end,
-    build_index_endpoint_path: lambda do |connection, ep|
-      v = call(:normalize_index_endpoint_identifier, ep)
-      return v.sub(%r{^/v1/}, '') if v.start_with?('projects/')
-      call(:ensure_project_id!, connection)
-      loc = (connection['location'] || '').to_s.downcase
-      error("IndexEndpoint requires regional location; got '#{loc}'") if loc.blank? || loc == 'global'
-      "projects/#{connection['project_id']}/locations/#{loc}/indexEndpoints/#{v}"
-    end,
-
-    # --- Sanitizers and conversion ----------------------------------------
-    safe_array: lambda do |v|
-      return [] if v.nil? || v == false
-      return v  if v.is_a?(Array)
-      [v]
-    end,
-    safe_integer: lambda do |v|
-      return nil if v.nil?; Integer(v) rescue v.to_i
-    end,
-    safe_float: lambda do |v|
-      return nil if v.nil?; Float(v)   rescue v.to_f
-    end,
-    clamp_int: lambda do |n, min, max|
-      [[n.to_i, min].max, max].min
-    end,
-    sanitize_embedding_params: lambda do |raw|
-      h = {}
-      # Only include autoTruncate when explicitly true (keeps payload minimal)
-      h['autoTruncate'] = true if raw['autoTruncate'] == true
-
-      if raw['outputDimensionality'].present?
-        od = call(:safe_integer, raw['outputDimensionality'])
-        error('outputDimensionality must be a positive integer') if od && od < 1
-        h['outputDimensionality'] = od if od
-      end
-      h
-    end,
-    sanitize_generation_config: lambda do |cfg|
-      return nil if cfg.nil? || (cfg.respond_to?(:empty?) && cfg.empty?)
-      g = cfg.dup
-      # String
-      g['responseMimeType'] = g['responseMimeType'].to_s if g.key?('responseMimeType')
-      # Floats
-      g['temperature']     = call(:safe_float,  g['temperature'])     if g.key?('temperature')
-      g['topP']            = call(:safe_float,  g['topP'])            if g.key?('topP')
-      # Integers
-      g['topK']            = call(:safe_integer,g['topK'])            if g.key?('topK')
-      g['maxOutputTokens'] = call(:safe_integer,g['maxOutputTokens']) if g.key?('maxOutputTokens')
-      if g.key?('candidateCount')
-        c = call(:safe_integer, g['candidateCount'])
-        # Known safe window for Gemini text generation (defensive)
-        g['candidateCount'] = (c && c >= 1 && c <= 4) ? c : nil
-      end
-      # Arrays
-      g['stopSequences']   = call(:safe_array, g['stopSequences']).map(&:to_s) if g.key?('stopSequences')
-      # Strip
-      g.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
-      g
-    end,
-    sanitize_contents_roles: lambda do |contents|
-      call(:safe_array, contents).map do |c|
-        h = c.is_a?(Hash) ? c.transform_keys(&:to_s) : {}
-        role = (h['role'] || 'user').to_s.downcase
-        next nil if role == 'system' # we move system text via systemInstruction
-        error("Invalid role: #{role}") unless %w[user model].include?(role)
-        h['role'] = role
-        h
-      end.compact
-    end,
-    sanitize_drive_ids: lambda do |raw_list, allow_empty: false, label: 'drive_file_ids'|
-      # 1) normalize → 2) drop empties → 3) de-dup
-      norm = call(:safe_array, raw_list)
-               .map { |x| call(:normalize_drive_file_id, x) }
-               .reject { |x| x.to_s.strip.empty? }
-               .uniq
-      return [] if norm.empty? && allow_empty
-      error("No valid Drive IDs found in #{label}. Remove empty entries or fix links.") if norm.empty?
-      # Validate basic length/pattern to catch obvious junk that isn’t empty
-      bad = norm.find { |id| id !~ /\A[A-Za-z0-9_-]{8,}\z/ }
-      error("Invalid Drive ID in #{label}: #{bad}") if bad
-      norm
-    end,
-    sanitize_feature_vector: lambda do |arr|
-      call(:safe_array, arr).map { |x| call(:safe_float, x) }.reject { |x| x.nil? }
-    end,
-
-    # --- Embeddings -------------------------------------------------------
-    extract_embedding_vector: lambda do |pred|
-      # Extracts float vector from embedding prediction (both shapes supported)
-      vec = pred.dig('embeddings', 'values') ||
-            pred.dig('embeddings', 0, 'values') ||
-            pred['values']
-      error('Embedding prediction missing values') if vec.blank?
-      vec.map(&:to_f)
-    end,
-    vector_cosine_similarity: lambda do |a, b|
-      return 0.0 if a.blank? || b.blank?
-      error("Embedding dimensions differ: #{a.length} vs #{b.length}") if a.length != b.length
-      dot = 0.0; sum_a = 0.0; sum_b = 0.0
-      a.each_index do |i|
-        ai = a[i].to_f; bi = b[i].to_f
-        dot += ai * bi; sum_a += ai * ai; sum_b += bi * bi
-      end
-      denom = Math.sqrt(sum_a) * Math.sqrt(sum_b)
-      denom.zero? ? 0.0 : (dot / denom)
-    end,
-    embedding_max_instances: lambda do |model_path_or_id|
-      id = model_path_or_id.to_s.split('/').last
-      if id.start_with?('gemini-embedding-001')
-        1
-      else
-        250
-      end
-    end,
-    predict_embeddings: lambda do |connection, model_path, instances, params={}|
-      max  = call(:embedding_max_instances, model_path)
-      preds = []
-      billable = 0
-      # Derive location from the model path (projects/.../locations/{loc}/...)
-      loc = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
-
-      (instances || []).each_slice(max) do |slice|
-        url  = call(:aipl_v1_url, connection, loc, "#{model_path}:predict")
-        resp = post(url)
-                .headers(call(:request_headers, call(:build_correlation_id)))
-                .payload({
-                  'instances'  => slice,
-                  'parameters' => (params.presence || {})
-                }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) })
-        preds.concat(resp['predictions'] || [])
-        billable += resp.dig('metadata', 'billableCharacterCount').to_i
-      end
-      out = { 'predictions' => preds }
-      out['metadata'] = { 'billableCharacterCount' => billable } if billable > 0
-      out
-    end,
-
-    # --- Generative -------------------------------------------------------
-    system_instruction_from_text: lambda do |text|
-      return nil if text.blank?
-      { 'role' => 'system', 'parts' => [ { 'text' => text.to_s } ] }
-    end,
-    format_context_chunks: lambda do |chunks|
-      # Stable, parseable layout the model can learn
-      call(:safe_array, chunks).each_with_index.map { |c, i|
-        cid  = c['id'] || "chunk-#{i+1}"
-        src  = c['source']
-        uri  = c['uri']
-        sc   = c['score']
-        meta = c['metadata']
-
-        header = ["[#{cid}]",
-                  (src.present? ? "source=#{src}" : nil),
-                  (uri.present? ? "uri=#{uri}"     : nil),
-                  (sc  ? "score=#{sc}"             : nil)].compact.join(' ')
-
-        body = c['text'].to_s
-        meta_str = meta.present? ? "\n(meta: #{meta.to_json})" : ''
-        "#{header}\n#{body}#{meta_str}"
-      }.join("\n\n---\n\n")
-    end,
-    safe_parse_json: lambda do |s|
-      JSON.parse(s) rescue { 'answer' => s }
-    end,
-    llm_referee: lambda do |connection, model, email_text, shortlist_names, all_cats, fallback_category = nil|
-      # Minimal, schema-constrained JSON referee using Gemini
-      model_path = call(:build_model_path_with_global_preview, connection, model)
-
-      cats_norm = call(:safe_array, all_cats).map { |c| c.is_a?(Hash) ? c : { 'name' => c.to_s } }
-      allowed   = if shortlist_names.present?
-                     call(:safe_array, shortlist_names).map { |x| x.is_a?(Hash) ? (x['name'] || x[:name]).to_s : x.to_s }
-                   else
-                     cats_norm.map { |c| c['name'] }
-                   end
-
-      system_text = <<~SYS
-        You are a strict email classifier. Choose exactly one category from the allowed list.
-        Output MUST be valid JSON only (no prose).
-        Confidence is a calibrated estimate in [0,1]. Keep reasoning crisp (<= 2 sentences).
-      SYS
-
-      user_text = <<~USR
-        Email:
-        #{email_text}
-
-        Allowed categories:
-        #{allowed.join(", ")}
-
-        Category descriptions (if any):
-        #{cats_norm.map { |c|
-            desc = c['description']
-            exs  = call(:safe_array, (c['examples'] || c[:examples]))
-            line = "- #{c['name']}"
-            line += ": #{desc}" if desc.present?
-            line += " | examples: #{exs.join(' ; ')}" if exs.present?
-            line
-          }.join("\n")}
-      USR
-
-      payload = {
-        'systemInstruction' => { 'role' => 'system', 'parts' => [ { 'text' => system_text } ] },
-        'contents' => [
-          { 'role' => 'user', 'parts' => [ { 'text' => user_text } ] }
-        ],
-        'generationConfig' => {
-          'temperature'       => 0,
-          'maxOutputTokens'   => 256,
-          'responseMimeType'  => 'application/json',
-          'responseSchema'    => {
-            'type' => 'object',
-            'additionalProperties' => false,
-            'properties' => {
-              'category'     => { 'type' => 'string' },
-              'confidence'   => { 'type' => 'number' },
-              'reasoning'    => { 'type' => 'string' },
-              'distribution' => {
-                'type'  => 'array',
-                'items' => {
-                  'type' => 'object',
-                  'additionalProperties' => false,
-                  'properties' => {
-                    'category' => { 'type' => 'string' },
-                    'prob'     => { 'type' => 'number' }
-                  },
-                  'required' => %w[category prob]
-                }
-              }
-            },
-            'required' => %w[category]
-          }
-        }
-      }
-
-      loc  = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
-      url  = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
-      resp = post(url)
-               .headers(call(:request_headers, call(:build_correlation_id)))
-               .payload(call(:json_compact, payload))
-
-      text   = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s.strip
-      parsed = JSON.parse(text) rescue { 'category' => nil, 'confidence' => nil, 'reasoning' => nil, 'distribution' => [] }
-
-      # Validate/repair category
-      if parsed['category'].present? && !allowed.include?(parsed['category'])
-        parsed['category'] = nil
-      end
-      if parsed['category'].blank? && fallback_category.present?
-        parsed['category'] = fallback_category
-      end
-      error('Referee returned no valid category and no fallback is configured') if parsed['category'].blank?
-
-      parsed
-    end,
-
-    # --- RAG helpers ------------------------------------------------------\
-    normalize_rag_corpus: lambda do |connection, raw|
-      v = raw.to_s.strip
-      return '' if v.blank?
-      return v if v.start_with?('projects/')
-      # Allow short form: just corpus id -> expand using connection project/region
-      call(:ensure_project_id!, connection)
-      loc = (connection['location'] || '').to_s.downcase
-      error("RAG corpus requires regional location; got '#{loc}'") if loc.blank? || loc == 'global'
-      "projects/#{connection['project_id']}/locations/#{loc}/ragCorpora/#{v}"
-    end,
-
-    # --- Hints ------------------------------------------------------------
-    model_id_hint: lambda do
-      'Free-text model id. Short: "gemini-2.5-pro" or "text-embedding-005". ' +
-      'Publisher form: "publishers/google/models/{id}". ' +
-      'Full: "projects/{project}/locations/{region}/publishers/google/models/{id}". ' +
-      'Tip: find ids in Vertex Model Garden or via REST GET v1/projects/{project}/locations/{region}/publishers/google/models/*.'
-    end,
-
-    # --- Miscellaneous ----------------------------------------------------
-    build_email_text: lambda do |subject, body|
-      # Build a single email text body for classification
-      s = subject.to_s.strip
-      b = body.to_s.strip
-      parts = []
-      parts << "Subject: #{s}" if s.present?
-      parts << "Body:\n#{b}"    if b.present?
-      parts.join("\n\n")
-    end,
-    safe_map: lambda do |v|
-      # Like Array#map but safe against nil/false/non-arrays.
-      call(:safe_array, v).map { |x| yield(x) }
-    end,
-    request_headers: lambda do |correlation_id, extra=nil|
-      base = {
-        'X-Correlation-Id' => correlation_id.to_s,
-        'Content-Type'     => 'application/json',
-        'Accept'           => 'application/json'
-      }
-      extra.is_a?(Hash) ? base.merge(extra) : base
-    end,
-    json_compact: lambda do |obj|
-      # Compact a JSON-able Hash/Array without mutating the caller:
-      # - Removes nil
-      # - Removes empty arrays/objects/strings
-      # - Preserves false/0
-      case obj
-      when Hash
-        obj.each_with_object({}) do |(k, v), h|
-          next if v.nil?
-          cv = call(:json_compact, v)
-          # keep false/0; drop only empty containers/strings
-          keep =
-            case cv
-            when String then !cv.empty?
-            when Array  then !cv.empty?
-            when Hash   then !cv.empty?
-            else true
+          # If metadata provided, switch to multipart upload to set metadata atomically.
+          meta_hash = call(:safe_string_object_metadata, global_metadata || {})
+          created =
+            if meta_hash.present?
+              boundary = "workato-multipart-#{SecureRandom.hex(8)}"
+              meta_json = { name: oname, contentType: ctype, metadata: meta_hash }.to_json
+              multipart =
+                "--#{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n#{meta_json}\r\n" \
+                "--#{boundary}\r\nContent-Type: #{ctype}\r\nContent-Transfer-Encoding: binary\r\n\r\n#{body}\r\n" \
+                "--#{boundary}--\r\n"
+              post("https://www.googleapis.com/upload/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o")
+                .params(uploadType: 'multipart', userProject: user_project)
+                .headers('Content-Type': "multipart/related; boundary=#{boundary}")
+                .request_body(multipart)
+            else
+              post("https://www.googleapis.com/upload/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o")
+                .params(uploadType: 'media', name: oname, userProject: user_project)
+                .headers('Content-Type': ctype)
+                .request_body(body)
             end
-          h[k] = cv if keep
+          return { 'ok' => {
+            'drive_file_id'  => file_id,
+            'drive_name'     => fname,
+            'bucket'         => created['bucket'],
+            'gcs_object_name'=> created['name'],
+            'bytes_uploaded' => body.bytesize,
+            'content_type'   => ctype,
+            'content_md5'    => cs['md5'],
+            'content_sha256' => cs['sha256']
+          } }
         end
-      when Array
-        obj.map { |e| call(:json_compact, e) }.reject do |cv|
-          case cv
-          when String then cv.empty?
-          when Array  then cv.empty?
-          when Hash   then cv.empty?
-          else false
-          end
-        end
-      else
-        obj
+      rescue => e
+        code = (e.to_s[/\b(\d{3})\b/, 1] || 'ERROR')
+        return { 'error' => {
+          'drive_file_id'   => file_id,
+          'drive_name'      => (defined?(fname) ? fname : nil),
+          'gcs_object_name' => object_name,
+          'error_code'      => code,
+          'error_message'   => e.to_s
+        } }
       end
+    end,
+
+    # --- 7. METADATA ---------------------
+    meta_get_resolve_shortcut: lambda do |file_id|
+      meta = get("https://www.googleapis.com/drive/v3/files/#{file_id}")
+             .params(
+               supportsAllDrives: true,
+               fields: 'id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress),shortcutDetails'
+             )
+      target = meta.dig('shortcutDetails', 'targetId')
+      if target.present?
+        get("https://www.googleapis.com/drive/v3/files/#{target}")
+          .params(
+            supportsAllDrives: true,
+            fields: 'id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress)'
+          )
+      else
+        meta
+      end
+    end,
+
+    safe_string_object_metadata: lambda do |meta|
+      return {} unless meta.is_a?(Hash)
+      meta.transform_values { |v| v.nil? ? nil : v.to_s }
+    end,
+
+    # --- 8. DRIVE ------------------------
+    drive_query_children!: lambda do |parent_id, q_extra_arr, page_size, page_token, corpora, drive_id|
+      # Builds and executes files.list for children of a single parent.
+      # q_extra_arr: array of additional q fragments (already sanitized).
+      q_parts = ["trashed=false", "'#{parent_id}' in parents"] + Array(q_extra_arr)
+      res = get('https://www.googleapis.com/drive/v3/files')
+              .params(
+                q: q_parts.join(' and '),
+                pageSize: [[page_size.to_i, 1].max, 1000].min,
+                pageToken: page_token,
+                orderBy: 'modifiedTime desc',
+                spaces: 'drive',
+                corpora: corpora,
+                driveId: drive_id,
+                supportsAllDrives: true,
+                includeItemsFromAllDrives: true,
+                fields: 'files(id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress)),nextPageToken'
+              )
+      [res['files'] || [], res['nextPageToken']]
+    end,
+
+    drive_bfs_collect_files!: lambda do |root_id, filters, corpora, drive_id, overall_limit, max_depth|
+      # Breadth-first traversal from root_id.
+      # Returns array of mapped file metas (not including folders when filters['exclude_folders'] is true).
+      # Always discovers folders regardless of mime filter, then lists files for each folder honoring filters.
+      folder_mime = 'application/vnd.google-apps.folder' # official folder MIME.
+      limit = [[overall_limit.to_i, 1].max, 10_000].min
+      depth_cap = max_depth.to_i <= 0 ? Float::INFINITY : max_depth.to_i
+
+      # Build file filter fragments for q
+      q_files = []
+      if filters['modified_after'].present?
+        q_files << "modifiedTime >= '#{call(:util_to_iso8601_utc, filters['modified_after'])}'"
+      end
+      if filters['modified_before'].present?
+        q_files << "modifiedTime <= '#{call(:util_to_iso8601_utc, filters['modified_before'])}'"
+      end
+      if filters['mime_types'].present?
+        ors = Array(filters['mime_types']).map { |mt| "mimeType='#{mt}'" }.join(' or ')
+        q_files << "(#{ors})"
+      end
+      if !!filters['exclude_folders']
+        q_files << "mimeType != '#{folder_mime}'"
+      end
+
+      results = []
+      queue = [[root_id, 1]] # [folder_id, depth]
+
+      until queue.empty? || results.length >= limit
+        parent_id, depth = queue.shift
+
+        # 1) Discover subfolders at this parent (do not apply user mime filters here)
+        folder_page_token = nil
+        loop do
+          folders, folder_page_token = call(
+            :drive_query_children!, parent_id, ["mimeType='#{folder_mime}'"], 1000, folder_page_token, corpora, drive_id)
+          folders.each do |f|
+            queue << [f['id'], depth + 1] if depth < depth_cap
+          end
+          break if folder_page_token.blank?
+        end
+
+        # 2) List files at this parent honoring user filters
+        file_page_token = nil
+        loop do
+          files, file_page_token = call(
+            :drive_query_children!, parent_id, q_files, (limit - results.length), file_page_token, corpora, drive_id)
+          mapped = files.map { |f| call(:map_drive_meta, f) }
+          results.concat(mapped)
+          break if file_page_token.blank? || results.length >= limit
+        end
+      end
+
+      results
+    end,
+
+    # --- 9. UI BUILDERS ------------------
+    ui_content_mode_field: lambda do |pick_list_key, default|
+      # Pick-list field with extends_schema for dynamic re-rendering
+      {
+        name: 'content_mode',
+        label: 'Content mode',
+        control_type: 'select',
+        pick_list: pick_list_key,
+        optional: false,
+        default: default,
+        extends_schema: true,
+        hint: 'Switch to reveal relevant inputs.'
+      }
+    end,
+   
+    ui_write_body_fields: lambda do |mode|
+      # For PUT (write): either text content + postprocess, or base64 bytes
+      if mode == 'bytes'
+        [
+          { name: 'content_bytes', optional: false, label: 'Content (Base64)',
+            hint: 'Required when mode is bytes.' }
+        ]
+      else
+        [
+          { name: 'text_content', optional: false, label: 'Content (text)',
+            control_type: 'text-area',
+            hint: 'Required when mode is text.' },
+          { name: 'postprocess', type: 'object', optional: true, label: 'Post-process',
+            properties: [
+              { name: 'util_strip_urls', type: 'boolean', control_type: 'checkbox',
+                label: 'Strip URLs from text', default: false }
+            ] }
+        ]
+      end
+    end,
+
+    ui_read_postprocess_if_text: lambda do |mode|
+      # For GET (read): show postprocess only for text mode
+      return [] unless mode == 'text'
+      [{
+        name: 'postprocess', type: 'object', optional: true, label: 'Post-process',
+        properties: [
+          { name: 'util_strip_urls', type: 'boolean', control_type: 'checkbox',
+            label: 'Strip URLs from text', default: false }
+        ]
+      }]
+    end,
+
+    ui_gcs_advanced: lambda do
+      # Advanced drawer shared by actions that talk to GCS
+      [{
+        name: 'advanced', type: 'object', optional: true, label: 'Advanced',
+        properties: [
+          { name: 'content_type', optional: true, label: 'Content-Type',
+            hint: 'Defaults: text/plain; charset=UTF-8 (text), application/octet-stream (bytes).' },
+          { name: 'custom_metadata', type: 'object', optional: true, label: 'Custom metadata' },
+          { name: 'preconditions', type: 'object', optional: true, label: 'Preconditions',
+            properties: [
+              { name: 'if_generation_match', optional: true, label: 'If-Generation-Match' },
+              { name: 'if_metageneration_match', optional: true, label: 'If-Metageneration-Match' }
+            ] }
+        ]
+      }]
+    end,
+
+    ui_gcs_put_inputs: lambda do |config_fields|
+      # Assemble inputs for GCS PUT
+      mode = (config_fields['content_mode'] || 'text').to_s
+      base = [
+        { name: 'bucket', optional: false, label: 'Bucket' },
+        { name: 'object_name', optional: false, label: 'Object name' },
+        call(:ui_content_mode_field, 'content_modes_write', 'text')
+      ]
+      base + call(:ui_write_body_fields, mode) + call(:ui_gcs_advanced)
+    end,
+
+    ui_gcs_get_inputs: lambda do |config_fields|
+      # Assemble inputs for GCS GET
+      mode = (config_fields['content_mode'] || 'none').to_s
+      base = [
+        { name: 'bucket', optional: false, label: 'Bucket' },
+        { name: 'object_name', optional: false, label: 'Object name' },
+        call(:ui_content_mode_field, 'content_modes', 'none')
+      ]
+      base + call(:ui_read_postprocess_if_text, mode)
+    end,
+
+    ui_drive_get_inputs: lambda do |config_fields|
+      # Assemble inputs for Drive GET
+      mode = (config_fields['content_mode'] || 'none').to_s
+      base = [
+        { name: 'file_id_or_url', optional: false, label: 'File ID or URL' },
+        call(:ui_content_mode_field, 'content_modes', 'none')
+      ]
+      extra =
+        if mode == 'text'
+          [
+            { name: 'editors_export_format', label: 'Editors export format',
+              control_type: 'select', pick_list: 'editors_export_formats', optional: true,
+              hint: 'Only used when the file is a Google Editors type. Default: PDF for Docs, XLSX for Sheets, PDF for Slides, SVG for Drawings.' }
+          ] + call(:ui_read_postprocess_if_text, mode)
+        else
+          []
+        end
+      base + extra
+    end,
+ 
+    ui_drive_list_inputs: lambda do |_config_fields|
+      # Assemble inputs for Drive LIST
+      [
+        { name: 'folder_id_or_url', label: 'Folder ID or URL', optional: true, hint: 'Leave blank to search My Drive / corpus.' },
+        { name: 'drive_id', label: 'Shared drive ID', optional: true },
+        { name: 'strict_on_access_errors', type: 'boolean', control_type: 'checkbox', label: 'Fail on access errors (403/404)', optional: true,
+          default: true, hint: 'If enabled and the folder is inaccessible or not a folder, the step fails instead of returning an empty page.' },
+        { name: 'recursive', type: 'boolean', control_type: 'checkbox', label: 'Recurse into subfolders',
+          optional: true, default: false, hint: 'When enabled and a Folder is provided, lists files in the entire subtree.' },
+        { name: 'max_depth', type: 'integer', optional: true, label: 'Maximum depth',
+          hint: '0 or blank = unlimited. Depth 1 = just the folder itself, 2 = its subfolders, etc.' },
+        { name: 'overall_limit', type: 'integer', optional: true, label: 'Overall result limit',
+          hint: 'Hard cap across the whole subtree. Default 1000. Upper bound 10000.' },
+        {
+          name: 'filters', type: 'object', optional: true, label: 'Filters',
+          properties: [
+            { name: 'modified_after', type: 'date_time', optional: true, label: 'Modified after' },
+            { name: 'modified_before', type: 'date_time', optional: true, label: 'Modified before' },
+            { name: 'mime_types', type: 'array', of: 'string', optional: true,
+              hint: 'Exact mimeType values (OR).' },
+            { name: 'exclude_folders', type: 'boolean', control_type: 'checkbox',
+              optional: true, default: false, label: 'Exclude folders' }
+          ]
+        },
+        {
+          name: 'paging', type: 'object', optional: true, label: 'Paging',
+          properties: [
+            { name: 'max_results', type: 'integer', optional: true, label: 'Max results',
+              hint: '1–1000, default 100' },
+            { name: 'page_token', type: 'string', optional: true }
+          ]
+        }
+      ]
+    end,
+
+    ui_gcs_list_inputs: lambda do |_config_fields|
+      # Assemble inputs for GCS LIST
+      [
+        { name: 'bucket', optional: false, label: 'Bucket' },
+        {
+          name: 'filters', type: 'object', optional: true, label: 'Filters',
+          properties: [
+            { name: 'prefix', optional: true, label: 'Prefix' },
+            { name: 'delimiter', optional: true, label: 'Delimiter',
+              hint: 'Use "/" to emulate folders.' },
+            { name: 'include_versions', type: 'boolean', control_type: 'checkbox',
+              optional: true, default: false, label: 'Include noncurrent versions' }
+          ]
+        },
+        {
+          name: 'paging', type: 'object', optional: true, label: 'Paging',
+          properties: [
+            { name: 'max_results', type: 'integer', optional: true, label: 'Max results',
+              hint: '1–1000, default 1000' },
+            { name: 'page_token', optional: true, label: 'Page token' }
+          ]
+        }
+      ]
+    end,
+
+    ui_transfer_inputs: lambda do |_config_fields|
+      # Assemble inputs for Drive -> GCS transfer
+      [
+        { name: 'bucket', optional: false, label: 'Destination bucket' },
+        { name: 'gcs_prefix', optional: true, label: 'Destination prefix',
+          hint: 'E.g. "ingest/". Drive file name is used for object name.' },
+        { name: 'drive_file_ids', type: 'array', of: 'string', optional: false,
+          label: 'Drive file IDs or URLs', hint: 'Map from List files → file_ids, or paste multiple.' },
+        { name: 'content_mode_for_editors', control_type: 'select', pick_list: 'editors_modes',
+          optional: true, default: 'text', label: 'Editors files handling' },
+        { name: 'editors_export_format', label: 'Editors export format (when Editors=text)',
+          control_type: 'select', pick_list: 'editors_export_formats', optional: true }
+      ]
+    end,
+
+    ui_transfer_batch_inputs: lambda do |_config_fields|
+      # Assemble inputs for batch Drive -> GCS transfer
+      [
+        { name: 'bucket', optional: false, label: 'Destination bucket' },
+        { name: 'gcs_prefix', optional: true, label: 'Destination prefix' },
+        { name: 'default_editors_mode', control_type: 'select', pick_list: 'editors_modes',
+          optional: true, default: 'text', label: 'Default Editors handling' },
+        { name: 'default_editors_export_format', control_type: 'select', pick_list: 'editors_export_formats',
+          optional: true, label: 'Default Editors export format' },
+        { name: 'default_content_type', optional: true, label: 'Default Content-Type' },
+        { name: 'default_custom_metadata', type: 'object', optional: true, label: 'Default custom metadata' },
+        { name: 'stop_on_error', type: 'boolean', control_type: 'checkbox', default: false, label: 'Stop on first error' },
+        { name: 'items', type: 'array', of: 'object', label: 'Items',
+          properties: call(:schema_transfer_batch_plan_item_fields), optional: false }
+      ]
+    end,
+
+    # --- 10. SCHEMA ----------------------
+    schema_transfer_batch_plan_item_fields: lambda do
+      [
+        { name: 'drive_file_id_or_url', label: 'Drive file ID or URL', optional: false },
+        { name: 'target_object_name',   label: 'Override GCS object name', optional: true,
+          hint: 'If blank, uses Drive file name.' },
+        { name: 'editors_mode', label: 'Editors handling (override)', optional: true, control_type: 'select',
+          pick_list: 'editors_modes',  hint: 'If blank, the action-level Editors setting is used.' },
+        { name: 'editors_export_format', label: 'Editors export format (override)',
+          control_type: 'select', pick_list: 'editors_export_formats', optional: true,
+          hint: 'Only used when editors_mode=text and file is a Google Editors type.' },
+        { name: 'content_type', label: 'Content-Type override', optional: true },
+        { name: 'custom_metadata', label: 'Custom metadata (override)', type: 'object', optional: true }
+      ]
     end
-  },
 
-  # --------- TRIGGERS -----------------------------------------------------
-  triggers: {},
-
-  # --------- CUSTOM ACTION SUPPORT ----------------------------------------
-  custom_action: true,
-  custom_action_help: {
-    body: 'Create custom Vertex AI operations using the established connection'
   }
 }
