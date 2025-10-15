@@ -9,32 +9,32 @@
 
   connection: {
     fields: [
-      { name: 'service_account_key_json', control_type: 'text-area',      optional: false,  hint: 'Paste full JSON key' },
-      { name: 'location',                                                 optional: false,  hint: 'e.g., global, us-central1, us-east4' },
-      { name: 'project_id',                                               optional: true,   hint: 'GCP project ID (inferred from key if blank)' },
-      { name: 'user_project',   label: 'User project for quota/billing',  optional: true, extends_schema: true,
-        hint: 'Sets x-goog-user-project for billing/quota. Service account must have roles/serviceusage.serviceUsageConsumer on this project.' },
-      { name: 'dynamic_models', label: 'Refresh models from Model Garden',optional: true, default: false,
-        type: 'boolean', control_type: 'checkbox',  hint: 'Recommended OFF in production builders. Use the refresh action below to populate cache.' },
-      { name: 'include_preview_models', label: 'Include preview models',  optional: true, default: false,
-        type: 'boolean', control_type: 'checkbox', sticky: true },
-      { name: 'validate_model_on_run', label: 'Validate model before run',optional: true, 
-        type: 'boolean', control_type: 'checkbox', sticky: true }
+      # Service account details
+      { name: 'service_account_key_json',   optional: false,  control_type: 'text-area', 
+        hint: 'Paste full JSON key' },
+      { name: 'location',                   optional: false,  control_type: 'text',
+        hint: 'e.g., global, us-central1, us-east4' },
+      { name: 'project_id',                 optional: true,   control_type: 'text',
+        hint: 'GCP project ID (inferred from key if blank)' },
+      { name: 'user_project',               optional: true,   control_type: 'text',      label: 'User project for quota/billing',
+        extends_schema: true, hint: 'Sets x-goog-user-project for billing/quota. Service account must have roles/serviceusage.serviceUsageConsumer on this project.' },
+      # Dynamic model listing
+      { name: 'dynamic_models',             optional: true,   control_type: 'checkbox',   label: 'Refresh model list from API (Model Garden)',
+        type: 'boolean',  default: false, hint: 'Keep OFF for Builder stability. Use manual entry or run a refresh action if you add one.' },
+      { name: 'include_preview_models',     optional: true,   control_type: 'checkbox',   label: 'Include preview/experimental models',
+        type: 'boolean',  default: false, sticky: true },
+      { name: 'validate_model_on_run',      optional: true,   control_type: 'checkbox',   label: 'Validate model before run',
+        type: 'boolean',  default: true, sticky: true },
+      { name: 'manual_model_entry_only',    optional: true,   control_type: 'checkbox',   label: 'Manual model entry only',
+        type: 'boolean', default: false, hint: 'Hide picklists in forms; require fully-qualified model paths.' }
 
       # Defaults for test probe
-      { name: 'set_defaults_for_probe', type: 'boolean', control_type: 'checkbox', extends_schema: true, optional: false, 
-        default: false, hint: 'Optionally set default model(s) for connection test' },
-      { name: 'default_probe_gen_model', optional: true, ngIf: 'input.set_defaults_for_probe == "true"',
-        hint: 'e.g., gemini-2.0-flash' },
-      { name: 'default_probe_embed_model', optional: true, ngIf: 'input.set_defaults_for_probe == "true"',
-        hint: 'e.g., text-embedding-005' },
-
-      { name: 'show_legacy_sa_fields', label: 'Show legacy SA fields',optional: true,
-        extends_schema: true, default: false, control_type: 'checkbox', type: 'boolean' },
-      { name: 'client_email', label: 'Service account client_email (deprecated)', optional: true, extends_schema: true, 
-        ngIf: 'input.show_legacy_sa_fields == "true"' },
-      { name: 'private_key',  label: 'Service account private_key (deprecated)',  optional: true, control_type: 'password', multiline: true, 
-        extends_schema: true, ngIf: 'input.show_legacy_sa_fields == "true"', hint: 'Include BEGIN/END PRIVATE KEY lines.' },
+      { name: 'set_defaults_for_probe',     optional: false,  control_type: 'checkbox', 
+        extends_schema: true, type: 'boolean', default: false, hint: 'Optionally set default model(s) for connection test' },
+      { name: 'default_probe_gen_model',    optional: true,
+        ngIf: 'input.set_defaults_for_probe == "true"', hint: 'e.g., gemini-2.0-flash' },
+      { name: 'default_probe_embed_model',  optional: true,
+        ngIf: 'input.set_defaults_for_probe == "true"', hint: 'e.g., text-embedding-005' }
     ],
 
     authorization: {
@@ -491,7 +491,7 @@
             pick_list: 'rag_source_families', hint: 'Choose which source you are importing from (purely a UI gate; validation still enforced at runtime).' },
           { name: 'gcs_uris',         optional: true, ngIf: 'input.source_family == "gcs"',   type: 'array', of: 'string', 
             hint: 'Pass files or directory prefixes (e.g., gs://bucket/dir). Wildcards (*, **) are NOT supported.' },
-          { name: 'folder_or_files', label: 'Drive input type' optional: true, ngif: 'input.source_family == "drive"', control_type: 'select', extends_schema: true,
+          { name: 'folder_or_files', label: 'Drive input type', optional: true, ngif: 'input.source_family == "drive"', control_type: 'select', extends_schema: true,
             pick_list: 'drive_input_type' },
           { name: 'drive_folder_id',  optional: true, ngIf: 'input.folder_or_files == "folder"', 
             hint: 'Google Drive folder ID (share with Vertex RAG service agent)' },
@@ -847,7 +847,7 @@
           { name: 'show_advanced', label: 'Show advanced options', type: 'boolean', control_type: 'checkbox', optional: true, default: false },
           # Model
           { name: 'model', label: 'Model', optional: false, control_type: 'select', pick_list: 'models_generative', hint: 'Select or use a custom value.',
-            toggle_hint: 'Use custom value', toggle_field: { name: 'model', label: 'Model', type: 'string', control_type: 'text' } },
+            extends_schema: true, toggle_hint: 'Use custom value', toggle_field: { name: 'model', label: 'Model', type: 'string', control_type: 'text' } },
           # Content
           { name: 'contents', type: 'array', of: 'object', properties: object_definitions['content'], optional: false },
 
@@ -877,6 +877,11 @@
         # Correlation id and duration for logs / analytics
         t0 = Time.now
         corr = call(:build_correlation_id)
+
+        # Validate selected model (region + GA/preview policy)
+        begin
+          call(:validate_publisher_model!, connection, call(:build_model_path_with_global_preview, connection, input['model']).sub(%r{\A.*/v1/}, ''))
+        rescue => e; end
 
         # Compute model path
         model_path = call(:build_model_path_with_global_preview, connection, input['model'])
@@ -965,6 +970,11 @@
         # Correlation id and duration for logs / analytics
         t0 = Time.now
         corr = call(:build_correlation_id)
+
+        # Validate selected model (region + GA/preview policy)
+        begin
+          call(:validate_publisher_model!, connection, call(:build_model_path_with_global_preview, connection, input['model']).sub(%r{\A.*/v1/}, ''))
+        rescue => e; end
 
         # Compute model path
         model_path = call(:build_model_path_with_global_preview, connection, input['model'])
@@ -1092,6 +1102,11 @@
         # Correlation id and duration for logs/analytics
         t0 = Time.now
         corr = call(:build_correlation_id)
+
+        # Validate selected model (region + GA/preview policy)
+        begin
+          call(:validate_publisher_model!, connection, call(:build_model_path_with_global_preview, connection, input['model']).sub(%r{\A.*/v1/}, ''))
+        rescue => e; end
 
         begin
           model_path = call(:build_model_path_with_global_preview, connection, input['model'])
@@ -1221,6 +1236,11 @@
         t0 = Time.now
         corr = call(:build_correlation_id)
         
+        # Validate publisher model
+        begin
+          call(:validate_publisher_model!, connection, call(:build_embedding_model_path, connection, input['model']).sub(%r{\A.*/v1/}, ''))
+        rescue => e; end
+
         begin
           model_path = call(:build_embedding_model_path, connection, input['model'])
 
@@ -1490,6 +1510,11 @@
         t0 = Time.now
         corr = call(:build_correlation_id)
 
+        # Validate selected model (region + GA/preview policy)
+        begin
+          call(:validate_publisher_model!, connection, call(:build_model_path_with_global_preview, connection, input['model']).sub(%r{\A.*/v1/}, ''))
+        rescue => e; end
+
         # Compute model path
         model_path = call(:build_model_path_with_global_preview, connection, input['model'])
 
@@ -1608,6 +1633,7 @@
         ['Google Drive', 'drive']
       ]
     end,
+
     drive_input_type: lambda do
       [
         ['Drive Files', 'files'],
@@ -1953,12 +1979,17 @@
       region = (connection['location'].presence || 'us-central1').to_s
       include_preview = !!connection['include_preview_models']
       cache_key = "models|#{region}|#{publisher}|preview=#{include_preview}"
-      if (cached = workato.cache.get(cache_key)).is_a?(Hash)
-        ts = Time.parse(cached['cached_at']) rescue nil
-        return cached['models'] if ts && ts > (Time.now - 3600)
-      end
+      begin
+        cached = workato.cache.get(cache_key)
+        if cached.is_a?(Hash)
+          ts = Time.parse(cached['cached_at']) rescue nil
+          return cached['models'] if ts && ts > (Time.now - 3600)
+        end
+      rescue; end
       models = call(:fetch_fresh_publisher_models, connection, publisher, region)
-      workato.cache.set(cache_key, { 'models' => models, 'cached_at' => Time.now.utc.iso8601 }, 3600) if models.present?
+      begin
+        workato.cache.set(cache_key, { 'models' => models, 'cached_at' => Time.now.utc.iso8601 }, 3600) if models.present?
+      rescue; end
       models
     end,
 
@@ -1969,8 +2000,8 @@
       begin
         loop do
           resp = get(url)
-                  .headers(call(:request_headers, call(:build_correlation_id)))
-                  .params(page_size: 500, page_token: token, view: 'PUBLISHER_MODEL_VIEW_BASIC')
+                   .headers(call(:request_headers, call(:build_correlation_id)))
+                   .params(page_size: 500, page_token: token, view: 'PUBLISHER_MODEL_VIEW_BASIC')
           items.concat(Array(resp['publisherModels']))
           token = resp['nextPageToken']
           pages += 1
@@ -1986,17 +2017,17 @@
       id = model_id.to_s.downcase
       return :embedding if id =~ /(embedding|embed)/
       return :image     if id =~ /(vision|image|imagen)/
-      return :text      # default; includes chat/code under generative umbrella for pickers
+      :text
     end,
 
     to_model_options: lambda do |models, bucket:, include_preview: false|
       return [] if models.blank?
-      static_reject = /(^|-)1\.0-|text-bison|chat-bison/
+      retired = /(^|-)1\.0-|text-bison|chat-bison/
       seen = {}
       models.filter_map do |m|
         name = m['name'].to_s # publishers/google/models/<id>
         id   = name.split('/').last
-        next if id.blank? || id =~ static_reject
+        next if id.blank? || id =~ retired
         next unless call(:vertex_model_bucket, id) == bucket
         stage = m['launchStage'].to_s
         next if !include_preview && stage.present? && stage != 'GA'
@@ -2007,35 +2038,35 @@
     end,
 
     dynamic_model_picklist: lambda do |connection, bucket, static_fallback|
-      # 1) Respect flag: avoid live calls in Builder unless explicitly enabled
+      # Never block Builder: only fetch live if explicitly enabled; otherwise return static.
       unless connection['dynamic_models']
         return static_fallback
       end
-      # 2) Cached live list (fast). If anything fails, fall back silently.
       begin
         models = call(:fetch_publisher_models, connection, 'google')
         opts   = call(:to_model_options, models,
                       bucket: bucket,
                       include_preview: !!connection['include_preview_models'])
-        return (opts.presence || static_fallback)
+        (opts.presence || static_fallback)
       rescue
         static_fallback
       end
     end,
 
+    # Validate selected model at run time (region + GA/preview policy)
     validate_publisher_model!: lambda do |connection, model_name|
-      # Validate chosen model on run (region-aware, GA gate if desired)
       return if model_name.to_s.empty? || connection['validate_model_on_run'] != true
       unless model_name =~ %r{\Apublishers/[^/]+/models/[^/]+\z}
-        error("Invalid model: #{model_name}. Expected publishers/{publisher}/models/{id}")
+        error("Invalid model: #{model_name}. Expected: publishers/{publisher}/models/{id}")
       end
       region = (connection['location'].presence || 'us-central1').to_s
       url = "https://#{region}-aiplatform.googleapis.com/v1/#{model_name}"
       resp = get(url)
-              .headers(call(:request_headers, call(:build_correlation_id)))
-              .params(view: 'PUBLISHER_MODEL_VIEW_BASIC')
-      if !connection['include_preview_models'] && (resp['launchStage'].to_s.presence || 'GA') != 'GA'
-        error("Model is not GA in #{region}. Enable 'Include preview/experimental models' to proceed.")
+               .headers(call(:request_headers, call(:build_correlation_id)))
+               .params(view: 'PUBLISHER_MODEL_VIEW_BASIC')
+      if !connection['include_preview_models']
+        stage = resp['launchStage'].to_s
+        error("Model is #{stage} (not GA) in #{region}. Enable preview models to proceed.") if stage.present? && stage != 'GA'
       end
     end,
 
