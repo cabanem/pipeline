@@ -520,7 +520,7 @@
             pick_list: 'rag_source_families', hint: 'Choose which source you are importing from (purely a UI gate; validation still enforced at runtime).' },
           { name: 'gcs_uris',         optional: true, ngIf: 'input.source_family == "gcs"',   type: 'array', of: 'string', 
             hint: 'Pass files or directory prefixes (e.g., gs://bucket/dir). Wildcards (*, **) are NOT supported.' },
-          { name: 'folder_or_files', label: 'Drive input type', optional: true, ngif: 'input.source_family == "drive"', control_type: 'select', extends_schema: true,
+          { name: 'folder_or_files', label: 'Drive input type', optional: true, ngIf: 'input.source_family == "drive"', control_type: 'select', extends_schema: true,
             pick_list: 'drive_input_type' },
           { name: 'drive_folder_id',  optional: true, ngIf: 'input.folder_or_files == "folder"', 
             hint: 'Google Drive folder ID (share with Vertex RAG service agent)' },
@@ -891,7 +891,7 @@
         error('At least one non-system message is required in contents') if contents.blank?
 
         sys_inst  = call(:system_instruction_from_text, input['system_preamble'])
-        gen_cfg   = call(:sanitize_generation_config, input['generationConfig'])
+        gen_cfg   = call(:sanitize_generation_config, input['generation_config'])
 
         payload = {
           'contents'          => contents,
@@ -998,7 +998,7 @@
             tools = [ { 'retrieval' => { 'vertexAiSearch' => vas } } ]
           end
 
-        gen_cfg = call(:sanitize_generation_config, input['generationConfig'])
+        gen_cfg = call(:sanitize_generation_config, input['generation_config'])
 
         payload = {
           'contents'          => contents,
