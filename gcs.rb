@@ -1,3 +1,6 @@
+require 'openssl'
+require 'erb'
+
 {
   title: 'Google Drive with Cloud Storage',
   version: '1.0.0',
@@ -586,8 +589,11 @@
       rescue => e
         details = call(:google_error_extract, e)
         {}.merge(
-          'error' => call(:normalize_error_for_pills, details, 'drive', (mode == 'bytes' ? 'files.get(media)' : 'files.get|export'))
-          call(:telemetry_envelope, t0, corr, false, (details['code'] || 0), details['message'] || e.to_s, details)
+          'error' => call(:normalize_error_for_pills, details, 'drive',
+                          (mode == 'bytes' ? 'files.get(media)' : 'files.get|export'))
+        ).merge(
+          call(:telemetry_envelope, t0, corr, false, (details['code'] || 0),
+               details['message'] || e.to_s, details)
         )
       end
     },
@@ -662,8 +668,10 @@
           'has_more'        => false,
           'next_page_token' => nil
         ).merge(
-          'error' => call(:normalize_error_for_pills, details, 'gcs', 'objects.list'),
-          call(:telemetry_envelope, t0, corr, false, (details['code'] || 0), details['message'] || e.to_s, details)
+          'error' => call(:normalize_error_for_pills, details, 'gcs', 'objects.list')
+        ).merge(
+          call(:telemetry_envelope, t0, corr, false, (details['code'] || 0),
+               details['message'] || e.to_s, details)
         )
       end,
 
@@ -897,8 +905,10 @@
         details = call(:google_error_extract, e)
         {}.merge(
           'error' => call(:normalize_error_for_pills, details, 'gcs', 'objects.insert(upload)')
-        ).merge(call(:telemetry_envelope, t0, corr, false, (details['code'] || 0), details['message'] || e.to_s, details))
-      end,
+        ).merge(
+          call(:telemetry_envelope, t0, corr, false, (details['code'] || 0),
+               details['message'] || e.to_s, details)
+        )
 
       sample_output: lambda do
         {
@@ -998,9 +1008,12 @@
           'failed'   => [],
           'summary'  => { 'total' => 0, 'success' => 0, 'failed' => 0 }
         }.merge(
-          'error' => call(:normalize_error_for_pills, details, 'drive|gcs', 'transfer.single'),
-          call(:telemetry_envelope, t0, corr, false, (details['code'] || 0), details['message'] || e.to_s, details)
+          'error' => call(:normalize_error_for_pills, details, 'drive|gcs', 'transfer.single')
+        ).merge(
+          call(:telemetry_envelope, t0, corr, false, (details['code'] || 0),
+               details['message'] || e.to_s, details)
         )
+
       end,
 
       sample_output: lambda do
@@ -1109,8 +1122,10 @@
           'failed'   => [],
           'summary'  => { 'total' => 0, 'success' => 0, 'failed' => 0 }
         }.merge(
-          'error' => call(:normalize_error_for_pills, details, 'drive|gcs', 'transfer.batch'),
-          call(:telemetry_envelope, t0, corr, false, (details['code'] || 0), details['message'] || e.to_s, details)
+          'error' => call(:normalize_error_for_pills, details, 'drive|gcs', 'transfer.batch')
+        ).merge(
+          call(:telemetry_envelope, t0, corr, false, (details['code'] || 0),
+               details['message'] || e.to_s, details)
         )
       end,
 
