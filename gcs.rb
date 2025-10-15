@@ -1,10 +1,6 @@
 {
   title: 'Google Drive with Cloud Storage',
   version: '1.0.0',
-  # Note about versions - version numbers are structured as "'M'.'B'.'N'"
-  # - 'M' represents major changes (new release)
-  # - 'B' represents a breaking change
-  # - 'N' represents a minor, non-breaking change
 
   # --------- CONNECTION ---------------------------------------------------
   connection: {
@@ -84,7 +80,6 @@
   },
 
   # --------- CONNECTION TEST ----------------------------------------------
-
   test: lambda do |connection|
     # Leverage the same probe logic as the action.
     bucket   = connection['default_probe_bucket']
@@ -1240,10 +1235,10 @@
       (mime || '').start_with?('application/vnd.google-apps.')
     end,
 
-    # Choose the export MIME for Google Drive files
-    # If caller provides preferred_export_mime, use it *when compatible* with the source type,
-    # otherwise fall back to a sensible default that Google accepts.
     util_editors_export_mime: lambda do |source_mime, preferred_export_mime|
+      # Choose the export MIME for Google Drive files
+      # If caller provides preferred_export_mime, use it *when compatible* with the source type,
+      # otherwise fall back to a sensible default that Google accepts.
       src = (source_mime || '')
       pref = preferred_export_mime.to_s
 
@@ -1293,8 +1288,8 @@
       s.valid_encoding? ? s : s.encode('UTF-8', invalid: :replace, undef: :replace, replace: '')
     end,
 
-    # Compute MD5 and SHA-256 from raw bytes
     util_compute_checksums: lambda do |raw|
+      # Compute MD5 and SHA-256 from raw bytes
       s = raw.to_s
       md5 = OpenSSL::Digest::MD5.hexdigest(s)
       sha = OpenSSL::Digest::SHA256.hexdigest(s)
@@ -1308,7 +1303,6 @@
     end,
 
     # --- 3. TELEMETRY --------------------
-
     telemetry_envelope: lambda do |started_at, correlation_id, ok, code, message, upstream_details=nil|
       # Build base telemetry data
       dur   = ((Time.now - started_at) * 1000.0).to_i
@@ -1350,7 +1344,6 @@
     end,
 
     # --- 4. MAPPERS (UPSTREAM → SCHEMA) --
-
     map_gcs_meta: lambda do |o|
       {
         'bucket'       => o['bucket'],
@@ -1386,10 +1379,10 @@
       }
     end,
 
-    # Core probe used by connection test and action
-    # Returns the full spec'd object (merged with telemetry by the caller when appropriate),
-    # but here we also add telemetry to keep it symmetrical with actions that expect it.
     do_permission_probe: lambda do |connection, bucket, canary_folder_id_or_url, canary_drive_id, gcs_prefix|
+      # Core probe used by connection test and action
+      # Returns the full spec'd object (merged with telemetry by the caller when appropriate),
+      # but here we also add telemetry to keep it symmetrical with actions that expect it.
       t0 = Time.now
       corr = SecureRandom.uuid
 
@@ -1508,14 +1501,13 @@
     end,
 
     # --- 5. AUTH HELPERS -----------------
-
-    # Base64url without padding
     b64url: lambda do |bytes|
+      # Base64url without padding
       Base64.urlsafe_encode64(bytes).gsub(/=+$/, '')
     end,
 
-    # Sign a JWT (RS256) using the service account private key
     jwt_sign_rs256: lambda do |claims, private_key_pem|
+      # Sign a JWT (RS256) using the service account private key
       header = { alg: 'RS256', typ: 'JWT' }
 
       encoded_header  = call(:b64url, header.to_json)
@@ -1589,8 +1581,8 @@
       }
     end,
 
-    # Public surface: returns *string* access token, cached by scope set
     auth_build_access_token!: lambda do |connection, scopes: nil|
+      # Public surface: returns *string* access token, cached by scope set
       set = call(:auth_normalize_scopes, scopes)
       scope_key = set.join(' ')
       if (cached = call(:auth_token_cache_get, connection, scope_key))
@@ -1601,9 +1593,8 @@
     end,
 
     # --- 6. CORE WORKFLOWS ---------------
-
-    # transfer one Drive file to GCS. Returns {:ok=>hash} or {:error=>hash}.
     transfer_one_drive_to_gcs: lambda do |connection, file_id, bucket, object_name, editors_mode, editors_export_format, global_content_type, global_metadata|
+      # transfer one Drive file to GCS. Returns {:ok=>hash} or {:error=>hash}.
       user_project = connection['user_project']
       begin
         meta = call(:meta_get_resolve_shortcut, file_id)
@@ -1696,7 +1687,6 @@
     end,
 
     # --- 7. METADATA ---------------------
-
     meta_get_resolve_shortcut: lambda do |file_id|
       meta = get("https://www.googleapis.com/drive/v3/files/#{file_id}")
              .params(
@@ -1721,7 +1711,6 @@
     end,
 
     # --- 8. DRIVE ------------------------
-
     drive_query_children!: lambda do |parent_id, q_extra_arr, page_size, page_token, corpora, drive_id|
       # Builds and executes files.list for children of a single parent.
       # q_extra_arr: array of additional q fragments (already sanitized).
@@ -1798,9 +1787,8 @@
     end,
 
     # --- 9. UI BUILDERS ------------------
-
-    # Pick-list field with extends_schema for dynamic re-rendering
     ui_content_mode_field: lambda do |pick_list_key, default|
+      # Pick-list field with extends_schema for dynamic re-rendering
       {
         name: 'content_mode',
         label: 'Content mode',
@@ -1812,9 +1800,9 @@
         hint: 'Switch to reveal relevant inputs.'
       }
     end,
-
-    # For PUT (write): either text content + postprocess, or base64 bytes
+   
     ui_write_body_fields: lambda do |mode|
+      # For PUT (write): either text content + postprocess, or base64 bytes
       if mode == 'bytes'
         [
           { name: 'content_bytes', optional: false, label: 'Content (Base64)',
@@ -1834,8 +1822,8 @@
       end
     end,
 
-    # For GET (read): show postprocess only for text mode
     ui_read_postprocess_if_text: lambda do |mode|
+      # For GET (read): show postprocess only for text mode
       return [] unless mode == 'text'
       [{
         name: 'postprocess', type: 'object', optional: true, label: 'Post-process',
@@ -1846,8 +1834,8 @@
       }]
     end,
 
-    # Advanced drawer shared by actions that talk to GCS
     ui_gcs_advanced: lambda do
+      # Advanced drawer shared by actions that talk to GCS
       [{
         name: 'advanced', type: 'object', optional: true, label: 'Advanced',
         properties: [
@@ -1863,8 +1851,8 @@
       }]
     end,
 
-    # Assemble inputs for GCS PUT
     ui_gcs_put_inputs: lambda do |config_fields|
+      # Assemble inputs for GCS PUT
       mode = (config_fields['content_mode'] || 'text').to_s
       base = [
         { name: 'bucket', optional: false, label: 'Bucket' },
@@ -1874,8 +1862,8 @@
       base + call(:ui_write_body_fields, mode) + call(:ui_gcs_advanced)
     end,
 
-    # Assemble inputs for GCS GET
     ui_gcs_get_inputs: lambda do |config_fields|
+      # Assemble inputs for GCS GET
       mode = (config_fields['content_mode'] || 'none').to_s
       base = [
         { name: 'bucket', optional: false, label: 'Bucket' },
@@ -1885,8 +1873,8 @@
       base + call(:ui_read_postprocess_if_text, mode)
     end,
 
-    # Assemble inputs for Drive GET
     ui_drive_get_inputs: lambda do |config_fields|
+      # Assemble inputs for Drive GET
       mode = (config_fields['content_mode'] || 'none').to_s
       base = [
         { name: 'file_id_or_url', optional: false, label: 'File ID or URL' },
@@ -1904,9 +1892,9 @@
         end
       base + extra
     end,
-
-    # Assemble inputs for Drive LIST
+ 
     ui_drive_list_inputs: lambda do |_config_fields|
+      # Assemble inputs for Drive LIST
       [
         { name: 'folder_id_or_url', label: 'Folder ID or URL', optional: true, hint: 'Leave blank to search My Drive / corpus.' },
         { name: 'drive_id', label: 'Shared drive ID', optional: true },
@@ -1938,8 +1926,8 @@
       ]
     end,
 
-    # Assemble inputs for GCS LIST
     ui_gcs_list_inputs: lambda do |_config_fields|
+      # Assemble inputs for GCS LIST
       [
         { name: 'bucket', optional: false, label: 'Bucket' },
         {
@@ -1963,8 +1951,8 @@
       ]
     end,
 
-    # Assemble inputs for Drive -> GCS transfer
     ui_transfer_inputs: lambda do |_config_fields|
+      # Assemble inputs for Drive -> GCS transfer
       [
         { name: 'bucket', optional: false, label: 'Destination bucket' },
         { name: 'gcs_prefix', optional: true, label: 'Destination prefix',
@@ -1978,8 +1966,8 @@
       ]
     end,
 
-    # Assemble inputs for batch Drive -> GCS transfer
     ui_transfer_batch_inputs: lambda do |_config_fields|
+      # Assemble inputs for batch Drive -> GCS transfer
       [
         { name: 'bucket', optional: false, label: 'Destination bucket' },
         { name: 'gcs_prefix', optional: true, label: 'Destination prefix' },
