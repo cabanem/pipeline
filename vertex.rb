@@ -271,8 +271,7 @@ require 'base64'
           { name: 'show_advanced', label: 'Show advanced options',
             type: 'boolean', control_type: 'checkbox', optional: true, default: false },
           # Model (free-text only)
-          { name: 'model', label: 'Model', optional: false, control_type: 'text',
-            hint: call(:model_id_hint) },
+          { name: 'model', label: 'Model', optional: false, control_type: 'text' },
 
           # Contract-friendly content
           { name: 'contents', type: 'array', of: 'object',
@@ -334,10 +333,9 @@ require 'base64'
             hint: 'At least 2. You can also pass simple strings (names only).' },
 
           { name: 'embedding_model', label: 'Embedding model', control_type: 'text', optional: true,
-            default: 'text-embedding-005', hint: call(:model_id_hint) + ' Used in embedding or hybrid modes.' },
+            default: 'text-embedding-005', },
 
-          { name: 'generative_model', label: 'Generative model', control_type: 'text', optional: true,
-            hint: call(:model_id_hint) + ' Required for generative mode. Optional in hybrid (for explanation).' },
+          { name: 'generative_model', label: 'Generative model', control_type: 'text', optional: true },
 
           { name: 'min_confidence', type: 'number', optional: true, default: 0.25,
             hint: '0–1. If top score falls below this, fallback is used.' },
@@ -712,8 +710,7 @@ require 'base64'
 
       input_fields: lambda do |_|
         [
-          { name: 'model', label: 'Model', optional: false, control_type: 'text',
-            hint: call(:model_id_hint) },
+          { name: 'model', label: 'Model', optional: false, control_type: 'text' },
           { name: 'rag_corpus', optional: false,
             hint: 'projects/{project}/locations/{region}/ragCorpora/{corpus}' },
           { name: 'question', optional: false },
@@ -1168,8 +1165,7 @@ require 'base64'
       input_fields: lambda do |connection, object_definitions|
         [
           { name: 'contents', type: 'array', of: 'object', properties: object_definitions['content'], optional: false },
-          { name: 'model', label: 'Model', optional: false, control_type: 'text',
-            hint: call(:model_id_hint)},
+          { name: 'model', label: 'Model', optional: false, control_type: 'text' },
           { name: 'grounding', control_type: 'select', pick_list: 'modes_grounding', optional: false },
           { name: 'vertex_ai_search_datastore', optional: true,
             hint: 'projects/.../locations/.../collections/default_collection/dataStores/...' },
@@ -1267,8 +1263,7 @@ require 'base64'
 
       input_fields: lambda do |_|
         [
-          { name: 'model', label: 'Model', optional: false, control_type: 'text',
-            hint: call(:model_id_hint) },
+          { name: 'model', label: 'Model', optional: false, control_type: 'text' },
           { name: 'question', optional: false },
 
           { name: 'context_chunks', type: 'array', of: 'object', optional: false, properties: [
@@ -1420,8 +1415,7 @@ require 'base64'
 
       input_fields: lambda do |_|
         [
-          { name: 'model', label: 'Embedding model', optional: false, control_type: 'text', default: 'text-embedding-005',
-            hint: call(:model_id_hint)},
+          { name: 'model', label: 'Embedding model', optional: false, control_type: 'text', default: 'text-embedding-005' },
           { name: 'texts', type: 'array', of: 'string', optional: false },
           { name: 'task', hint: 'Optional: RETRIEVAL_QUERY or RETRIEVAL_DOCUMENT' },
           { name: 'autoTruncate', type: 'boolean', hint: 'Truncate long inputs automatically' },
@@ -1688,8 +1682,7 @@ require 'base64'
 
       input_fields: lambda do |connection, object_definitions|
         [
-          { name: 'model', label: 'Model', optional: false, control_type: 'text',
-            hint: call(:model_id_hint) },
+          { name: 'model', label: 'Model', optional: false, control_type: 'text' },
           { name: 'contents', type: 'array', of: 'object', properties: object_definitions['content'], optional: false },
           { name: 'system_preamble', label: 'System preamble (text)', optional: true }
         ]
