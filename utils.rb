@@ -43,7 +43,7 @@ require 'json'
       end
     },
     chunk: {
-      fields: lambda do
+      fields: lambda do |object_definitions|
         [
           { name: 'doc_id' },
           { name: 'chunk_id' },
@@ -59,7 +59,7 @@ require 'json'
       end
     },
     citation: {
-      fields: lambda do
+      fields: lambda do |object_definitions|
         [
           { name: 'label' },
           { name: 'chunk_id' },
@@ -74,7 +74,7 @@ require 'json'
       fields: lambda do
         [
           { name: 'id' },
-          { name: 'vector', type: 'array' },
+          { name: 'vector', type: 'array', of: 'number' },
           { name: 'namespace' },
           { name: 'metadata', type: 'object' }
         ]
@@ -152,6 +152,25 @@ require 'json'
         i = slice_end - ov
       end
       out
+    end,
+    ensure_array: lambda do |v|
+      v.is_a?(Array) ? v : (v.nil? ? [] : [v])
+    end,
+    flatten_chunks_input: lambda do |input|
+      # Accept either:
+      #  - { chunks: [...] }
+      #  - { documents: [ {chunks:[...]}, ... ] }
+      all = []
+      if input['chunks'].is_a?(Array)
+        input['chunks'].each { |c| all << (c.is_a?(Hash) ? c : {}) }
+      end
+      if input['documents'].is_a?(Array)
+        input['documents'].each do |d|
+          next unless d.is_a?(Hash)
+          (d['chunks'] || []).each { |c| all << (c.is_a?(Hash) ? c : {}) }
+        end
+      end
+      all
     end
   },
 
@@ -159,10 +178,12 @@ require 'json'
   actions: {
     
     # --- INGESTION (SEEDING) ----------------------------------------------
-    # 1.  Prep for indexing
+
+    # ---- 1.  Prep for indexing -------------------------------------------
     prep_for_indexing: {
       title: 'Ingestion: Prepare document for indexing',
       subtitle: 'Cleans, chunks, and emits chunk records with IDs + metadata',
+      display_priority: 10,
       help: lambda do |_|
         { body: 'Provide raw text and (optionally) a file path + metadata. Returns normalized chunks ready for embedding/indexing.' }
       end,
@@ -178,7 +199,7 @@ require 'json'
         ]
       end,
 
-      output_fields: lambda do
+      output_fields: lambda do |object_definitions|
         [
           { name: 'doc_id' },
           { name: 'file_path' },
@@ -282,11 +303,272 @@ require 'json'
         }
       end
     },
+    prep_for_indexing_batch: {
+      title: 'Ingestion (Batch): Prepare multiple documents for indexing',
+      subtitle: 'Cleans + chunks N documents; returns an array of per-doc results',
+      batch: true,
+      display_priority: 10,
 
-    # 2.  Build embedding requests
+      input_fields: lambda do
+        [
+          {
+            name: 'items', type: 'array', of: 'object', optional: false,
+            hint: 'Each item: {file_path?, content, max_chunk_chars?, overlap_chars?, metadata?}'
+          },
+          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
+        ]
+      end,
+
+      output_fields: lambda do |object_definitions|
+        [
+          {
+            name: 'results', type: 'array', of: 'object', properties: [
+              { name: 'doc_id' },
+              { name: 'file_path' },
+              { name: 'checksum' },
+              { name: 'chunk_count', type: 'integer' },
+              { name: 'max_chunk_chars', type: 'integer' },
+              { name: 'overlap_chars', type: 'integer' },
+              { name: 'created_at' },
+              { name: 'duration_ms', type: 'integer' },
+              { name: 'chunks', type: 'array', of: 'object', properties: object_definitions['chunk'] },
+              { name: 'trace_id', optional: true },
+              { name: 'notes', optional: true }
+            ]
+          },
+          { name: 'count', type: 'integer' },
+          { name: 'batch_trace_id', optional: true }
+        ]
+      end,
+
+      execute: lambda do |_connection, input|
+        started_batch = Time.now
+        batch_trace   = call(:guid)
+        debug         = call(:safe_bool, input['debug'])
+        items         = call(:ensure_array, input['items'])
+
+        results = items.map do |it|
+          t0          = Time.now
+          raw         = (it['content'] || '').to_s
+          file_path   = (it['file_path'] || '').to_s
+          user_meta   = call(:sanitize_metadata, it['metadata'])
+          normalized  = call(:normalize_newlines, raw)
+          cleaned     = call(:strip_control_chars, normalized)
+          max_chars   = call(:clamp_int, (it['max_chunk_chars'] || 2000), 200, 8000)
+          overlap     = call(:clamp_int, (it['overlap_chars']  || 200),   0,   4000)
+          overlap     = [overlap, max_chars - 1].min
+          checksum    = Digest::SHA256.hexdigest(cleaned)
+          doc_id      = call(:generate_document_id, file_path, checksum)
+          spans       = call(:chunk_by_chars, cleaned, max_chars, overlap)
+          created_at  = call(:now_iso)
+          records     = spans.map do |span|
+            chunk_id = "#{doc_id}:#{span['index']}"
+            text     = span['text']
+            {
+              'doc_id'      => doc_id,
+              'chunk_id'    => chunk_id,
+              'index'       => span['index'],
+              'text'        => text,
+              'tokens'      => call(:est_tokens, text),
+              'span_start'  => span['span_start'],
+              'span_end'    => span['span_end'],
+              'source'      => { 'file_path' => file_path, 'checksum' => checksum },
+              'metadata'    => user_meta,
+              'created_at'  => created_at
+            }
+          end
+          per = {
+            'doc_id'          => doc_id,
+            'file_path'       => file_path,
+            'checksum'        => checksum,
+            'chunk_count'     => records.length,
+            'max_chunk_chars' => max_chars,
+            'overlap_chars'   => overlap,
+            'created_at'      => created_at,
+            'duration_ms'     => ((Time.now - t0) * 1000).round,
+            'chunks'          => records
+          }
+          if debug
+            per['trace_id'] = call(:guid)
+            per['notes']    = 'prep_for_indexing(item) completed'
+          end
+          per
+        end
+
+        out = { 'results' => results, 'count' => results.length }
+        out['batch_trace_id'] = batch_trace if debug
+        out
+      end,
+      sample_output: lambda do
+        {
+          'results' => [
+            {
+              'doc_id' => 'doc-abc123',
+              'file_path' => 'drive://Reports/2025/summary.txt',
+              'checksum' => '3a2b9c…',
+              'chunk_count' => 2,
+              'max_chunk_chars' => 2000,
+              'overlap_chars' => 200,
+              'created_at' => '2025-10-15T12:00:00Z',
+              'duration_ms' => 11,
+              'chunks' => [
+                {
+                  'doc_id' => 'doc-abc123',
+                  'chunk_id' => 'doc-abc123:0',
+                  'index' => 0,
+                  'text' => 'First slice…',
+                  'tokens' => 42,
+                  'span_start' => 0,
+                  'span_end' => 1799,
+                  'source' => { 'file_path' => 'drive://Reports/2025/summary.txt', 'checksum' => '3a2b9c…' },
+                  'metadata' => { 'department' => 'HR' },
+                  'created_at' => '2025-10-15T12:00:00Z'
+                }
+              ],
+              'trace_id' => 'trace-1',
+              'notes' => 'prep_for_indexing(item) completed'
+            }
+          ],
+          'count' => 1,
+          'batch_trace_id' => 'batch-trace-1234'
+        }
+      end
+    },
+
+    # ---- 2.  Build index upserts -----------------------------------------
+    build_index_upserts: {
+      title: 'Ingestion: Build index upserts',
+      subtitle: 'Provider-agnostic: [{id, vector, namespace, metadata}]',
+      display_priority: 9,
+
+      input_fields: lambda do
+        [
+          { name: 'chunks', type: 'array', of: 'object', optional: false },
+          { name: 'namespace', optional: true, hint: 'e.g., hr-knowledge-v1' },
+          { name: 'provider', optional: true, hint: 'e.g., vertex' }
+        ]
+      end,
+
+      output_fields: lambda do |object_definitions|
+        [
+          { name: 'provider' }, { name: 'namespace' }, { name: 'count', type: 'integer' },
+          { name: 'records', type: 'array', of: 'object', properties: object_definitions['upsert_record'] },
+        ]
+      end,
+
+      execute: lambda do |_connection, input|
+        ns  = input['namespace'].to_s
+        prv = input['provider'].to_s
+        chunks = call(:require_array_of_objects, input['chunks'], 'chunks')
+        upserts = chunks.select { |c| c['embedding'].is_a?(Array) }.map do |c|
+          {
+            'id'        => call(:resolve_chunk_id, c),
+            'vector'    => c['embedding'],
+            'namespace' => ns,
+            'metadata'  => {
+              'doc_id'   => c['doc_id'],
+              'file_path'=> c.dig('source','file_path'),
+              'span'     => { 'start' => c['span_start'], 'end' => c['span_end'] },
+              'tokens'   => c['tokens'],
+              'extra'    => call(:sanitize_metadata, c['metadata'])
+            }.compact
+          }.compact
+        end
+        { 'provider' => prv, 'namespace' => ns, 'records' => upserts, 'count' => upserts.length }
+      end,
+
+      sample_output: lambda do
+        {
+          'provider' => 'vertex',
+          'namespace' => 'hr-knowledge-v1',
+          'count' => 2,
+          'records' => [
+            {
+              'id' => 'doc-abc123:0',
+              'vector' => [0.01, 0.02, 0.03],
+              'namespace' => 'hr-knowledge-v1',
+              'metadata' => {
+                'doc_id' => 'doc-abc123',
+                'file_path' => 'drive://Reports/2025/summary.txt',
+                'span' => { 'start' => 0, 'end' => 1799 },
+                'tokens' => 42,
+                'extra' => { 'department' => 'HR' }
+              }
+            }
+          ]
+        }
+      end
+    },
+    build_index_upserts_batch: {
+      title: 'Ingestion (Batch): Build index upserts',
+      subtitle: 'Accepts documents[*].chunks or chunks[*]; emits provider-agnostic upserts',
+      display_priority: 9,
+
+      input_fields: lambda do
+        [
+          { name: 'documents', type: 'array', of: 'object', optional: true },
+          { name: 'chunks', type: 'array', of: 'object', optional: true },
+          { name: 'namespace', optional: true, hint: 'e.g., hr-knowledge-v1' },
+          { name: 'provider',  optional: true, hint: 'e.g., vertex' }
+        ]
+      end,
+
+      output_fields: lambda do |object_definitions|
+        [
+          { name: 'provider' }, { name: 'namespace' }, { name: 'count', type: 'integer' },
+          { name: 'records', type: 'array', of: 'object', properties: object_definitions['upsert_record'] }
+        ]
+      end,
+
+      execute: lambda do |_connection, input|
+        ns  = input['namespace'].to_s
+        prv = input['provider'].to_s
+        chunks = call(:flatten_chunks_input, input)
+        upserts = chunks.select { |c| c['embedding'].is_a?(Array) }.map do |c|
+          {
+            'id'        => call(:resolve_chunk_id, c),
+            'vector'    => c['embedding'],
+            'namespace' => ns,
+            'metadata'  => {
+              'doc_id'    => c['doc_id'],
+              'file_path' => c.dig('source','file_path'),
+              'span'      => { 'start' => c['span_start'], 'end' => c['span_end'] },
+              'tokens'    => c['tokens'],
+              'extra'     => call(:sanitize_metadata, c['metadata'])
+            }.compact
+          }.compact
+        end
+        { 'provider' => prv, 'namespace' => ns, 'records' => upserts, 'count' => upserts.length }
+      end,
+  
+      sample_output: lambda do
+        {
+          'provider' => 'vertex',
+          'namespace' => 'hr-knowledge-v1',
+          'count' => 2,
+          'records' => [
+            {
+              'id' => 'doc-abc123:0',
+              'vector' => [0.01, 0.02, 0.03],
+              'namespace' => 'hr-knowledge-v1',
+              'metadata' => {
+                'doc_id' => 'doc-abc123',
+                'file_path' => 'drive://Reports/2025/summary.txt',
+                'span' => { 'start' => 0, 'end' => 1799 },
+                'tokens' => 42,
+                'extra' => { 'department' => 'HR' }
+              }
+            }
+          ]
+        }
+      end
+    },
+
+    # ---- 3.  Embedding  --------------------------------------------------
     build_embedding_requests: {
       title: 'Ingestion: Build embedding requests from chunks',
       subtitle: '[{id, text, metadata}] for your embedding step',
+      display_priority: 8,
       # chunks[*] -> [{id, text, metadata}] for embedding
 
       input_fields: lambda do
@@ -329,11 +611,59 @@ require 'json'
         }
       end
     },
+    build_embedding_requests_batch: {
+      title: 'Ingestion (Batch): Build embedding requests',
+      subtitle: 'Accepts documents[*].chunks or chunks[*]; flattens to [{id,text,metadata}]',
+      display_priority: 8,
 
-    # 3.  Attach embeddings
+      input_fields: lambda do
+        [
+          { name: 'documents', type: 'array', of: 'object', optional: true,
+            hint: 'Each doc should include chunks:[...]' },
+          { name: 'chunks', type: 'array', of: 'object', optional: true },
+          { name: 'debug',  type: 'boolean', control_type: 'checkbox', optional: true }
+        ]
+      end,
+
+      output_fields: lambda do
+        [
+          { name: 'count', type: 'integer' },
+          { name: 'requests', type: 'array', of: 'object', properties: [
+            { name: 'id' }, { name: 'text' }, { name: 'metadata', type: 'object' }
+          ] },
+          { name: 'trace_id', optional: true }
+        ]
+      end,
+
+      execute: lambda do |_connection, input|
+        chunks = call(:flatten_chunks_input, input)
+        reqs = chunks.map do |c|
+          {
+            'id'       => call(:resolve_chunk_id, c),
+            'text'     => c['text'].to_s,
+            'metadata' => call(:sanitize_metadata, c['metadata'])
+          }
+        end
+        out = { 'requests' => reqs, 'count' => reqs.length }
+        out['trace_id'] = call(:guid) if call(:safe_bool, input['debug'])
+        out
+      end,
+    
+      sample_output: lambda do
+        {
+          'count' => 2,
+          'requests' => [
+            { 'id' => 'doc-abc123:0', 'text' => 'First slice…', 'metadata' => { 'department' => 'HR' } },
+            { 'id' => 'doc-abc123:1', 'text' => 'Second slice…', 'metadata' => {} }
+          ],
+          'trace_id' => 'trace-emb-batch-1'
+        }
+      end
+    },
     attach_embeddings: {
       title: 'Ingestion: Attach embeddings to chunks',
       subtitle: 'Merges [{id, embedding}] onto chunks by id',
+      display_priority: 7,
 
       input_fields: lambda do
         [
@@ -377,53 +707,92 @@ require 'json'
       end
 
     },
-
-    # 4.  Build index upserts
-    build_index_upserts: {
-      title: 'Ingestion: Build index upserts',
-      subtitle: 'Provider-agnostic: [{id, vector, namespace, metadata}]',
+    attach_embeddings_batch: {
+      title: 'Ingestion (Batch): Attach embeddings to chunks',
+      subtitle: 'Supports [{chunks,embeddings}] or top-level chunks/embeddings',
+      display_priority: 7,
 
       input_fields: lambda do
         [
-          { name: 'chunks', type: 'array', of: 'object', optional: false },
-          { name: 'namespace', optional: true, hint: 'e.g., hr-knowledge-v1' },
-          { name: 'provider', optional: true, hint: 'e.g., vertex' }
+          { name: 'pairs', type: 'array', of: 'object', optional: true,
+            hint: 'Each: {chunks:[...], embeddings:[{id,embedding}], id_key?, embedding_key?}' },
+          { name: 'chunks', type: 'array', of: 'object', optional: true },
+          { name: 'embeddings', type: 'array', of: 'object', optional: true },
+          { name: 'id_key', optional: true, hint: 'Default id' },
+          { name: 'embedding_key', optional: true, hint: 'Default embedding' },
+          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
         ]
       end,
 
       output_fields: lambda do
         [
-          { name: 'provider' }, { name: 'namespace' }, { name: 'count', type: 'integer' },
-          { name: 'records', type: 'array', of: 'object', properties: object_definitions['upsert_record'] },
+          { name: 'count', type: 'integer' },
+          { name: 'chunks', type: 'array', of: 'object' },
+          { name: 'trace_id', optional: true }
         ]
       end,
 
       execute: lambda do |_connection, input|
-        ns  = input['namespace'].to_s
-        prv = input['provider'].to_s
-        chunks = call(:require_array_of_objects, input['chunks'], 'chunks')
-        upserts = chunks.select { |c| c['embedding'].is_a?(Array) }.map do |c|
-          {
-            'id'        => call(:resolve_chunk_id, c),
-            'vector'    => c['embedding'],
-            'namespace' => ns,
-            'metadata'  => {
-              'doc_id'   => c['doc_id'],
-              'file_path'=> c.dig('source','file_path'),
-              'span'     => { 'start' => c['span_start'], 'end' => c['span_end'] },
-              'tokens'   => c['tokens'],
-              'extra'    => call(:sanitize_metadata, c['metadata'])
-            }.compact
-          }.compact
+        id_key = (input['id_key'] || 'id').to_s
+        emb_key = (input['embedding_key'] || 'embedding').to_s
+        merged = []
+
+        if input['pairs'].is_a?(Array) && !input['pairs'].empty?
+          input['pairs'].each do |p|
+            next unless p.is_a?(Hash)
+            eList = call(:require_array_of_objects, p['embeddings'], 'embeddings')
+            cList = call(:require_array_of_objects, p['chunks'], 'chunks')
+            idx = {}
+            eList.each { |e| idx[e[id_key].to_s] = e[emb_key] }
+            cList.each do |c|
+              cid = call(:resolve_chunk_id, c)
+              vec = idx[cid]
+              merged << (vec ? c.merge('embedding' => vec) : c)
+            end
+          end
+        else
+          eList = call(:require_array_of_objects, input['embeddings'] || [], 'embeddings')
+          cList = call(:require_array_of_objects, input['chunks']     || [], 'chunks')
+          idx = {}
+          eList.each { |e| idx[e[id_key].to_s] = e[emb_key] }
+          cList.each do |c|
+            cid = call(:resolve_chunk_id, c)
+            vec = idx[cid]
+            merged << (vec ? c.merge('embedding' => vec) : c)
+          end
         end
-        { 'provider' => prv, 'namespace' => ns, 'records' => upserts, 'count' => upserts.length }
+
+        out = { 'count' => merged.length, 'chunks' => merged }
+        out['trace_id'] = call(:guid) if call(:safe_bool, input['debug'])
+        out
+      end,
+
+      sample_output: lambda do
+        {
+          'count' => 2,
+          'chunks' => [
+            {
+              'chunk_id' => 'doc-abc123:0',
+              'doc_id' => 'doc-abc123',
+              'text' => 'First slice…',
+              'embedding' => [0.11, 0.12, 0.13],
+              'span_start' => 0,
+              'span_end' => 1799,
+              'source' => { 'file_path' => 'drive://Reports/2025/summary.txt', 'checksum' => '3a2b9c…' },
+              'metadata' => { 'department' => 'HR' },
+              'created_at' => '2025-10-15T12:00:00Z'
+            }
+          ],
+          'trace_id' => 'trace-attach-batch-1'
+        }
       end
     },
 
-    # 5.  Emit data to table rows
+    # ---- 3.  Emit --------------------------------------------------------
     to_data_table_rows: {
       title: 'Ingestion: To Data Table rows',
       subtitle: 'Slim corpus rows from chunks for persistence',
+      display_priority: 6,
 
       input_fields: lambda do
         [
@@ -465,11 +834,74 @@ require 'json'
         { 'table' => 'kb_chunks', 'count' => 2, 'rows' => [{ 'id' => 'docA:0', 'doc_id' => 'docA' }] }
       end
     },
+    to_data_table_rows_batch: {
+      title: 'Ingestion (Batch): To Data Table rows',
+      subtitle: 'Flattens multiple documents into slim corpus rows',
+      display_priority: 6,
 
-    # 6.  Construct GCS manifest
+      input_fields: lambda do
+        [
+          { name: 'documents', type: 'array', of: 'object', optional: true },
+          { name: 'chunks', type: 'array', of: 'object', optional: true },
+          { name: 'table_name', optional: true },
+          { name: 'include_text', type: 'boolean', control_type: 'checkbox', optional: true, hint: 'Default true' }
+        ]
+      end,
+
+      output_fields: lambda do
+        [
+          { name: 'table' },
+          { name: 'count', type: 'integer' },
+          { name: 'rows', type: 'array', of: 'object' }
+        ]
+      end,
+
+      execute: lambda do |_connection, input|
+        include_text = input['include_text'].nil? ? true : !!input['include_text']
+        chunks = call(:flatten_chunks_input, input)
+        rows = chunks.map do |c|
+          base = {
+            'id'         => call(:resolve_chunk_id, c),
+            'doc_id'     => c['doc_id'],
+            'file_path'  => c.dig('source','file_path'),
+            'checksum'   => c.dig('source','checksum'),
+            'tokens'     => c['tokens'],
+            'span_start' => c['span_start'],
+            'span_end'   => c['span_end'],
+            'metadata'   => call(:sanitize_metadata, c['metadata']),
+            'created_at' => c['created_at']
+          }
+          include_text ? base.merge('text' => c['text'].to_s) : base
+        end
+        { 'table' => input['table_name'].to_s, 'count' => rows.length, 'rows' => rows }
+      end,
+  
+      sample_output: lambda do
+        {
+          'table' => 'kb_chunks',
+          'count' => 2,
+          'rows' => [
+            {
+              'id' => 'doc-abc123:0',
+              'doc_id' => 'doc-abc123',
+              'file_path' => 'drive://Reports/2025/summary.txt',
+              'checksum' => '3a2b9c…',
+              'tokens' => 42,
+              'span_start' => 0,
+              'span_end' => 1799,
+              'metadata' => { 'department' => 'HR' },
+              'created_at' => '2025-10-15T12:00:00Z',
+              'text' => 'First slice…'
+            }
+          ]
+        }
+      end
+    },
+
     make_gcs_manifest: {
       title: 'Ingestion: Make GCS manifest',
       subtitle: 'Build {object_name, content_type, body} for corpus snapshot',
+      display_priority: 5,
 
       input_fields: lambda do
         [
@@ -532,6 +964,93 @@ require 'json'
           'content_type' => 'application/json', 'bytes' => 123, 'body' => '{…}' }
       end
     },
+    make_gcs_manifest_batch: {
+      title: 'Ingestion (Batch): Make GCS manifests',
+      subtitle: 'One manifest per document; supports json or ndjson',
+      display_priority: 6,
+
+      input_fields: lambda do
+        [
+          { name: 'namespace', optional: true, hint: 'e.g., hr-knowledge-v1' },
+          { name: 'documents', type: 'array', of: 'object', optional: false,
+            hint: 'Each doc requires {doc_id?, chunks:[...]} (doc_id inferred if missing)' },
+          { name: 'prefix', optional: true, hint: 'e.g., manifests/' },
+          { name: 'format', optional: true, hint: 'json|ndjson (default json)' }
+        ]
+      end,
+
+      output_fields: lambda do
+        [
+          { name: 'count', type: 'integer' },
+          { name: 'manifests', type: 'array', of: 'object', properties: [
+            { name: 'object_name' },
+            { name: 'content_type' },
+            { name: 'bytes', type: 'integer' },
+            { name: 'body' }
+          ] }
+        ]
+      end,
+
+      execute: lambda do |_connection, input|
+        ns  = (input['namespace'] || 'default').to_s
+        pre = (input['prefix'] || '').to_s
+        fmt = (input['format'] || 'json').to_s.downcase
+        ts  = Time.now.utc.strftime('%Y%m%dT%H%M%SZ')
+
+        manifests = []
+        call(:ensure_array, input['documents']).each do |doc|
+          chunks = call(:ensure_array, doc['chunks'])
+          # Derive doc_id if not present (use first chunk’s doc_id or fallback uuid)
+          did = (doc['doc_id'] || chunks.dig(0, 'doc_id') || call(:guid)).to_s
+          oname = "#{pre}#{ns}/#{did}/manifest-#{ts}.#{fmt == 'ndjson' ? 'ndjson' : 'json'}"
+
+          records = chunks.map do |c|
+            {
+              'id'        => call(:resolve_chunk_id, c),
+              'doc_id'    => c['doc_id'],
+              'text'      => c['text'].to_s,
+              'tokens'    => c['tokens'],
+              'span'      => { 'start' => c['span_start'], 'end' => c['span_end'] },
+              'file_path' => c.dig('source','file_path'),
+              'checksum'  => c.dig('source','checksum'),
+              'metadata'  => call(:sanitize_metadata, c['metadata'])
+            }
+          end
+
+          if fmt == 'ndjson'
+            body  = records.map { |r| r.to_json }.join("\n")
+            ctype = 'application/x-ndjson'
+          else
+            body  = { 'namespace' => ns, 'doc_id' => did, 'generated_at' => Time.now.utc.iso8601, 'records' => records }.to_json
+            ctype = 'application/json'
+          end
+
+          manifests << {
+            'object_name'  => oname,
+            'content_type' => ctype,
+            'bytes'        => body.bytesize,
+            'body'         => body
+          }
+        end
+
+        { 'count' => manifests.length, 'manifests' => manifests }
+      end,
+
+      sample_output: lambda do
+        {
+          'count' => 2,
+          'manifests' => [
+            {
+              'object_name' => 'manifests/hr-knowledge-v1/doc-abc123/manifest-20251015T120000Z.json',
+              'content_type' => 'application/json',
+              'bytes' => 2048,
+              'body' => '{"namespace":"hr-knowledge-v1","doc_id":"doc-abc123","generated_at":"2025-10-15T12:00:00Z","records":[…]}'
+            }
+          ]
+        }
+      end
+    },
+
 
     # --- SERVE (QUERY)  ---------------------------------------------------
     # 7.  Build vector query
@@ -566,6 +1085,17 @@ require 'json'
         end
         obj['top_k'] = 1 if obj['top_k'] < 1
         { 'query' => obj }
+      end,
+
+      sample_output: lambda do
+        {
+          'query' => {
+            'namespace' => 'hr-knowledge-v1',
+            'top_k' => 20,
+            'mode' => 'text',
+            'query_text' => 'What is our PTO policy?'
+          }
+        }
       end
     },
 
@@ -607,6 +1137,30 @@ require 'json'
         end
         merged = out.values.sort_by { |x| -x['score'].to_f }
         { 'count' => merged.length, 'results' => merged }
+      end,
+
+      sample_output: lambda do
+        {
+          'count' => 2,
+          'results' => [
+            {
+              'chunk_id' => 'doc-abc123:0',
+              'doc_id' => 'doc-abc123',
+              'text' => 'First slice…',
+              'score' => 0.92,
+              'metadata' => { 'tokens' => 42 },
+              'source' => { 'file_path' => 'drive://Reports/2025/summary.txt' }
+            },
+            {
+              'chunk_id' => 'doc-xyz789:3',
+              'doc_id' => 'doc-xyz789',
+              'text' => 'Another match…',
+              'score' => 0.87,
+              'metadata' => {},
+              'source' => { 'file_path' => 'drive://Policies/PTO.md' }
+            }
+          ]
+        }
       end
     },
 
@@ -649,7 +1203,31 @@ require 'json'
           per[doc] += 1
         end
         { 'total_tokens' => used, 'count' => picked.length, 'context' => picked }
+      end,
+
+      sample_output: lambda do
+        {
+          'total_tokens' => 120,
+          'count' => 2,
+          'context' => [
+            {
+              'chunk_id' => 'doc-abc123:0',
+              'doc_id' => 'doc-abc123',
+              'text' => 'First slice…',
+              'tokens' => 60,
+              'metadata' => { 'section' => 'Benefits' }
+            },
+            {
+              'chunk_id' => 'doc-xyz789:1',
+              'doc_id' => 'doc-xyz789',
+              'text' => 'Second slice…',
+              'tokens' => 60,
+              'metadata' => {}
+            }
+          ]
+        }
       end
+
     },
     # 11. Build citation map
     # 12. Build messages for Gemini
@@ -747,7 +1325,33 @@ require 'json'
         clean = text.gsub(/[ \t]+/, ' ').gsub(/\n{3,}/, "\n\n").strip
 
         { 'answer' => clean, 'citations' => citations, 'citation_count' => citations.length }
+      end,
+  
+      sample_output: lambda do
+        {
+          'answer' => "Our PTO policy grants 15 days annually. See [^1] and [^2] for details.",
+          'citation_count' => 2,
+          'citations' => [
+            {
+              'label' => '[^1]',
+              'chunk_id' => 'doc-abc123:0',
+              'doc_id' => 'doc-abc123',
+              'file_path' => 'drive://Policies/PTO.md',
+              'span' => { 'start' => 0, 'end' => 500 },
+              'metadata' => { 'section' => 'Overview' }
+            },
+            {
+              'label' => '[^2]',
+              'chunk_id' => 'doc-xyz789:2',
+              'doc_id' => 'doc-xyz789',
+              'file_path' => 'drive://Policies/Benefits.md',
+              'span' => { 'start' => 1200, 'end' => 1500 },
+              'metadata' => { 'section' => 'Entitlements' }
+            }
+          ]
+        }
       end
+
     }
   },
 
