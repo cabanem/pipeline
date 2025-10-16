@@ -486,9 +486,30 @@ require 'json'
       batch: true,
       display_priority: 10,
 
-      config_fields: lambda do |_connection|
-        call(:schema_builder_ingest_items_config_fields)
-      end,
+      config_fields: [
+        {
+          name: 'design_item_schema',
+          type: 'boolean',
+          control_type: 'checkbox',
+          label: 'Design item schema',
+          hint: 'Use Schema Builder to define the shape of each list element.'
+        },
+        {
+          name: 'item_schema',
+          extends_schema: true,
+          control_type: 'schema-designer',
+          schema_neutral: false,
+          sticky: true,
+          optional: true,
+          label: 'Item fields',
+          hint: 'Define the fields present in each item of the list.'
+        },
+        { name: 'item_content_field',      control_type: 'select', label: 'Item field: content',        optional: true, pick_list: 'item_schema_field_names' },
+        { name: 'item_file_path_field',    control_type: 'select', label: 'Item field: file_path',      optional: true, pick_list: 'item_schema_field_names' },
+        { name: 'item_metadata_field',     control_type: 'select', label: 'Item field: metadata (obj)', optional: true, pick_list: 'item_schema_field_names' },
+        { name: 'item_max_chunk_chars_field', control_type: 'select', label: 'Item field: max_chunk_chars', optional: true, pick_list: 'item_schema_field_names' },
+        { name: 'item_overlap_chars_field',   control_type: 'select', label: 'Item field: overlap_chars',   optional: true, pick_list: 'item_schema_field_names' }
+      ],
 
       input_fields: lambda do |object_definitions, _config_fields|
         [
@@ -632,9 +653,13 @@ require 'json'
       subtitle: 'Provider-agnostic: [{id, vector, namespace, metadata}]',
       display_priority: 9,
 
-      config_fields: lambda do |_connection|
-        call(:schema_builder_config_fields)
-      end,
+      config_fields: [
+        { name: 'override_output_schema', type: 'boolean', control_type: 'checkbox',
+          label: 'Design custom output schema' },
+        { name: 'custom_output_schema', extends_schema: true, control_type: 'schema-designer',
+          schema_neutral: false, sticky: true, optional: true,
+          label: 'Output columns', sample_data_type: 'csv' }
+      ],
 
       input_fields: lambda do
         [
@@ -708,6 +733,14 @@ require 'json'
       batch: true,
       display_priority: 9,
 
+      config_fields: [
+        { name: 'override_output_schema', type: 'boolean', control_type: 'checkbox',
+          label: 'Design custom output schema' },
+        { name: 'custom_output_schema', extends_schema: true, control_type: 'schema-designer',
+          schema_neutral: false, sticky: true, optional: true,
+          label: 'Output columns', sample_data_type: 'csv' }
+      ],
+
       input_fields: lambda do
         [
           { name: 'documents', type: 'array', of: 'object', optional: true },
@@ -717,11 +750,14 @@ require 'json'
         ]
       end,
 
-      output_fields: lambda do |object_definitions|
-        [
-          { name: 'provider' }, { name: 'namespace' }, { name: 'count', type: 'integer' },
+      output_fields: lambda do |object_definitions, _config_fields|
+        default_fields = [
+          { name: 'provider' },
+          { name: 'namespace' },
+          { name: 'count', type: 'integer' },
           { name: 'records', type: 'array', of: 'object', properties: object_definitions['upsert_record'] }
         ]
+        call(:resolve_output_schema, default_fields, _config_fields, object_definitions)
       end,
 
       execute: lambda do |_connection, input|
@@ -1000,9 +1036,15 @@ require 'json'
       subtitle: 'Slim corpus rows from chunks for persistence',
       display_priority: 6,
 
-      config_fields: lambda do |_connection|
-        call(:schema_builder_config_fields)
-      end,
+      config_fields: [
+        { name: 'override_output_schema', type: 'boolean', control_type: 'checkbox',
+          label: 'Design custom output schema',
+          hint: 'Use Schema Builder to define this action’s datapills.' },
+        { name: 'custom_output_schema', extends_schema: true, control_type: 'schema-designer',
+          schema_neutral: false, sticky: true, optional: true,
+          label: 'Output columns', hint: 'Define output fields (datapills).',
+          sample_data_type: 'csv' }
+      ],
 
       input_fields: lambda do
         [
@@ -1064,6 +1106,14 @@ require 'json'
       batch: true,
       display_priority: 6,
 
+      config_fields: [
+        { name: 'override_output_schema', type: 'boolean', control_type: 'checkbox',
+          label: 'Design custom output schema' },
+        { name: 'custom_output_schema', extends_schema: true, control_type: 'schema-designer',
+          schema_neutral: false, sticky: true, optional: true,
+          label: 'Output columns', sample_data_type: 'csv' }
+      ],
+
       input_fields: lambda do
         [
           { name: 'documents', type: 'array', of: 'object', optional: true },
@@ -1073,12 +1123,13 @@ require 'json'
         ]
       end,
 
-      output_fields: lambda do
-        [
+      output_fields: lambda do |object_definitions, _config_fields|
+        default_fields = [
           { name: 'table' },
           { name: 'count', type: 'integer' },
           { name: 'rows', type: 'array', of: 'object' }
         ]
+        call(:resolve_output_schema, default_fields, _config_fields, object_definitions)
       end,
 
       execute: lambda do |_connection, input|
@@ -1285,7 +1336,6 @@ require 'json'
       end
     },
 
-
     # --- SERVE (QUERY)  ---------------------------------------------------
     # 7.  Build vector query
     build_vector_query: {
@@ -1338,18 +1388,27 @@ require 'json'
       title: 'Serve: Merge search results',
       subtitle: 'Normalize, dedupe by chunk_id, keep best score',
 
+      config_fields: [
+        { name: 'override_output_schema', type: 'boolean', control_type: 'checkbox',
+          label: 'Design custom output schema' },
+        { name: 'custom_output_schema', extends_schema: true, control_type: 'schema-designer',
+          schema_neutral: false, sticky: true, optional: true,
+          label: 'Output columns', sample_data_type: 'csv' }
+      ],
+
       input_fields: lambda do
         [
           { name: 'results', type: 'array', of: 'object', optional: false }
         ]
       end,
 
-      output_fields: lambda do |object_definitions|
-        [
+      output_fields: lambda do |object_definitions, _config_fields|
+        default_fields = [
           { name: 'count', type: 'integer' },
           { name: 'results', type: 'array', of: 'object' }
-        ] + Array(object_definitions['envelope_fields'])
-      end,     
+        ]
+        call(:resolve_output_schema, default_fields, _config_fields, object_definitions)
+      end,
 
       execute: lambda do |_connection, input|
         t0 = Time.now
@@ -1593,7 +1652,15 @@ require 'json'
   },
 
   # --------- PICK LISTS ---------------------------------------------------
-  pick_lists: {},
+  pick_lists: {
+
+    item_schema_field_names: lambda do |_connection, _config_fields|
+      fields = _config_fields['item_schema'].is_a?(Array) ? _config_fields['item_schema'] : []
+      names  = fields.map { |f| f['name'].to_s }.reject(&:empty?).uniq
+      names.map { |n| [n, n] }
+    end
+
+  },
 
   # --------- TRIGGERS -----------------------------------------------------
   triggers: {}
