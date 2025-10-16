@@ -331,12 +331,6 @@ require 'json'
         }
       ]
     end,
-    # Build picklist of [label, value] from the configured item_schema
-    item_schema_field_names: lambda do |_connection, _config_fields|
-      fields = _config_fields['item_schema'].is_a?(Array) ? _config_fields['item_schema'] : []
-      names  = fields.map { |f| f['name'].to_s }.reject(&:empty?)
-      names.uniq.map { |n| [n, n] }
-    end,
     # Safe getter using declared field name or fallback name
     get_item_field: lambda do |item, cfg, declared_key, fallback_key|
       key = (cfg[declared_key] || fallback_key).to_s
@@ -359,15 +353,15 @@ require 'json'
         { body: 'Provide raw text and (optionally) a file path + metadata. Returns normalized chunks ready for embedding/indexing.' }
       end,
 
-      config_fields: lambda do |_connection|
-        [
-          { name: 'override_output_schema', type: 'boolean', control_type: 'checkbox', abel: 'Design custom output schema',
-            hint: 'Check to use the schema builder to define this action’s datapills.' },
-          { name: 'custom_output_schema', extends_schema: true, control_type: 'schema-designer', schema_neutral: false,
-            sticky: true, optional: true, label: 'Output columns', sample_data_type: 'csv'
-            hint: 'Use the Schema Builder to define the output fields (datapills).'  }
-        ]
-      end,
+      config_fields: [
+        { name: 'override_output_schema', type: 'boolean', control_type: 'checkbox',
+          label: 'Design custom output schema',
+          hint: 'Check to use the schema builder to define this action’s datapills.' },
+        { name: 'custom_output_schema', extends_schema: true, control_type: 'schema-designer',
+          schema_neutral: false, sticky: true, optional: true,
+          label: 'Output columns', sample_data_type: 'csv',
+          hint: 'Use the Schema Builder to define the output fields (datapills).' }
+      ],
 
       input_fields: lambda do
         [
@@ -380,8 +374,8 @@ require 'json'
         ]
       end,
 
-      output_fields: lambda do |object_definitions|
-        [
+      output_fields: lambda do |object_definitions, _config_fields|
+        default_fields = [
           { name: 'doc_id' },
           { name: 'file_path' },
           { name: 'checksum' },
@@ -391,12 +385,15 @@ require 'json'
           { name: 'created_at' },
           { name: 'duration_ms', type: 'integer' },
           { name: 'chunks', type: 'array', of: 'object', properties: object_definitions['chunk'] },
-          { name: 'trace_id' , optional: true },
-          { name: 'notes',    optional: true }
-        ] + Array(object_definitions['evelope_fields'])
+          { name: 'trace_id', optional: true },
+          { name: 'notes', optional: true }
+        ]
+        call(:resolve_output_schema, default_fields, _config_fields, object_definitions)
       end,
 
       execute: lambda do |_connection, input|
+        t0   = Time.now
+        corr = call(:guid)
         started_at  = Time.now
         trace_id    = call(:guid)
         raw         = input['content'].to_s
@@ -734,11 +731,9 @@ require 'json'
       display_priority: 9,
 
       config_fields: [
-        { name: 'override_output_schema', type: 'boolean', control_type: 'checkbox',
-          label: 'Design custom output schema' },
+        { name: 'override_output_schema', type: 'boolean', control_type: 'checkbox', label: 'Design custom output schema' },
         { name: 'custom_output_schema', extends_schema: true, control_type: 'schema-designer',
-          schema_neutral: false, sticky: true, optional: true,
-          label: 'Output columns', sample_data_type: 'csv' }
+          schema_neutral: false, sticky: true, optional: true, label: 'Output columns', sample_data_type: 'csv' }
       ],
 
       input_fields: lambda do
@@ -761,8 +756,10 @@ require 'json'
       end,
 
       execute: lambda do |_connection, input|
-        ns  = input['namespace'].to_s
-        prv = input['provider'].to_s
+        t0  = Time.now
+        corr = call(:guid)
+        ns   = input['namespace'].to_s
+        prv  = input['provider'].to_s
         chunks = call(:flatten_chunks_input, input)
         upserts = chunks.select { |c| c['embedding'].is_a?(Array) }.map do |c|
           {
@@ -778,7 +775,9 @@ require 'json'
             }.compact
           }.compact
         end
-        { 'provider' => prv, 'namespace' => ns, 'records' => upserts, 'count' => upserts.length }
+        {
+          'provider' => prv, 'namespace' => ns, 'records' => upserts, 'count' => upserts.length
+        }.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
       end,
   
       sample_output: lambda do
