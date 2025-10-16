@@ -481,7 +481,7 @@ require 'json'
       end
     },
     prep_for_indexing_batch: {
-      title: 'Ingestion (Batch): Prepare multiple documents for indexing',
+      title: 'Ingestion: Prepare multiple documents for indexing',
       subtitle: 'Cleans + chunks N documents; returns an array of per-doc results',
       batch: true,
       display_priority: 10,
@@ -703,8 +703,9 @@ require 'json'
       end
     },
     build_index_upserts_batch: {
-      title: 'Ingestion (Batch): Build index upserts',
+      title: 'Ingestion: Build index upserts',
       subtitle: 'Accepts documents[*].chunks or chunks[*]; emits provider-agnostic upserts',
+      batch: true,
       display_priority: 9,
 
       input_fields: lambda do
@@ -815,8 +816,9 @@ require 'json'
       end
     },
     build_embedding_requests_batch: {
-      title: 'Ingestion (Batch): Build embedding requests',
+      title: 'Ingestion: Build embedding requests',
       subtitle: 'Accepts documents[*].chunks or chunks[*]; flattens to [{id,text,metadata}]',
+      batch: true,
       display_priority: 8,
 
       input_fields: lambda do
@@ -911,8 +913,9 @@ require 'json'
 
     },
     attach_embeddings_batch: {
-      title: 'Ingestion (Batch): Attach embeddings to chunks',
+      title: 'Ingestion: Attach embeddings to chunks',
       subtitle: 'Supports [{chunks,embeddings}] or top-level chunks/embeddings',
+      batch: true,
       display_priority: 7,
 
       input_fields: lambda do
@@ -1056,8 +1059,9 @@ require 'json'
       end
     },
     to_data_table_rows_batch: {
-      title: 'Ingestion (Batch): To Data Table rows',
+      title: 'Ingestion: To Data Table rows',
       subtitle: 'Flattens multiple documents into slim corpus rows',
+      batch: true,
       display_priority: 6,
 
       input_fields: lambda do
@@ -1194,8 +1198,9 @@ require 'json'
       end
     },
     make_gcs_manifest_batch: {
-      title: 'Ingestion (Batch): Make GCS manifests',
+      title: 'Ingestion: Make GCS manifests',
       subtitle: 'One manifest per document; supports json or ndjson',
+      batch: true,
       display_priority: 6,
 
       input_fields: lambda do
