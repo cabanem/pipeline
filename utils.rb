@@ -26,6 +26,37 @@ require 'json'
 
   # --------- OBJECT DEFINITIONS -------------------------------------------
   object_definitions: {
+    envelope_fields: {
+      fields: lambda do |_|
+        [
+          { name: 'error', type: 'object', optional: true, properties: [
+              { name: 'code', type: 'integer' },
+              { name: 'status' },
+              { name: 'reason' },
+              { name: 'domain' },
+              { name: 'location' },
+              { name: 'message' },
+              { name: 'service', hint: 'utility' },
+              { name: 'operation' }
+            ] },
+          { name: 'ok', type: 'boolean' },
+          { name: 'telemetry', type: 'object', properties: [
+              { name: 'http_status', type: 'integer' },
+              { name: 'message' },
+              { name: 'duration_ms', type: 'integer' },
+              { name: 'correlation_id' }
+            ] },
+          { name: 'upstream', type: 'object', optional: true, properties: [
+              { name: 'code', type: 'integer' },
+              { name: 'status' },
+              { name: 'reason' },
+              { name: 'domain' },
+              { name: 'location' },
+              { name: 'message' }
+            ] }
+        ]
+      end
+    },
     span: {
       fields: lambda do
         [
@@ -78,6 +109,24 @@ require 'json'
           { name: 'namespace' },
           { name: 'metadata', type: 'object' }
         ]
+      end
+    },
+    ingest_item: {
+      fields: lambda do |_object_definitions, _config_fields|
+        # If user designed a schema, use it; else default to your canonical item.
+        if _config_fields['design_item_schema'] &&
+           _config_fields['item_schema'].is_a?(Array) &&
+           !_config_fields['item_schema'].empty?
+          _config_fields['item_schema']
+        else
+          [
+            { name: 'file_path', optional: true },
+            { name: 'content',   control_type: 'text-area' },
+            { name: 'max_chunk_chars', type: 'integer', optional: true },
+            { name: 'overlap_chars',   type: 'integer', optional: true },
+            { name: 'metadata', type: 'object', optional: true }
+          ]
+        end
       end
     }
   },
@@ -171,7 +220,129 @@ require 'json'
         end
       end
       all
-    end
+    end,
+    telemetry_envelope: lambda do |started_at, correlation_id, ok, code, message, upstream=nil|
+      dur = ((Time.now - started_at) * 1000.0).to_i
+      base = {
+        'ok' => !!ok,
+        'telemetry' => {
+          'http_status'    => code.to_i,
+          'message'        => (message || (ok ? 'OK' : 'ERROR')).to_s,
+          'duration_ms'    => dur,
+          'correlation_id' => correlation_id
+        }
+      }
+      upstream.is_a?(Hash) ? base.merge('upstream' => upstream) : base
+    end,
+    normalize_error_for_pills: lambda do |details, operation|
+      d = details.is_a?(Hash) ? details.dup : {}
+      {
+        'code'      => (d['code'] || d[:code]),
+        'status'    => (d['status'] || d[:status]).to_s,
+        'reason'    => (d['reason'] || d[:reason]).to_s,
+        'domain'    => (d['domain'] || d[:domain]).to_s,
+        'location'  => (d['location'] || d[:location]).to_s,
+        'message'   => (d['message'] || d[:message] || d['error'] || d[:error]).to_s,
+        'service'   => 'utility',
+        'operation' => operation.to_s
+      }.compact
+    end,
+    schema_builder_config_fields: lambda do
+      [
+        {
+          name: 'override_output_schema',
+          type: 'boolean',
+          control_type: 'checkbox',
+          label: 'Design custom output schema',
+          hint: 'Use Schema Builder to define this action’s datapills.'
+        },
+        {
+          name: 'custom_output_schema',
+          extends_schema: true,
+          control_type: 'schema-designer',
+          schema_neutral: false,
+          sticky: true,
+          optional: true,
+          label: 'Output columns',
+          hint: 'Define the output fields (datapills) for this action.',
+          sample_data_type: 'csv'
+        }
+      ]
+    end,
+    resolve_output_schema: lambda do |default_fields, cfg, object_definitions|
+      custom = cfg.is_a?(Hash) &&
+               cfg['override_output_schema'] &&
+               cfg['custom_output_schema'].is_a?(Array) &&
+               !cfg['custom_output_schema'].empty? ?
+                 cfg['custom_output_schema'] : nil
+
+      base = custom || default_fields
+      base + Array(object_definitions['envelope_fields'])
+    end,
+    schema_builder_ingest_items_config_fields: lambda do
+      [
+        { name: 'design_item_schema', type: 'boolean', control_type: 'checkbox', label: 'Design item schema',
+          hint: 'Check to use Schema Builder to define the shape of each list element.' },
+        {
+          name: 'item_schema',
+          extends_schema: true,
+          control_type: 'schema-designer',
+          schema_neutral: false,
+          sticky: true,
+          optional: true,
+          label: 'Item fields',
+          hint: 'Define the fields present in each item of the list.'
+        },
+        # Which fields in the item correspond to our semantics?
+        {
+          name: 'item_content_field',
+          control_type: 'select',
+          label: 'Item field: content',
+          optional: true,
+          pick_list: 'item_schema_field_names'
+        },
+        {
+          name: 'item_file_path_field',
+          control_type: 'select',
+          label: 'Item field: file_path',
+          optional: true,
+          pick_list: 'item_schema_field_names'
+        },
+        {
+          name: 'item_metadata_field',
+          control_type: 'select',
+          label: 'Item field: metadata (object)',
+          optional: true,
+          pick_list: 'item_schema_field_names'
+        },
+        {
+          name: 'item_max_chunk_chars_field',
+          control_type: 'select',
+          label: 'Item field: max_chunk_chars',
+          optional: true,
+          pick_list: 'item_schema_field_names'
+        },
+        {
+          name: 'item_overlap_chars_field',
+          control_type: 'select',
+          label: 'Item field: overlap_chars',
+          optional: true,
+          pick_list: 'item_schema_field_names'
+        }
+      ]
+    end,
+    # Build picklist of [label, value] from the configured item_schema
+    item_schema_field_names: lambda do |_connection, _config_fields|
+      fields = _config_fields['item_schema'].is_a?(Array) ? _config_fields['item_schema'] : []
+      names  = fields.map { |f| f['name'].to_s }.reject(&:empty?)
+      names.uniq.map { |n| [n, n] }
+    end,
+    # Safe getter using declared field name or fallback name
+    get_item_field: lambda do |item, cfg, declared_key, fallback_key|
+      key = (cfg[declared_key] || fallback_key).to_s
+      v = item[key]
+      v.nil? ? item[fallback_key] : v
+    end,
   },
 
   # --------- ACTIONS ------------------------------------------------------
@@ -186,6 +357,16 @@ require 'json'
       display_priority: 10,
       help: lambda do |_|
         { body: 'Provide raw text and (optionally) a file path + metadata. Returns normalized chunks ready for embedding/indexing.' }
+      end,
+
+      config_fields: lambda do |_connection|
+        [
+          { name: 'override_output_schema', type: 'boolean', control_type: 'checkbox', abel: 'Design custom output schema',
+            hint: 'Check to use the schema builder to define this action’s datapills.' },
+          { name: 'custom_output_schema', extends_schema: true, control_type: 'schema-designer', schema_neutral: false,
+            sticky: true, optional: true, label: 'Output columns', sample_data_type: 'csv'
+            hint: 'Use the Schema Builder to define the output fields (datapills).'  }
+        ]
       end,
 
       input_fields: lambda do
@@ -212,7 +393,7 @@ require 'json'
           { name: 'chunks', type: 'array', of: 'object', properties: object_definitions['chunk'] },
           { name: 'trace_id' , optional: true },
           { name: 'notes',    optional: true }
-        ]
+        ] + Array(object_definitions['evelope_fields'])
       end,
 
       execute: lambda do |_connection, input|
@@ -258,22 +439,19 @@ require 'json'
           }
         end
 
-        out = {
-          'doc_id'       => doc_id,
-          'file_path'    => file_path,
-          'checksum'     => checksum,
-          'chunk_count'  => records.length,
+        base = {
+          'doc_id'          => doc_id,
+          'file_path'       => file_path,
+          'checksum'        => checksum,
+          'chunk_count'     => records.length,
           'max_chunk_chars' => max_chars,
           'overlap_chars'   => overlap,
-          'created_at'   => created_at,
-          'duration_ms'  => ((Time.now - started_at) * 1000).round,
-          'chunks'       => records
+          'created_at'      => created_at,
+          'chunks'          => records
         }
-        if debug
-          out['trace_id'] = trace_id
-          out['notes']    = 'prep_for_indexing completed'
-        end
-        out
+        base['trace_id'] = corr if debug
+        base['notes']    = 'prep_for_indexing completed' if debug
+        base.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
       end,
 
       sample_output: lambda do
@@ -285,7 +463,6 @@ require 'json'
           'max_chunk_chars' => 2000,
           'overlap_chars' => 200,
           'created_at' => '2025-10-15T12:00:00Z',
-          'duration_ms' => 12,
           'chunks' => [
             {
               'doc_id' => 'd9f1…',
@@ -297,9 +474,9 @@ require 'json'
               'span_end' => 1800,
               'source' => { 'file_path' => 'drive://Reports/2025/summary.txt', 'checksum' => '3a2b…' },
               'metadata' => { 'department' => 'HR' },
-              'created_at' => '2025-10-15T12:00:00Z'
-            }
-          ]
+              'created_at' => '2025-10-15T12:00:00Z' }],
+          'ok' => true,
+          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample' }
         }
       end
     },
@@ -309,11 +486,19 @@ require 'json'
       batch: true,
       display_priority: 10,
 
-      input_fields: lambda do
+      config_fields: lambda do |_connection|
+        call(:schema_builder_ingest_items_config_fields)
+      end,
+
+      input_fields: lambda do |object_definitions, _config_fields|
         [
           {
-            name: 'items', type: 'array', of: 'object', optional: false,
-            hint: 'Each item: {file_path?, content, max_chunk_chars?, overlap_chars?, metadata?}'
+            name: 'items',
+            type: 'array',
+            of: 'object',
+            properties: object_definitions['ingest_item'],
+            optional: false,
+            hint: 'Map your list here. Use “Design item schema” in the step’s config if your list shape is custom.'
           },
           { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
         ]
@@ -338,10 +523,10 @@ require 'json'
           },
           { name: 'count', type: 'integer' },
           { name: 'batch_trace_id', optional: true }
-        ]
+        ] + Array(object_definitions['envelope_fields'])
       end,
 
-      execute: lambda do |_connection, input|
+      execute: lambda do |_connection, input, _schema, _input_schema_name, _connection_schema, _config_fields|
         started_batch = Time.now
         batch_trace   = call(:guid)
         debug         = call(:safe_bool, input['debug'])
@@ -349,13 +534,18 @@ require 'json'
 
         results = items.map do |it|
           t0          = Time.now
-          raw         = (it['content'] || '').to_s
-          file_path   = (it['file_path'] || '').to_s
-          user_meta   = call(:sanitize_metadata, it['metadata'])
+          # Resolve fields using config mapping (falls back to canonical keys)
+          raw         = call(:get_item_field, it, _config_fields, 'item_content_field', 'content').to_s
+          file_path   = call(:get_item_field, it, _config_fields, 'item_file_path_field', 'file_path').to_s
+          user_meta   = call(:sanitize_metadata, call(:get_item_field, it, _config_fields, 'item_metadata_field', 'metadata'))
+          # Per-item overrides for chunking bounds (optional)
+          max_in      = call(:get_item_field, it, _config_fields, 'item_max_chunk_chars_field', 'max_chunk_chars')
+          ov_in       = call(:get_item_field, it, _config_fields, 'item_overlap_chars_field',   'overlap_chars')
+
           normalized  = call(:normalize_newlines, raw)
           cleaned     = call(:strip_control_chars, normalized)
-          max_chars   = call(:clamp_int, (it['max_chunk_chars'] || 2000), 200, 8000)
-          overlap     = call(:clamp_int, (it['overlap_chars']  || 200),   0,   4000)
+          max_chars   = call(:clamp_int, (max_in || 2000), 200, 8000)
+          overlap     = call(:clamp_int, (ov_in  || 200),   0,   4000)
           overlap     = [overlap, max_chars - 1].min
           checksum    = Digest::SHA256.hexdigest(cleaned)
           doc_id      = call(:generate_document_id, file_path, checksum)
@@ -395,10 +585,11 @@ require 'json'
           per
         end
 
-        out = { 'results' => results, 'count' => results.length }
-        out['batch_trace_id'] = batch_trace if debug
-        out
+        base = { 'results' => results, 'count' => results.length }
+        base['batch_trace_id'] = batch_trace if debug
+        base.merge(call(:telemetry_envelope, started_batch, batch_trace, true, 200, 'OK'))
       end,
+
       sample_output: lambda do
         {
           'results' => [
@@ -441,6 +632,10 @@ require 'json'
       subtitle: 'Provider-agnostic: [{id, vector, namespace, metadata}]',
       display_priority: 9,
 
+      config_fields: lambda do |_connection|
+        call(:schema_builder_config_fields)
+      end,
+
       input_fields: lambda do
         [
           { name: 'chunks', type: 'array', of: 'object', optional: false },
@@ -449,16 +644,21 @@ require 'json'
         ]
       end,
 
-      output_fields: lambda do |object_definitions|
-        [
-          { name: 'provider' }, { name: 'namespace' }, { name: 'count', type: 'integer' },
-          { name: 'records', type: 'array', of: 'object', properties: object_definitions['upsert_record'] },
+      output_fields: lambda do |object_definitions, _config_fields|
+        default_fields = [
+          { name: 'provider' },
+          { name: 'namespace' },
+          { name: 'count', type: 'integer' },
+          { name: 'records', type: 'array', of: 'object', properties: object_definitions['upsert_record'] }
         ]
+        call(:resolve_output_schema, default_fields, _config_fields, object_definitions)
       end,
 
       execute: lambda do |_connection, input|
-        ns  = input['namespace'].to_s
-        prv = input['provider'].to_s
+        t0  = Time.now
+        corr = call(:guid)
+        ns   = input['namespace'].to_s
+        prv  = input['provider'].to_s
         chunks = call(:require_array_of_objects, input['chunks'], 'chunks')
         upserts = chunks.select { |c| c['embedding'].is_a?(Array) }.map do |c|
           {
@@ -474,7 +674,10 @@ require 'json'
             }.compact
           }.compact
         end
-        { 'provider' => prv, 'namespace' => ns, 'records' => upserts, 'count' => upserts.length }
+        {
+          'provider' => prv, 'namespace' => ns,
+          'records'  => upserts, 'count' => upserts.length
+        }.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
       end,
 
       sample_output: lambda do
@@ -794,6 +997,10 @@ require 'json'
       subtitle: 'Slim corpus rows from chunks for persistence',
       display_priority: 6,
 
+      config_fields: lambda do |_connection|
+        call(:schema_builder_config_fields)
+      end,
+
       input_fields: lambda do
         [
           { name: 'chunks', type: 'array', of: 'object', optional: false },
@@ -802,15 +1009,18 @@ require 'json'
         ]
       end,
 
-      output_fields: lambda do
-        [
+      output_fields: lambda do |object_definitions, _config_fields|
+        default_fields = [
           { name: 'table' },
           { name: 'count', type: 'integer' },
           { name: 'rows', type: 'array', of: 'object' }
         ]
+        call(:resolve_output_schema, default_fields, _config_fields, object_definitions)
       end,
 
       execute: lambda do |_connection, input|
+        t0 = Time.now
+        corr = call(:guid)
         include_text = input['include_text'].nil? ? true : !!input['include_text']
         chunks = call(:require_array_of_objects, input['chunks'], 'chunks')
         rows = chunks.map do |c|
@@ -827,11 +1037,22 @@ require 'json'
           }
           include_text ? base.merge('text' => c['text'].to_s) : base
         end
-        { 'table' => input['table_name'].to_s, 'count' => rows.length, 'rows' => rows }
+        {
+          'table' => input['table_name'].to_s,
+          'count' => rows.length,
+          'rows'  => rows
+        }.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
       end,
 
       sample_output: lambda do
-        { 'table' => 'kb_chunks', 'count' => 2, 'rows' => [{ 'id' => 'docA:0', 'doc_id' => 'docA' }] }
+        {
+          'table' => 'kb_chunks',
+          'count' => 2,
+          'rows'  => [{ 'id' => 'docA:0', 'doc_id' => 'docA' }],
+          'ok'    => true,
+          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 1, 'correlation_id' => 'sample' }
+        }
+
       end
     },
     to_data_table_rows_batch: {
@@ -913,16 +1134,18 @@ require 'json'
         ]
       end,
 
-      output_fields: lambda do
+      output_fields: lambda do |object_definitions|
         [
           { name: 'object_name' },
           { name: 'content_type' },
           { name: 'bytes', type: 'integer' },
           { name: 'body' }
-        ]
+        ] + Array(object_definitions['envelope_fields'])
       end,
 
       execute: lambda do |_connection, input|
+        t0 = Time.now
+        corr = call(:guid)
         ns   = (input['namespace'] || 'default').to_s
         did  = (input['doc_id'] || 'multi').to_s
         pre  = (input['prefix'] || '').to_s
@@ -956,12 +1179,18 @@ require 'json'
           'content_type' => ctype,
           'bytes'        => body.bytesize,
           'body'         => body
-        }
+        }.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
       end,
     
       sample_output: lambda do
-        { 'object_name' => 'manifests/ns/doc/manifest-20250101T000000Z.json',
-          'content_type' => 'application/json', 'bytes' => 123, 'body' => '{…}' }
+        {
+          'object_name'  => 'manifests/ns/doc/manifest-20250101T000000Z.json',
+          'content_type' => 'application/json',
+          'bytes'        => 123,
+          'body'         => '{…}',
+          'ok'           => true,
+          'telemetry'    => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 1, 'correlation_id' => 'sample' }
+        }
       end
     },
     make_gcs_manifest_batch: {
@@ -1110,14 +1339,16 @@ require 'json'
         ]
       end,
 
-      output_fields: lambda do
+      output_fields: lambda do |object_definitions|
         [
           { name: 'count', type: 'integer' },
           { name: 'results', type: 'array', of: 'object' }
-        ]
+        ] + Array(object_definitions['envelope_fields'])
       end,     
 
       execute: lambda do |_connection, input|
+        t0 = Time.now
+        corr = call(:guid)
         results = call(:require_array_of_objects, input['results'], 'results')
         out = {}
         results.each do |r|
@@ -1137,6 +1368,7 @@ require 'json'
         end
         merged = out.values.sort_by { |x| -x['score'].to_f }
         { 'count' => merged.length, 'results' => merged }
+          .merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
       end,
 
       sample_output: lambda do
