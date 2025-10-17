@@ -194,6 +194,18 @@ require 'json'
 
   # --------- METHODS ------------------------------------------------------
   methods: {
+    detect_pairs_from_bundle: lambda do |bundle|
+      return [] unless bundle.is_a?(Hash)
+      list = bundle['embeddings']
+      return [] unless list.is_a?(Array)
+      list.map do |e|
+        next nil unless e.is_a?(Hash)
+        {
+          'id' => (e['id'] || e['chunk_id'] || e[:id] || e[:chunk_id]).to_s,
+          'embedding' => e['embedding'] || e[:embedding]
+        }
+      end.compact
+    end,
     guid: lambda { SecureRandom.uuid },
     now_iso: lambda { Time.now.utc.iso8601 },
     generate_document_id: lambda do |file_path, checksum|
@@ -1503,23 +1515,34 @@ require 'json'
     },
     attach_embeddings: {
       title: 'Ingestion - Attach embeddings to chunks',
-      subtitle: 'Merges [{id, embedding}] onto chunks by id',
+      help: lambda do |_|
+        { body: 'Fast path: map “Embeddings bundle” from previous step; Advanced allows custom keys/modes' }
+      end,
       display_priority: 7,
 
-      input_fields: lambda do |object_definitions, _connection, _cfg|
+      input_fields: lambda do |object_definitions, _connection, cfg|
         [
-          { name: 'chunks', type: 'array', of: 'object', optional: false, properties: object_definitions['chunk'],
-            hint: 'Map the Chunks list; we’ll merge embeddings by id/chunk_id.' },
-          { name: 'embeddings', label: 'Embeddings [{id, embedding}]',
-            type: 'array', of: 'object', optional: false,
-            properties: [
-              { name: 'id' },
-              { name: 'embedding', type: 'array', of: 'number' }
-            ]},
-          { name: 'embedding_key', optional: true, hint: 'Default: embedding' },
-          { name: 'id_key', optional: true, hint: 'Default: id' },
+            { name: 'chunks', type: 'array', of: 'object', optional: false, properties: object_definitions['chunk'],
+            hint: 'Map the Chunks list from “Prepare document for indexing” or later.' },
+          # --- Simple / Recommended path ---
+          { name: 'embeddings_bundle', type: 'object', optional: true,
+            hint: 'Map the whole object from “Map Vertex embeddings to ids”. Looks like: { embeddings:[{id, embedding}] }' },
+          # --- Alternate inputs (only one is needed) ---
+          { name: 'embeddings', label: 'Embeddings [{id,embedding}]', type: 'array', of: 'object', optional: true,
+            properties: [{ name: 'id' }, { name: 'embedding', type: 'array', of: 'number' }],
+            hint: 'Use when you already have the list of {id, embedding} objects.' },
+          { name: 'vectors', label: 'Vectors [[…],[…]] (parallel to chunks)', type: 'array', of: 'array', optional: true, hint: 'Use only if you have no ids; requires Alignment = by_index.' },
+          { name: 'alignment', control_type: 'select', optional: true,
+            pick_list: 'attach_alignment_modes', hint: 'Default: by_id (safer)' },
+          { name: 'show_advanced', type: 'boolean', control_type: 'checkbox', optional: true, sticky: true,
+            label: 'Show advanced options' },
+          # --- Advanced ---
+          (cfg && cfg['show_advanced'] ? { name: 'id_key', optional: true, hint: 'Default id' } : nil),
+          (cfg && cfg['show_advanced'] ? { name: 'embedding_key', optional: true, hint: 'Default embedding' } : nil),
+          (cfg && cfg['show_advanced'] ? { name: 'strict', type: 'boolean', control_type: 'checkbox', optional: true,
+            hint: 'When true, raise on missing/duplicate ids instead of skipping.' } : nil),
           { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
-        ]
+        ].compact
       end,
 
       output_fields: lambda do |_object_definitions, _config_fields|
@@ -1530,20 +1553,62 @@ require 'json'
       end,
 
       execute: lambda do |_connection, input|
-        id_key = (input['id_key'] || 'id').to_s
+        align = (input['alignment'] || 'by_id').to_s
+        id_key  = (input['id_key'] || 'id').to_s
         emb_key = (input['embedding_key'] || 'embedding').to_s
-        embeddings = call(:require_array_of_objects, input['embeddings'], 'embeddings')
-        chunks     = call(:require_array_of_objects, input['chunks'], 'chunks')
-        idx = {}
-        embeddings.each do |e|
-          idx[e[id_key].to_s] = e[emb_key]
+        strict  = !!input['strict']
+
+        chunks = call(:require_array_of_objects, input['chunks'], 'chunks')
+
+        # 1) Normalize embedding pairs
+        pairs = []
+        if input['embeddings_bundle'].is_a?(Hash)
+          pairs = call(:detect_pairs_from_bundle, input['embeddings_bundle'])
+        elsif input['embeddings'].is_a?(Array)
+          pairs = input['embeddings'].map do |e|
+            next nil unless e.is_a?(Hash)
+            { 'id' => e[id_key].to_s, 'embedding' => e[emb_key] }
+          end.compact
+        elsif input['vectors'].is_a?(Array)
+          error('Alignment must be by_index when using vectors') unless align == 'by_index'
+          vecs = input['vectors']
+          error('vectors length must equal chunks length') unless vecs.length == chunks.length
+          # Will attach by index below
         end
-        out_chunks = chunks.map do |c|
-          cid = call(:resolve_chunk_id, c)
-          vec = idx[cid]
-          next c unless vec
-          c.merge('embedding' => vec)
-        end
+
+        # 2) Merge
+        out_chunks =
+          if align == 'by_index'
+            if input['vectors'].is_a?(Array)
+              chunks.each_with_index.map do |c, i|
+                vec = input['vectors'][i]
+                next c unless vec.is_a?(Array) && !vec.empty?
+                c.merge('embedding' => vec.map { |x| Float(x) rescue nil }.compact)
+              end
+            else
+              error('by_index alignment requires vectors[[...]] input')
+            end
+          else # by_id (default)
+            idx = {}
+            dupes = []
+            pairs.each do |p|
+              pid = p['id'].to_s
+              if pid.empty?
+                error('Found embedding without id') if strict
+                next
+              end
+              dupes << pid if idx.key?(pid) && strict
+              idx[pid] = p['embedding']
+            end
+            error("Duplicate ids in embeddings: #{dupes.uniq.join(', ')}") if strict && !dupes.empty?
+            chunks.map do |c|
+              cid = call(:resolve_chunk_id, c)
+              vec = idx[cid]
+              next c unless vec.is_a?(Array) && !vec.empty?
+              c.merge('embedding' => vec.map { |x| Float(x) rescue nil }.compact)
+            end
+          end
+
         out = { 'count' => out_chunks.length, 'chunks' => out_chunks }
         out['trace_id'] = call(:guid) if call(:safe_bool, input['debug'])
         out
@@ -2390,6 +2455,13 @@ require 'json'
   # --------- PICK LISTS ---------------------------------------------------
   pick_lists: {
 
+    attach_alignment_modes: lambda do |_connection=nil, _cfg={}|
+      [
+        ['Match by id (recommended)', 'by_id'],
+        ['Match by index (vectors[i] -> chunks[i])', 'by_index']
+      ]
+    end,
+    
     item_schema_field_names: lambda do |_connection, _config_fields = {}|
       fields = _config_fields['item_schema'].is_a?(Array) ? _config_fields['item_schema'] : []
       names  = fields.map { |f| f['name'].to_s }.reject(&:empty?).uniq
