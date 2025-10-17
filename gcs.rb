@@ -1,5 +1,11 @@
 require 'openssl'
 require 'erb'
+require 'json'
+require 'securerandom'
+require 'digest'
+require 'base64'
+require 'time'
+require 'uri'
 
 {
   title: 'Google Drive with Cloud Storage',
@@ -550,13 +556,14 @@ require 'erb'
         t0 = Time.now
         corr = SecureRandom.uuid
 
-        # Normalize folder id (shortcuts resolved 1x via meta_get_resolve_shortcut)
+        # Evaluate content mode early so rescue can safely reference it
+        mode = (input['content_mode'] || 'none').to_s
+
+        # Normalize file id (shortcuts resolved 1x via meta_get_resolve_shortcut)
         file_id = call(:util_extract_drive_id, input['file_id_or_url'])
         meta = call(:meta_get_resolve_shortcut, file_id)
         result = call(:map_drive_meta, meta)
 
-        # Eval content mode, url processing behavior
-        mode = (input['content_mode'] || 'none').to_s
         strip = input.dig('postprocess', 'util_strip_urls') ? true : false
 
         # No mode specified on input
@@ -582,6 +589,7 @@ require 'erb'
             if call(:util_is_textual_mime?, meta['mimeType'])
               bytes = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}")
                       .params(alt: 'media', supportsAllDrives: true)
+                      .headers('Accept-Encoding': 'identity')
                       .response_format_raw
               raw  = bytes.to_s
               text = call(:util_force_utf8, raw)
@@ -759,16 +767,9 @@ require 'erb'
       # CONTENT RULES
       #   - `content_mode=text` allowed only for textual MIME; otherwise 415 to prevent garbage text.
 
-      input_fields: lambda do
-        [
-          { name: 'bucket', optional: false, hint: 'GCS bucket' },
-          { name: 'object', optional: false, hint: 'Object name (URL-encoded safe, we will encode)' },
-          { name: 'content_mode', control_type: 'select', pick_list: [['Text','text'], ['Bytes','bytes']], optional: false, hint: 'Emit UTF-8 text or base64 bytes' },
-          { name: 'user_project', hint: 'Requester-pays billing project', optional: true },
-          { name: 'generation', hint: 'Read a specific generation (optional)', optional: true },
-          { name: 'if_generation_match', type: 'integer', optional: true, hint: 'Precondition: only if generation matches' },
-          { name: 'max_bytes', type: 'integer', optional: true, hint: 'Hard cap; truncate content and set content_truncated=true if exceeded (default 10MB)' }
-        ]
+      input_fields: lambda do |_obj, _conn, config_fields|
+        # Reuse standard GET UI for consistency with the rest of the connector
+        call(:ui_gcs_get_inputs, config_fields)
       end,
 
       output_fields: lambda do |object_definitions|
@@ -776,111 +777,118 @@ require 'erb'
       end,
 
       execute: lambda do |connection, input|
-        # Correlation id and duration for logs / analytics
-        t0 = Time.now
-        corr = SecureRandom.uuid
+        begin
+          # Correlation id and duration for logs / analytics
+          t0 = Time.now
+          corr = SecureRandom.uuid
 
-        bucket        = _['bucket']
-        object_raw    = _['object']
-        object        = URI.encode_www_form_component(object_raw)
-        content_mode  = (_['content_mode'] || 'text').to_s
-        user_project  = _['user_project'].presence
-        generation    = _['generation'].presence
-        if_gen_match  = _['if_generation_match']
-        max_bytes     = (_['max_bytes'] || 10 * 1024 * 1024).to_i
+          bucket        = input['bucket']
+          object_raw    = input['object_name'] || input['object'] # tolerate old field name
+          object        = URI.encode_www_form_component(object_raw)
+          content_mode  = (input['content_mode'] || 'text').to_s
+          user_project  = (input['user_project'].presence || connection['user_project'])
+          generation    = input['generation'].presence
+          if_gen_match  = input['if_generation_match']
+          max_bytes     = (input['max_bytes'] || 10 * 1024 * 1024).to_i
 
-        base = "https://storage.googleapis.com/storage/v1/b/#{bucket}/o/#{object}"
-        qp   = []
-        qp << "userProject=#{user_project}" if user_project
-        qp << "generation=#{generation}"    if generation
-        meta_url = "#{base}?#{qp.join('&')}"
+          base = "https://storage.googleapis.com/storage/v1/b/#{bucket}/o/#{object}"
+          qp   = []
+          qp << "userProject=#{user_project}" if user_project
+          qp << "generation=#{generation}"    if generation
+          meta_url = "#{base}?#{qp.join('&')}"
 
-        headers = {
-          'Accept'           => 'application/json',
-          'Accept-Encoding'  => 'identity' # avoid gzip transcoding ambiguity
-        }
-        headers['x-goog-user-project'] = user_project if user_project
+          headers = {
+            'Accept'           => 'application/json',
+            'Accept-Encoding'  => 'identity' # avoid gzip transcoding ambiguity
+          }
+          headers['x-goog-user-project'] = user_project if user_project
 
-        meta = get(meta_url, headers)
+          meta = get(meta_url, headers)
 
-        media_qp = ["alt=media","prettyPrint=false"]
-        media_qp << "userProject=#{user_project}" if user_project
-        media_qp << "generation=#{generation}"    if generation
-        media_url = "#{base}?#{media_qp.join('&')}"
+          media_qp = ["alt=media","prettyPrint=false"]
+          media_qp << "userProject=#{user_project}" if user_project
+          media_qp << "generation=#{generation}"    if generation
+          media_url = "#{base}?#{media_qp.join('&')}"
 
-        media_headers = { 'Accept-Encoding' => 'identity' }
-        media_headers['x-goog-user-project'] = user_project if user_project
-        media_headers['If-Generation-Match'] = if_gen_match.to_s if if_gen_match
+          media_headers = { 'Accept-Encoding' => 'identity' }
+          media_headers['x-goog-user-project'] = user_project if user_project
+          media_headers['If-Generation-Match'] = if_gen_match.to_s if if_gen_match
 
-        # Stream/read bytes
-        bytes = get(media_url, media_headers)
+          # Stream/read bytes (raw, no JSON parsing)
+          bytes = get(media_url, media_headers).response_format_raw.to_s
 
-        # Hard cap
-        truncated = false
-        if bytes.bytesize > max_bytes
-          bytes = bytes.byteslice(0, max_bytes)
-          truncated = true
-        end
+          # Hard cap
+          truncated = false
+          if bytes.bytesize > max_bytes
+            bytes = bytes.byteslice(0, max_bytes)
+            truncated = true
+          end
 
-        content_type = (meta['contentType'] || 'application/octet-stream').to_s
+          content_type = (meta['contentType'] || 'application/octet-stream').to_s
 
-        is_textual = call(:util_is_textual_mime?, content_type) ||
-                    %w[application/json application/xml image/svg+xml text/csv text/tab-separated-values].include?(content_type)
+          is_textual = call(:util_is_textual_mime?, content_type) ||
+                      %w[application/json application/xml image/svg+xml text/csv text/tab-separated-values].include?(content_type)
 
-        # Normalize text or return base64 bytes
-        if content_mode == 'text' && is_textual
-          text = call(:util_to_utf8, bytes)
-          content_bytes_b64 = nil
-          text_content      = text
-        else
-          text_content      = nil
-          content_bytes_b64 = Base64.strict_encode64(bytes)
-        end
+          # Normalize text or return base64 bytes
+          if content_mode == 'text' && is_textual
+            text = call(:util_to_utf8, bytes)
+            # Honor optional post-process (strip URLs) for parity with Drive GET
+            if input.dig('postprocess', 'util_strip_urls')
+              text = call(:util_strip_urls, text)
+            end
 
-        # Checksums
-        local_md5_hex     = call(:util_md5_hex, bytes)
-        local_sha256_hex  = call(:util_sha256_hex, bytes)
-        gcs_md5_b64       = meta['md5Hash']
-        gcs_crc32c_b64    = meta['crc32c']
+            content_bytes_b64 = nil
+            text_content      = text
+          else
+            text_content      = nil
+            content_bytes_b64 = Base64.strict_encode64(bytes)
+            note = 'Non-textual content_type; returned Base64 bytes instead of text.'
+          end
 
-        {
-          id:               meta['id'],
-          bucket:           meta['bucket'],
-          name:             meta['name'],
-          size:             meta['size'].to_i,
-          content_type:     content_type,
-          content_encoding: meta['contentEncoding'],
-          storage_class:    meta['storageClass'],
-          generation:       meta['generation'],
-          metageneration:   meta['metageneration'],
-          time_created:     meta['timeCreated'],
-          updated:          meta['updated'],
-          cache_control:    meta['cacheControl'],
-          content_language: meta['contentLanguage'],
-          kms_key_name:     meta['kmsKeyName'],
-          metadata:         meta['metadata'],
-          media_link:       meta['mediaLink'],
-          md5_hash_b64:     gcs_md5_b64,
-          md5_hash_hex:     call(:util_b64md5_to_hex, gcs_md5_b64),
-          crc32c_b64:       gcs_crc32c_b64,
-          crc32c_hex:       call(:util_b64crc32c_to_hex, gcs_crc32c_b64),
-          content_truncated: truncated,
-          text_content:     text_content,
-          content_bytes:    content_bytes_b64,
-          content_md5:      local_md5_hex,
-          content_sha256:   local_sha256_hex,
-          ok:               true,
-          telemetry:        { http_status: 200 }
-        }
-      end
+          # Checksums
+          local_md5_hex     = call(:util_md5_hex, bytes)
+          local_sha256_hex  = call(:util_sha256_hex, bytes)
+          gcs_md5_b64       = meta['md5Hash']
+          gcs_crc32c_b64    = meta['crc32c']
 
-      rescue => e
-        details = call(:google_error_extract, e)
-        {}.merge(
-          'error' => call(:normalize_error_for_pills, details, 'gcs',
-                          (mode == 'bytes' ? 'objects.get(media)' : (mode == 'text' ? 'objects.get(media)' : 'objects.get')))
-        ).merge(call(:telemetry_envelope, t0, corr, false, (details['code'] || 0), details['message'] || e.to_s, details))
-      end,
+          {
+            'id'                => meta['id'],
+            'bucket'            => meta['bucket'],
+            'name'              => meta['name'],
+            'size'              => meta['size'].to_i,
+            'content_type'      => content_type,
+            'content_encoding'  => meta['contentEncoding'],
+            'storage_class'     => meta['storageClass'],
+            'generation'        => meta['generation'],
+            'metageneration'    => meta['metageneration'],
+            'time_created'      => meta['timeCreated'],
+            'updated'           => meta['updated'],
+            'cache_control'     => meta['cacheControl'],
+            'content_language'  => meta['contentLanguage'],
+            'kms_key_name'      => meta['kmsKeyName'],
+            'metadata'          => meta['metadata'],
+            'media_link'        => meta['mediaLink'],
+            'md5_hash_b64'      => gcs_md5_b64,
+            'md5_hash_hex'      => call(:util_b64md5_to_hex, gcs_md5_b64),
+            'crc32c_b64'        => gcs_crc32c_b64,
+            'crc32c_hex'        => call(:util_b64crc32c_to_hex, gcs_crc32c_b64),
+            'content_truncated' => truncated,
+            'text_content'      => text_content,
+            'content_bytes'     => content_bytes_b64,
+            'content_md5'       => local_md5_hex,
+            'content_sha256'    => local_sha256_hex
+          }.merge(call(:telemetry_envelope, t0, corr, true, 200, (note || 'OK')))
+        rescue => e
+          details = call(:google_error_extract, e)
+          {}.merge(
+            'error' => call(:normalize_error_for_pills, details, 'gcs',
+                            (content_mode == 'bytes' ? 'objects.get(media)' :
+                            (content_mode == 'text' ? 'objects.get(media)' : 'objects.get')))
+          ).merge(
+            call(:telemetry_envelope, t0, corr, false, (details['code'] || 0),
+                                      details['message'] || e.to_s, details)
+          )
+        end,
 
       sample_output: lambda do
         {
@@ -1384,7 +1392,9 @@ require 'erb'
 
     util_is_textual_mime?: lambda do |mime|
       m = (mime || '').downcase
-      m.start_with?('text/') || %w[application/json application/xml image/svg+xml].include?(m)
+      m.start_with?('text/') ||
+      m.include?('charset=') ||
+      %w[application/json application/xml image/svg+xml application/javascript].include?(m)
     end,
 
     util_is_google_editors_mime?: lambda do |mime|
@@ -1449,13 +1459,6 @@ require 'erb'
       p.end_with?('/') ? p : "#{p}/"
     end,
 
-    util_is_textual_mime?: lambda do |mime|
-      m = (mime || '').downcase
-      m.start_with?('text/') ||
-      m.include?('charset=') ||
-      m == 'application/javascript'
-    end,
-
     util_to_utf8: lambda do |bytes|
       str = bytes.is_a?(String) ? bytes.dup : bytes.to_s
       str.force_encoding('UTF-8')
@@ -1477,7 +1480,7 @@ require 'erb'
       return nil unless b64
       # GCS CRC32C is big-endian; decode and hexlify
       Base64.decode64(b64).unpack1('H*')
-    end
+    end,
 
     # --- 3. TELEMETRY --------------------
     telemetry_envelope: lambda do |started_at, correlation_id, ok, code, message, upstream_details=nil|
