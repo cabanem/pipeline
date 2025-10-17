@@ -128,6 +128,7 @@ require 'json'
           { name: 'span_end',   type: 'integer' },
           { name: 'source', type: 'object', properties: object_definitions['source'] },
           { name: 'metadata', type: 'object' },
+          { name: 'embedding', label: 'Embedding vector', type: 'array', of: 'number', optional: true },
           { name: 'created_at' }
         ]
       end
@@ -691,8 +692,10 @@ require 'json'
                       hint: 'Default 4096 total bytes after coercion.' }
         end
 
-        fields << { name: 'debug', label: 'Include debug notes', type: 'boolean',
-                    control_type: 'checkbox', optional: true }
+        if advanced
+          fields << { name: 'debug', label: 'Include debug notes', type: 'boolean',
+                      control_type: 'checkbox', optional: true }
+        end
         fields
       end,
 
@@ -1019,16 +1022,12 @@ require 'json'
       input_fields: lambda do |object_definitions, _config_fields = {}|
         [
           { name: 'chunks', type: 'array', of: 'object', optional: false, properties: object_definitions['chunk'],
-            hint: 'Map the Chunks list from “Prepare document for indexing”.' },
-          { name: 'namespace', optional: true, hint: 'e.g., hr-knowledge-v1' },
-          { name: 'provider', optional: true, hint: 'e.g., vertex' }
+            hint: 'Map the Chunks list from “Prepare document for indexing”.', sticky: true },
         ]
       end,
 
       output_fields: lambda do |object_definitions, _config_fields|
         default_fields = [
-          { name: 'provider' },
-          { name: 'namespace' },
           { name: 'count', type: 'integer' },
           { name: 'records', type: 'array', of: 'object', properties: object_definitions['upsert_record'] }
         ]
@@ -1036,11 +1035,11 @@ require 'json'
       end,
 
       execute: lambda do |_connection, input|
-        t0  = Time.now
-        corr = call(:guid)
-        ns   = input['namespace'].to_s
-        prv  = input['provider'].to_s
-        chunks = call(:require_array_of_objects, input['chunks'], 'chunks')
+        t0      = Time.now
+        corr    = call(:guid)
+        ns      = nil
+        prv     = nil
+        chunks  = call(:require_array_of_objects, input['chunks'], 'chunks')
         upserts = chunks.select { |c| c['embedding'].is_a?(Array) }.map do |c|
           {
             'id'        => call(:resolve_chunk_id, c),
@@ -1055,10 +1054,7 @@ require 'json'
             }.compact
           }.compact
         end
-        {
-          'provider' => prv, 'namespace' => ns,
-          'records'  => upserts, 'count' => upserts.length
-        }.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+        { 'records' => upserts, 'count' => upserts.length }.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
       end,
 
       sample_output: lambda do
@@ -1100,16 +1096,12 @@ require 'json'
       input_fields: lambda do |_object_definitions = nil, _config_fields = {}|
         [
           { name: 'documents', type: 'array', of: 'object', optional: true },
-          { name: 'chunks', type: 'array', of: 'object', optional: true },
-          { name: 'namespace', optional: true, hint: 'e.g., hr-knowledge-v1' },
-          { name: 'provider',  optional: true, hint: 'e.g., vertex' }
+          { name: 'chunks', type: 'array', of: 'object', optional: true }
         ]
       end,
 
       output_fields: lambda do |object_definitions, _config_fields|
         default_fields = [
-          { name: 'provider' },
-          { name: 'namespace' },
           { name: 'count', type: 'integer' },
           { name: 'records', type: 'array', of: 'object', properties: object_definitions['upsert_record'] }
         ]
@@ -1119,8 +1111,8 @@ require 'json'
       execute: lambda do |_connection, input|
         t0  = Time.now
         corr = call(:guid)
-        ns   = input['namespace'].to_s
-        prv  = input['provider'].to_s
+        ns   = nil
+        prv  = nil
         chunks = call(:flatten_chunks_input, input)
         upserts = chunks.select { |c| c['embedding'].is_a?(Array) }.map do |c|
           {
@@ -1137,7 +1129,7 @@ require 'json'
           }.compact
         end
         {
-          'provider' => prv, 'namespace' => ns, 'records' => upserts, 'count' => upserts.length
+          'records' => upserts, 'count' => upserts.length
         }.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
       end,
   
@@ -1160,6 +1152,169 @@ require 'json'
               }
             }
           ]
+        }
+      end
+    },
+    build_vertex_datapoints: {
+      title: 'Ingestion: Build Vertex datapoints',
+      subtitle: 'Chunks with embeddings → [{datapointId, featureVector, restricts, labels?, metadata?}]',
+      display_priority: 7,
+
+      input_fields: lambda do |object_definitions, _cfg = {}|
+        [
+          { name: 'chunks', type: 'array', of: 'object', optional: false,
+            properties: object_definitions['chunk'],
+            hint: 'Use output of attach_embeddings (chunks now include embedding)' },
+          { name: 'tenant', optional: true, hint: 'Applied as restricts: {namespace: "tenant"}' },
+          { name: 'source_token', optional: true, hint: 'Applied as restricts: {namespace: "source"} (e.g., handbook)' },
+          { name: 'doc_namespace', optional: true, hint: 'Namespace name for document ids (default "doc")' },
+          { name: 'labels', type: 'object', optional: true, hint: 'Optional labels object added per datapoint' }
+        ]
+      end,
+
+      output_fields: lambda do
+        [
+          { name: 'count', type: 'integer' },
+          { name: 'datapoints', type: 'array', of: 'object', properties: [
+              { name: 'datapointId' },
+              { name: 'featureVector', type: 'array', of: 'number' },
+              { name: 'restricts', type: 'array', of: 'object', properties: [
+                  { name: 'namespace' },
+                  { name: 'allowTokens', type: 'array', of: 'string' },
+                  { name: 'denyTokens',  type: 'array', of: 'string' }
+                ]
+              },
+              { name: 'crowdingTag' },
+              { name: 'labels', type: 'object' },
+              { name: 'metadata', type: 'object' }
+            ]
+          }
+        ]
+      end,
+
+      execute: lambda do |_connection, input|
+        chunks = input['chunks'].is_a?(Array) ? input['chunks'] : []
+        error('chunks must be a non-empty array') if chunks.empty?
+        doc_ns = (input['doc_namespace'] || 'doc').to_s
+        tenant = input['tenant'].to_s
+        source = input['source_token'].to_s
+        labels = input['labels'].is_a?(Hash) ? input['labels'] : nil
+
+        dps = chunks.map.with_index do |c, i|
+          id   = (c['chunk_id'] || c['id'] || c['index']).to_s
+          error("chunk[#{i}] missing id/chunk_id") if id.empty?
+          vec  = c['embedding']
+          error("chunk[#{i}] missing embedding") if !vec.is_a?(Array) || vec.empty?
+          # Build restricts
+          rest = []
+          rest << { 'namespace' => doc_ns, 'allowTokens' => [c['doc_id'].to_s] } if c['doc_id'].to_s != ''
+          rest << { 'namespace' => 'tenant', 'allowTokens' => [tenant] } if !tenant.empty?
+          rest << { 'namespace' => 'source', 'allowTokens' => [source] } if !source.empty?
+          # Metadata passthrough (safe)
+          md = {
+            'doc_id'    => c['doc_id'],
+            'source'    => c['source'],
+            'span'      => { 'start' => c['span_start'], 'end' => c['span_end'] },
+            'tokens'    => c['tokens'],
+            'extra'     => c['metadata']
+          }.delete_if { |_k,v| v.nil? }
+          dp = {
+            'datapointId'   => id,
+            'featureVector' => vec.map { |x| Float(x) rescue nil }.compact,
+            'restricts'     => rest,
+            'metadata'      => md
+          }
+          dp['labels'] = labels if labels
+          dp
+        end
+        { 'count' => dps.length, 'datapoints' => dps }
+      end,
+
+      sample_output: lambda do
+        {
+          'count' => 1,
+          'datapoints' => [
+            {
+              'datapointId' => 'doc-abc123:0',
+              'featureVector' => [0.01, 0.02],
+              'restricts' => [
+                { 'namespace' => 'doc', 'allowTokens' => ['doc-abc123'] },
+                { 'namespace' => 'tenant', 'allowTokens' => ['acme'] },
+                { 'namespace' => 'source', 'allowTokens' => ['handbook'] }
+              ],
+              'metadata' => {
+                'doc_id' => 'doc-abc123',
+                'source' => { 'file_path' => 'drive://Policies/PTO.md' },
+                'span'   => { 'start' => 0, 'end' => 1799 },
+                'tokens' => 42,
+                'extra'  => { 'department' => 'HR' }
+              }
+            }
+          ]
+        }
+      end
+    },
+    map_vertex_embeddings: {
+      title: 'Ingestion: Map Vertex embeddings to ids',
+      subtitle: 'Align requests[*].id with embed_text.predictions[*].embeddings.values',
+      display_priority: 7,
+
+      input_fields: lambda do
+        [
+          { name: 'requests',  type: 'array', of: 'object', optional: false,
+            hint: 'From build_embedding_requests: [{id,text,metadata}]' },
+          { name: 'predictions', type: 'array', of: 'object', optional: false,
+            hint: 'Vertex embed_text.predictions[*]' },
+          { name: 'check_dimension', type: 'integer', optional: true,
+            hint: 'Optional: expected vector length (index dimension)' }
+        ]
+      end,
+
+      output_fields: lambda do
+        [
+          { name: 'count', type: 'integer' },
+          { name: 'embeddings', type: 'array', of: 'object', properties: [
+              { name: 'id' }, { name: 'embedding', type: 'array', of: 'number' }
+            ]
+          },
+          { name: 'vector_dim', type: 'integer' }
+        ]
+      end,
+
+      execute: lambda do |_connection, input|
+        reqs = input['requests'].is_a?(Array) ? input['requests'] : []
+        preds = input['predictions'].is_a?(Array) ? input['predictions'] : []
+        error('requests and predictions length mismatch') if reqs.length != preds.length
+
+        out = []
+        dim = nil
+        reqs.each_with_index do |r, i|
+          id = (r['id'] || r[:id]).to_s
+          error("requests[#{i}].id is required") if id.empty?
+          vec = preds[i].dig('embeddings','values') ||
+                preds[i].dig('embeddings',0,'values') ||
+                preds[i]['values']
+          error("predictions[#{i}] missing embeddings.values") if !vec.is_a?(Array) || vec.empty?
+          vec = vec.map { |x| Float(x) rescue nil }.compact
+          error("predictions[#{i}] contains non-numeric values") if vec.empty?
+          dim ||= vec.length
+          error("predictions[#{i}] dimension mismatch (#{vec.length} != #{dim})") if vec.length != dim
+          if input['check_dimension'].to_i > 0
+            exp = input['check_dimension'].to_i
+            error("vector dimension #{vec.length} != expected #{exp}") if vec.length != exp
+          end
+          out << { 'id' => id, 'embedding' => vec }
+        end
+        { 'count' => out.length, 'embeddings' => out, 'vector_dim' => (dim || 0) }
+      end,
+
+      sample_output: lambda do
+        { 'count' => 2,
+          'embeddings' => [
+            { 'id' => 'doc-abc123:0', 'embedding' => [0.01, 0.02, 0.03] },
+            { 'id' => 'doc-abc123:1', 'embedding' => [0.04, 0.05, 0.06] }
+          ],
+          'vector_dim' => 3
         }
       end
     },
