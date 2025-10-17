@@ -26,6 +26,35 @@ require 'json'
 
   # --------- OBJECT DEFINITIONS -------------------------------------------
   object_definitions: {
+    prep_result: {
+      fields: lambda do |object_definitions = {}, _cfg = {}|
+        [
+          { name: 'doc_id' },
+          { name: 'file_path' },
+          { name: 'checksum' },
+          { name: 'chunk_count', type: 'integer' },
+          { name: 'max_chunk_chars', type: 'integer' },
+          { name: 'overlap_chars', type: 'integer' },
+          { name: 'created_at' },
+          { name: 'duration_ms', type: 'integer' },
+          { name: 'chunks', type: 'array', of: 'object',
+            properties: (object_definitions['chunk'] || []) },
+          { name: 'trace_id', optional: true },
+          { name: 'notes', optional: true }
+        ]
+      end
+    },
+
+    prep_batch: {
+      fields: lambda do |object_definitions = {}, _cfg = {}|
+        [
+          { name: 'results', type: 'array', of: 'object',
+            properties: (object_definitions['prep_result'] || []) },
+          { name: 'count', type: 'integer' },
+          { name: 'batch_trace_id', optional: true }
+        ]
+      end
+    },
     table_row: {
       fields: lambda do |_object_definitions = nil, _config_fields = {}|
         [
@@ -678,7 +707,7 @@ require 'json'
           { name: 'overlap_chars', type: 'integer' },
           { name: 'created_at' },
           { name: 'duration_ms', type: 'integer' },
-          { name: 'chunks', type: 'array', of: 'object', properties: (object_definitions['chunk'] || []) },
+          { name: 'chunks', type: 'array', of: 'object', properties: object_definitions['chunk'] },
           { name: 'trace_id', optional: true },
           { name: 'notes', optional: true }
         ] + Array(object_definitions['envelope_fields'])
@@ -1371,9 +1400,9 @@ require 'json'
       display_priority: 6,
       input_fields: lambda do
         [
-          { name: 'document', type: 'object', optional: true,
+          { name: 'document', type: 'object', optional: true, properties: (object_definitions['prep_result'] || []),
             hint: 'Output of Prepare document for indexing (single)' },
-          { name: 'batch', type: 'object', optional: true,
+          { name: 'batch', type: 'object', optional: true, properties: (object_definitions['prep_batch'] || []),
             hint: 'Output of Prepare multiple documents for indexing (batch)' }
         ]
       end,
@@ -1409,12 +1438,10 @@ require 'json'
       input_fields: lambda do |object_definitions = nil, cfg = {}|
         advanced = !!cfg['show_advanced']
         fields = [
-          { name: 'document', type: 'object', optional: true,
+          { name: 'document', type: 'object', optional: true, properties: (object_definitions['prep_result'] || []),
             hint: 'Directly map the whole output of “Prepare document for indexing”' },
-          { name: 'batch', type: 'object', optional: true,
+          { name: 'batch', type: 'object', optional: true, properties: (object_definitions['prep_batch'] || []),
             hint: 'Directly map the whole output of “Prepare multiple documents for indexing”' },
-          { name: 'chunks', type: 'array', of: 'object', optional: true, properties: (object_definitions['chunk'] || []),
-            hint: 'Alternatively, map a flat chunks list.' },
           { name: 'table_name', optional: true, hint: 'Optional label for your downstream step' },
           { name: 'include_text', type: 'boolean', control_type: 'checkbox', optional: true,
             hint: 'Default true' }
@@ -1432,7 +1459,7 @@ require 'json'
           { name: 'table' },
           { name: 'profile' },
           { name: 'count', type: 'integer' },
-          { name: 'rows', type: 'array', of: 'object', properties: (object_definitions['chunk'] || [])
+          { name: 'rows', type: 'array', of: 'object', properties: object_definitions['table_row'] }
         ] + Array(object_definitions['envelope_fields'])
       end,
 
