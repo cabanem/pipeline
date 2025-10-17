@@ -44,7 +44,6 @@ require 'json'
         ]
       end
     },
-
     prep_batch: {
       fields: lambda do |object_definitions = {}, _cfg = {}|
         [
@@ -71,7 +70,7 @@ require 'json'
       end
     },
     envelope_fields: {
-      fields: lambda do |_|
+      fields: lambda do |_object_definitions = nil, _config_fields = {}|
         [
           { name: 'error', type: 'object', optional: true, properties: [
               { name: 'code', type: 'integer' },
@@ -146,7 +145,7 @@ require 'json'
       end
     },
     upsert_record: {
-      fields: lambda do
+      fields: lambda do |_object_definitions = nil, _config_fields = {}|
         [
           { name: 'id' },
           { name: 'vector', type: 'array', of: 'number' },
@@ -1017,7 +1016,7 @@ require 'json'
           label: 'Output columns', sample_data_type: 'csv' }
       ],
 
-      input_fields: lambda do |object_definitions, _cfg = {}|
+      input_fields: lambda do |object_definitions, _config_fields = {}|
         [
           { name: 'chunks', type: 'array', of: 'object', optional: false, properties: object_definitions['chunk'],
             hint: 'Map the Chunks list from “Prepare document for indexing”.' },
@@ -1098,7 +1097,7 @@ require 'json'
           schema_neutral: false, sticky: true, optional: true, label: 'Output columns', sample_data_type: 'csv' }
       ],
 
-      input_fields: lambda do
+      input_fields: lambda do |_object_definitions = nil, _config_fields = {}|
         [
           { name: 'documents', type: 'array', of: 'object', optional: true },
           { name: 'chunks', type: 'array', of: 'object', optional: true },
@@ -1172,7 +1171,7 @@ require 'json'
       display_priority: 8,
       # chunks[*] -> [{id, text, metadata}] for embedding
 
-      input_fields: lambda do |object_definitions, _cfg = {}|
+      input_fields: lambda do |object_definitions, _config_fields = {}|
         [
           { name: 'chunks', type: 'array', of: 'object', optional: false, properties: object_definitions['chunk'],
             hint: 'Map the Chunks list from “Prepare document for indexing”.' },
@@ -1219,7 +1218,7 @@ require 'json'
       batch: true,
       display_priority: 8,
 
-      input_fields: lambda do
+      input_fields: lambda do |_object_definitions = nil, _config_fields = {}|
         [
           { name: 'documents', type: 'array', of: 'object', optional: true,
             hint: 'Each doc should include chunks:[...]' },
@@ -1317,7 +1316,7 @@ require 'json'
       batch: true,
       display_priority: 7,
 
-      input_fields: lambda do
+      input_fields: lambda do |_object_definitions = nil, _config_fields = {}|
         [
           { name: 'pairs', type: 'array', of: 'object', optional: true,
             hint: 'Each: {chunks:[...], embeddings:[{id,embedding}], id_key?, embedding_key?}' },
@@ -1398,7 +1397,7 @@ require 'json'
       title: 'Ingestion: Extract chunks',
       subtitle: 'Accepts {chunks:[...]} or {results:[{chunks:[...]}]} and emits {chunks:[...]}',
       display_priority: 6,
-      input_fields: lambda do
+      input_fields: lambda do |object_definitions, _config_fields = {}|
         [
           { name: 'document', type: 'object', optional: true, properties: (object_definitions['prep_result'] || []),
             hint: 'Output of Prepare document for indexing (single)' },
@@ -1706,7 +1705,7 @@ require 'json'
         ]
       end,
 
-      output_fields: lambda do
+      output_fields: lambda do |_object_definitions = nil, _config_fields = {}|
         [
           { name: 'count', type: 'integer' },
           { name: 'manifests', type: 'array', of: 'object', properties: [
