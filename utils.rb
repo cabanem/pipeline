@@ -524,6 +524,64 @@ require 'json'
       return({ 'tags' => tags }) unless tags.empty?
       return call(:parse_file_path_meta, input['file_path']) if input['metadata_use_path'] == true
       {}
+    end,
+    scalarize: lambda do |v|
+      case v
+      when String, Numeric, TrueClass, FalseClass, NilClass then v
+      else v.to_s
+      end
+    end,
+    flatten_metadata_for_table: lambda do |metadata, prefix, caps = {}|
+      meta = call(:sanitize_metadata, metadata || {})
+      flat = call(:flatten_object_shallow, meta, prefix.to_s)
+      # enforce caps similar to coerce_metadata
+      max_keys  = (caps['metadata_max_keys']  || 50).to_i
+      max_bytes = (caps['metadata_max_bytes'] || 4096).to_i
+      flat = flat.first(max_keys).to_h.merge('__meta_truncated__' => true) if max_keys > 0 && flat.length > max_keys
+      # string truncation and byte cap
+      flat.each { |k, v| flat[k] = v.is_a?(String) ? call(:truncate_string, v, [max_bytes / 8, 0].max) : v }
+      if max_bytes > 0 && call(:json_bytesize, flat) > max_bytes
+        flat.keys.sort.reverse.each do |k|
+          next if k == '__meta_truncated__'
+          flat.delete(k)
+          break if call(:json_bytesize, flat) <= max_bytes
+        end
+        flat['__meta_truncated__'] = true
+      end
+      # force primitives only
+      Hash[flat.map { |k, v| [k, call(:scalarize, v)] }]
+    end,
+    build_table_row: lambda do |chunk, profile, include_text, meta_prefix, caps|
+      base = {
+        'id'         => call(:resolve_chunk_id, chunk),
+        'doc_id'     => chunk['doc_id'],
+        'file_path'  => chunk.dig('source','file_path'),
+        'checksum'   => chunk.dig('source','checksum'),
+        'tokens'     => chunk['tokens'],
+        'span_start' => chunk['span_start'],
+        'span_end'   => chunk['span_end'],
+        'created_at' => chunk['created_at']
+      }.delete_if { |_, v| v.nil? }
+
+      case profile
+      when 'slim'
+        row = {
+          'id'        => base['id'],
+          'doc_id'    => base['doc_id'],
+          'file_path' => base['file_path']
+        }
+        row['text'] = chunk['text'].to_s if include_text
+        row
+      when 'wide'
+        row = base.dup
+        row['text'] = chunk['text'].to_s if include_text
+        meta = call(:flatten_metadata_for_table, chunk['metadata'], (meta_prefix || 'meta_'), caps || {})
+        row.merge(meta)
+      else # 'standard' (default)
+        row = base.dup
+        row['text'] = chunk['text'].to_s if include_text
+        row
+      end
     end
 
   },
@@ -743,6 +801,8 @@ require 'json'
       subtitle: 'Cleans + chunks N documents; returns an array of per-doc results',
       batch: true,
       display_priority: 10,
+      # Not really deprecated, just not ready for use yet
+      deprecated: true,
 
       config_fields: [
         {
@@ -919,9 +979,10 @@ require 'json'
           label: 'Output columns', sample_data_type: 'csv' }
       ],
 
-      input_fields: lambda do
+      input_fields: lambda do |object_definitions, _cfg = {}|
         [
-          { name: 'chunks', type: 'array', of: 'object', optional: false },
+          { name: 'chunks', type: 'array', of: 'object', optional: false, roperties: object_definitions['chunk'],
+            hint: 'Map the Chunks list from “Prepare document for indexing”.' },
           { name: 'namespace', optional: true, hint: 'e.g., hr-knowledge-v1' },
           { name: 'provider', optional: true, hint: 'e.g., vertex' }
         ]
@@ -990,6 +1051,8 @@ require 'json'
       subtitle: 'Accepts documents[*].chunks or chunks[*]; emits provider-agnostic upserts',
       batch: true,
       display_priority: 9,
+      # Not really deprecated, just not ready for use yet
+      deprecated: true,
 
       config_fields: [
         { name: 'override_output_schema', type: 'boolean', control_type: 'checkbox', label: 'Design custom output schema' },
@@ -1071,9 +1134,10 @@ require 'json'
       display_priority: 8,
       # chunks[*] -> [{id, text, metadata}] for embedding
 
-      input_fields: lambda do
+      input_fields: lambda do |object_definitions, _cfg = {}|
         [
-          { name: 'chunks', type: 'array', of: 'object', optional: false },
+          { name: 'chunks', type: 'array', of: 'object', optional: false, properties: object_definitions['chunk'],
+            hint: 'Map the Chunks list from “Prepare document for indexing”.' },
           { name: 'debug',  type: 'boolean', control_type: 'checkbox', optional: true }
         ]
       end,
@@ -1166,9 +1230,10 @@ require 'json'
       subtitle: 'Merges [{id, embedding}] onto chunks by id',
       display_priority: 7,
 
-      input_fields: lambda do
+      input_fields: lambda do |object_definitions, _cfg = {}|
         [
-          { name: 'chunks', type: 'array', of: 'object', optional: false },
+          { name: 'chunks', type: 'array', of: 'object', optional: false, properties: object_definitions['chunk'],
+            hint: 'Map the Chunks list; we’ll merge embeddings by id/chunk_id.' },
           { name: 'embeddings', label: 'Embeddings [{id, embedding}]', type: 'array', of: 'object', optional: false },
           { name: 'embedding_key', optional: true, hint: 'Default: embedding' },
           { name: 'id_key', optional: true, hint: 'Default: id' },
@@ -1291,74 +1356,127 @@ require 'json'
     },
 
     # ---- 3.  Emit --------------------------------------------------------
+    extract_chunks: {
+      title: 'Ingestion: Extract chunks'
+      subtitle: 'Accepts {chunks:[...]} or {results:[{chunks:[...]}]} and emits {chunks:[...]}'
+      display_priority: 6,
+      input_fields: lambda do
+        [
+          { name: 'document', type: 'object', optional: true,
+            hint: 'Output of Prepare document for indexing (single)' },
+          { name: 'batch', type: 'object', optional: true,
+            hint: 'Output of Prepare multiple documents for indexing (batch)' }
+        ]
+      end,
+      output_fields: lambda do |object_definitions|
+        [{ name: 'chunks', type: 'array', of: 'object', properties: object_definitions['chunk'] }]
+      end,
+      execute: lambda do |_conn, input|
+        doc   = input['document'].is_a?(Hash) ? input['document'] : {}
+        batch = input['batch'].is_a?(Hash) ? input['batch'] : {}
+        chunks =
+          if doc['chunks'].is_a?(Array)
+            doc['chunks']
+          elsif batch['results'].is_a?(Array)
+            batch['results'].flat_map { |r| (r || {})['chunks'] || [] }
+          else
+            []
+          end
+        { 'chunks' => chunks }
+      end
+    },
     to_data_table_rows: {
       title: 'Ingestion: To Data Table rows',
       subtitle: 'Slim corpus rows from chunks for persistence',
       display_priority: 6,
 
       config_fields: [
+        { name: 'row_profile', control_type: 'select', pick_list: 'table_row_profiles',
+          sticky: true, optional: true, hint: 'Standard is safe default.' },
+        { name: 'show_advanced', type: 'boolean', control_type: 'checkbox', sticky: true,
+          label: 'Show advanced options', hint: 'Reveal schema designer and metadata caps.' },
         { name: 'override_output_schema', type: 'boolean', control_type: 'checkbox',
-          label: 'Design custom output schema',
-          hint: 'Use Schema Builder to define this action’s datapills.' },
+          label: 'Design custom output schema', hint: 'Use Schema Builder for datapills.' },
         { name: 'custom_output_schema', extends_schema: true, control_type: 'schema-designer',
           schema_neutral: false, sticky: true, optional: true,
           label: 'Output columns', hint: 'Define output fields (datapills).',
           sample_data_type: 'csv' }
       ],
 
-      input_fields: lambda do
-        [
-          { name: 'chunks', type: 'array', of: 'object', optional: false },
-          { name: 'table_name', optional: true, hint: 'For your own bookkeeping' },
-          { name: 'include_text', type: 'boolean', control_type: 'checkbox', optional: true, hint: 'Default true' }
+      input_fields: lambda do |object_definitions = nil, cfg = {}|
+        advanced = !!cfg['show_advanced']
+        fields = [
+          { name: 'chunks', type: 'array', of: 'object', optional: false, roperties: object_definitions['chunk'],
+            hint: 'Use output from “Prepare document(s) for indexing)”' },
+          { name: 'table_name', optional: true, hint: 'Optional label for your downstream step' },
+          { name: 'include_text', type: 'boolean', control_type: 'checkbox', optional: true,
+            hint: 'Default true' }
         ]
+        if advanced
+          fields << { name: 'metadata_prefix', optional: true, hint: 'Prefix for flattened metadata (Wide). Default meta_' }
+          fields << { name: 'metadata_max_keys', type: 'integer', optional: true, hint: 'Cap flattened keys. Default 50' }
+          fields << { name: 'metadata_max_bytes', type: 'integer', optional: true, hint: 'Total bytes cap for flattened metadata. Default 4096' }
+        end
+        fields
       end,
 
-      output_fields: lambda do |object_definitions, _config_fields|
+      output_fields: lambda do |object_definitions, cfg|
         default_fields = [
           { name: 'table' },
+          { name: 'profile' },
           { name: 'count', type: 'integer' },
           { name: 'rows', type: 'array', of: 'object' }
         ]
-        call(:resolve_output_schema, default_fields, _config_fields, object_definitions)
+        call(:resolve_output_schema, default_fields, cfg, object_definitions)
       end,
 
-      execute: lambda do |_connection, input|
-        t0 = Time.now
-        corr = call(:guid)
+      execute: lambda do |_connection, input, _schema = nil, _input_schema_name = nil, _connection_schema = nil, cfg = {}|
+        t0    = Time.now
+        corr  = call(:guid)
+        prof  = (cfg['row_profile'] || 'standard').to_s
         include_text = input['include_text'].nil? ? true : !!input['include_text']
         chunks = call(:require_array_of_objects, input['chunks'], 'chunks')
+        caps = {
+          'metadata_max_keys'  => input['metadata_max_keys'],
+          'metadata_max_bytes' => input['metadata_max_bytes']
+        }.compact
+        meta_prefix = (input['metadata_prefix'] || 'meta_').to_s
+
         rows = chunks.map do |c|
-          base = {
-            'id'         => call(:resolve_chunk_id, c),
-            'doc_id'     => c['doc_id'],
-            'file_path'  => c.dig('source','file_path'),
-            'checksum'   => c.dig('source','checksum'),
-            'tokens'     => c['tokens'],
-            'span_start' => c['span_start'],
-            'span_end'   => c['span_end'],
-            'metadata'   => call(:sanitize_metadata, c['metadata']),
-            'created_at' => c['created_at']
-          }
-          include_text ? base.merge('text' => c['text'].to_s) : base
+          call(:build_table_row, c, prof, include_text, meta_prefix, caps)
         end
+
         {
-          'table' => input['table_name'].to_s,
-          'count' => rows.length,
-          'rows'  => rows
+          'table'   => input['table_name'].to_s,
+          'profile' => prof,
+          'count'   => rows.length,
+          'rows'    => rows
         }.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
       end,
 
       sample_output: lambda do
         {
           'table' => 'kb_chunks',
+          'profile' => 'standard',
           'count' => 2,
-          'rows'  => [{ 'id' => 'docA:0', 'doc_id' => 'docA' }],
+          'rows'  => [
+            {
+              'id' => 'doc-abc123:0',
+              'doc_id' => 'doc-abc123',
+              'file_path' => 'drive://Reports/2025/summary.txt',
+              'checksum' => '3a2b9c…',
+              'tokens' => 42,
+              'span_start' => 0,
+              'span_end' => 1799,
+              'created_at' => '2025-10-15T12:00:00Z',
+              'text' => 'First slice…'
+            }
+          ],
           'ok'    => true,
           'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 1, 'correlation_id' => 'sample' }
         }
-
       end
+
     },
     to_data_table_rows_batch: {
       title: 'Ingestion: To Data Table rows',
@@ -1367,6 +1485,10 @@ require 'json'
       display_priority: 6,
 
       config_fields: [
+        { name: 'row_profile', control_type: 'select', pick_list: 'table_row_profiles',
+          sticky: true, optional: true, hint: 'Standard is safe default.' },
+        { name: 'show_advanced', type: 'boolean', control_type: 'checkbox', sticky: true,
+          label: 'Show advanced options', hint: 'Reveal schema designer and metadata caps.' },
         { name: 'override_output_schema', type: 'boolean', control_type: 'checkbox',
           label: 'Design custom output schema' },
         { name: 'custom_output_schema', extends_schema: true, control_type: 'schema-designer',
@@ -1374,47 +1496,63 @@ require 'json'
           label: 'Output columns', sample_data_type: 'csv' }
       ],
 
-      input_fields: lambda do
-        [
-          { name: 'documents', type: 'array', of: 'object', optional: true },
-          { name: 'chunks', type: 'array', of: 'object', optional: true },
-          { name: 'table_name', optional: true },
-          { name: 'include_text', type: 'boolean', control_type: 'checkbox', optional: true, hint: 'Default true' }
+      input_fields: lambda do |_object_definitions = nil, cfg = {}|
+        advanced = !!cfg['show_advanced']
+        fields = [
+          { name: 'documents', type: 'array', of: 'object', optional: true,
+            hint: 'Each doc contains chunks:[...]' },
+          { name: 'chunks', type: 'array', of: 'object', optional: true,
+            hint: 'You can also pass a flat chunks list.' },
+          { name: 'table_name', optional: true, hint: 'Optional label for your downstream step' },
+          { name: 'include_text', type: 'boolean', control_type: 'checkbox', optional: true,
+            hint: 'Default true' }
         ]
+        if advanced
+          fields << { name: 'metadata_prefix', optional: true, hint: 'Prefix for flattened metadata (Wide). Default meta_' }
+          fields << { name: 'metadata_max_keys', type: 'integer', optional: true, hint: 'Cap flattened keys. Default 50' }
+          fields << { name: 'metadata_max_bytes', type: 'integer', optional: true, hint: 'Total bytes cap for flattened metadata. Default 4096' }
+        end
+        fields
       end,
 
-      output_fields: lambda do |object_definitions, _config_fields|
+      output_fields: lambda do |object_definitions, cfg|
         default_fields = [
           { name: 'table' },
+          { name: 'profile' },
           { name: 'count', type: 'integer' },
           { name: 'rows', type: 'array', of: 'object' }
         ]
-        call(:resolve_output_schema, default_fields, _config_fields, object_definitions)
+        call(:resolve_output_schema, default_fields, cfg, object_definitions)
       end,
 
-      execute: lambda do |_connection, input|
+      execute: lambda do |_connection, input, _schema = nil, _input_schema_name = nil, _connection_schema = nil, cfg = {}|
+        t0    = Time.now
+        corr  = call(:guid)
+        prof  = (cfg['row_profile'] || 'standard').to_s
         include_text = input['include_text'].nil? ? true : !!input['include_text']
         chunks = call(:flatten_chunks_input, input)
+        caps = {
+          'metadata_max_keys'  => input['metadata_max_keys'],
+          'metadata_max_bytes' => input['metadata_max_bytes']
+        }.compact
+        meta_prefix = (input['metadata_prefix'] || 'meta_').to_s
+
         rows = chunks.map do |c|
-          base = {
-            'id'         => call(:resolve_chunk_id, c),
-            'doc_id'     => c['doc_id'],
-            'file_path'  => c.dig('source','file_path'),
-            'checksum'   => c.dig('source','checksum'),
-            'tokens'     => c['tokens'],
-            'span_start' => c['span_start'],
-            'span_end'   => c['span_end'],
-            'metadata'   => call(:sanitize_metadata, c['metadata']),
-            'created_at' => c['created_at']
-          }
-          include_text ? base.merge('text' => c['text'].to_s) : base
+          call(:build_table_row, c, prof, include_text, meta_prefix, caps)
         end
-        { 'table' => input['table_name'].to_s, 'count' => rows.length, 'rows' => rows }
+
+        {
+          'table'   => input['table_name'].to_s,
+          'profile' => prof,
+          'count'   => rows.length,
+          'rows'    => rows
+        }.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
       end,
-  
+    
       sample_output: lambda do
         {
           'table' => 'kb_chunks',
+          'profile' => 'wide',
           'count' => 2,
           'rows' => [
             {
@@ -1425,11 +1563,14 @@ require 'json'
               'tokens' => 42,
               'span_start' => 0,
               'span_end' => 1799,
-              'metadata' => { 'department' => 'HR' },
               'created_at' => '2025-10-15T12:00:00Z',
-              'text' => 'First slice…'
+              'text' => 'First slice…',
+              'meta_department' => 'HR',
+              'meta_owner' => 'PeopleOps'
             }
-          ]
+          ],
+          'ok'    => true,
+          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 1, 'correlation_id' => 'sample' }
         }
       end
     },
@@ -1439,11 +1580,12 @@ require 'json'
       subtitle: 'Build {object_name, content_type, body} for corpus snapshot',
       display_priority: 5,
 
-      input_fields: lambda do
+      input_fields: lambda do |object_definitions, _cfg = {}|
         [
           { name: 'namespace', optional: true, hint: 'e.g., hr-knowledge-v1' },
           { name: 'doc_id', optional: true },
-          { name: 'chunks', type: 'array', of: 'object', optional: false },
+          { name: 'chunks', type: 'array', of: 'object', optional: false, properties: object_definitions['chunk'],
+            hint: 'Map the Chunks list.' },
           { name: 'prefix', optional: true, hint: 'e.g., manifests/' },
           { name: 'format', optional: true, hint: 'json|ndjson (default json)' }
         ]
@@ -1953,7 +2095,15 @@ require 'json'
         ['Auto from file_path', 'auto_from_path'],
         ['Advanced (enter JSON object)', 'advanced']
       ]
-    end
+    end,
+
+    table_row_profiles: lambda do |_connection = nil, _cfg = {}|
+      [
+        ['Slim (id, doc_id, file_path, +text?)', 'slim'],
+        ['Standard (adds checksum, tokens, span, created_at)', 'standard'],
+        ['Wide (Standard + flattened metadata)', 'wide']
+      ]
+    end,
   },
 
   # --------- TRIGGERS -----------------------------------------------------
