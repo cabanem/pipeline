@@ -282,7 +282,7 @@ require 'erb'
   # --------- ACTIONS ------------------------------------------------------
   actions: {
 
-    # 1) drive_list_files
+    # DRIVE
     drive_list_files: {
       title: 'Drive: List files',
       subtitle: 'List files in Drive',
@@ -504,8 +504,6 @@ require 'erb'
         }
       end
     },
-
-    # 2) drive_get_file
     drive_get_file: {
       title: 'Drive: Get file',
       subtitle: 'Fetch Drive file metadata and content',
@@ -598,7 +596,7 @@ require 'erb'
       end
     },
 
-    # 3) gcs_list_objects
+    # GCS
     gcs_list_objects: {
       title: 'GCS: List objects',
       subtitle: 'List objects in Google Cloud Storage bucket',
@@ -699,8 +697,6 @@ require 'erb'
         }
       end
     },
-
-    # 4) gcs_get_object
     gcs_get_object: {
       title: 'GCS: Get object',
       subtitle: 'Fetch an object from Google Cloud Storage bucket',
@@ -810,8 +806,6 @@ require 'erb'
         }
       end
     },
-
-    # 5) gcs_put_object
     gcs_put_object: {
       title: 'GCS: Put object',
       subtitle: 'Upload an object to Google Cloud Storage bucket',
@@ -909,7 +903,7 @@ require 'erb'
           call(:telemetry_envelope, t0, corr, false, (details['code'] || 0),
                details['message'] || e.to_s, details)
         )
-
+      end,
       sample_output: lambda do
         {
           'bucket' => 'my-bucket',
@@ -928,11 +922,11 @@ require 'erb'
       end
     },
 
-    # 6) transfer_drive_to_gcs
+    # TRANSFER (DRIVE --> GCS)
     transfer_drive_to_gcs: {
       title: 'Transfer: Drive → GCS',
       subtitle: 'Transfer a single file from Drive to Cloud Storage bucket',
-      display_priority: 10,
+      display_priority: 110,
       help: lambda do |_|
         { body: 'For each Drive file ID, fetch content (export Editors to text if selected) and upload to GCS under a prefix.' }
       end,
@@ -1037,12 +1031,10 @@ require 'erb'
         }
       end
     },
-
-    # 7) transfer_drive_to_gcs_batch
     transfer_drive_to_gcs_batch: {
       title: 'Transfer: Drive → GCS',
       subtitle: 'Transfer multiple items from Drive to Cloud Storage bucket',
-      display_priority: 10,
+      display_priority: 110,
       help: lambda do |_|
         { body: 'Upload many Drive files to GCS in one run, with optional per-item overrides (name, Editors mode, content-type, metadata). Partial success is returned.' }
       end,
@@ -1151,11 +1143,11 @@ require 'erb'
       end
     },
 
-    # 8) permission_probe
+    # CHECK PERMISSIONS
     permission_probe: {
       title: 'Permission probe (Drive & GCS)',
       subtitle: 'Verify token identity, Drive visibility, GCS access, and requester-pays',
-      display_priority: 1,
+      display_priority: 120,
       # PURPOSE
       #   One-shot diagnostic to verify:
       #     1) Token identity (email)
