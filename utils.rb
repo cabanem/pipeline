@@ -1577,14 +1577,16 @@ require 'json'
         ].compact
       end,
 
-      output_fields: lambda do |_object_definitions, _config_fields|
+      output_fields: lambda do |object_definitions, _config_fields|
         [
           { name: 'count', type: 'integer' },
-          { name: 'chunks', type: 'array', of: 'object' }
-        ]
+          { name: 'chunks', type: 'array', of: 'object', properties: object_definitions['chunk'] }
+        ] + Array(object_definitions['envelope_fields'])
       end,
 
       execute: lambda do |_connection, input|
+      t0   = Time.now
+      corr = call(:guid)
         align = (input['alignment'] || 'by_id').to_s
         id_key  = (input['id_key'] || 'id').to_s
         emb_key = (input['embedding_key'] || 'embedding').to_s
@@ -1641,13 +1643,18 @@ require 'json'
             end
           end
 
-        out = { 'count' => out_chunks.length, 'chunks' => out_chunks }
-        out['trace_id'] = call(:guid) if call(:safe_bool, input['debug'])
-        out
+      out = { 'count' => out_chunks.length, 'chunks' => out_chunks }
+      out['trace_id'] = call(:guid) if call(:safe_bool, input['debug'])
+      out.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
       end,
 
       sample_output: lambda do
-        { 'count' => 2, 'chunks' => [{ 'chunk_id' => 'docA:0', 'embedding' => [0.1, 0.2] }] }
+      {
+        'count' => 2,
+        'chunks' => [{ 'chunk_id' => 'docA:0', 'embedding' => [0.1, 0.2] }],
+        'ok' => true,
+        'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 1, 'correlation_id' => 'sample' }
+      }
       end
 
     },
@@ -1657,64 +1664,110 @@ require 'json'
       batch: true,
       display_priority: 7,
 
-      input_fields: lambda do |_object_definitions, _connection, _config_fields|
+      input_fields: lambda do |object_definitions, _connection, cfg|
         [
+          # Either process one big set...
+          { name: 'chunks', type: 'array', of: 'object', optional: true,
+            properties: object_definitions['chunk'], hint: 'Flat list (optional if using pairs[])' },
+          { name: 'embeddings_bundle', type: 'object', optional: true, properties: object_definitions['embedding_bundle'] },
+          { name: 'embeddings', type: 'array', of: 'object', optional: true,
+            properties: object_definitions['embedding_pair'] },
+          { name: 'vectors', type: 'array', of: 'object', optional: true, properties: object_definitions['vector_item'] },
+          { name: 'alignment', control_type: 'select', optional: true, pick_list: 'attach_alignment_modes' },
+          # ...or many sets via pairs[]
           { name: 'pairs', type: 'array', of: 'object', optional: true,
-            hint: 'Each: {chunks:[...], embeddings:[{id,embedding}], id_key?, embedding_key?}',
+            hint: 'Each: {chunks, embeddings_bundle?, embeddings?, vectors?, alignment?, id_key?, embedding_key?}',
             properties: [
               { name: 'chunks', type: 'array', of: 'object', properties: object_definitions['chunk'] },
+              { name: 'embeddings_bundle', type: 'object', properties: object_definitions['embedding_bundle'] },
               { name: 'embeddings', type: 'array', of: 'object', properties: object_definitions['embedding_pair'] },
+              { name: 'vectors', type: 'array', of: 'object', properties: object_definitions['vector_item'] },
+              { name: 'alignment', control_type: 'select', pick_list: 'attach_alignment_modes' },
               { name: 'id_key' }, { name: 'embedding_key' }
-            ] },
-          { name: 'chunks', type: 'array', of: 'object', optional: true, properties: object_definitions['chunk'] },
-          { name: 'embeddings', type: 'array', of: 'object', optional: true, properties: object_definitions['embedding_pair'] },
-          { name: 'id_key', optional: true, hint: 'Default id' },
-          { name: 'embedding_key', optional: true, hint: 'Default embedding' },
+            ]
+          },
+          { name: 'show_advanced', type: 'boolean', control_type: 'checkbox', optional: true, sticky: true,
+            label: 'Show advanced options' },
+          (cfg && cfg['show_advanced'] ? { name: 'id_key', optional: true, hint: 'Default id' } : nil),
+          (cfg && cfg['show_advanced'] ? { name: 'embedding_key', optional: true, hint: 'Default embedding' } : nil),
+          (cfg && cfg['show_advanced'] ? { name: 'strict', type: 'boolean', control_type: 'checkbox', optional: true } : nil),
           { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
-        ]
+        ].compact
       end,
 
-      output_fields: lambda do |_object_definitions, _config_fields|
+      output_fields: lambda do |object_definitions, _config_fields|
         [
           { name: 'count', type: 'integer' },
-          { name: 'chunks', type: 'array', of: 'object' },
+          { name: 'chunks', type: 'array', of: 'object', properties: object_definitions['chunk'] },
           { name: 'trace_id', optional: true }
-        ]
+        ] + Array(object_definitions['envelope_fields'])
       end,
 
       execute: lambda do |_connection, input|
-        id_key = (input['id_key'] || 'id').to_s
+        t0   = Time.now
+        corr = call(:guid)
+        id_key  = (input['id_key'] || 'id').to_s
         emb_key = (input['embedding_key'] || 'embedding').to_s
+        strict  = !!input['strict']
         merged = []
+
+        attach_once = lambda do |cList, opts|
+          align   = (opts['alignment'] || input['alignment'] || 'by_id').to_s
+          idk     = (opts['id_key'] || id_key).to_s
+          embk    = (opts['embedding_key'] || emb_key).to_s
+          # Build pairs from whichever embedding input is present
+          pairs =
+            if opts['embeddings_bundle'].is_a?(Hash)
+              call(:detect_pairs_from_bundle, opts['embeddings_bundle'])
+            elsif opts['embeddings'].is_a?(Array)
+              opts['embeddings'].map { |e| { 'id' => e[idk].to_s, 'embedding' => e[embk] } }.compact
+            else
+              []
+            end
+
+          if align == 'by_index'
+            vecs = call(:safe_array, opts['vectors']).map { |v| v.is_a?(Hash) ? v['values'] : v }
+            error('vectors length must equal chunks length') unless vecs.length == cList.length
+            return cList.each_with_index.map { |c,i|
+              v = vecs[i]; v.is_a?(Array) && !v.empty? ? c.merge('embedding' => v.map { |x| Float(x) rescue nil }.compact) : c
+            }
+          else
+            # by_id
+            idx = {}
+            dups = []
+            pairs.each do |p|
+              pid = p['id'].to_s
+              if pid.empty?
+                error('Found embedding without id') if strict
+                next
+              end
+              dups << pid if idx.key?(pid) && strict
+              idx[pid] = p['embedding']
+            end
+            error("Duplicate ids in embeddings: #{dups.uniq.join(', ')}") if strict && !dups.empty?
+            return cList.map { |c|
+              vec = idx[call(:resolve_chunk_id, c)]
+              vec.is_a?(Array) && !vec.empty? ? c.merge('embedding' => vec.map { |x| Float(x) rescue nil }.compact) : c
+            }
+          end
+        end
 
         if input['pairs'].is_a?(Array) && !input['pairs'].empty?
           input['pairs'].each do |p|
             next unless p.is_a?(Hash)
-            eList = call(:require_array_of_objects, p['embeddings'], 'embeddings')
             cList = call(:require_array_of_objects, p['chunks'], 'chunks')
-            idx = {}
-            eList.each { |e| idx[e[id_key].to_s] = e[emb_key] }
-            cList.each do |c|
-              cid = call(:resolve_chunk_id, c)
-              vec = idx[cid]
-              merged << (vec ? c.merge('embedding' => vec) : c)
-            end
+            merged.concat(attach_once.call(cList, p))
           end
+        elsif input['chunks'].is_a?(Array)
+          cList = call(:require_array_of_objects, input['chunks'], 'chunks')
+          merged.concat(attach_once.call(cList, input))
         else
-          eList = call(:require_array_of_objects, input['embeddings'] || [], 'embeddings')
-          cList = call(:require_array_of_objects, input['chunks']     || [], 'chunks')
-          idx = {}
-          eList.each { |e| idx[e[id_key].to_s] = e[emb_key] }
-          cList.each do |c|
-            cid = call(:resolve_chunk_id, c)
-            vec = idx[cid]
-            merged << (vec ? c.merge('embedding' => vec) : c)
-          end
+          error('Supply either top-level chunks[...] (+ embeddings*) or pairs[*].')
         end
 
         out = { 'count' => merged.length, 'chunks' => merged }
         out['trace_id'] = call(:guid) if call(:safe_bool, input['debug'])
-        out
+        out.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
       end,
 
       sample_output: lambda do
@@ -1733,7 +1786,9 @@ require 'json'
               'created_at' => '2025-10-15T12:00:00Z'
             }
           ],
-          'trace_id' => 'trace-attach-batch-1'
+          'trace_id' => 'trace-attach-batch-1',
+          'ok' => true,
+          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 1, 'correlation_id' => 'sample' }
         }
       end
     },
