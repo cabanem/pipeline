@@ -155,6 +155,31 @@ require 'erb'
         ] + Array(object_definitions['envelope_fields'])
       end
     },
+    gcs_object_full: {
+      fields: lambda do
+        [
+          { name: 'id' }, { name: 'bucket' }, { name: 'name' },
+          { name: 'size', type: 'integer' },
+          { name: 'content_type' }, { name: 'content_encoding' },
+          { name: 'storage_class' }, { name: 'generation' }, { name: 'metageneration' },
+          { name: 'time_created' }, { name: 'updated' },
+          { name: 'cache_control' }, { name: 'content_language' },
+          { name: 'kms_key_name' },
+          { name: 'metadata', type: 'object', properties: [] }, # open dict for pills
+          { name: 'media_link' },
+          { name: 'md5_hash_b64' }, { name: 'md5_hash_hex' },
+          { name: 'crc32c_b64' }, { name: 'crc32c_hex' },
+          { name: 'content_truncated', type: 'boolean' },
+          { name: 'text_content' },
+          { name: 'content_bytes' },
+          { name: 'content_md5' }, { name: 'content_sha256' },
+          { name: 'ok', type: 'boolean' },
+          { name: 'telemetry', type: 'object', properties: [
+              { name: 'http_status', type: 'integer' }
+          ]}
+        ]
+      end
+    },
 
     # --- Composite definitions
     drive_file_min: {
@@ -593,6 +618,26 @@ require 'erb'
           call(:telemetry_envelope, t0, corr, false, (details['code'] || 0),
                details['message'] || e.to_s, details)
         )
+      end,
+
+      sample_output: lambda do
+        {
+          'id'            => '1AbCdEfGhIjK',
+          'name'          => 'Handbook - PTO policy',
+          'mime_type'     => 'application/vnd.google-apps.document',
+          'size'          => nil,
+          'modified_time' => '2025-01-01T12:00:00Z',
+          'checksum'      => nil,
+          'web_view_url'  => 'https://drive.google.com/file/d/1AbCdEfGhIjK/view',
+          'owners'        => [{ 'display_name' => 'Drive Bot', 'email' => 'bot@example.com' }],
+          'exported_as'   => 'text/plain',
+          'text_content'  => 'Employees may carry over up to 40 hours...',
+          'content_bytes' => nil,
+          'content_md5'   => 'd41d8cd98f00b204e9800998ecf8427e',
+          'content_sha256'=> 'e3b0c44298fc1c149afbf4c8996fb924...',
+          'ok'            => true,
+          'telemetry'     => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 1, 'correlation_id' => 'sample' }
+        }
       end
     },
 
@@ -714,8 +759,16 @@ require 'erb'
       # CONTENT RULES
       #   - `content_mode=text` allowed only for textual MIME; otherwise 415 to prevent garbage text.
 
-      input_fields: lambda do |_obj, _conn, config_fields|
-        call(:ui_gcs_get_inputs, config_fields)
+      input_fields: lambda do
+        [
+          { name: 'bucket', optional: false, hint: 'GCS bucket' },
+          { name: 'object', optional: false, hint: 'Object name (URL-encoded safe, we will encode)' },
+          { name: 'content_mode', control_type: 'select', pick_list: [['Text','text'], ['Bytes','bytes']], optional: false, hint: 'Emit UTF-8 text or base64 bytes' },
+          { name: 'user_project', hint: 'Requester-pays billing project', optional: true },
+          { name: 'generation', hint: 'Read a specific generation (optional)', optional: true },
+          { name: 'if_generation_match', type: 'integer', optional: true, hint: 'Precondition: only if generation matches' },
+          { name: 'max_bytes', type: 'integer', optional: true, hint: 'Hard cap; truncate content and set content_truncated=true if exceeded (default 10MB)' }
+        ]
       end,
 
       output_fields: lambda do |object_definitions|
@@ -727,57 +780,100 @@ require 'erb'
         t0 = Time.now
         corr = SecureRandom.uuid
 
-        bucket = input['bucket']
-        name = input['object_name']
-        
-        # Fetch metadata first (derive contentType for branch decisions)
-        meta = get("https://storage.googleapis.com/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o/#{ERB::Util.url_encode(name)}")
-               .params(alt: 'json', userProject: connection['user_project'])
-        base = call(:map_gcs_meta, meta)
-        mode = (input['content_mode'] || 'none').to_s
-        strip = input.dig('postprocess', 'util_strip_urls') ? true : false
-        ctype = meta['contentType']
-        # Branched execution
+        bucket        = _['bucket']
+        object_raw    = _['object']
+        object        = URI.encode_www_form_component(object_raw)
+        content_mode  = (_['content_mode'] || 'text').to_s
+        user_project  = _['user_project'].presence
+        generation    = _['generation'].presence
+        if_gen_match  = _['if_generation_match']
+        max_bytes     = (_['max_bytes'] || 10 * 1024 * 1024).to_i
 
-        # - None
-        if mode == 'none'
-          base.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+        base = "https://storage.googleapis.com/storage/v1/b/#{bucket}/o/#{object}"
+        qp   = []
+        qp << "userProject=#{user_project}" if user_project
+        qp << "generation=#{generation}"    if generation
+        meta_url = "#{base}?#{qp.join('&')}"
 
-        # - Text
-        elsif mode == 'text'
-          # Guardrail: only textual MIME types → decode to UTF-8 (optionally strip URLs)
-          unless call(:util_is_textual_mime?, ctype)
-            error('415 Unsupported Media Type - Non-text object; use content_mode=bytes or none.')
-          end
-          bytes = get("https://storage.googleapis.com/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o/#{ERB::Util.url_encode(name)}")
-                  .params(alt: 'media', userProject: connection['user_project'])
-                  .response_format_raw
-          raw  = bytes.to_s
-          text = call(:util_force_utf8, raw)
-          text = call(:util_strip_urls, text) if strip
-          cs = call(:util_compute_checksums, raw)
-          base.merge(
-            'text_content'    => text,
-            'content_md5'     => cs['md5'],
-            'content_sha256'  => cs['sha256']
-          ).merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+        headers = {
+          'Accept'           => 'application/json',
+          'Accept-Encoding'  => 'identity' # avoid gzip transcoding ambiguity
+        }
+        headers['x-goog-user-project'] = user_project if user_project
 
-        # - Bytes
-        elsif mode == 'bytes'
-          # Always allowed, returns Base64 plus checksums
-          bytes = get("https://storage.googleapis.com/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o/#{ERB::Util.url_encode(name)}")
-                  .params(alt: 'media', userProject: connection['user_project'])
-                  .response_format_raw
-          raw = bytes.to_s
-          cs  = call(:util_compute_checksums, raw)
-          base.merge(
-            'content_bytes'   => Base64.strict_encode64(raw),
-            'content_md5'     => cs['md5'],
-            'content_sha256'  => cs['sha256']
-          ).merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
-        else
-          error("400 Bad Request - Unknown content_mode: #{mode}")
+        meta = get(meta_url, headers)
+
+        media_qp = ["alt=media","prettyPrint=false"]
+        media_qp << "userProject=#{user_project}" if user_project
+        media_qp << "generation=#{generation}"    if generation
+        media_url = "#{base}?#{media_qp.join('&')}"
+
+        media_headers = { 'Accept-Encoding' => 'identity' }
+        media_headers['x-goog-user-project'] = user_project if user_project
+        media_headers['If-Generation-Match'] = if_gen_match.to_s if if_gen_match
+
+        # Stream/read bytes
+        bytes = get(media_url, media_headers)
+
+        # Hard cap
+        truncated = false
+        if bytes.bytesize > max_bytes
+          bytes = bytes.byteslice(0, max_bytes)
+          truncated = true
         end
+
+        content_type = (meta['contentType'] || 'application/octet-stream').to_s
+
+        is_textual = call(:util_is_textual_mime?, content_type) ||
+                    %w[application/json application/xml image/svg+xml text/csv text/tab-separated-values].include?(content_type)
+
+        # Normalize text or return base64 bytes
+        if content_mode == 'text' && is_textual
+          text = call(:util_to_utf8, bytes)
+          content_bytes_b64 = nil
+          text_content      = text
+        else
+          text_content      = nil
+          content_bytes_b64 = Base64.strict_encode64(bytes)
+        end
+
+        # Checksums
+        local_md5_hex     = call(:util_md5_hex, bytes)
+        local_sha256_hex  = call(:util_sha256_hex, bytes)
+        gcs_md5_b64       = meta['md5Hash']
+        gcs_crc32c_b64    = meta['crc32c']
+
+        {
+          id:               meta['id'],
+          bucket:           meta['bucket'],
+          name:             meta['name'],
+          size:             meta['size'].to_i,
+          content_type:     content_type,
+          content_encoding: meta['contentEncoding'],
+          storage_class:    meta['storageClass'],
+          generation:       meta['generation'],
+          metageneration:   meta['metageneration'],
+          time_created:     meta['timeCreated'],
+          updated:          meta['updated'],
+          cache_control:    meta['cacheControl'],
+          content_language: meta['contentLanguage'],
+          kms_key_name:     meta['kmsKeyName'],
+          metadata:         meta['metadata'],
+          media_link:       meta['mediaLink'],
+          md5_hash_b64:     gcs_md5_b64,
+          md5_hash_hex:     call(:util_b64md5_to_hex, gcs_md5_b64),
+          crc32c_b64:       gcs_crc32c_b64,
+          crc32c_hex:       call(:util_b64crc32c_to_hex, gcs_crc32c_b64),
+          content_truncated: truncated,
+          text_content:     text_content,
+          content_bytes:    content_bytes_b64,
+          content_md5:      local_md5_hex,
+          content_sha256:   local_sha256_hex,
+          ok:               true,
+          telemetry:        { http_status: 200 }
+        }
+      end
+
       rescue => e
         details = call(:google_error_extract, e)
         {}.merge(
@@ -788,23 +884,36 @@ require 'erb'
 
       sample_output: lambda do
         {
+          'id' => 'b/my-bucket/o/handbook.txt/1699999999999999',
           'bucket' => 'my-bucket',
-          'name' => 'path/to/file.txt',
-          'size' => 123,
+          'name' => 'handbook.txt',
+          'size' => 12345,
           'content_type' => 'text/plain',
-          'updated' => '2025-01-01T00:00:00Z',
-          'generation' => '1735689600000000',
-          'md5_hash' => '1B2M2Y8AsgTpgAmY7PhCfg==',
-          'crc32c' => 'AAAAAA==',
-          'metadata' => { 'source' => 'ingest' },
-          'text_content' => 'hello world',
+          'content_encoding' => nil,
+          'storage_class' => 'STANDARD',
+          'generation' => '1699999999999999',
+          'metageneration' => '1',
+          'time_created' => '2025-01-01T12:00:00Z',
+          'updated' => '2025-01-01T12:00:00Z',
+          'cache_control' => 'private, max-age=0',
+          'content_language' => 'en',
+          'kms_key_name' => nil,
+          'metadata' => { 'source' => 'hr', 'doc' => 'pto' },
+          'media_link' => 'https://storage.googleapis.com/download/storage/v1/b/my-bucket/o/handbook.txt?generation=1699...&alt=media',
+          'md5_hash_b64' => '1B2M2Y8AsgTpgAmY7PhCfg==',
+          'md5_hash_hex' => 'd41d8cd98f00b204e9800998ecf8427e',
+          'crc32c_b64' => 'AAAAAA==',
+          'crc32c_hex' => '00000000',
+          'content_truncated' => false,
+          'text_content' => "Employees may carry over up to 40 hours...\n",
           'content_bytes' => nil,
           'content_md5' => 'd41d8cd98f00b204e9800998ecf8427e',
           'content_sha256' => 'e3b0c44298fc1c149afbf4c8996fb924...',
           'ok' => true,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 1, 'correlation_id' => 'sample' }
+          'telemetry' => { 'http_status' => 200 }
         }
       end
+
     },
     gcs_put_object: {
       title: 'GCS: Put object',
@@ -1283,44 +1392,35 @@ require 'erb'
     end,
 
     util_editors_export_mime: lambda do |source_mime, preferred_export_mime|
-      # Choose the export MIME for Google Drive files
-      # If caller provides preferred_export_mime, use it *when compatible* with the source type,
-      # otherwise fall back to a sensible default that Google accepts.
-      src = (source_mime || '')
+      # Choose export MIME for Google Editors when caller wants *text*.
+      # If caller supplies an allowed textual MIME for the type, use it;
+      # otherwise pick a textual default to keep content_mode=text truly textual.
+      src  = (source_mime || '')
       pref = preferred_export_mime.to_s
 
       case src
-      when 'application/vnd.google-apps.document'
-        allowed = %w[
-          application/pdf
-          application/vnd.openxmlformats-officedocument.wordprocessingml.document
-          text/plain
-        ]
-        allowed.include?(pref) ? pref : 'application/pdf'
+      when 'application/vnd.google-apps.document'      # Docs
+        allowed = %w[text/plain application/vnd.openxmlformats-officedocument.wordprocessingml.document application/pdf]
+        # Prefer plain text by default for text mode
+        allowed.include?(pref) ? pref : 'text/plain'
 
-      when 'application/vnd.google-apps.spreadsheet'
-        allowed = %w[
-          text/csv
-          application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
-        ]
-        allowed.include?(pref) ? pref : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+      when 'application/vnd.google-apps.spreadsheet'   # Sheets
+        allowed = %w[text/csv application/vnd.openxmlformats-officedocument.spreadsheetml.sheet]
+        # Prefer CSV for text mode
+        allowed.include?(pref) ? pref : 'text/csv'
 
-      when 'application/vnd.google-apps.presentation'
-        allowed = %w[
-          application/pdf
-          text/plain
-        ]
-        allowed.include?(pref) ? pref : 'application/pdf'
+      when 'application/vnd.google-apps.presentation'  # Slides
+        allowed = %w[text/plain application/pdf]
+        # Prefer plain text for text mode
+        allowed.include?(pref) ? pref : 'text/plain'
 
-      when 'application/vnd.google-apps.drawing'
-        allowed = %w[
-          image/svg+xml
-          image/png
-        ]
+      when 'application/vnd.google-apps.drawing'       # Drawings
+        allowed = %w[image/svg+xml image/png]
+        # SVG is textual (XML), so still safe for text consumption paths
         allowed.include?(pref) ? pref : 'image/svg+xml'
 
       else
-        # Non-editors or unknown → caller should not invoke export.
+        # Non-Editors or unknown → caller should not invoke export.
         pref.presence || 'application/octet-stream'
       end
     end,
@@ -1348,6 +1448,36 @@ require 'erb'
       return '' if p.empty?
       p.end_with?('/') ? p : "#{p}/"
     end,
+
+    util_is_textual_mime?: lambda do |mime|
+      m = (mime || '').downcase
+      m.start_with?('text/') ||
+      m.include?('charset=') ||
+      m == 'application/javascript'
+    end,
+
+    util_to_utf8: lambda do |bytes|
+      str = bytes.is_a?(String) ? bytes.dup : bytes.to_s
+      str.force_encoding('UTF-8')
+      str = str.encode('UTF-8', invalid: :replace, undef: :replace, replace: '�') unless str.valid_encoding?
+      # strip UTF-8 BOM
+      str.sub!(/\A\xEF\xBB\xBF/, '')
+      str
+    end,
+
+    util_md5_hex: lambda { |bytes| Digest::MD5.hexdigest(bytes) },
+    util_sha256_hex: lambda { |bytes| Digest::SHA256.hexdigest(bytes) },
+
+    util_b64md5_to_hex: lambda do |b64|
+      return nil unless b64
+      Digest::MD5.new.update(Base64.decode64(b64)).hexdigest
+    end,
+
+    util_b64crc32c_to_hex: lambda do |b64|
+      return nil unless b64
+      # GCS CRC32C is big-endian; decode and hexlify
+      Base64.decode64(b64).unpack1('H*')
+    end
 
     # --- 3. TELEMETRY --------------------
     telemetry_envelope: lambda do |started_at, correlation_id, ok, code, message, upstream_details=nil|
@@ -1834,16 +1964,8 @@ require 'erb'
     # --- 9. UI BUILDERS ------------------
     ui_content_mode_field: lambda do |pick_list_key, default|
       # Pick-list field with extends_schema for dynamic re-rendering
-      {
-        name: 'content_mode',
-        label: 'Content mode',
-        control_type: 'select',
-        pick_list: pick_list_key,
-        optional: false,
-        default: default,
-        extends_schema: true,
-        hint: 'Switch to reveal relevant inputs.'
-      }
+      { name: 'content_mode', label: 'Content mode', control_type: 'select', pick_list: pick_list_key, 
+        optional: false, default: default, extends_schema: true, hint: 'Switch to reveal relevant inputs.'  }
     end,
     ui_write_body_fields: lambda do |mode|
       # For PUT (write): either text content + postprocess, or base64 bytes
