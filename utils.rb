@@ -26,22 +26,6 @@ require 'json'
 
   # --------- OBJECT DEFINITIONS -------------------------------------------
   object_definitions: {
-   table_row: {
-     fields: lambda do |_object_definitions = nil, _config_fields = {}|
-       [
-         { name: 'id' },
-         { name: 'doc_id' },
-         { name: 'file_path' },
-         { name: 'checksum' },
-         { name: 'tokens', type: 'integer' },
-         { name: 'span_start', type: 'integer' },
-         { name: 'span_end',   type: 'integer' },
-         { name: 'created_at' },
-         # text is optional (include_text flag). Declare it so pills exist even if omitted.
-         { name: 'text' }
-       ]
-     end
-   },
     table_row: {
       fields: lambda do |_object_definitions = nil, _config_fields = {}|
         [
@@ -635,12 +619,7 @@ require 'json'
         { name: 'preset', control_type: 'select', pick_list: 'chunking_presets', sticky: true,
           optional: true, hint: 'Auto picks sensible sizes from content length.' },
         { name: 'show_advanced', type: 'boolean', control_type: 'checkbox', sticky: true,
-          label: 'Show advanced options', hint: 'Reveal custom sizes, JSON metadata, and caps.' },
-        { name: 'override_output_schema', type: 'boolean', control_type: 'checkbox',
-          label: 'Design custom output schema', hint: 'Use Schema Builder for datapills.' },
-        { name: 'custom_output_schema', extends_schema: true, control_type: 'schema-designer',
-          schema_neutral: false, sticky: true, optional: true, label: 'Output columns',
-          sample_data_type: 'csv' }
+          label: 'Show advanced options', hint: 'Reveal custom sizes, JSON metadata, and caps.' }
       ],
 
       input_fields: lambda do |_object_definitions, cfg|
@@ -690,7 +669,7 @@ require 'json'
       end,
 
       output_fields: lambda do |object_definitions, _config_fields|
-        default_fields = [
+        [
           { name: 'doc_id' },
           { name: 'file_path' },
           { name: 'checksum' },
@@ -699,11 +678,10 @@ require 'json'
           { name: 'overlap_chars', type: 'integer' },
           { name: 'created_at' },
           { name: 'duration_ms', type: 'integer' },
-          { name: 'chunks', type: 'array', of: 'object', properties: object_definitions['chunk'] },
+          { name: 'chunks', type: 'array', of: 'object', properties: (object_definitions['chunk'] || []) },
           { name: 'trace_id', optional: true },
           { name: 'notes', optional: true }
-        ]
-        call(:resolve_output_schema, default_fields, _config_fields, object_definitions)
+        ] + Array(object_definitions['envelope_fields'])
       end,
 
       execute: lambda do |_connection, input, _schema = nil, _input_schema_name = nil, _connection_schema = nil, _cfg = {}|
@@ -1425,13 +1403,7 @@ require 'json'
         { name: 'row_profile', control_type: 'select', pick_list: 'table_row_profiles',
           sticky: true, optional: true, hint: 'Standard is safe default.' },
         { name: 'show_advanced', type: 'boolean', control_type: 'checkbox', sticky: true,
-          label: 'Show advanced options', hint: 'Reveal schema designer and metadata caps.' },
-        { name: 'override_output_schema', type: 'boolean', control_type: 'checkbox',
-          label: 'Design custom output schema', hint: 'Use Schema Builder for datapills.' },
-        { name: 'custom_output_schema', extends_schema: true, control_type: 'schema-designer',
-          schema_neutral: false, sticky: true, optional: true,
-          label: 'Output columns', hint: 'Define output fields (datapills).',
-          sample_data_type: 'csv' }
+          label: 'Show advanced options', hint: 'Reveal metadata caps.' }
       ],
 
       input_fields: lambda do |object_definitions = nil, cfg = {}|
@@ -1441,7 +1413,7 @@ require 'json'
             hint: 'Directly map the whole output of “Prepare document for indexing”' },
           { name: 'batch', type: 'object', optional: true,
             hint: 'Directly map the whole output of “Prepare multiple documents for indexing”' },
-          { name: 'chunks', type: 'array', of: 'object', optional: true, properties: object_definitions['chunk'],
+          { name: 'chunks', type: 'array', of: 'object', optional: true, properties: (object_definitions['chunk'] || []),
             hint: 'Alternatively, map a flat chunks list.' },
           { name: 'table_name', optional: true, hint: 'Optional label for your downstream step' },
           { name: 'include_text', type: 'boolean', control_type: 'checkbox', optional: true,
@@ -1455,14 +1427,13 @@ require 'json'
         fields
       end,
 
-      output_fields: lambda do |object_definitions, cfg|
-        default_fields = [
+      output_fields: lambda do |object_definitions, _cfg|
+        [
           { name: 'table' },
           { name: 'profile' },
           { name: 'count', type: 'integer' },
-          { name: 'rows', type: 'array', of: 'object', properties: object_definitions['table_row'] }
-        ]
-        call(:resolve_output_schema, default_fields, cfg, object_definitions)
+          { name: 'rows', type: 'array', of: 'object', properties: (object_definitions['chunk'] || [])
+        ] + Array(object_definitions['envelope_fields'])
       end,
 
       execute: lambda do |_connection, input, _schema = nil, _input_schema_name = nil, _connection_schema = nil, cfg = {}|
