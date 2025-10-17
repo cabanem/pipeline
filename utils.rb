@@ -189,7 +189,37 @@ require 'json'
             hint: 'Alternate: predictions[*].embedding (float array)' }
         ]
       end
-    }
+    },
+    embedding_pair: {
+      fields: lambda do |_|
+        [
+          { name: 'id' },
+          { name: 'embedding', type: 'array', of: 'number' }
+        ]
+      end
+    },
+    embedding_bundle: {
+      fields: lambda do |object_definitions|
+        [
+          { name: 'embeddings', type: 'array', of: 'object',
+            properties: object_definitions['embedding_pair'],
+            hint: 'Output of “Map Vertex embeddings to ids”' },
+          { name: 'count', type: 'integer', optional: true },
+          { name: 'vector_dim', type: 'integer', optional: true },
+          { name: 'trace_id', optional: true }
+        ]
+      end
+    },
+
+    vector_item: {
+      fields: lambda do |_|
+        [
+          # Workato can’t map into bare arrays; wrap each vector as an object.
+          { name: 'values', type: 'array', of: 'number',
+            hint: 'One embedding vector (float array)' }
+        ]
+      end
+    },
   },
 
   # --------- METHODS ------------------------------------------------------
@@ -1522,16 +1552,16 @@ require 'json'
 
       input_fields: lambda do |object_definitions, _connection, cfg|
         [
-            { name: 'chunks', type: 'array', of: 'object', optional: false, properties: object_definitions['chunk'],
+          { name: 'chunks', type: 'array', of: 'object', optional: false, properties: object_definitions['chunk'],
             hint: 'Map the Chunks list from “Prepare document for indexing” or later.' },
           # --- Simple / Recommended path ---
-          { name: 'embeddings_bundle', type: 'object', optional: true,
-            hint: 'Map the whole object from “Map Vertex embeddings to ids”. Looks like: { embeddings:[{id, embedding}] }' },
+          { name: 'embeddings_bundle', type: 'object', optional: true, properties: object_definitions['embedding_bundle'],
+            hint: 'Map the whole output of “Map Vertex embeddings to ids”.' },
           # --- Alternate inputs (only one is needed) ---
           { name: 'embeddings', label: 'Embeddings [{id,embedding}]', type: 'array', of: 'object', optional: true,
-            properties: [{ name: 'id' }, { name: 'embedding', type: 'array', of: 'number' }],
-            hint: 'Use when you already have the list of {id, embedding} objects.' },
-          { name: 'vectors', label: 'Vectors [[…],[…]] (parallel to chunks)', type: 'array', of: 'array', optional: true, hint: 'Use only if you have no ids; requires Alignment = by_index.' },
+            properties: object_definitions['embedding_pair'], hint: 'Use when you already have the list of {id, embedding} objects.' },
+          { name: 'vectors', label: 'Vectors (parallel to chunks)', type: 'array', of: 'object', optional: true,
+            properties: object_definitions['vector_item'],  hint: 'Use only if you have no ids; requires Alignment = by_index.' },
           { name: 'alignment', control_type: 'select', optional: true,
             pick_list: 'attach_alignment_modes', hint: 'Default: by_id (safer)' },
           { name: 'show_advanced', type: 'boolean', control_type: 'checkbox', optional: true, sticky: true,
@@ -1571,7 +1601,7 @@ require 'json'
           end.compact
         elsif input['vectors'].is_a?(Array)
           error('Alignment must be by_index when using vectors') unless align == 'by_index'
-          vecs = input['vectors']
+          vecs = input['vectors'].map { |v| v.is_a?(Hash) ? v['values'] : v }
           error('vectors length must equal chunks length') unless vecs.length == chunks.length
           # Will attach by index below
         end
@@ -2461,7 +2491,7 @@ require 'json'
         ['Match by index (vectors[i] -> chunks[i])', 'by_index']
       ]
     end,
-    
+
     item_schema_field_names: lambda do |_connection, _config_fields = {}|
       fields = _config_fields['item_schema'].is_a?(Array) ? _config_fields['item_schema'] : []
       names  = fields.map { |f| f['name'].to_s }.reject(&:empty?).uniq
