@@ -834,8 +834,6 @@ require 'json'
       subtitle: 'Cleans + chunks N documents; returns an array of per-doc results',
       batch: true,
       display_priority: 10,
-      # Not really deprecated, just not ready for use yet
-      deprecated: true,
 
       config_fields: [
         {
@@ -880,7 +878,7 @@ require 'json'
         ]
       end,
 
-      output_fields: lambda do |object_definitions|
+      output_fields: lambda do |object_definitions, _config_fields|
         [
           {
             name: 'results', type: 'array', of: 'object', properties: [
@@ -1330,11 +1328,11 @@ require 'json'
         ]
       end,
 
-      output_fields: lambda do |_|
+      output_fields: lambda do |object_definitions, _config_fields|
         [
           { name: 'chunks', type: 'array', of: 'object',
-            properties: object_definitions['chunk'] || [] }
-        ].concat(object_definitions['envelope_fields'] || [])
+            properties: object_definitions['chunk'] }
+        ].concat(object_definitions['envelope_fields'] )
       end,
 
       sample_output: lambda do |_|
@@ -1516,7 +1514,7 @@ require 'json'
       batch: true,
       display_priority: 7,
 
-      input_fields: lambda do |_object_definitions, _connection, _config_field|
+      input_fields: lambda do |_object_definitions, _connection, _config_fields|
         [
           { name: 'pairs', type: 'array', of: 'object', optional: true,
             hint: 'Each: {chunks:[...], embeddings:[{id,embedding}], id_key?, embedding_key?}',
@@ -1535,7 +1533,7 @@ require 'json'
         ]
       end,
 
-      output_fields: lambda do
+      output_fields: lambda do |_object_definitions, _config_fields|
         [
           { name: 'count', type: 'integer' },
           { name: 'chunks', type: 'array', of: 'object' },
@@ -1951,7 +1949,7 @@ require 'json'
         ]
       end,
 
-      output_fields: lambda do |_object_definitions, _config_fields|
+      output_fields: lambda do |object_definitions, _config_fields|
         [
           { name: 'count', type: 'integer' },
           { name: 'manifests', type: 'array', of: 'object', properties: [
@@ -2277,7 +2275,7 @@ require 'json'
         ]
       end,
 
-      output_fields: lambda do
+      output_fields: lambda do |_object_definitions, _config_fields|
         [
           { name: 'answer' },
           { name: 'citation_count', type: 'integer' },
