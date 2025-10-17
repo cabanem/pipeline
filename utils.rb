@@ -112,7 +112,7 @@ require 'json'
       end
     },
     ingest_item: {
-      fields: lambda do |_object_definitions, _config_fields|
+      fields: lambda do |_object_definitions, _config_fields = {}|
         # If user designed a schema, use it; else default to your canonical item.
         if _config_fields['design_item_schema'] &&
            _config_fields['item_schema'].is_a?(Array) &&
@@ -282,7 +282,7 @@ require 'json'
     schema_builder_ingest_items_config_fields: lambda do
       [
         { name: 'design_item_schema', type: 'boolean', control_type: 'checkbox', label: 'Design item schema',
-          hint: 'Check to use Schema Builder to define the shape of each list element.' },
+          sticky: true, hint: 'Check to use Schema Builder to define the shape of each list element.' },
         {
           name: 'item_schema',
           extends_schema: true,
@@ -365,12 +365,23 @@ require 'json'
 
       input_fields: lambda do
         [
-          { name: 'file_path', label: 'File path / source key', optional: true },
-          { name: 'content', label: 'Raw text content', optional: false, control_type: 'text-area' },
-          { name: 'max_chunk_chars', type: 'integer', optional: true, hint: 'Default 2000; hard clamp [200..8000]' },
-          { name: 'overlap_chars', type: 'integer', optional: true, hint: 'Default 200; must be < max_chunk_chars' },
-          { name: 'metadata', type: 'object', optional: true, hint: 'Arbitrary key/value pairs to carry forward' },
-          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true, hint: 'Include trace and timings in output' }
+          { name: 'file_path', label: 'Source URI (recommended)',
+            hint: 'Stable URI like gcs://bucket/path or drive://folder/file; used to derive deterministic doc_id.',
+            optional: true },
+          { name: 'content', label: 'Plain text content (required)',
+            hint: 'UTF-8 text only. Convert PDFs/DOCX before calling.',
+            optional: false, control_type: 'text-area' },
+          { name: 'max_chunk_chars', label: 'Max characters per chunk',
+            type: 'integer', optional: true,
+            hint: 'Default 2000. Allowed range: 200–8000.' },
+          { name: 'overlap_chars', label: 'Overlap between chunks (chars)',
+            type: 'integer', optional: true,
+            hint: 'Default 200. Must be less than Max characters per chunk.' },
+          { name: 'metadata', type: 'object', optional: true,
+            hint: 'Small JSON-safe facts (strings/numbers/bools/flat objects). Avoid large blobs/PII.' },
+          { name: 'debug', label: 'Include debug notes',
+            type: 'boolean', control_type: 'checkbox', optional: true,
+            hint: 'Adds trace_id and normalization notes to the output.' }
         ]
       end,
 
@@ -406,9 +417,14 @@ require 'json'
         cleaned    = call(:strip_control_chars, normalized)
 
         # 2) Bounds and defaults
-        max_chars  = call(:clamp_int, (input['max_chunk_chars'] || 2000), 200, 8000)
-        overlap    = call(:clamp_int, (input['overlap_chars']  || 200),   0,   4000)
-        overlap    = [overlap, max_chars - 1].min
+        max_in     = input['max_chunk_chars']
+        ov_in      = input['overlap_chars']
+        max_chars  = call(:clamp_int, (max_in || 2000), 200, 8000)
+        overlap    = call(:clamp_int, (ov_in  || 200),  0,   4000)
+        # Hard rule: overlap must be < max_chars (don’t silently fix without telling the user)
+        if overlap >= max_chars
+          error("overlap_chars (#{overlap}) must be less than max_chunk_chars (#{max_chars}). Try overlap_chars=#{[max_chars/10,1].max}.")
+        end
 
         # 3) IDs
         checksum   = Digest::SHA256.hexdigest(cleaned)
@@ -508,7 +524,7 @@ require 'json'
         { name: 'item_overlap_chars_field',   control_type: 'select', label: 'Item field: overlap_chars',   optional: true, pick_list: 'item_schema_field_names' }
       ],
 
-      input_fields: lambda do |object_definitions, _config_fields|
+      input_fields: lambda do |object_definitions, _config_fields ={}|
         [
           {
             name: 'items',
@@ -1653,7 +1669,7 @@ require 'json'
   # --------- PICK LISTS ---------------------------------------------------
   pick_lists: {
 
-    item_schema_field_names: lambda do |_connection, _config_fields|
+    item_schema_field_names: lambda do |_connection, _config_fields = {}|
       fields = _config_fields['item_schema'].is_a?(Array) ? _config_fields['item_schema'] : []
       names  = fields.map { |f| f['name'].to_s }.reject(&:empty?).uniq
       names.map { |n| [n, n] }
