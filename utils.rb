@@ -1397,29 +1397,66 @@ require 'json'
       title: 'Ingestion: Extract chunks',
       subtitle: 'Accepts {chunks:[...]} or {results:[{chunks:[...]}]} and emits {chunks:[...]}',
       display_priority: 6,
+
       input_fields: lambda do |object_definitions, _config_fields = {}|
         [
-          { name: 'document', type: 'object', optional: true, properties: (object_definitions['prep_result'] || []),
+          { name: 'document', type: 'object', optional: true,
+            properties: (object_definitions['prep_result'] || []),
             hint: 'Output of Prepare document for indexing (single)' },
-          { name: 'batch', type: 'object', optional: true, properties: (object_definitions['prep_batch'] || []),
-            hint: 'Output of Prepare multiple documents for indexing (batch)' }
+          { name: 'batch', type: 'object', optional: true,
+            properties: (object_definitions['prep_batch'] || []),
+            hint: 'Output of Prepare multiple documents for indexing (batch)' },
+          { name: 'chunks', type: 'array', of: 'object', optional: true,
+            properties: object_definitions['chunk'],
+            hint: 'Alternative: map a flat chunks list directly' }
         ]
       end,
+
       output_fields: lambda do |object_definitions|
-        [{ name: 'chunks', type: 'array', of: 'object', properties: object_definitions['chunk'] }]
+        [
+          { name: 'chunks', type: 'array', of: 'object', properties: object_definitions['chunk'] }
+        ] + Array(object_definitions['envelope_fields'])
       end,
-      execute: lambda do |_conn, input|
+
+      execute: lambda do |_connection, input|
+        t0    = Time.now
+        corr  = call(:guid)
         doc   = input['document'].is_a?(Hash) ? input['document'] : {}
-        batch = input['batch'].is_a?(Hash) ? input['batch'] : {}
+        batch = input['batch'].is_a?(Hash)    ? input['batch']    : {}
+
         chunks =
-          if doc['chunks'].is_a?(Array)
+          if input['chunks'].is_a?(Array)
+            input['chunks']
+          elsif doc['chunks'].is_a?(Array)
             doc['chunks']
           elsif batch['results'].is_a?(Array)
             batch['results'].flat_map { |r| (r || {})['chunks'] || [] }
           else
             []
           end
+
         { 'chunks' => chunks }
+          .merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+      end,
+      sample_output: lambda do
+        {
+          'chunks' => [
+            {
+              'doc_id' => 'doc-abc123',
+              'chunk_id' => 'doc-abc123:0',
+              'index' => 0,
+              'text' => 'First slice…',
+              'tokens' => 42,
+              'span_start' => 0,
+              'span_end' => 1799,
+              'source' => { 'file_path' => 'drive://Reports/2025/summary.txt', 'checksum' => '3a2b9c…' },
+              'metadata' => { 'department' => 'HR' },
+              'created_at' => '2025-10-15T12:00:00Z'
+            }
+          ],
+          'ok' => true,
+          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 1, 'correlation_id' => 'sample' }
+        }
       end
     },
     to_data_table_rows: {
