@@ -493,7 +493,39 @@ require 'json'
       else
         {}
       end
+    end,
+    # Size heuristics chosen to “just work”:
+    # - short docs keep chunks small to avoid over-splitting
+    # - long docs increase chunk to reduce record explosion
+    auto_chunk_bounds_for: lambda do |text_len|
+      n = text_len.to_i
+      case n
+      when 0..2_000     then { 'max' => 800,  'overlap' => 80  }   # ~1–2 pages
+      when 2_001..8_000 then { 'max' => 1_600,'overlap' => 160 }   # ~3–8 pages
+      when 8_001..25_000 then { 'max' => 2_400,'overlap' => 200 }  # ~10–30 pages
+      else                  { 'max' => 3_600,'overlap' => 240 }    # larger corpora
+      end
+    end,
+    choose_metadata_simple: lambda do |input|
+      # Priority: KV > Tags > Use path > nothing
+      pairs = input['metadata_kv'].is_a?(Array) ? input['metadata_kv'] : []
+      unless pairs.empty?
+        out = {}
+        pairs.each do |p|
+          next unless p.is_a?(Hash)
+          k = p['key'].to_s.strip
+          next if k.empty?
+          out[k] = p['value']
+        end
+        return out
+      end
+      tags_csv = input['metadata_tags_csv'].to_s
+      tags = tags_csv.split(',').map { |t| t.strip }.reject(&:empty?)
+      return({ 'tags' => tags }) unless tags.empty?
+      return call(:parse_file_path_meta, input['file_path']) if input['metadata_use_path'] == true
+      {}
     end
+
   },
 
   # --------- ACTIONS ------------------------------------------------------
@@ -507,26 +539,14 @@ require 'json'
       subtitle: 'Cleans, chunks, and emits chunk records with IDs + metadata',
       display_priority: 10,
       help: lambda do |_|
-        { body: 'Provide raw text and (optionally) a file path + metadata. Returns normalized chunks ready for embedding/indexing.' }
+        { body: 'Paste text, optionally include a Source URI, pick a Chunk size (Auto is best). Add metadata via rows/tags — no JSON needed. Use “Show advanced options” for custom sizes or JSON metadata.' }
       end,
 
       config_fields: [
-        { name: 'mode_simple', type: 'boolean', control_type: 'checkbox', sticky: true,
-          label: 'Simple mode', hint: 'Recommended. Uses presets unless you enter custom values.' },
         { name: 'preset', control_type: 'select', pick_list: 'chunking_presets', sticky: true,
-          optional: true, hint: 'Choose a preset; select Custom to enable manual sizes.' },
-        { name: 'metadata_source', control_type: 'select', pick_list: 'metadata_sources',
-          label: 'Metadata source', sticky: true, optional: false, hint: 'Hide JSON. Let builders pick KV, tags, or auto.' },
-        { name: 'advanced_json', type: 'boolean', control_type: 'checkbox', sticky: true, optional: true,
-          label: 'Enable Advanced JSON field (for power users)' },
-        { name: 'metadata_mode', control_type: 'select', pick_list: 'metadata_modes', sticky: true,
-          label: 'Metadata handling', optional: true, hint: 'Default: Flat & safe.' },
-        { name: 'metadata_prefix', optional: true, sticky: true,
-          hint: 'Optional prefix for flattened keys, e.g., "src_"' },
-        { name: 'metadata_max_keys', type: 'integer', optional: true, sticky: true,
-          hint: 'Default 50. 0 = unlimited (not recommended).' },
-        { name: 'metadata_max_bytes', type: 'integer', optional: true, sticky: true,
-          hint: 'Default 4096 total bytes after coercion.' },
+          optional: true, hint: 'Auto picks sensible sizes from content length.' },
+        { name: 'show_advanced', type: 'boolean', control_type: 'checkbox', sticky: true,
+          label: 'Show advanced options', hint: 'Reveal custom sizes, JSON metadata, and caps.' },
         { name: 'override_output_schema', type: 'boolean', control_type: 'checkbox',
           label: 'Design custom output schema', hint: 'Use Schema Builder for datapills.' },
         { name: 'custom_output_schema', extends_schema: true, control_type: 'schema-designer',
@@ -534,45 +554,49 @@ require 'json'
           sample_data_type: 'csv' }
       ],
 
-      input_fields: lambda do |_obj_defs = nil, cfg = {}|
+      input_fields: lambda do |_object_definitions, cfg|
         cfg ||= {}
-        [
+        advanced = !!cfg['show_advanced']
+        preset   = (cfg['preset'] || 'auto').to_s
+        fields   = [
           { name: 'file_path', label: 'Source URI (recommended)',
             hint: 'Stable URI like gcs://bucket/path or drive://folder/file; used to derive deterministic doc_id.',
             optional: true },
           { name: 'content', label: 'Plain text content (required)', hint: 'UTF-8 text only. Convert PDFs/DOCX before calling.',
             optional: false, control_type: 'text-area' },
-          # Manual sizes only visible/used when preset == custom or simple mode is off
-          { name: 'max_chunk_chars', label: 'Max characters per chunk', sticky: true, type: 'integer', optional: true,
-            hint: (cfg['preset'] == 'custom' || !cfg['mode_simple']) ? 'Allowed: 200–8000. Example: 2000.' : 'Preset-managed' },
-          { name: 'overlap_chars', label: 'Overlap between chunks (chars)', sticky: true, type: 'integer', optional: true,
-            hint: (cfg['preset'] == 'custom' || !cfg['mode_simple']) ? 'Must be < Max. Example: 200.' : 'Preset-managed' },
         ]
-        case (cfg['metadata_source'] || 'none').to_s
-        when 'kv'
-          fields << {
-            name: 'metadata_pairs', type: 'array', of: 'object', optional: true,
-            hint: 'Add simple key–value rows. No JSON needed.',
-            properties: [
-              { name: 'key',   hint: 'e.g., department' },
-              { name: 'value', hint: 'e.g., HR' }
-            ]
-          }
-        when 'tags_csv'
-          fields << { name: 'metadata_tags_csv', optional: true,
-                      hint: 'Comma separated (e.g., HR,policy,2025)' }
-        when 'advanced'
-          if cfg['advanced_json']
-            fields << { name: 'metadata', type: 'object', optional: true,
-                        hint: 'Advanced users only: JSON object. Everyone else should use KV or Tags.' }
-          end
-        when 'auto_from_path'
-          # no extra fields
+
+        # Simple metadata block (no JSON in normal path)
+        fields << {
+          name: 'metadata_kv', type: 'array', of: 'object', optional: true,
+          label: 'Metadata (key–value pairs)', hint: 'Add optional attributes as rows.',
+          properties: [{ name: 'key' }, { name: 'value' }]
+        }
+        fields << { name: 'metadata_tags_csv', optional: true, label: 'Tags (comma separated)',
+                    hint: 'e.g., HR,policy,2025' }
+        fields << { name: 'metadata_use_path', type: 'boolean', control_type: 'checkbox', optional: true,
+                    label: 'Use details from Source URI', hint: 'Derives filename/extension/folder.' }
+
+        # Custom sizes only if preset == custom OR advanced
+        if preset == 'custom' || advanced
+          fields << { name: 'max_chunk_chars', label: 'Max characters per chunk',
+                      type: 'integer', optional: true, sticky: true, hint: 'Allowed: 200–8000. Example: 2000.' }
+          fields << { name: 'overlap_chars',   label: 'Overlap between chunks (chars)',
+                      type: 'integer', optional: true, sticky: true, hint: 'Must be < Max. Example: 200.' }
         end
-        fields += [
-          { name: 'debug', label: 'Include debug notes', type: 'boolean', control_type: 'checkbox', optional: true,
-            hint: 'Adds trace_id and normalization notes to the output.' }
-        ]
+
+        # Advanced JSON and caps (hidden unless Advanced)
+        if advanced
+          fields << { name: 'metadata_json', type: 'object', optional: true,
+                      label: 'Advanced metadata (JSON object)', hint: 'For power users only.' }
+          fields << { name: 'metadata_max_keys', type: 'integer', optional: true, sticky: true,
+                      hint: 'Default 50. 0 = unlimited (not recommended).' }
+          fields << { name: 'metadata_max_bytes', type: 'integer', optional: true, sticky: true,
+                      hint: 'Default 4096 total bytes after coercion.' }
+        end
+
+        fields << { name: 'debug', label: 'Include debug notes', type: 'boolean',
+                    control_type: 'checkbox', optional: true }
         fields
       end,
 
@@ -600,7 +624,23 @@ require 'json'
         trace_id    = call(:guid)
         raw         = input['content'].to_s
         file_path   = input['file_path'].to_s
-        user_meta   = call(:build_metadata_from_ui, _cfg, input)
+        meta_simple = call(:choose_metadata_simple, input)
+        meta_adv    = input['metadata_json'].is_a?(Hash) ? input['metadata_json'] : {}
+        # Apply optional caps only if provided (advanced UI)
+        caps = {
+          'metadata_max_keys'  => (_cfg['metadata_max_keys'] || input['metadata_max_keys']),
+          'metadata_max_bytes' => (_cfg['metadata_max_bytes'] || input['metadata_max_bytes'])
+        }.compact
+        user_meta = if caps.empty?
+          call(:sanitize_metadata, meta_simple.merge(meta_adv))
+        else
+          call(:coerce_metadata, meta_simple.merge(meta_adv), {
+            'metadata_mode'      => 'flat',
+            'metadata_prefix'    => '',
+            'metadata_max_keys'  => caps['metadata_max_keys']  || 50,
+            'metadata_max_bytes' => caps['metadata_max_bytes'] || 4096
+          })
+        end
         debug       = call(:safe_bool, input['debug'])
 
         # 1) Normalize/Clean
@@ -608,19 +648,23 @@ require 'json'
         cleaned    = call(:strip_control_chars, normalized)
 
         # 2) Bounds via preset/simple mode (config_fields) or manual entries
-        preset = (_cfg['preset'] || 'balanced').to_s
-        simple = !!_cfg['mode_simple']
-        if simple && preset != 'custom'
-          case preset
-          when 'small'    then max_chars, overlap = 1000, 100
-          when 'large'    then max_chars, overlap = 4000, 200
-          else                  max_chars, overlap = 2000, 200   # balanced
-          end
-        else
+        preset = (_cfg['preset'] || 'auto').to_s
+        if preset == 'custom' || _cfg['show_advanced']
           max_in  = input['max_chunk_chars']
           ov_in   = input['overlap_chars']
           max_chars = call(:clamp_int, (max_in || 2000), 200, 8000)
           overlap   = call(:clamp_int, (ov_in  || 200),    0, 4000)
+        else
+          case preset
+          when 'auto'
+            bounds    = call(:auto_chunk_bounds_for, cleaned.length)
+            max_chars = bounds['max']
+            overlap   = bounds['overlap']
+          when 'small'    then max_chars, overlap = 1000, 100
+          when 'large'    then max_chars, overlap = 4000, 200
+          when 'balanced' then max_chars, overlap = 2000, 200
+          else                 max_chars, overlap = 2000, 200
+          end
         end
         # Hard rule: overlap must be < max_chars (don’t silently fix without telling the user)
         if overlap >= max_chars
@@ -664,7 +708,7 @@ require 'json'
           'chunks'          => records
         }
         base['trace_id'] = corr if debug
-        base['notes']    = 'prep_for_indexing completed' if debug
+        base['notes']    = "prep_for_indexing completed (preset=#{preset}, max=#{max_chars}, overlap=#{overlap})" if debug
         base.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
       end,
 
@@ -1885,6 +1929,7 @@ require 'json'
 
     chunking_presets: lambda do |_connection = nil, _cfg = {}|
       [
+        ['Auto (recommended)', 'auto'],
         ['Balanced (2k max, 200 overlap)', 'balanced'],
         ['Small (1k max, 100 overlap)', 'small'],
         ['Large (4k max, 200 overlap)', 'large'],
