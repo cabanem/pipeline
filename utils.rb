@@ -370,6 +370,83 @@ require 'json'
       s = val.to_s
       error("#{name} is required") if s.strip.empty?
       s
+    end,
+    json_bytesize: lambda do |v|
+      # Conservative byte estimate for JSON payloads (not perfect; good enough for caps)
+      v.to_json.to_s.bytesize rescue v.to_s.bytesize
+    end,
+    truncate_string: lambda do |s, max_bytes|
+      str = s.to_s
+      return str if max_bytes.to_i <= 0
+      b = str.encode('UTF-8', invalid: :replace, undef: :replace).bytes
+      return str if b.length <= max_bytes
+      # keep as many bytes as fit, add ellipsis
+      kept = b[0, [max_bytes - 3, 0].max]
+      kept.pack('C*').force_encoding('UTF-8').scrub + '…'
+    end,
+    flatten_object_shallow: lambda do |obj, prefix|
+      return {} unless obj.is_a?(Hash)
+      out = {}
+      pfx = prefix.to_s
+      obj.each do |k,v|
+        key = (pfx.empty? ? k.to_s : "#{pfx}#{k}")
+        out[key] = v
+      end
+      out
+    end,
+    # Metadata coercion:
+    # - mode 'none' => {}
+    # - mode 'pass' => JSON-safe (stringify keys, drop unserializable), no flattening
+    # - mode 'flat' => flatten 1 level (object only), wrap primitives/arrays under a key
+    # Caps: max_keys (default 50), max_bytes (default 4096), truncate long strings
+    coerce_metadata: lambda do |val, cfg|
+      mode       = (cfg['metadata_mode'] || 'flat').to_s
+      prefix     = (cfg['metadata_prefix'] || '').to_s
+      max_keys   = (cfg['metadata_max_keys'] || 50).to_i
+      max_bytes  = (cfg['metadata_max_bytes'] || 4096).to_i
+
+      return {} if mode == 'none' || val.nil?
+
+      base =
+        if mode == 'pass'
+          h = val.is_a?(Hash) ? val : { 'value' => val }
+          Hash[h.map { |k, v| [k.to_s, v] }]
+        else # flat (default)
+          case val
+          when Hash
+            call(:flatten_object_shallow, val, prefix)
+          when Array
+            { (prefix + 'list') => val }
+          when String, Numeric, TrueClass, FalseClass
+            { (prefix + 'value') => val }
+          else
+            { (prefix + 'value') => val.to_s }
+          end
+        end
+
+      # Enforce key cap
+      if max_keys > 0 && base.keys.length > max_keys
+        base = base.first(max_keys).to_h.merge('__meta_truncated__' => true)
+      end
+
+      # Truncate long strings and enforce byte cap
+      base.each do |k,v|
+        if v.is_a?(String)
+          base[k] = call(:truncate_string, v, [max_bytes / 8, 0].max) # per-field soft cap
+        end
+      end
+      if max_bytes > 0 && call(:json_bytesize, base) > max_bytes
+        # Drop lowest-priority keys until under cap (naive heuristic: drop by sorted key)
+        base.keys.sort.reverse.each do |k|
+          next if k == '__meta_truncated__'
+          base.delete(k)
+          if call(:json_bytesize, base) <= max_bytes
+            base['__meta_truncated__'] = true
+            break
+          end
+        end
+      end
+      base
     end
   },
 
@@ -388,47 +465,40 @@ require 'json'
       end,
 
       config_fields: [
-        # UX mode
-        { name: 'mode', control_type: 'select', optional: true, label: 'Mode',
-          hint: 'Simple uses presets; Advanced exposes numeric bounds',
-          pick_list: [['Simple','simple'],['Advanced','advanced']], toggle_hint: 'advanced' },
-        # Simple
-        { name: 'preset', control_type: 'select', optional: true, label: 'Chunk size preset',
-          hint: 'Tiny(600)/Small(1200)/Medium(2000)/Large(3500)/Max(8000)',
-          pick_list: [['Tiny','tiny'],['Small','small'],['Medium','medium'],['Large','large'],['Max','max']] },
-        # Advanced
-        { name: 'adv_max_chunk_chars', type: 'integer', optional: true, label: 'Max characters per chunk (advanced)' },
-        { name: 'adv_overlap_chars',   type: 'integer', optional: true, label: 'Overlap between chunks (advanced)' },
-
-        # Output schema (unchanged)
+        { name: 'mode_simple', type: 'boolean', control_type: 'checkbox', sticky: true,
+          label: 'Simple mode', hint: 'Recommended. Uses presets unless you enter custom values.' },
+        { name: 'preset', control_type: 'select', pick_list: 'chunking_presets', sticky: true,
+          optional: true, hint: 'Choose a preset; select Custom to enable manual sizes.' },
+        { name: 'metadata_mode', control_type: 'select', pick_list: 'metadata_modes', sticky: true,
+          label: 'Metadata handling', optional: true, hint: 'Default: Flat & safe.' },
+        { name: 'metadata_prefix', optional: true, sticky: true,
+          hint: 'Optional prefix for flattened keys, e.g., "src_"' },
+        { name: 'metadata_max_keys', type: 'integer', optional: true, sticky: true,
+          hint: 'Default 50. 0 = unlimited (not recommended).' },
+        { name: 'metadata_max_bytes', type: 'integer', optional: true, sticky: true,
+          hint: 'Default 4096 total bytes after coercion.' },
         { name: 'override_output_schema', type: 'boolean', control_type: 'checkbox',
-          label: 'Design custom output schema',
-          hint: 'Use the Schema Builder to define this action’s datapills.' },
+          label: 'Design custom output schema', hint: 'Use Schema Builder for datapills.' },
         { name: 'custom_output_schema', extends_schema: true, control_type: 'schema-designer',
-          schema_neutral: false, sticky: true, optional: true,
-          label: 'Output columns', sample_data_type: 'csv',
-          hint: 'Use the Schema Builder to define the output fields (datapills).' }
+          schema_neutral: false, sticky: true, optional: true, label: 'Output columns',
+          sample_data_type: 'csv' }
       ],
 
-      input_fields: lambda do
+      input_fields: lambda do |_obj_defs=nil, cfg={}|
         [
           { name: 'file_path', label: 'Source URI (recommended)',
             hint: 'Stable URI like gcs://bucket/path or drive://folder/file; used to derive deterministic doc_id.',
             optional: true },
-          { name: 'content', label: 'Plain text content (required)',
-            hint: 'UTF-8 text only. Convert PDFs/DOCX before calling.',
+          { name: 'content', label: 'Plain text content (required)', hint: 'UTF-8 text only. Convert PDFs/DOCX before calling.',
             optional: false, control_type: 'text-area' },
-          # Show hints that reflect current mode
-          { name: 'max_chunk_chars', label: 'Max characters per chunk',
-            type: 'integer', optional: true,
-            hint: _config_fields['mode'].to_s == 'advanced' ? 'Advanced mode: provide explicit bound (200–8000).' : 'Optional; preset controls size.' },
-          { name: 'overlap_chars', label: 'Overlap between chunks (chars)',
-            type: 'integer', optional: true,
-            hint: _config_fields['mode'].to_s == 'advanced' ? 'Advanced mode: must be < max_chunk_chars.' : 'Optional; preset controls overlap.' },
+          # Manual sizes only visible/used when preset == custom or simple mode is off
+          { name: 'max_chunk_chars', label: 'Max characters per chunk', sticky: true, type: 'integer', optional: true,
+            hint: (cfg['preset'] == 'custom' || !cfg['mode_simple']) ? 'Allowed: 200–8000. Example: 2000.' : 'Preset-managed' },
+          { name: 'overlap_chars', label: 'Overlap between chunks (chars)', sticky: true, type: 'integer', optional: true,
+            hint: (cfg['preset'] == 'custom' || !cfg['mode_simple']) ? 'Must be < Max. Example: 200.' : 'Preset-managed' },
           { name: 'metadata', type: 'object', optional: true,
             hint: 'Small JSON-safe facts (strings/numbers/bools/flat objects). Avoid large blobs/PII.' },
-          { name: 'debug', label: 'Include debug notes',
-            type: 'boolean', control_type: 'checkbox', optional: true,
+          { name: 'debug', label: 'Include debug notes', type: 'boolean', control_type: 'checkbox', optional: true,
             hint: 'Adds trace_id and normalization notes to the output.' }
         ]
       end,
@@ -450,40 +520,35 @@ require 'json'
         call(:resolve_output_schema, default_fields, _config_fields, object_definitions)
       end,
 
-      execute: lambda do |_connection, input_connection, input, _schema, _input_schema_name, _connection_schema, _config_fields|
+      execute: lambda do |_connection, input, _schema=nil, _input_schema_name=nil, _connection_schema=nil, _cfg={}|
         t0   = Time.now
         corr = call(:guid)
         started_at  = Time.now
         trace_id    = call(:guid)
         raw         = input['content'].to_s
         file_path   = input['file_path'].to_s
-        user_meta   = call(:sanitize_metadata, input['metadata'])
-        debug     = call(:safe_bool, input['debug'])
+        user_meta   = call(:coerce_metadata, input['metadata'], _cfg)
+        debug       = call(:safe_bool, input['debug'])
 
         # 1) Normalize/Clean
         normalized = call(:normalize_newlines, raw)
         cleaned    = call(:strip_control_chars, normalized)
 
-        # 2) Bounds and defaults
-        # Resolve bounds from config preset (Simple) or explicit numbers (Advanced)
-        mode = (_config_fields['mode'] || 'simple').to_s
-        preset = (_config_fields['preset'] || 'medium').to_s
-        preset_bounds = call(:chunk_preset_bounds, preset)
-        adv_max = call(:coerce_int_or_nil, call(:cfg_or_input, _config_fields, input, 'adv_max_chunk_chars'))
-        adv_ov  = call(:coerce_int_or_nil, call(:cfg_or_input, _config_fields, input, 'adv_overlap_chars'))
-        inp_max = call(:coerce_int_or_nil, input['max_chunk_chars'])
-        inp_ov  = call(:coerce_int_or_nil, input['overlap_chars'])
-
-        if mode == 'advanced'
-          chosen_max = adv_max || inp_max || 2000
-          chosen_ov  = adv_ov  || inp_ov  || 200
+        # 2) Bounds via preset/simple mode (config_fields) or manual entries
+        preset = (_cfg['preset'] || 'balanced').to_s
+        simple = !!_cfg['mode_simple']
+        if simple && preset != 'custom'
+          case preset
+          when 'small'    then max_chars, overlap = 1000, 100
+          when 'large'    then max_chars, overlap = 4000, 200
+          else                  max_chars, overlap = 2000, 200   # balanced
+          end
         else
-          chosen_max = inp_max || preset_bounds['max']
-          chosen_ov  = inp_ov  || preset_bounds['overlap']
+          max_in  = input['max_chunk_chars']
+          ov_in   = input['overlap_chars']
+          max_chars = call(:clamp_int, (max_in || 2000), 200, 8000)
+          overlap   = call(:clamp_int, (ov_in  || 200),    0, 4000)
         end
-
-        max_chars  = call(:clamp_int, chosen_max, 200, 8000)
-        overlap    = call(:clamp_int, chosen_ov,   0,   4000)
         # Hard rule: overlap must be < max_chars (don’t silently fix without telling the user)
         if overlap >= max_chars
           error("overlap_chars (#{overlap}) must be less than max_chunk_chars (#{max_chars}). Try overlap_chars=#{[max_chars/10,1].max}.")
@@ -1736,8 +1801,31 @@ require 'json'
       fields = _config_fields['item_schema'].is_a?(Array) ? _config_fields['item_schema'] : []
       names  = fields.map { |f| f['name'].to_s }.reject(&:empty?).uniq
       names.map { |n| [n, n] }
-    end
+    end,
 
+    input_source_modes: lambda do |_connection, _cfg|
+      [
+        ['Chunks list (chunks[*])', 'chunks'],
+        ['Documents list (documents[*].chunks[*])', 'documents']
+      ]
+    end,
+
+    chunking_presets: lambda do |_connection, _cfg|
+      [
+        ['Balanced (2k max, 200 overlap)', 'balanced'],
+        ['Small (1k max, 100 overlap)', 'small'],
+        ['Large (4k max, 200 overlap)', 'large'],
+        ['Custom (enter values below)', 'custom']
+      ]
+    end,
+
+    metadata_modes: lambda do |_connection, _cfg|
+      [
+        ['Ignore (no metadata included)', 'none'],
+        ['Flat & safe (recommended)',     'flat'],
+        ['Pass-through (no transformation)', 'pass']
+      ]
+    end
   },
 
   # --------- TRIGGERS -----------------------------------------------------
