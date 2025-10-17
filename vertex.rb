@@ -8,7 +8,7 @@ require 'base64'
   description: 'Vertex AI via service account (JWT)',
   help: {
     body: 'cloud.google.com/vertex-ai/docs/vector-search/quick-start'
-  }
+  },
 
   # --------- CONNECTION ---------------------------------------------------
   connection: {
@@ -304,7 +304,7 @@ require 'base64'
   # --------- ACTIONS ------------------------------------------------------
   actions: {
 
-    # 1) Email categorization
+    # 1)  Email categorization
     gen_categorize_email: {
       title: 'Categorize email',
       subtitle: 'Classify an email into a category',
@@ -501,7 +501,7 @@ require 'base64'
       end
     },
 
-    # 2) RAG store engine (Vertex AI)
+    # 2)  RAG store engine (Vertex AI)
     rag_files_import: {
       title: 'RAG: Import files to corpus',
       subtitle: 'projects.locations.ragCorpora.ragFiles:import',
@@ -858,11 +858,14 @@ require 'base64'
       end
     },
 
-    # 3) Vector search
+    # 3)  Vector index
     indexes_upsert_datapoints: {
       title: 'Vector Index: Upsert datapoints',
-      subtitle: 'indexes:upsertDatapoints (Matching Engine / Vector Search)',
-      display_priority: 8,
+      subtitle: 'indexes.upsertDatapoints — Vertex AI Matching Engine',
+      display_priority: 90,
+      description: 'Insert or update datapoints in a vector index (idempotent by datapointId). Accepts friendly labels/metadata and '\
+                  'converts them to attributes[], validates vector dimensions (optional), batches requests with max_per_call, and ' \
+                  'returns the LRO name plus acknowledged_count.',
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
@@ -961,7 +964,6 @@ require 'base64'
           chunks.each do |dps|
             req_body = call(:json_compact, { 'datapoints' => dps })
             resp = post(url)
-
                    .headers(call(:request_headers, corr))
                    .payload(req_body)
             code = call(:telemetry_success_code, resp)
@@ -1002,9 +1004,12 @@ require 'base64'
       end
     },
     index_endpoints_find_neighbors: {
-      title: 'Vector Search: Find neighbors',
-      subtitle: 'indexEndpoints:findNeighbors (Matching Engine / Vector Search)',
-      display_priority: 8,
+      title: 'Vector Search: Query neighbors',
+      subtitle: 'indexEndpoints.findNeighbors — Vertex AI Matching Engine',
+      display_priority: 80,
+      description: 'Query nearest neighbors on a deployed index. Provide either a query featureVector or a reference '   \
+                  'datapoint, with optional string filters, per-crowding limits, and distanceMeasure override. Returns '\
+                  'neighbors with distances per query.',
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
@@ -1143,8 +1148,11 @@ require 'base64'
     },
     indexes_create: {
       title: 'Vector Index: Create index',
-      subtitle: 'indexes.create (Matching Engine / Vector Search)',
-      display_priority: 8,
+      subtitle: 'projects.locations.indexes.create — Vertex AI Matching Engine',
+      display_priority: 90,
+      description: 'Create a vector index resource with displayName/description/metadata. Optionally ' \
+                   'pass indexId and requestId (idempotency). Returns the long-running operation (LRO) '\
+                   'for provisioning.',
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
@@ -1237,8 +1245,9 @@ require 'base64'
     },
     indexes_delete: {
       title: 'Vector Index: Delete index',
-      subtitle: 'indexes.delete (Matching Engine / Vector Search)',
-      display_priority: 8,
+      subtitle: 'projects.locations.indexes.delete — Vertex AI Matching Engine',
+      display_priority: 90,
+      description: 'Delete a vector index by resource name or short ID. Returns the LRO that tracks deletion.',
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
@@ -1302,10 +1311,14 @@ require 'base64'
           'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 9, 'correlation_id' => 'sample' } }
       end
     },
+
+    # 4)  Vector serach
     index_endpoints_create: {
-      title: 'Vector Search: Create index endpoint',
-      subtitle: 'indexEndpoints.create (Matching Engine / Vector Search)',
-      display_priority: 8,
+      title: 'Vector Index: Create index endpoint',
+      subtitle: 'projects.locations.indexEndpoints.create — Vertex AI Matching Engine',
+      display_priority: 90,
+      description: 'Create an IndexEndpoint to host deployed indexes. Supports displayName, description, '\
+                   'and labels. Returns the LRO for endpoint creation.',
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
@@ -1390,9 +1403,10 @@ require 'base64'
       end
     },
     index_endpoints_delete: {
-      title: 'Vector Search: Delete index endpoint',
-      subtitle: 'indexEndpoints.delete (Matching Engine / Vector Search)',
-      display_priority: 8,
+      title: 'Vector Index: Delete index endpoint',
+      subtitle: 'projects.locations.indexEndpoints.delete — Vertex AI Matching Engine',
+      display_priority: 90,
+      description: 'Delete an IndexEndpoint by resource name or short ID. Returns the LRO for teardown.',
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
@@ -1457,9 +1471,11 @@ require 'base64'
       end
     },
     index_endpoints_deploy: {
-      title: 'Vector Search: Deploy index to endpoint',
-      subtitle: 'indexEndpoints:deployIndex',
-      display_priority: 8,
+      title: 'Vector Index: Deploy index to endpoint',
+      subtitle: 'projects.locations.indexEndpoints.deployIndex — Vertex AI Matching Engine',
+      display_priority: 90,
+      description: 'Deploy an index to an IndexEndpoint under a chosen deployedIndexId. Supports '\
+                   'optional displayName, labels, and privateEndpoints. Returns the LRO for deployment.',
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
@@ -1552,9 +1568,10 @@ require 'base64'
       end
     },
     index_endpoints_undeploy: {
-      title: 'Vector Search: Undeploy index from endpoint',
-      subtitle: 'indexEndpoints:undeployIndex',
-      display_priority: 8,
+      title: 'Vector Index: Undeploy index from endpoint',
+      subtitle: 'projects.locations.indexEndpoints.undeployIndex — Vertex AI Matching Engine',
+      display_priority: 90,
+      description: 'Remove a deployed index from an IndexEndpoint by deployedIndexId. Returns the LRO for undeploy.',
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
@@ -1629,8 +1646,9 @@ require 'base64'
     },
     indexes_remove_datapoints: {
       title: 'Vector Index: Remove datapoints',
-      subtitle: 'indexes:removeDatapoints (Matching Engine / Vector Search)',
-      display_priority: 8,
+      subtitle: 'indexes.removeDatapoints — Vertex AI Matching Engine',
+      display_priority: 90,
+      description: 'Bulk-remove datapoints from an index by datapointIds[]. Validates input and returns a success envelope once the request is accepted.',
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
@@ -1684,7 +1702,8 @@ require 'base64'
       title: 'Vector Index: Get',
       subtitle: 'projects.locations.indexes.get',
       display_priority: 7,
-      description: 'Fetch a Vertex Vector Search index and extract key probe fields (dimensions, distance metric, algorithm, shards, etc.)',
+      description: 'Fetch a vector index and extract key probe fields (dimensions, distance metric, algorithm, '\
+                   'shard/neighbor settings, and state). Useful for connection tests and recipe conditionals.',
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
 
@@ -1857,7 +1876,9 @@ require 'base64'
       title: 'Vector Index: List',
       subtitle: 'projects.locations.indexes.list',
       display_priority: 7,
-      description: 'List Vertex Vector Search indexes for the current project/location, with pagination and parsed convenience fields.',
+      description: 'List vector indexes in the current project/location with pagination. '\
+                   'Also returns parsed convenience fields (dimensions, distance metric, '\
+                   'algorithm, shard/neighbor settings, and state) for easy mapping.',
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
 
@@ -2037,7 +2058,7 @@ require 'base64'
       end
     },
 
-    # 4) Generate content (Gemini)
+    # 5)  Generate content (Gemini)
     gen_generate_content: {
       title: 'Generative: Generate content (Gemini)',
       subtitle: 'Generate content from a prompt',
@@ -2359,7 +2380,7 @@ require 'base64'
       end
     },
 
-    # 5) Embeddings
+    # 6)  Embeddings
     embed_text: {
       title: 'Embeddings: Embed text',
       subtitle: 'Get embeddings from a publisher embedding model',
@@ -2443,7 +2464,7 @@ require 'base64'
       end
     },
 
-    # 6) Predict
+    # 7)  Predict
     endpoint_predict: {
       title: 'Prediction: Endpoint predict (custom model)',
       subtitle: 'POST :predict to a Vertex AI Endpoint',
@@ -2629,7 +2650,7 @@ require 'base64'
       end
     },
 
-    # 7) Utility
+    # 8)  Utility
     count_tokens: {
       title: 'Utility: Count tokens',
       description: 'POST :countTokens on a publisher model',
