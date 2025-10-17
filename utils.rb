@@ -58,7 +58,7 @@ require 'json'
       end
     },
     span: {
-      fields: lambda do
+      fields: lambda do |_object_definitions = nil, _config_fields = {}|
         [
           { name: 'start', type: 'integer' },
           { name: 'end',   type: 'integer' }
@@ -66,7 +66,7 @@ require 'json'
       end
     },
     source: {
-      fields: lambda do
+      fields: lambda do |_object_definitions = nil, _config_fields = {}|
         [
           { name: 'file_path' },
           { name: 'checksum' }
@@ -74,7 +74,7 @@ require 'json'
       end
     },
     chunk: {
-      fields: lambda do |object_definitions|
+      fields: lambda do |object_definitions = {}, _config_fields = {}|
         [
           { name: 'doc_id' },
           { name: 'chunk_id' },
@@ -90,7 +90,7 @@ require 'json'
       end
     },
     citation: {
-      fields: lambda do |object_definitions|
+      fields: lambda do |object_definitions = {}, _config_fields = {}|
         [
           { name: 'label' },
           { name: 'chunk_id' },
@@ -447,6 +447,52 @@ require 'json'
         end
       end
       base
+    end,
+    parse_file_path_meta: lambda do |file_path|
+      fp = file_path.to_s
+      return {} if fp.empty?
+      # drive://folder/file.txt or gcs://bucket/dir/file.pdf
+      m = fp.match(/\A([a-z0-9+.-]+):\/\/(.+)\z/i)
+      scheme = m ? m[1] : nil
+      rest   = m ? m[2] : fp
+      parts  = rest.split('/')
+      fname  = parts.last.to_s
+      ext    = fname.include?('.') ? fname.split('.').last : ''
+      {
+        'uri_scheme' => scheme,
+        'path'       => rest,
+        'filename'   => fname,
+        'extension'  => ext,
+        'folder'     => parts[0..-2].join('/')
+      }.delete_if { |_,v| v.to_s.empty? }
+    end,
+    build_metadata_from_ui: lambda do |cfg, input|
+      mode = (cfg['metadata_source'] || 'none').to_s
+      case mode
+      when 'none'
+        {}
+      when 'kv'
+        pairs = input['metadata_pairs'].is_a?(Array) ? input['metadata_pairs'] : []
+        out = {}
+        pairs.each do |p|
+          next unless p.is_a?(Hash)
+          k = p['key'].to_s.strip
+          next if k.empty?
+          out[k] = p['value']
+        end
+        out
+      when 'tags_csv'
+        raw = input['metadata_tags_csv'].to_s
+        tags = raw.split(',').map { |t| t.strip }.reject(&:empty?)
+        tags.empty? ? {} : { 'tags' => tags }
+      when 'auto_from_path'
+        call(:parse_file_path_meta, input['file_path'])
+      when 'advanced'
+        # For advanced users only; still JSON-safe
+        call(:coerce_metadata, input['metadata'], cfg || {})
+      else
+        {}
+      end
     end
   },
 
@@ -469,6 +515,10 @@ require 'json'
           label: 'Simple mode', hint: 'Recommended. Uses presets unless you enter custom values.' },
         { name: 'preset', control_type: 'select', pick_list: 'chunking_presets', sticky: true,
           optional: true, hint: 'Choose a preset; select Custom to enable manual sizes.' },
+        { name: 'metadata_source', control_type: 'select', pick_list: 'metadata_sources',
+          label: 'Metadata source', sticky: true, optional: false, hint: 'Hide JSON. Let builders pick KV, tags, or auto.' },
+        { name: 'advanced_json', type: 'boolean', control_type: 'checkbox', sticky: true, optional: true,
+          label: 'Enable Advanced JSON field (for power users)' },
         { name: 'metadata_mode', control_type: 'select', pick_list: 'metadata_modes', sticky: true,
           label: 'Metadata handling', optional: true, hint: 'Default: Flat & safe.' },
         { name: 'metadata_prefix', optional: true, sticky: true,
@@ -484,7 +534,8 @@ require 'json'
           sample_data_type: 'csv' }
       ],
 
-      input_fields: lambda do |_obj_defs=nil, cfg={}|
+      input_fields: lambda do |_obj_defs = nil, cfg = {}|
+        cfg ||= {}
         [
           { name: 'file_path', label: 'Source URI (recommended)',
             hint: 'Stable URI like gcs://bucket/path or drive://folder/file; used to derive deterministic doc_id.',
@@ -496,11 +547,33 @@ require 'json'
             hint: (cfg['preset'] == 'custom' || !cfg['mode_simple']) ? 'Allowed: 200–8000. Example: 2000.' : 'Preset-managed' },
           { name: 'overlap_chars', label: 'Overlap between chunks (chars)', sticky: true, type: 'integer', optional: true,
             hint: (cfg['preset'] == 'custom' || !cfg['mode_simple']) ? 'Must be < Max. Example: 200.' : 'Preset-managed' },
-          { name: 'metadata', type: 'object', optional: true,
-            hint: 'Small JSON-safe facts (strings/numbers/bools/flat objects). Avoid large blobs/PII.' },
+        ]
+        case (cfg['metadata_source'] || 'none').to_s
+        when 'kv'
+          fields << {
+            name: 'metadata_pairs', type: 'array', of: 'object', optional: true,
+            hint: 'Add simple key–value rows. No JSON needed.',
+            properties: [
+              { name: 'key',   hint: 'e.g., department' },
+              { name: 'value', hint: 'e.g., HR' }
+            ]
+          }
+        when 'tags_csv'
+          fields << { name: 'metadata_tags_csv', optional: true,
+                      hint: 'Comma separated (e.g., HR,policy,2025)' }
+        when 'advanced'
+          if cfg['advanced_json']
+            fields << { name: 'metadata', type: 'object', optional: true,
+                        hint: 'Advanced users only: JSON object. Everyone else should use KV or Tags.' }
+          end
+        when 'auto_from_path'
+          # no extra fields
+        end
+        fields += [
           { name: 'debug', label: 'Include debug notes', type: 'boolean', control_type: 'checkbox', optional: true,
             hint: 'Adds trace_id and normalization notes to the output.' }
         ]
+        fields
       end,
 
       output_fields: lambda do |object_definitions, _config_fields|
@@ -520,14 +593,14 @@ require 'json'
         call(:resolve_output_schema, default_fields, _config_fields, object_definitions)
       end,
 
-      execute: lambda do |_connection, input, _schema=nil, _input_schema_name=nil, _connection_schema=nil, _cfg={}|
+      execute: lambda do |_connection, input, _schema = nil, _input_schema_name = nil, _connection_schema = nil, _cfg = {}|
         t0   = Time.now
         corr = call(:guid)
         started_at  = Time.now
         trace_id    = call(:guid)
         raw         = input['content'].to_s
         file_path   = input['file_path'].to_s
-        user_meta   = call(:coerce_metadata, input['metadata'], _cfg)
+        user_meta   = call(:build_metadata_from_ui, _cfg, input)
         debug       = call(:safe_bool, input['debug'])
 
         # 1) Normalize/Clean
@@ -1803,14 +1876,14 @@ require 'json'
       names.map { |n| [n, n] }
     end,
 
-    input_source_modes: lambda do |_connection, _cfg|
+    input_source_modes: lambda do |_connection = nil, _cfg = {}|
       [
         ['Chunks list (chunks[*])', 'chunks'],
         ['Documents list (documents[*].chunks[*])', 'documents']
       ]
     end,
 
-    chunking_presets: lambda do |_connection, _cfg|
+    chunking_presets: lambda do |_connection = nil, _cfg = {}|
       [
         ['Balanced (2k max, 200 overlap)', 'balanced'],
         ['Small (1k max, 100 overlap)', 'small'],
@@ -1819,11 +1892,21 @@ require 'json'
       ]
     end,
 
-    metadata_modes: lambda do |_connection, _cfg|
+    metadata_modes: lambda do |_connection = nil, _cfg = {}|
       [
         ['Ignore (no metadata included)', 'none'],
         ['Flat & safe (recommended)',     'flat'],
         ['Pass-through (no transformation)', 'pass']
+      ]
+    end,
+
+    metadata_sources: lambda do |_connection = nil, _cfg = {}|
+      [
+        ['None', 'none'],
+        ['Key–value list', 'kv'],
+        ['Tags (comma-separated)', 'tags_csv'],
+        ['Auto from file_path', 'auto_from_path'],
+        ['Advanced (enter JSON object)', 'advanced']
       ]
     end
   },
