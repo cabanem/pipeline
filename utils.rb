@@ -1426,7 +1426,12 @@ require 'json'
         [
           { name: 'chunks', type: 'array', of: 'object', optional: false, properties: object_definitions['chunk'],
             hint: 'Map the Chunks list; we’ll merge embeddings by id/chunk_id.' },
-          { name: 'embeddings', label: 'Embeddings [{id, embedding}]', type: 'array', of: 'object', optional: false },
+          { name: 'embeddings', label: 'Embeddings [{id, embedding}]',
+            type: 'array', of: 'object', optional: false,
+            properties: [
+              { name: 'id' },
+              { name: 'embedding', type: 'array', of: 'number' }
+            ]},
           { name: 'embedding_key', optional: true, hint: 'Default: embedding' },
           { name: 'id_key', optional: true, hint: 'Default: id' },
           { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
@@ -1474,9 +1479,16 @@ require 'json'
       input_fields: lambda do |_object_definitions = nil, _config_fields = {}|
         [
           { name: 'pairs', type: 'array', of: 'object', optional: true,
-            hint: 'Each: {chunks:[...], embeddings:[{id,embedding}], id_key?, embedding_key?}' },
+            hint: 'Each: {chunks:[...], embeddings:[{id,embedding}], id_key?, embedding_key?}',
+            properties: [
+              { name: 'chunks', type: 'array', of: 'object', properties: [] },
+              { name: 'embeddings', type: 'array', of: 'object',
+                properties: [{ name: 'id' }, { name: 'embedding', type: 'array', of: 'number' }] },
+              { name: 'id_key' }, { name: 'embedding_key' }
+            ] },
           { name: 'chunks', type: 'array', of: 'object', optional: true },
-          { name: 'embeddings', type: 'array', of: 'object', optional: true },
+          { name: 'embeddings', type: 'array', of: 'object', optional: true,
+            properties: [{ name: 'id' }, { name: 'embedding', type: 'array', of: 'number' }] },
           { name: 'id_key', optional: true, hint: 'Default id' },
           { name: 'embedding_key', optional: true, hint: 'Default embedding' },
           { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
@@ -1589,6 +1601,8 @@ require 'json'
           else
             []
           end
+          error('No chunks found: map one of document.chunks, batch.results[].chunks, or chunks[].') if chunks.empty?
+
 
         { 'chunks' => chunks }
           .merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
@@ -1633,7 +1647,7 @@ require 'json'
             hint: 'Directly map the whole output of “Prepare document for indexing”' },
           { name: 'batch', type: 'object', optional: true, properties: (object_definitions['prep_batch'] || []),
             hint: 'Directly map the whole output of “Prepare multiple documents for indexing”' },
-          { name: 'table_name', optional: true, hint: 'Optional label for your downstream step' },
+          { name: 'table_name', optional: true, hint: 'Optional label for your downstream step; result is unaffected when absent.' },
           { name: 'include_text', type: 'boolean', control_type: 'checkbox', optional: true,
             hint: 'Default true' }
         ]
