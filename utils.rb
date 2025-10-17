@@ -637,7 +637,7 @@ require 'json'
 
     # ---- 1.  Prep for indexing -------------------------------------------
     prep_for_indexing: {
-      title: 'Ingestion: Prepare document for indexing',
+      title: 'Ingestion - Prepare document for indexing',
       subtitle: 'Cleans, chunks, and emits chunk records with IDs + metadata',
       display_priority: 10,
       help: lambda do |_|
@@ -837,7 +837,7 @@ require 'json'
       end
     },
     prep_for_indexing_batch: {
-      title: 'Ingestion: Prepare multiple documents for indexing',
+      title: 'Ingestion - Prepare multiple documents for indexing',
       subtitle: 'Cleans + chunks N documents; returns an array of per-doc results',
       batch: true,
       display_priority: 10,
@@ -1007,7 +1007,7 @@ require 'json'
 
     # ---- 2.  Build index upserts -----------------------------------------
     build_index_upserts: {
-      title: 'Ingestion: Build index upserts',
+      title: 'Ingestion - Build index upserts',
       subtitle: 'Provider-agnostic: [{id, vector, namespace, metadata}]',
       display_priority: 9,
 
@@ -1080,7 +1080,7 @@ require 'json'
       end
     },
     build_index_upserts_batch: {
-      title: 'Ingestion: Build index upserts',
+      title: 'Ingestion - Build index upserts',
       subtitle: 'Accepts documents[*].chunks or chunks[*]; emits provider-agnostic upserts',
       batch: true,
       display_priority: 9,
@@ -1156,7 +1156,7 @@ require 'json'
       end
     },
     build_vertex_datapoints: {
-      title: 'Ingestion: Build Vertex datapoints',
+      title: 'Ingestion - Build Vertex datapoints',
       subtitle: 'Chunks with embeddings → [{datapointId, featureVector, restricts, labels?, metadata?}]',
       display_priority: 7,
 
@@ -1255,7 +1255,7 @@ require 'json'
       end
     },
     map_vertex_embeddings: {
-      title: 'Ingestion: Map Vertex embeddings to ids',
+      title: 'Ingestion - Map Vertex embeddings to ids',
       subtitle: 'Align requests[*].id with embed_text.predictions[*].embeddings.values',
       display_priority: 7,
 
@@ -1318,10 +1318,52 @@ require 'json'
         }
       end
     },
+    enrich_chunks_with_metadata: {
+      title: 'Ingestion - Enrich chunks with document metadata',
+      description: 'Merges document-level metadata (source, uri, mime, author, version) into each chunk.metadata.',
+      input_fields: lambda do |_|
+        [
+          { name: 'chunks', type: 'array', of: 'object', optional: false,
+            properties: object_definitions['chunk'] || [] },
+          { name: 'document_metadata', type: 'object', optional: false,
+            properties: [
+              { name: 'document_id' }, { name: 'file_name' }, { name: 'uri' },
+              { name: 'mime_type' }, { name: 'source_system' }, { name: 'version' },
+              { name: 'ingested_at' }, { name: 'labels', type: 'array', of: 'string' }
+            ] }
+        ]
+      end,
+      output_fields: lambda do |_|
+        [
+          { name: 'chunks', type: 'array', of: 'object',
+            properties: object_definitions['chunk'] || [] }
+        ].concat(object_definitions['envelope_fields'] || [])
+      end,
+      sample_output: lambda do |_|
+        {
+          'chunks' => [
+            { 'chunk_id' => 'doc1#0001', 'text' => '...', 'metadata' => {
+              'document_id' => 'doc1', 'uri' => 'gs://bucket/a.pdf', 'mime_type' => 'application/pdf'
+            }}
+          ],
+          'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK' }
+        }
+      end,
+      execute: lambda do |_connection, input|
+        t0   = Time.now
+        corr = call(:guid)
+        meta = input['document_metadata'] || {}
+        chunks = Array(input['chunks']).map do |c|
+          m = (c['metadata'] || {}).merge(meta) { |_k, old_v, new_v| old_v.nil? ? new_v : old_v }
+          c.merge('metadata' => m)
+        end
+        { 'chunks' => chunks }.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+      end
+    },
 
     # ---- 3.  Embedding  --------------------------------------------------
     build_embedding_requests: {
-      title: 'Ingestion: Build embedding requests from chunks',
+      title: 'Ingestion - Build embedding requests from chunks',
       subtitle: '[{id, text, metadata}] for your embedding step',
       display_priority: 8,
       # chunks[*] -> [{id, text, metadata}] for embedding
@@ -1368,7 +1410,7 @@ require 'json'
       end
     },
     build_embedding_requests_batch: {
-      title: 'Ingestion: Build embedding requests',
+      title: 'Ingestion - Build embedding requests',
       subtitle: 'Accepts documents[*].chunks or chunks[*]; flattens to [{id,text,metadata}]',
       batch: true,
       display_priority: 8,
@@ -1418,7 +1460,7 @@ require 'json'
       end
     },
     attach_embeddings: {
-      title: 'Ingestion: Attach embeddings to chunks',
+      title: 'Ingestion - Attach embeddings to chunks',
       subtitle: 'Merges [{id, embedding}] onto chunks by id',
       display_priority: 7,
 
@@ -1471,7 +1513,7 @@ require 'json'
 
     },
     attach_embeddings_batch: {
-      title: 'Ingestion: Attach embeddings to chunks',
+      title: 'Ingestion - Attach embeddings to chunks',
       subtitle: 'Supports [{chunks,embeddings}] or top-level chunks/embeddings',
       batch: true,
       display_priority: 7,
@@ -1561,7 +1603,7 @@ require 'json'
 
     # ---- 3.  Emit --------------------------------------------------------
     extract_chunks: {
-      title: 'Ingestion: Extract chunks',
+      title: 'Ingestion - Extract chunks',
       subtitle: 'Accepts {chunks:[...]} or {results:[{chunks:[...]}]} and emits {chunks:[...]}',
       display_priority: 6,
 
@@ -1629,7 +1671,7 @@ require 'json'
       end
     },
     to_data_table_rows: {
-      title: 'Ingestion: To Data Table rows',
+      title: 'Ingestion - To Data Table rows',
       subtitle: 'Slim corpus rows from chunks for persistence',
       display_priority: 6,
 
@@ -1724,7 +1766,7 @@ require 'json'
 
     },
     to_data_table_rows_batch: {
-      title: 'Ingestion: To Data Table rows',
+      title: 'Ingestion - To Data Table rows',
       subtitle: 'Flattens multiple documents into slim corpus rows',
       batch: true,
       display_priority: 6,
@@ -1821,7 +1863,7 @@ require 'json'
     },
 
     make_gcs_manifest: {
-      title: 'Ingestion: Make GCS manifest',
+      title: 'Ingestion - Make GCS manifest',
       subtitle: 'Build {object_name, content_type, body} for corpus snapshot',
       display_priority: 5,
 
@@ -1896,7 +1938,7 @@ require 'json'
       end
     },
     make_gcs_manifest_batch: {
-      title: 'Ingestion: Make GCS manifests',
+      title: 'Ingestion - Make GCS manifests',
       subtitle: 'One manifest per document; supports json or ndjson',
       batch: true,
       display_priority: 6,
@@ -1986,8 +2028,9 @@ require 'json'
     # --- SERVE (QUERY)  ---------------------------------------------------
     # 7.  Build vector query
     build_vector_query: {
-      title: 'Serve: Build vector query',
+      title: 'Serve - Build vector query',
       subtitle: 'Normalize text + optional embedding into a search request object',
+      display_priority: 5,
 
       input_fields: lambda do
         [
@@ -2032,8 +2075,9 @@ require 'json'
 
     # 8.  Merge search results
     merge_search_results: {
-      title: 'Serve: Merge search results',
+      title: 'Serve - Merge search results',
       subtitle: 'Normalize, dedupe by chunk_id, keep best score',
+      display_priority: 5,
 
       config_fields: [
         { name: 'override_output_schema', type: 'boolean', control_type: 'checkbox',
@@ -2110,8 +2154,9 @@ require 'json'
     # 9.  Select top-k by score
     # 10. Select context by token budget
     select_context_by_token_budget: {
-      title: 'Serve: Select context by token budget',
+      title: 'Serve - Select context by token budget',
       subtitle: 'Greedy pack by tokens with optional per-doc cap',
+      display_priority: 4,
 
       input_fields: lambda do
         [
@@ -2175,8 +2220,9 @@ require 'json'
     # 11. Build citation map
     # 12. Build messages for Gemini
     build_messages_gemini: {
-      title: 'Serve: Build Gemini messages',
+      title: 'Serve - Build Gemini messages',
       subtitle: 'Construct system/user messages with injected context',
+      display_priority: 3,
 
       input_fields: lambda do
         [
@@ -2221,8 +2267,9 @@ require 'json'
     },
     # 13. Postprocess answer
     postprocess_answer: {
-      title: 'Serve: Postprocess LLM answer',
+      title: 'Serve - Postprocess LLM answer',
       subtitle: 'Extract [^n] citations and attach structured metadata',
+      display_priority: 3,
 
       input_fields: lambda do
         [
