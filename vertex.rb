@@ -297,7 +297,16 @@ require 'base64'
           { name: 'threshold' }    # e.g., BLOCK_LOW_AND_ABOVE
         ]
       end
-    }
+    },
+
+    kv_pair: {
+      fields: lambda do
+        [
+          { name: 'key' },
+          { name: 'value' }
+        ]
+      end
+    },
 
   },
 
@@ -640,7 +649,9 @@ require 'base64'
               { name: 'score', type: 'number' },
               { name: 'source' },
               { name: 'uri' },
-              { name: 'metadata', type: 'object' }
+              { name: 'metadata', type: 'object' },
+              { name: 'metadata_kv', label: 'metadata (KV)', type: 'array', of: 'object', properties: object_definitions['kv_pair'] },
+              { name: 'metadata_json', label: 'metadata (JSON)', }
             ]
           }
         ] + [
@@ -693,8 +704,10 @@ require 'base64'
         {
           'question' => 'What is the PTO carryover policy?',
           'contexts' => [
-            { 'id' => 'doc-42#c3', 'text' => 'Employees may carry over up to 40 hours...', 'score' => 0.91,
-              'source' => 'handbook', 'uri' => 'https://drive.google.com/file/d/abc...', 'metadata' => { 'page' => 7 } }
+      { 'id' => 'doc-42#c3', 'text' => 'Employees may carry over up to 40 hours...', 'score' => 0.91,
+        'source' => 'handbook', 'uri' => 'https://drive.google.com/file/d/abc...', 'metadata' => { 'page' => 7 },
+        'metadata_kv' => [ { 'key' => 'page', 'value' => 7 } ],
+        'metadata_json' => '{"page":7}' }
           ],
           'ok' => true,
           'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 22, 'correlation_id' => 'sample' }
@@ -855,6 +868,369 @@ require 'base64'
           'ok' => true,
           'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 44, 'correlation_id' => 'sample' }
         }
+      end
+    },
+    rag_corpora_create: {
+      title: 'RAG: Create corpus',
+      subtitle: 'projects.locations.ragCorpora.create',
+      display_priority: 9,
+      retry_on_response: [408,429,500,502,503,504],
+      max_retries: 3,
+      input_fields: lambda do |_|
+        [
+          { name: 'corpusId', optional: false, hint: 'Short ID for the new corpus' },
+          { name: 'displayName', optional: true },
+          { name: 'description', optional: true },
+          { name: 'labels', type: 'object', optional: true },
+          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
+        ]
+      end,
+      output_fields: lambda do |_|
+        [
+          { name: 'name' }, { name: 'displayName' }, { name: 'description' },
+          { name: 'labels', type: 'object' }, { name: 'createTime' }, { name: 'updateTime' }
+        ] + [
+          { name: 'ok', type: 'boolean' },
+          { name: 'telemetry', type: 'object', properties: [
+            { name: 'http_status', type: 'integer' }, { name: 'message' },
+            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
+          ]},
+          { name: 'debug', type: 'object' }
+        ]
+      end,
+      execute: lambda do |connection, input|
+        t0 = Time.now; corr = call(:build_correlation_id); url=nil; req_body=nil
+        begin
+          call(:ensure_project_id!, connection)
+          call(:ensure_regional_location!, connection)
+          loc  = connection['location'].to_s.downcase
+          parent = "projects/#{connection['project_id']}/locations/#{loc}"
+          url  = call(:aipl_v1_url, connection, loc, "#{parent}/ragCorpora")
+          body = {
+            'displayName' => input['displayName'],
+            'description' => input['description'],
+            'labels'      => input['labels']
+          }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
+          req_body = call(:json_compact, body)
+          resp = post(url).params(corpusId: input['corpusId'].to_s).headers(call(:request_headers, corr)).payload(req_body)
+          code = call(:telemetry_success_code, resp)
+          out  = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          unless call(:normalize_boolean, connection['prod_mode'])
+            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
+          end
+          out
+        rescue => e
+          g = call(:extract_google_error, e)
+          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
+          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
+          unless call(:normalize_boolean, connection['prod_mode'])
+            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
+          end
+          out
+        end
+      end,
+      sample_output: lambda do
+        {
+          'name' => 'projects/p/locations/us-central1/ragCorpora/hr-kb',
+          'displayName' => 'HR KB',
+          'labels' => { 'env' => 'prod' },
+          'ok' => true,
+          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample' }
+        }
+      end
+    },
+    rag_corpora_get: {
+      title: 'RAG: Get corpus',
+      subtitle: 'projects.locations.ragCorpora.get',
+      display_priority: 9,
+      retry_on_response: [408,429,500,502,503,504],
+      max_retries: 3,
+      input_fields: lambda do |_|
+        [ { name: 'rag_corpus', optional: false, hint: 'Short id or full resource' } ]
+      end,
+      output_fields: lambda do |_|
+        [
+          { name: 'name' }, { name: 'displayName' }, { name: 'description' },
+          { name: 'labels', type: 'object' }, { name: 'createTime' }, { name: 'updateTime' }
+        ] + [
+          { name: 'ok', type: 'boolean' },
+          { name: 'telemetry', type: 'object', properties: [
+            { name: 'http_status', type: 'integer' }, { name: 'message' },
+            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
+          ]}
+        ]
+      end,
+      execute: lambda do |connection, input|
+        t0 = Time.now; corr = call(:build_correlation_id); url=nil
+        begin
+          call(:ensure_project_id!, connection)
+          call(:ensure_regional_location!, connection)
+          path = call(:build_rag_corpus_path, connection, input['rag_corpus'])
+          loc  = connection['location'].to_s.downcase
+          url  = call(:aipl_v1_url, connection, loc, path)
+          resp = get(url).headers(call(:request_headers, corr))
+          code = call(:telemetry_success_code, resp)
+          resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+        rescue => e
+          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
+        end
+      end
+    },
+    rag_corpora_list: {
+      title: 'RAG: List corpora',
+      subtitle: 'projects.locations.ragCorpora.list',
+      display_priority: 9,
+      retry_on_response: [408,429,500,502,503,504],
+      max_retries: 3,
+      input_fields: lambda do |_|
+        [
+          { name: 'page_size', type: 'integer', optional: true },
+          { name: 'page_token', optional: true },
+          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
+        ]
+      end,
+      output_fields: lambda do |_|
+        [
+          { name: 'items', type: 'array', of: 'object', properties: [
+            { name: 'name' }, { name: 'displayName' }, { name: 'description' },
+            { name: 'labels', type: 'object' }, { name: 'createTime' }, { name: 'updateTime' }
+          ]},
+          { name: 'next_page_token' }
+        ] + [
+          { name: 'ok', type: 'boolean' },
+          { name: 'telemetry', type: 'object', properties: [
+            { name: 'http_status', type: 'integer' }, { name: 'message' },
+            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
+          ]},
+          { name: 'debug', type: 'object' }
+        ]
+      end,
+      execute: lambda do |connection, input|
+        t0=Time.now; corr=call(:build_correlation_id); url=nil
+        begin
+          call(:ensure_project_id!, connection)
+          call(:ensure_regional_location!, connection)
+          loc  = connection['location'].to_s.downcase
+          parent = "projects/#{connection['project_id']}/locations/#{loc}"
+          url  = call(:aipl_v1_url, connection, loc, "#{parent}/ragCorpora")
+          qs = {}
+          qs['pageSize']  = input['page_size'].to_i if input['page_size'].to_i > 0
+          qs['pageToken'] = input['page_token'] if input['page_token'].present?
+          resp = get(url).params(qs).headers(call(:request_headers, corr))
+          code = call(:telemetry_success_code, resp)
+          body = call(:safe_json, resp&.body) || {}
+          out = {
+            'items' => call(:safe_array, body['ragCorpora']),
+            'next_page_token' => body['nextPageToken'],
+            'ok' => true
+          }.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          unless call(:normalize_boolean, connection['prod_mode'])
+            out['debug'] = call(:debug_pack, input['debug'], [url, qs].compact.join('?'), nil, resp&.body) if call(:normalize_boolean, input['debug'])
+          end
+          out
+        rescue => e
+          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
+        end
+      end
+    },
+    rag_corpora_delete: {
+      title: 'RAG: Delete corpus',
+      subtitle: 'projects.locations.ragCorpora.delete',
+      display_priority: 9,
+      retry_on_response: [408,429,500,502,503,504],
+      max_retries: 3,
+      input_fields: lambda do |_|
+        [ { name: 'rag_corpus', optional: false } ]
+      end,
+      output_fields: lambda do |_|
+        [
+          { name: 'name' }, { name: 'done', type: 'boolean' }, { name: 'error', type: 'object' }
+        ] + [
+          { name: 'ok', type: 'boolean' },
+          { name: 'telemetry', type: 'object', properties: [
+            { name: 'http_status', type: 'integer' }, { name: 'message' },
+            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
+          ]}
+        ]
+      end,
+      execute: lambda do |connection, input|
+        t0=Time.now; corr=call(:build_correlation_id); url=nil
+        begin
+          call(:ensure_project_id!, connection)
+          call(:ensure_regional_location!, connection)
+          path = call(:build_rag_corpus_path, connection, input['rag_corpus'])
+          loc  = connection['location'].to_s.downcase
+          url  = call(:aipl_v1_url, connection, loc, path)
+          resp = delete(url).headers(call(:request_headers, corr))
+          code = call(:telemetry_success_code, resp)
+          resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+        rescue => e
+          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
+        end
+      end
+    },
+    rag_files_list: {
+      title: 'RAG: List files in corpus',
+      subtitle: 'projects.locations.ragCorpora.ragFiles.list',
+      display_priority: 9,
+      retry_on_response: [408,429,500,502,503,504],
+      max_retries: 3,
+      input_fields: lambda do |_|
+        [
+          { name: 'rag_corpus', optional: false, hint: 'Short id or full resource' },
+          { name: 'page_size', type: 'integer', optional: true },
+          { name: 'page_token', optional: true },
+          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
+        ]
+      end,
+      output_fields: lambda do |_|
+        [
+          { name: 'items', type: 'array', of: 'object', properties: [
+            { name: 'name' }, { name: 'displayName' }, { name: 'sourceUri' },
+            { name: 'createTime' }, { name: 'updateTime' },
+            { name: 'mimeType' }, { name: 'sizeBytes', type: 'integer' },
+            { name: 'labels', type: 'object' },
+            { name: 'labels_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] },
+            { name: 'labels_json' },
+            { name: 'metadata', type: 'object' },
+            { name: 'metadata_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] },
+            { name: 'metadata_json' }
+          ]},
+          { name: 'next_page_token' },
+          { name: 'ok', type: 'boolean' },
+          { name: 'telemetry', type: 'object', properties: [
+            { name: 'http_status', type: 'integer' }, { name: 'message' },
+            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
+          ]},
+          { name: 'debug', type: 'object' }
+        ]
+      end,
+      execute: lambda do |connection, input|
+        t0=Time.now; corr=call(:build_correlation_id); url=nil
+        begin
+          call(:ensure_project_id!, connection)
+          call(:ensure_regional_location!, connection)
+          corpus = call(:build_rag_corpus_path, connection, input['rag_corpus'])
+          loc = connection['location'].to_s.downcase
+          url = call(:aipl_v1_url, connection, loc, "#{corpus}/ragFiles")
+          qs = {}
+          qs['pageSize']  = input['page_size'].to_i if input['page_size'].to_i > 0
+          qs['pageToken'] = input['page_token'] if input['page_token'].present?
+          resp = get(url).params(qs).headers(call(:request_headers, corr))
+          code = call(:telemetry_success_code, resp)
+          body = call(:safe_json, resp&.body) || {}
+          items = call(:safe_array, body['ragFiles']).map do |it|
+            h  = (it || {}).to_h
+            lbl = (h['labels'] || {}).to_h
+            md  = (h['metadata'] || {}).to_h
+            h.merge(
+              'labels_kv'   => lbl.map { |k,v| { 'key' => k.to_s, 'value' => v } },
+              'labels_json' => (lbl.empty? ? nil : lbl.to_json),
+              'metadata_kv' => md.map  { |k,v| { 'key' => k.to_s, 'value' => v } },
+              'metadata_json'=> (md.empty? ? nil : md.to_json)
+            )
+          end
+          out = {
+            'items' => items,
+            'next_page_token' => body['nextPageToken'],
+            'ok' => true
+          }.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          unless call(:normalize_boolean, connection['prod_mode'])
+            out['debug'] = call(:debug_pack, input['debug'], [url, qs].compact.join('?'), nil, resp&.body) if call(:normalize_boolean, input['debug'])
+          end
+          out
+        rescue => e
+          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
+        end
+      end
+    },
+    rag_files_get: {
+      title: 'RAG: Get file',
+      subtitle: 'projects.locations.ragCorpora.ragFiles.get',
+      display_priority: 9,
+      retry_on_response: [408,429,500,502,503,504],
+      max_retries: 3,
+      input_fields: lambda do |_|
+        [ { name: 'rag_file', optional: false, hint: 'Full name: projects/.../ragCorpora/{id}/ragFiles/{fileId}' } ]
+      end,
+      output_fields: lambda do |_|
+        [
+          { name: 'name' }, { name: 'displayName' }, { name: 'sourceUri' },
+          { name: 'mimeType' }, { name: 'sizeBytes', type: 'integer' },
+          { name: 'labels', type: 'object' },
+          { name: 'labels_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] },
+          { name: 'labels_json' },
+          { name: 'metadata', type: 'object' },
+          { name: 'metadata_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] },
+          { name: 'metadata_json' },
+          { name: 'createTime' }, { name: 'updateTime' }
+        ] + [
+          { name: 'ok', type: 'boolean' },
+          { name: 'telemetry', type: 'object', properties: [
+            { name: 'http_status', type: 'integer' }, { name: 'message' },
+            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
+          ]}
+        ]
+      end,
+      execute: lambda do |connection, input|
+        t0=Time.now; corr=call(:build_correlation_id); url=nil
+        begin
+          call(:ensure_project_id!, connection)
+          call(:ensure_regional_location!, connection)
+          name = call(:build_rag_file_path, connection, input['rag_file'])
+          loc  = connection['location'].to_s.downcase
+          url  = call(:aipl_v1_url, connection, loc, name)
+          resp = get(url).headers(call(:request_headers, corr))
+          code = call(:telemetry_success_code, resp)
+          body = call(:safe_json, resp&.body) || {}
+          lbl = (body['labels'] || {}).to_h
+          md  = (body['metadata'] || {}).to_h
+          out = body.merge(
+            'labels_kv'    => lbl.map { |k,v| { 'key' => k.to_s, 'value' => v } },
+            'labels_json'  => (lbl.empty? ? nil : lbl.to_json),
+            'metadata_kv'  => md.map  { |k,v| { 'key' => k.to_s, 'value' => v } },
+            'metadata_json'=> (md.empty? ? nil : md.to_json)
+          ).merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          out
+        rescue => e
+          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
+        end
+      end
+    },
+    rag_files_delete: {
+      title: 'RAG: Delete file',
+      subtitle: 'projects.locations.ragCorpora.ragFiles.delete',
+      display_priority: 9,
+      retry_on_response: [408,429,500,502,503,504],
+      max_retries: 3,
+      input_fields: lambda do |_|
+        [ { name: 'rag_file', optional: false, hint: 'Full name: projects/.../ragCorpora/{id}/ragFiles/{fileId}' } ]
+      end,
+      output_fields: lambda do |_|
+        [
+          { name: 'name' }, { name: 'done', type: 'boolean' }, { name: 'error', type: 'object' }
+        ] + [
+          { name: 'ok', type: 'boolean' },
+          { name: 'telemetry', type: 'object', properties: [
+            { name: 'http_status', type: 'integer' }, { name: 'message' },
+            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
+          ]}
+        ]
+      end,
+      execute: lambda do |connection, input|
+        t0=Time.now; corr=call(:build_correlation_id); url=nil
+        begin
+          call(:ensure_project_id!, connection)
+          call(:ensure_regional_location!, connection)
+          name = call(:build_rag_file_path, connection, input['rag_file'])
+          loc  = connection['location'].to_s.downcase
+          url  = call(:aipl_v1_url, connection, loc, name)
+          resp = delete(url).headers(call(:request_headers, corr))
+          code = call(:telemetry_success_code, resp)
+          resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+        rescue => e
+          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
+        end
       end
     },
 
@@ -1258,7 +1634,7 @@ require 'base64'
       subtitle: 'Delete an index (Vertex AI Matching Engine)',
       description: 'projects.locations.indexes.delete — Vertex AI Matching Engine',
       display_priority: 90,
-      help: lambda do |_| \
+      help: lambda do |_|
         { body: 'Delete a vector index by resource name or short ID. Returns the LRO that tracks deletion.' )
       end,
       retry_on_request: ['GET','HEAD'],
@@ -1332,7 +1708,8 @@ require 'base64'
       description: 'projects.locations.indexEndpoints.create — Vertex AI Matching Engine',
       display_priority: 90,
       help: lambda do |_| 
-        { body: 'Create an IndexEndpoint to host deployed indexes. Supports displayName, description, and labels. Returns the LRO for endpoint creation.' },
+        { body: 'Create an IndexEndpoint to host deployed indexes. Supports displayName, description, and labels. Returns the LRO for endpoint creation.' }
+      end,
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
@@ -1421,7 +1798,9 @@ require 'base64'
       subtitle: 'Delete an index endpoint',
       description: 'projects.locations.indexEndpoints.delete — Vertex AI Matching Engine',
       display_priority: 90,
-      help: lambda do |_| {'Delete an IndexEndpoint by resource name or short ID. Returns the LRO for teardown.'},
+      help: lambda do |_|
+        {body: 'Delete an IndexEndpoint by resource name or short ID. Returns the LRO for teardown.'}
+      end,
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
@@ -1491,7 +1870,8 @@ require 'base64'
       description: 'projects.locations.indexEndpoints.deployIndex — Vertex AI Matching Engine',
       display_priority: 90,
       help: lambda do |_|
-        'Deploy an index to an IndexEndpoint under a chosen deployedIndexId. Supports optional displayName, labels, and privateEndpoints. Returns the LRO for deployment.' },
+        {body: 'Deploy an index to an IndexEndpoint under a chosen deployedIndexId. Supports optional displayName, labels, and privateEndpoints. Returns the LRO for deployment.' }
+      end,
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
@@ -1588,7 +1968,9 @@ require 'base64'
       subtitle: 'Undeploy an index from an endpoint',
       description: 'projects.locations.indexEndpoints.undeployIndex — Vertex AI Matching Engine',
       display_priority: 90,
-      help: lambda do |_| { 'Remove a deployed index from an IndexEndpoint by deployedIndexId. Returns the LRO for undeploy.' },
+      help: lambda do |_|
+        { body: 'Remove a deployed index from an IndexEndpoint by deployedIndexId. Returns the LRO for undeploy.' }
+      end,
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
@@ -1666,7 +2048,9 @@ require 'base64'
       subtitle: 'Remove datapoints from a deployed vector index',
       description: 'indexes.removeDatapoints — Vertex AI Matching Engine',
       display_priority: 90,
-      help: lambda do |_| { body: 'Bulk-remove datapoints from an index by datapointIds[]. Validates input and returns a success envelope once the request is accepted.' },
+      help: lambda do |_| 
+        { body: 'Bulk-remove datapoints from an index by datapointIds[]. Validates input and returns a success envelope once the request is accepted.' }
+      end,
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
@@ -1722,7 +2106,8 @@ require 'base64'
       description: 'Fetch a vector index and extract key fields',
       display_priority: 7,
       help: lambda do |_|
-        {body: 'Fetch a vector index and extract key probe fields (dimensions, distance metric, algorithm, shard/neighbor settings, and state). Useful for connection tests and recipe conditionals.' },
+        {body: 'Fetch a vector index and extract key probe fields (dimensions, distance metric, algorithm, shard/neighbor settings, and state). Useful for connection tests and recipe conditionals.' }
+      end,
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
 
@@ -1898,7 +2283,8 @@ require 'base64'
       help: lambda do |_| 
         { body: 'List vector indexes in the current project/location with pagination. '\
                 'Also returns parsed convenience fields (dimensions, distance metric, '\
-                'algorithm, shard/neighbor settings, and state) for easy mapping.' },
+                'algorithm, shard/neighbor settings, and state) for easy mapping.' }
+      end,
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
 
@@ -3199,13 +3585,17 @@ require 'base64'
     end,
     map_context_chunks: lambda do |raw_contexts, maxn = 20|
       call(:safe_array, raw_contexts).first(maxn).each_with_index.map do |c, i|
+        md = (c['metadata'] || {}).to_h
         {
           'id'       => (c['chunkId'] || "ctx-#{i+1}"),
           'text'     => c['text'].to_s,
           'score'    => (c['score'] || c['relevanceScore'] || 0.0).to_f,
           'source'   => (c['sourceDisplayName'] || c.dig('metadata','source')),
           'uri'      => (c['sourceUri']        || c.dig('metadata','uri')),
-          'metadata' => c['metadata']
+          'metadata' => md,
+          'metadata_kv' => md.map { |k,v| { 'key' => k.to_s, 'value' => v } },
+          'metadata_json' => (md.empty? ? nil : md.to_json)
+
         }
       end
     end,
