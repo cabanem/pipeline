@@ -640,7 +640,7 @@ require 'base64'
         ]
       end,
 
-      output_fields: lambda do |_|
+      output_fields: lambda do |connection, object_definitions|
         [
           { name: 'question' },
           { name: 'contexts', type: 'array', of: 'object', properties: [
@@ -1083,7 +1083,7 @@ require 'base64'
           { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
         ]
       end,
-      output_fields: lambda do |_|
+      output_fields: lambda do |connection, object_definitions|
         [
           { name: 'items', type: 'array', of: 'object', properties: [
             { name: 'name' }, { name: 'displayName' }, { name: 'sourceUri' },
@@ -1153,7 +1153,7 @@ require 'base64'
       input_fields: lambda do |_|
         [ { name: 'rag_file', optional: false, hint: 'Full name: projects/.../ragCorpora/{id}/ragFiles/{fileId}' } ]
       end,
-      output_fields: lambda do |_|
+      output_fields: lambda do |connection, object_definitions|
         [
           { name: 'name' }, { name: 'displayName' }, { name: 'sourceUri' },
           { name: 'mimeType' }, { name: 'sizeBytes', type: 'integer' },
@@ -2872,7 +2872,7 @@ require 'base64'
 
     # 7)  Predict
     endpoint_predict: {
-      title: 'Prediction: Endpoint predict (custom model)',
+      title: 'Prediction - Endpoint predict (custom model)',
       subtitle: 'POST :predict to a Vertex AI Endpoint',
       display_priority: 6,
       retry_on_request: ['GET', 'HEAD'],
@@ -2926,7 +2926,7 @@ require 'base64'
       end
     },
     batch_prediction_create: {
-      title: 'Batch: Create prediction job',
+      title: 'Prediction - Create prediction job',
       subtitle: 'Create projects.locations.batchPredictionJobs',
       batch: true,
       display_priority: 6,
@@ -3007,7 +3007,7 @@ require 'base64'
       end
     },
     batch_prediction_get: {
-      title: 'Batch: Fetch prediction job (get)',
+      title: 'Prediction - Fetch prediction job (get)',
       subtitle: 'Get a batch prediction job by ID',
       batch: true,
       display_priority: 6,
