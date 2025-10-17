@@ -331,12 +331,46 @@ require 'json'
         }
       ]
     end,
-    # Safe getter using declared field name or fallback name
     get_item_field: lambda do |item, cfg, declared_key, fallback_key|
       key = (cfg[declared_key] || fallback_key).to_s
       v = item[key]
       v.nil? ? item[fallback_key] : v
     end,
+    cfg_or_input: lambda do |cfg, input, key|
+      v = nil
+      v = cfg[key] if cfg.is_a?(Hash) && cfg.key?(key)
+      v = input[key] if v.nil? && input.is_a?(Hash)
+      v
+    end,
+    coerce_int_or_nil: lambda do |v|
+      return nil if v.nil? || v.to_s.strip.empty?
+      Integer(v) rescue nil
+    end,
+    chunk_preset_bounds: lambda do |preset|
+      case preset.to_s.downcase
+      when 'tiny'   then { 'max' => 600,  'overlap' => 60  }
+      when 'small'  then { 'max' => 1200, 'overlap' => 120 }
+      when 'medium' then { 'max' => 2000, 'overlap' => 200 }
+      when 'large'  then { 'max' => 3500, 'overlap' => 240 }
+      when 'max'    then { 'max' => 8000, 'overlap' => 400 }
+      else               { 'max' => 2000, 'overlap' => 200 }
+      end
+    end,
+    resolve_chunks_array: lambda do |input|
+      # Flatten documents[*].chunks or chunks[*]
+      if input['chunks'].is_a?(Array)
+        input['chunks']
+      elsif input['documents'].is_a?(Array)
+        input['documents'].flat_map { |d| (d || {})['chunks'] || [] }
+      else
+        []
+      end
+    end,
+    require_nonempty_string: lambda do |val, name|
+      s = val.to_s
+      error("#{name} is required") if s.strip.empty?
+      s
+    end
   },
 
   # --------- ACTIONS ------------------------------------------------------
@@ -354,9 +388,22 @@ require 'json'
       end,
 
       config_fields: [
+        # UX mode
+        { name: 'mode', control_type: 'select', optional: true, label: 'Mode',
+          hint: 'Simple uses presets; Advanced exposes numeric bounds',
+          pick_list: [['Simple','simple'],['Advanced','advanced']], toggle_hint: 'advanced' },
+        # Simple
+        { name: 'preset', control_type: 'select', optional: true, label: 'Chunk size preset',
+          hint: 'Tiny(600)/Small(1200)/Medium(2000)/Large(3500)/Max(8000)',
+          pick_list: [['Tiny','tiny'],['Small','small'],['Medium','medium'],['Large','large'],['Max','max']] },
+        # Advanced
+        { name: 'adv_max_chunk_chars', type: 'integer', optional: true, label: 'Max characters per chunk (advanced)' },
+        { name: 'adv_overlap_chars',   type: 'integer', optional: true, label: 'Overlap between chunks (advanced)' },
+
+        # Output schema (unchanged)
         { name: 'override_output_schema', type: 'boolean', control_type: 'checkbox',
           label: 'Design custom output schema',
-          hint: 'Check to use the schema builder to define this action’s datapills.' },
+          hint: 'Use the Schema Builder to define this action’s datapills.' },
         { name: 'custom_output_schema', extends_schema: true, control_type: 'schema-designer',
           schema_neutral: false, sticky: true, optional: true,
           label: 'Output columns', sample_data_type: 'csv',
@@ -371,12 +418,13 @@ require 'json'
           { name: 'content', label: 'Plain text content (required)',
             hint: 'UTF-8 text only. Convert PDFs/DOCX before calling.',
             optional: false, control_type: 'text-area' },
+          # Show hints that reflect current mode
           { name: 'max_chunk_chars', label: 'Max characters per chunk',
             type: 'integer', optional: true,
-            hint: 'Default 2000. Allowed range: 200–8000.' },
+            hint: _config_fields['mode'].to_s == 'advanced' ? 'Advanced mode: provide explicit bound (200–8000).' : 'Optional; preset controls size.' },
           { name: 'overlap_chars', label: 'Overlap between chunks (chars)',
             type: 'integer', optional: true,
-            hint: 'Default 200. Must be less than Max characters per chunk.' },
+            hint: _config_fields['mode'].to_s == 'advanced' ? 'Advanced mode: must be < max_chunk_chars.' : 'Optional; preset controls overlap.' },
           { name: 'metadata', type: 'object', optional: true,
             hint: 'Small JSON-safe facts (strings/numbers/bools/flat objects). Avoid large blobs/PII.' },
           { name: 'debug', label: 'Include debug notes',
@@ -402,7 +450,7 @@ require 'json'
         call(:resolve_output_schema, default_fields, _config_fields, object_definitions)
       end,
 
-      execute: lambda do |_connection, input|
+      execute: lambda do |_connection, input_connection, input, _schema, _input_schema_name, _connection_schema, _config_fields|
         t0   = Time.now
         corr = call(:guid)
         started_at  = Time.now
@@ -417,10 +465,25 @@ require 'json'
         cleaned    = call(:strip_control_chars, normalized)
 
         # 2) Bounds and defaults
-        max_in     = input['max_chunk_chars']
-        ov_in      = input['overlap_chars']
-        max_chars  = call(:clamp_int, (max_in || 2000), 200, 8000)
-        overlap    = call(:clamp_int, (ov_in  || 200),  0,   4000)
+        # Resolve bounds from config preset (Simple) or explicit numbers (Advanced)
+        mode = (_config_fields['mode'] || 'simple').to_s
+        preset = (_config_fields['preset'] || 'medium').to_s
+        preset_bounds = call(:chunk_preset_bounds, preset)
+        adv_max = call(:coerce_int_or_nil, call(:cfg_or_input, _config_fields, input, 'adv_max_chunk_chars'))
+        adv_ov  = call(:coerce_int_or_nil, call(:cfg_or_input, _config_fields, input, 'adv_overlap_chars'))
+        inp_max = call(:coerce_int_or_nil, input['max_chunk_chars'])
+        inp_ov  = call(:coerce_int_or_nil, input['overlap_chars'])
+
+        if mode == 'advanced'
+          chosen_max = adv_max || inp_max || 2000
+          chosen_ov  = adv_ov  || inp_ov  || 200
+        else
+          chosen_max = inp_max || preset_bounds['max']
+          chosen_ov  = inp_ov  || preset_bounds['overlap']
+        end
+
+        max_chars  = call(:clamp_int, chosen_max, 200, 8000)
+        overlap    = call(:clamp_int, chosen_ov,   0,   4000)
         # Hard rule: overlap must be < max_chars (don’t silently fix without telling the user)
         if overlap >= max_chars
           error("overlap_chars (#{overlap}) must be less than max_chunk_chars (#{max_chars}). Try overlap_chars=#{[max_chars/10,1].max}.")
