@@ -165,6 +165,30 @@ require 'json'
           { name: 'metadata', type: 'object', optional: true }
         ]
       end
+    },
+    vertex_prediction: {
+      fields: lambda do |_|
+        [
+          # Common Vertex shapes we want to expose for mapping:
+          { name: 'embeddings', type: 'object', properties: [
+              { name: 'values', type: 'array', of: 'number',
+                hint: 'Primary: predictions[*].embeddings.values (float array)' }
+            ]
+          },
+          # Some SDKs return an array of embeddings objects
+          { name: 'embeddings_list', label: 'embeddings[]', type: 'array', of: 'object', properties: [
+              { name: 'values', type: 'array', of: 'number',
+                hint: 'Alternate: predictions[*].embeddings[0].values' }
+            ],
+            hint: 'Use when embeddings is an array; map here instead of embeddings'
+          },
+          # Other alternates seen in Vertex responses
+          { name: 'values',   type: 'array', of: 'number', optional: true,
+            hint: 'Alternate: predictions[*].values (float array)' },
+          { name: 'embedding', type: 'array', of: 'number', optional: true,
+            hint: 'Alternate: predictions[*].embedding (float array)' }
+        ]
+      end
     }
   },
 
@@ -1252,12 +1276,27 @@ require 'json'
       subtitle: 'Align requests[*].id with embed_text.predictions[*].embeddings.values',
       display_priority: 7,
 
-      input_fields: lambda do |_object_definitions, _connection, _cfg|
+      input_fields: lambda do |object_definitions, _connection, _cfg|
         [
           { name: 'requests',  type: 'array', of: 'object', optional: false,
-            hint: 'From build_embedding_requests: [{id,text,metadata}]' },
-          { name: 'predictions', type: 'array', of: 'object', optional: false,
-            hint: 'Vertex embed_text.predictions[*]' },
+            hint: 'From build_embedding_requests: [{id,text,metadata}]',
+            properties: [
+              { name: 'id' }, { name: 'text' },
+              { name: 'metadata', type: 'object' }
+            ]
+          },
+          # Option A: map the whole Vertex output object here (which contains predictions: [])
+          { name: 'predictions_root', type: 'object', optional: true, properties: [
+              { name: 'predictions', type: 'array', of: 'object',
+                properties: object_definitions['vertex_prediction'] }
+            ],
+            hint: 'If your Vertex step outputs {predictions:[...]}, map it here.'
+          },
+          # Option B: map just the predictions array directly
+          { name: 'predictions', type: 'array', of: 'object', optional: true,
+            properties: object_definitions['vertex_prediction'],
+            hint: 'Or map predictions[*] directly if you already have the array.'
+          },
           { name: 'check_dimension', type: 'integer', optional: true,
             hint: 'Optional: expected vector length (index dimension)' }
         ]
@@ -1275,8 +1314,13 @@ require 'json'
       end,
 
       execute: lambda do |_connection, input|
-        reqs = input['requests'].is_a?(Array) ? input['requests'] : []
-        preds = input['predictions'].is_a?(Array) ? input['predictions'] : []
+        reqs  = input['requests'].is_a?(Array) ? input['requests'] : []
+        preds = []
+        if input['predictions'].is_a?(Array)
+          preds = input['predictions']
+        elsif input['predictions_root'].is_a?(Hash) && input['predictions_root']['predictions'].is_a?(Array)
+          preds = input['predictions_root']['predictions']
+        end
         error('requests and predictions length mismatch') if reqs.length != preds.length
 
         out = []
@@ -1284,9 +1328,11 @@ require 'json'
         reqs.each_with_index do |r, i|
           id = (r['id'] || r[:id]).to_s
           error("requests[#{i}].id is required") if id.empty?
+          # Try common Vertex shapes in priority order
           vec = preds[i].dig('embeddings','values') ||
-                preds[i].dig('embeddings',0,'values') ||
-                preds[i]['values']
+                (preds[i]['embeddings'].is_a?(Array) && preds[i].dig('embeddings',0,'values')) ||
+                preds[i]['values'] ||
+                preds[i]['embedding']
           error("predictions[#{i}] missing embeddings.values") if !vec.is_a?(Array) || vec.empty?
           vec = vec.map { |x| Float(x) rescue nil }.compact
           error("predictions[#{i}] contains non-numeric values") if vec.empty?
