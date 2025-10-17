@@ -1373,6 +1373,8 @@ require 'json'
           # Try common Vertex shapes in priority order
           vec = preds[i].dig('embeddings','values') ||
                 (preds[i]['embeddings'].is_a?(Array) && preds[i].dig('embeddings',0,'values')) ||
+                # support vertex_prediction.embeddings_list[]
+                (preds[i]['embeddings_list'].is_a?(Array) && preds[i].dig('embeddings_list',0,'values')) ||
                 preds[i]['values'] ||
                 preds[i]['embedding']
           error("predictions[#{i}] missing embeddings.values") if !vec.is_a?(Array) || vec.empty?
@@ -1599,25 +1601,25 @@ require 'json'
             next nil unless e.is_a?(Hash)
             { 'id' => e[id_key].to_s, 'embedding' => e[emb_key] }
           end.compact
-        elsif input['vectors'].is_a?(Array)
+      elsif input['vectors'].is_a?(Array)
           error('Alignment must be by_index when using vectors') unless align == 'by_index'
           vecs = input['vectors'].map { |v| v.is_a?(Hash) ? v['values'] : v }
           error('vectors length must equal chunks length') unless vecs.length == chunks.length
-          # Will attach by index below
+          # keep vecs in scope for by_index branch
         end
 
         # 2) Merge
         out_chunks =
-          if align == 'by_index'
-            if input['vectors'].is_a?(Array)
-              chunks.each_with_index.map do |c, i|
-                vec = input['vectors'][i]
-                next c unless vec.is_a?(Array) && !vec.empty?
-                c.merge('embedding' => vec.map { |x| Float(x) rescue nil }.compact)
-              end
-            else
-              error('by_index alignment requires vectors[[...]] input')
+        if align == 'by_index'
+          if input['vectors'].is_a?(Array)
+            chunks.each_with_index.map do |c, i|
+              vec = vecs[i]  # use normalized per-index array
+              next c unless vec.is_a?(Array) && !vec.empty?
+              c.merge('embedding' => vec.map { |x| Float(x) rescue nil }.compact)
             end
+          else
+            error('by_index alignment requires vectors[*].values (or raw float arrays)')
+          end
           else # by_id (default)
             idx = {}
             dupes = []
@@ -1660,14 +1662,12 @@ require 'json'
           { name: 'pairs', type: 'array', of: 'object', optional: true,
             hint: 'Each: {chunks:[...], embeddings:[{id,embedding}], id_key?, embedding_key?}',
             properties: [
-              { name: 'chunks', type: 'array', of: 'object', properties: [] },
-              { name: 'embeddings', type: 'array', of: 'object',
-                properties: [{ name: 'id' }, { name: 'embedding', type: 'array', of: 'number' }] },
+              { name: 'chunks', type: 'array', of: 'object', properties: object_definitions['chunk'] },
+              { name: 'embeddings', type: 'array', of: 'object', properties: object_definitions['embedding_pair'] },
               { name: 'id_key' }, { name: 'embedding_key' }
             ] },
-          { name: 'chunks', type: 'array', of: 'object', optional: true },
-          { name: 'embeddings', type: 'array', of: 'object', optional: true,
-            properties: [{ name: 'id' }, { name: 'embedding', type: 'array', of: 'number' }] },
+          { name: 'chunks', type: 'array', of: 'object', optional: true, properties: object_definitions['chunk'] },
+          { name: 'embeddings', type: 'array', of: 'object', optional: true, properties: object_definitions['embedding_pair'] },
           { name: 'id_key', optional: true, hint: 'Default id' },
           { name: 'embedding_key', optional: true, hint: 'Default embedding' },
           { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
