@@ -858,14 +858,17 @@ require 'base64'
       end
     },
 
-    # 3)  Vector index
+    # 3)  Vector search
     indexes_upsert_datapoints: {
-      title: 'Vector Index: Upsert datapoints',
-      subtitle: 'indexes.upsertDatapoints — Vertex AI Matching Engine',
+      title: 'Vector Index - Upsert datapoints',
+      subtitle: 'Upsert datapoints in a vector index',
       display_priority: 90,
-      description: 'Insert or update datapoints in a vector index (idempotent by datapointId). Accepts friendly labels/metadata and '\
-                  'converts them to attributes[], validates vector dimensions (optional), batches requests with max_per_call, and ' \
-                  'returns the LRO name plus acknowledged_count.',
+      description: 'indexes.upsertDatapoints — Vertex AI Matching Engine',
+      help: lambda do |_|
+        { body: "Insert or update datapoints in a vector index (idempotent by datapointId). Accepts friendly labels/metadata and "\
+                "converts them to attributes[], validates vector dimensions (optional), batches requests with max_per_call, and " \
+                "returns the LRO name plus acknowledged_count."}
+      end,
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
@@ -1005,11 +1008,15 @@ require 'base64'
     },
     index_endpoints_find_neighbors: {
       title: 'Vector Search: Query neighbors',
-      subtitle: 'indexEndpoints.findNeighbors — Vertex AI Matching Engine',
+      subtitle: 'Query neighbors using vector search',
+      description: 'indexEndpoints.findNeighbors — Vertex AI Matching Engine',
       display_priority: 80,
-      description: 'Query nearest neighbors on a deployed index. Provide either a query featureVector or a reference '   \
-                  'datapoint, with optional string filters, per-crowding limits, and distanceMeasure override. Returns '\
-                  'neighbors with distances per query.',
+      help: lambda do |_|
+        { body: "Query nearest neighbors on a deployed index. Provide either a query featureVector or a reference "  \
+                "datapoint, with optional string filters, per-crowding limits, and distanceMeasure override. Returns "\
+                "neighbors with distances per query."
+        }
+      end,
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
@@ -1147,12 +1154,15 @@ require 'base64'
       end
     },
     indexes_create: {
-      title: 'Vector Index: Create index',
-      subtitle: 'projects.locations.indexes.create — Vertex AI Matching Engine',
+      title: 'Vector Index - Create index',
+      subtitle: 'Create an vector index in Vertex AI Matching Engine',
+      description: 'projects.locations.indexes.create — Vertex AI Matching Engine',
       display_priority: 90,
-      description: 'Create a vector index resource with displayName/description/metadata. Optionally ' \
-                   'pass indexId and requestId (idempotency). Returns the long-running operation (LRO) '\
-                   'for provisioning.',
+      help: lambda do |_|
+        { body: "Create a vector index resource with displayName/description/metadata. Optionally "\
+                "pass indexId and requestId (for idempotency). Returns the long-running operation "\
+                "(LRO) for provisioning."  }
+      end,
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
@@ -1244,10 +1254,13 @@ require 'base64'
       end
     },
     indexes_delete: {
-      title: 'Vector Index: Delete index',
-      subtitle: 'projects.locations.indexes.delete — Vertex AI Matching Engine',
+      title: 'Vector Index - Delete index',
+      subtitle: 'Delete an index (Vertex AI Matching Engine)',
+      description: 'projects.locations.indexes.delete — Vertex AI Matching Engine',
       display_priority: 90,
-      description: 'Delete a vector index by resource name or short ID. Returns the LRO that tracks deletion.',
+      help: lambda do |_| \
+        { body: 'Delete a vector index by resource name or short ID. Returns the LRO that tracks deletion.' )
+      end,
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
@@ -1312,13 +1325,14 @@ require 'base64'
       end
     },
 
-    # 4)  Vector serach
+    # 4)  Vector index
     index_endpoints_create: {
-      title: 'Vector Index: Create index endpoint',
-      subtitle: 'projects.locations.indexEndpoints.create — Vertex AI Matching Engine',
+      title: 'Vector Index - Create index endpoint',
+      subtitle: 'Create an index endpoint',
+      description: 'projects.locations.indexEndpoints.create — Vertex AI Matching Engine',
       display_priority: 90,
-      description: 'Create an IndexEndpoint to host deployed indexes. Supports displayName, description, '\
-                   'and labels. Returns the LRO for endpoint creation.',
+      help: lambda do |_| 
+        { body: 'Create an IndexEndpoint to host deployed indexes. Supports displayName, description, and labels. Returns the LRO for endpoint creation.' },
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
@@ -1403,10 +1417,11 @@ require 'base64'
       end
     },
     index_endpoints_delete: {
-      title: 'Vector Index: Delete index endpoint',
-      subtitle: 'projects.locations.indexEndpoints.delete — Vertex AI Matching Engine',
+      title: 'Vector Index - Delete index endpoint',
+      subtitle: 'Delete an index endpoint',
+      description: 'projects.locations.indexEndpoints.delete — Vertex AI Matching Engine',
       display_priority: 90,
-      description: 'Delete an IndexEndpoint by resource name or short ID. Returns the LRO for teardown.',
+      help: lambda do |_| {'Delete an IndexEndpoint by resource name or short ID. Returns the LRO for teardown.'},
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
@@ -1471,11 +1486,12 @@ require 'base64'
       end
     },
     index_endpoints_deploy: {
-      title: 'Vector Index: Deploy index to endpoint',
-      subtitle: 'projects.locations.indexEndpoints.deployIndex — Vertex AI Matching Engine',
+      title: 'Vector Index - Deploy index to endpoint',
+      subtitle: 'Deploy an index to a vector endpoint',
+      description: 'projects.locations.indexEndpoints.deployIndex — Vertex AI Matching Engine',
       display_priority: 90,
-      description: 'Deploy an index to an IndexEndpoint under a chosen deployedIndexId. Supports '\
-                   'optional displayName, labels, and privateEndpoints. Returns the LRO for deployment.',
+      help: lambda do |_|
+        'Deploy an index to an IndexEndpoint under a chosen deployedIndexId. Supports optional displayName, labels, and privateEndpoints. Returns the LRO for deployment.' },
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
@@ -1568,10 +1584,11 @@ require 'base64'
       end
     },
     index_endpoints_undeploy: {
-      title: 'Vector Index: Undeploy index from endpoint',
-      subtitle: 'projects.locations.indexEndpoints.undeployIndex — Vertex AI Matching Engine',
+      title: 'Vector Index - Undeploy index from endpoint',
+      subtitle: 'Undeploy an index from an endpoint',
+      description: 'projects.locations.indexEndpoints.undeployIndex — Vertex AI Matching Engine',
       display_priority: 90,
-      description: 'Remove a deployed index from an IndexEndpoint by deployedIndexId. Returns the LRO for undeploy.',
+      help: lambda do |_| { 'Remove a deployed index from an IndexEndpoint by deployedIndexId. Returns the LRO for undeploy.' },
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
@@ -1645,10 +1662,11 @@ require 'base64'
       end
     },
     indexes_remove_datapoints: {
-      title: 'Vector Index: Remove datapoints',
-      subtitle: 'indexes.removeDatapoints — Vertex AI Matching Engine',
+      title: 'Vector Index - Remove datapoints',
+      subtitle: 'Remove datapoints from a deployed vector index',
+      description: 'indexes.removeDatapoints — Vertex AI Matching Engine',
       display_priority: 90,
-      description: 'Bulk-remove datapoints from an index by datapointIds[]. Validates input and returns a success envelope once the request is accepted.',
+      help: lambda do |_| { body: 'Bulk-remove datapoints from an index by datapointIds[]. Validates input and returns a success envelope once the request is accepted.' },
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
@@ -1699,11 +1717,12 @@ require 'base64'
       end
     },
     index_get: {
-      title: 'Vector Index: Get',
+      title: 'Vector Index - Get',
       subtitle: 'projects.locations.indexes.get',
+      description: 'Fetch a vector index and extract key fields',
       display_priority: 7,
-      description: 'Fetch a vector index and extract key probe fields (dimensions, distance metric, algorithm, '\
-                   'shard/neighbor settings, and state). Useful for connection tests and recipe conditionals.',
+      help: lambda do |_|
+        {body: 'Fetch a vector index and extract key probe fields (dimensions, distance metric, algorithm, shard/neighbor settings, and state). Useful for connection tests and recipe conditionals.' },
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
 
@@ -1873,12 +1892,13 @@ require 'base64'
       end
     },
     index_list: {
-      title: 'Vector Index: List',
+      title: 'Vector Index - List',
       subtitle: 'projects.locations.indexes.list',
       display_priority: 7,
-      description: 'List vector indexes in the current project/location with pagination. '\
-                   'Also returns parsed convenience fields (dimensions, distance metric, '\
-                   'algorithm, shard/neighbor settings, and state) for easy mapping.',
+      help: lambda do |_| 
+        { body: 'List vector indexes in the current project/location with pagination. '\
+                'Also returns parsed convenience fields (dimensions, distance metric, '\
+                'algorithm, shard/neighbor settings, and state) for easy mapping.' },
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
 
