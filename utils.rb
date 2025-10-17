@@ -1344,18 +1344,20 @@ require 'json'
         ]
       end,
 
-      output_fields: lambda do |_object_definitions, _config_fields|
+      output_fields: lambda do |object_definitions, _config_fields|
         [
           { name: 'count', type: 'integer' },
-          { name: 'embeddings', type: 'array', of: 'object', properties: [
-              { name: 'id' }, { name: 'embedding', type: 'array', of: 'number' }
-            ]
-          },
-          { name: 'vector_dim', type: 'integer' }
-        ]
+          { name: 'embeddings', type: 'array', of: 'object',
+            properties: object_definitions['embedding_pair'] },
+          { name: 'vector_dim', type: 'integer' },
+          # Add a wrapper object so users can map a single pill → embeddings_bundle
+          { name: 'bundle', type: 'object', properties: object_definitions['embedding_bundle'] }
+        ] + Array(object_definitions['envelope_fields'])
       end,
 
       execute: lambda do |_connection, input|
+        t0   = Time.now
+        corr = call(:guid)
         reqs  = input['requests'].is_a?(Array) ? input['requests'] : []
         preds = []
         if input['predictions'].is_a?(Array)
@@ -1388,16 +1390,34 @@ require 'json'
           end
           out << { 'id' => id, 'embedding' => vec }
         end
-        { 'count' => out.length, 'embeddings' => out, 'vector_dim' => (dim || 0) }
+        bundle = { 'embeddings' => out, 'count' => out.length, 'vector_dim' => (dim || 0), 'trace_id' => corr }
+        {
+          'count'      => out.length,
+          'embeddings' => out,
+          'vector_dim' => (dim || 0),
+          'bundle'     => bundle
+        }.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
       end,
 
       sample_output: lambda do
-        { 'count' => 2,
+        {
+          'count' => 2,
           'embeddings' => [
             { 'id' => 'doc-abc123:0', 'embedding' => [0.01, 0.02, 0.03] },
             { 'id' => 'doc-abc123:1', 'embedding' => [0.04, 0.05, 0.06] }
           ],
-          'vector_dim' => 3
+          'vector_dim' => 3,
+          'bundle' => {
+            'embeddings' => [
+              { 'id' => 'doc-abc123:0', 'embedding' => [0.01, 0.02, 0.03] },
+              { 'id' => 'doc-abc123:1', 'embedding' => [0.04, 0.05, 0.06] }
+            ],
+            'count' => 2,
+            'vector_dim' => 3,
+            'trace_id' => 'sample'
+          },
+          'ok' => true,
+          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 1, 'correlation_id' => 'sample' }
         }
       end
     },
@@ -1726,7 +1746,7 @@ require 'json'
             end
 
           if align == 'by_index'
-            vecs = call(:safe_array, opts['vectors']).map { |v| v.is_a?(Hash) ? v['values'] : v }
+            vecs = call(:ensure_array, opts['vectors']).map { |v| v.is_a?(Hash) ? v['values'] : v }
             error('vectors length must equal chunks length') unless vecs.length == cList.length
             return cList.each_with_index.map { |c,i|
               v = vecs[i]; v.is_a?(Array) && !v.empty? ? c.merge('embedding' => v.map { |x| Float(x) rescue nil }.compact) : c
