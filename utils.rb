@@ -26,6 +26,22 @@ require 'json'
 
   # --------- OBJECT DEFINITIONS -------------------------------------------
   object_definitions: {
+   table_row: {
+     fields: lambda do |_object_definitions = nil, _config_fields = {}|
+       [
+         { name: 'id' },
+         { name: 'doc_id' },
+         { name: 'file_path' },
+         { name: 'checksum' },
+         { name: 'tokens', type: 'integer' },
+         { name: 'span_start', type: 'integer' },
+         { name: 'span_end',   type: 'integer' },
+         { name: 'created_at' },
+         # text is optional (include_text flag). Declare it so pills exist even if omitted.
+         { name: 'text' }
+       ]
+     end
+   },
     envelope_fields: {
       fields: lambda do |_|
         [
@@ -981,7 +997,7 @@ require 'json'
 
       input_fields: lambda do |object_definitions, _cfg = {}|
         [
-          { name: 'chunks', type: 'array', of: 'object', optional: false, roperties: object_definitions['chunk'],
+          { name: 'chunks', type: 'array', of: 'object', optional: false, properties: object_definitions['chunk'],
             hint: 'Map the Chunks list from “Prepare document for indexing”.' },
           { name: 'namespace', optional: true, hint: 'e.g., hr-knowledge-v1' },
           { name: 'provider', optional: true, hint: 'e.g., vertex' }
@@ -1357,8 +1373,8 @@ require 'json'
 
     # ---- 3.  Emit --------------------------------------------------------
     extract_chunks: {
-      title: 'Ingestion: Extract chunks'
-      subtitle: 'Accepts {chunks:[...]} or {results:[{chunks:[...]}]} and emits {chunks:[...]}'
+      title: 'Ingestion: Extract chunks',
+      subtitle: 'Accepts {chunks:[...]} or {results:[{chunks:[...]}]} and emits {chunks:[...]}',
       display_priority: 6,
       input_fields: lambda do
         [
@@ -1425,7 +1441,7 @@ require 'json'
           { name: 'table' },
           { name: 'profile' },
           { name: 'count', type: 'integer' },
-          { name: 'rows', type: 'array', of: 'object' }
+          { name: 'rows', type: 'array', of: 'object', properties: object_definitions['table_row'] }
         ]
         call(:resolve_output_schema, default_fields, cfg, object_definitions)
       end,
@@ -1520,7 +1536,7 @@ require 'json'
           { name: 'table' },
           { name: 'profile' },
           { name: 'count', type: 'integer' },
-          { name: 'rows', type: 'array', of: 'object' }
+          { name: 'rows', type: 'array', of: 'object', properties: object_definitions['table_row'] }
         ]
         call(:resolve_output_schema, default_fields, cfg, object_definitions)
       end,
