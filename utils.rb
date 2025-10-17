@@ -27,7 +27,7 @@ require 'json'
   # --------- OBJECT DEFINITIONS -------------------------------------------
   object_definitions: {
     prep_result: {
-      fields: lambda do |object_definitions = {}, _cfg = {}|
+      fields: lambda do |object_definitions = {}|
         [
           { name: 'doc_id' },
           { name: 'file_path' },
@@ -45,7 +45,7 @@ require 'json'
       end
     },
     prep_batch: {
-      fields: lambda do |object_definitions = {}, _cfg = {}|
+      fields: lambda do |object_definitions = {}|
         [
           { name: 'results', type: 'array', of: 'object',
             properties: (object_definitions['prep_result'] || []) },
@@ -55,7 +55,7 @@ require 'json'
       end
     },
     table_row: {
-      fields: lambda do |_object_definitions = nil, _config_fields = {}|
+      fields: lambda do |_connection|
         [
           { name: 'id' },
           { name: 'doc_id' },
@@ -70,7 +70,7 @@ require 'json'
       end
     },
     envelope_fields: {
-      fields: lambda do |_object_definitions = nil, _config_fields = {}|
+      fields: lambda do |_connection|
         [
           { name: 'error', type: 'object', optional: true, properties: [
               { name: 'code', type: 'integer' },
@@ -101,7 +101,7 @@ require 'json'
       end
     },
     span: {
-      fields: lambda do |_object_definitions = nil, _config_fields = {}|
+      fields: lambda do |_connection|
         [
           { name: 'start', type: 'integer' },
           { name: 'end',   type: 'integer' }
@@ -109,7 +109,7 @@ require 'json'
       end
     },
     source: {
-      fields: lambda do |_object_definitions = nil, _config_fields = {}|
+      fields: lambda do |_connection|
         [
           { name: 'file_path' },
           { name: 'checksum' }
@@ -117,7 +117,7 @@ require 'json'
       end
     },
     chunk: {
-      fields: lambda do |object_definitions = {}, _config_fields = {}|
+      fields: lambda do |object_definitions = {}|
         [
           { name: 'doc_id' },
           { name: 'chunk_id' },
@@ -134,7 +134,7 @@ require 'json'
       end
     },
     citation: {
-      fields: lambda do |object_definitions = {}, _config_fields = {}|
+      fields: lambda do |object_definitions|
         [
           { name: 'label' },
           { name: 'chunk_id' },
@@ -146,7 +146,7 @@ require 'json'
       end
     },
     upsert_record: {
-      fields: lambda do |_object_definitions = nil, _config_fields = {}|
+      fields: lambda do |_connection|
         [
           { name: 'id' },
           { name: 'vector', type: 'array', of: 'number' },
@@ -156,21 +156,14 @@ require 'json'
       end
     },
     ingest_item: {
-      fields: lambda do |_object_definitions, _config_fields = {}|
-        # If user designed a schema, use it; else default to your canonical item.
-        if _config_fields['design_item_schema'] &&
-           _config_fields['item_schema'].is_a?(Array) &&
-           !_config_fields['item_schema'].empty?
-          _config_fields['item_schema']
-        else
-          [
-            { name: 'file_path', optional: true },
-            { name: 'content',   control_type: 'text-area' },
-            { name: 'max_chunk_chars', type: 'integer', optional: true },
-            { name: 'overlap_chars',   type: 'integer', optional: true },
-            { name: 'metadata', type: 'object', optional: true }
-          ]
-        end
+      fields: lambda do |_connection|
+        [
+          { name: 'file_path', optional: true },
+          { name: 'content',   control_type: 'text-area' },
+          { name: 'max_chunk_chars', type: 'integer', optional: true },
+          { name: 'overlap_chars',   type: 'integer', optional: true },
+          { name: 'metadata', type: 'object', optional: true }
+        ]
       end
     }
   },
@@ -651,7 +644,7 @@ require 'json'
           label: 'Show advanced options', hint: 'Reveal custom sizes, JSON metadata, and caps.' }
       ],
 
-      input_fields: lambda do |_object_definitions, cfg|
+      input_fields: lambda do |_object_definitions, _connection, cfg|
         cfg ||= {}
         advanced = !!cfg['show_advanced']
         preset   = (cfg['preset'] || 'auto').to_s
@@ -869,16 +862,20 @@ require 'json'
         { name: 'item_overlap_chars_field',   control_type: 'select', label: 'Item field: overlap_chars',   optional: true, pick_list: 'item_schema_field_names' }
       ],
 
-      input_fields: lambda do |object_definitions, _config_fields ={}|
+      input_fields: lambda do |object_definitions, _connection, config_fields|
+        # If a custom item schema is designed in the step config, use it here;
+        # otherwise fall back to the static object_definitions['ingest_item'].
+        item_props =
+          if config_fields['design_item_schema'] &&
+              config_fields['item_schema'].is_a?(Array) &&
+              !config_fields['item_schema'].empty?
+            config_fields['item_schema']
+          else
+            object_definitions['ingest_item']
+          end
         [
-          {
-            name: 'items',
-            type: 'array',
-            of: 'object',
-            properties: object_definitions['ingest_item'],
-            optional: false,
-            hint: 'Map your list here. Use “Design item schema” in the step’s config if your list shape is custom.'
-          },
+          { name: 'items', type: 'array', of: 'object', properties: item_props, optional: false,
+            hint: 'Map your list here. Use “Design item schema” if your list shape is custom.' },
           { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
         ]
       end,
@@ -1019,7 +1016,7 @@ require 'json'
           label: 'Output columns', sample_data_type: 'csv' }
       ],
 
-      input_fields: lambda do |object_definitions, _config_fields = {}|
+      input_fields: lambda do |object_definitions, _connection, _config_fields|
         [
           { name: 'chunks', type: 'array', of: 'object', optional: false, properties: object_definitions['chunk'],
             hint: 'Map the Chunks list from “Prepare document for indexing”.', sticky: true },
@@ -1084,8 +1081,6 @@ require 'json'
       subtitle: 'Accepts documents[*].chunks or chunks[*]; emits provider-agnostic upserts',
       batch: true,
       display_priority: 9,
-      # Not really deprecated, just not ready for use yet
-      deprecated: true,
 
       config_fields: [
         { name: 'override_output_schema', type: 'boolean', control_type: 'checkbox', label: 'Design custom output schema' },
@@ -1093,7 +1088,7 @@ require 'json'
           schema_neutral: false, sticky: true, optional: true, label: 'Output columns', sample_data_type: 'csv' }
       ],
 
-      input_fields: lambda do |_object_definitions = nil, _config_fields = {}|
+      input_fields: lambda do |_object_definitions, _connection, _config_fields|
         [
           { name: 'documents', type: 'array', of: 'object', optional: true },
           { name: 'chunks', type: 'array', of: 'object', optional: true }
@@ -1160,7 +1155,7 @@ require 'json'
       subtitle: 'Chunks with embeddings → [{datapointId, featureVector, restricts, labels?, metadata?}]',
       display_priority: 7,
 
-      input_fields: lambda do |object_definitions, _cfg = {}|
+      input_fields: lambda do |object_definitions, _connection, _cfg|
         [
           { name: 'chunks', type: 'array', of: 'object', optional: false,
             properties: object_definitions['chunk'],
@@ -1172,7 +1167,7 @@ require 'json'
         ]
       end,
 
-      output_fields: lambda do
+      output_fields: lambda do |_object_definitions, _config_fields|
         [
           { name: 'count', type: 'integer' },
           { name: 'datapoints', type: 'array', of: 'object', properties: [
@@ -1259,7 +1254,7 @@ require 'json'
       subtitle: 'Align requests[*].id with embed_text.predictions[*].embeddings.values',
       display_priority: 7,
 
-      input_fields: lambda do
+      input_fields: lambda do |_object_definitions, _connection, _cfg|
         [
           { name: 'requests',  type: 'array', of: 'object', optional: false,
             hint: 'From build_embedding_requests: [{id,text,metadata}]' },
@@ -1270,7 +1265,7 @@ require 'json'
         ]
       end,
 
-      output_fields: lambda do
+      output_fields: lambda do |_object_definitions, _config_fields|
         [
           { name: 'count', type: 'integer' },
           { name: 'embeddings', type: 'array', of: 'object', properties: [
@@ -1321,10 +1316,11 @@ require 'json'
     enrich_chunks_with_metadata: {
       title: 'Ingestion - Enrich chunks with document metadata',
       description: 'Merges document-level metadata (source, uri, mime, author, version) into each chunk.metadata.',
-      input_fields: lambda do |_|
+
+      input_fields: lambda do |object_definitions, _connection, _cfg|
         [
           { name: 'chunks', type: 'array', of: 'object', optional: false,
-            properties: object_definitions['chunk'] || [] },
+            properties: object_definitions['chunk']},
           { name: 'document_metadata', type: 'object', optional: false,
             properties: [
               { name: 'document_id' }, { name: 'file_name' }, { name: 'uri' },
@@ -1333,12 +1329,14 @@ require 'json'
             ] }
         ]
       end,
+
       output_fields: lambda do |_|
         [
           { name: 'chunks', type: 'array', of: 'object',
             properties: object_definitions['chunk'] || [] }
         ].concat(object_definitions['envelope_fields'] || [])
       end,
+
       sample_output: lambda do |_|
         {
           'chunks' => [
@@ -1368,7 +1366,7 @@ require 'json'
       display_priority: 8,
       # chunks[*] -> [{id, text, metadata}] for embedding
 
-      input_fields: lambda do |object_definitions, _config_fields = {}|
+      input_fields: lambda do |object_definitions, _connection, _config_fields|
         [
           { name: 'chunks', type: 'array', of: 'object', optional: false, properties: object_definitions['chunk'],
             hint: 'Map the Chunks list from “Prepare document for indexing”.' },
@@ -1376,7 +1374,7 @@ require 'json'
         ]
       end,
 
-      output_fields: lambda do
+      output_fields: lambda do |_object_definitions, _config_fields|
         [
           { name: 'count', type: 'integer' },
           { name: 'requests', type: 'array', of: 'object', properties: [
@@ -1415,7 +1413,7 @@ require 'json'
       batch: true,
       display_priority: 8,
 
-      input_fields: lambda do |_object_definitions = nil, _config_fields = {}|
+      input_fields: lambda do |_object_definitions, _connection, _config_fields|
         [
           { name: 'documents', type: 'array', of: 'object', optional: true,
             hint: 'Each doc should include chunks:[...]' },
@@ -1424,7 +1422,7 @@ require 'json'
         ]
       end,
 
-      output_fields: lambda do
+      output_fields: lambda do |_object_definitions, _config_fields|
         [
           { name: 'count', type: 'integer' },
           { name: 'requests', type: 'array', of: 'object', properties: [
@@ -1464,7 +1462,7 @@ require 'json'
       subtitle: 'Merges [{id, embedding}] onto chunks by id',
       display_priority: 7,
 
-      input_fields: lambda do |object_definitions, _cfg = {}|
+      input_fields: lambda do |object_definitions, _connection, _cfg|
         [
           { name: 'chunks', type: 'array', of: 'object', optional: false, properties: object_definitions['chunk'],
             hint: 'Map the Chunks list; we’ll merge embeddings by id/chunk_id.' },
@@ -1480,7 +1478,7 @@ require 'json'
         ]
       end,
 
-      output_fields: lambda do
+      output_fields: lambda do |_object_definitions, _config_fields|
         [
           { name: 'count', type: 'integer' },
           { name: 'chunks', type: 'array', of: 'object' }
@@ -1518,7 +1516,7 @@ require 'json'
       batch: true,
       display_priority: 7,
 
-      input_fields: lambda do |_object_definitions = nil, _config_fields = {}|
+      input_fields: lambda do |_object_definitions, _connection, _config_field|
         [
           { name: 'pairs', type: 'array', of: 'object', optional: true,
             hint: 'Each: {chunks:[...], embeddings:[{id,embedding}], id_key?, embedding_key?}',
@@ -1607,7 +1605,7 @@ require 'json'
       subtitle: 'Accepts {chunks:[...]} or {results:[{chunks:[...]}]} and emits {chunks:[...]}',
       display_priority: 6,
 
-      input_fields: lambda do |object_definitions, _config_fields = {}|
+      input_fields: lambda do |object_definitions, _connection, _config_fields|
         [
           { name: 'document', type: 'object', optional: true,
             properties: (object_definitions['prep_result'] || []),
@@ -1621,7 +1619,7 @@ require 'json'
         ]
       end,
 
-      output_fields: lambda do |object_definitions|
+      output_fields: lambda do |object_definitions, _config_fields|
         [
           { name: 'chunks', type: 'array', of: 'object', properties: object_definitions['chunk'] }
         ] + Array(object_definitions['envelope_fields'])
@@ -1682,7 +1680,7 @@ require 'json'
           label: 'Show advanced options', hint: 'Reveal metadata caps.' }
       ],
 
-      input_fields: lambda do |object_definitions = nil, cfg = {}|
+      input_fields: lambda do |object_definitions, _connection, cfg|
         advanced = !!cfg['show_advanced']
         fields = [
           { name: 'document', type: 'object', optional: true, properties: (object_definitions['prep_result'] || []),
@@ -1783,7 +1781,7 @@ require 'json'
           label: 'Output columns', sample_data_type: 'csv' }
       ],
 
-      input_fields: lambda do |_object_definitions = nil, cfg = {}|
+      input_fields: lambda do |_object_definitions, _connection, cfg|
         advanced = !!cfg['show_advanced']
         fields = [
           { name: 'documents', type: 'array', of: 'object', optional: true,
@@ -1867,7 +1865,7 @@ require 'json'
       subtitle: 'Build {object_name, content_type, body} for corpus snapshot',
       display_priority: 5,
 
-      input_fields: lambda do |object_definitions, _cfg = {}|
+      input_fields: lambda do |object_definitions, _connection, _cfg|
         [
           { name: 'namespace', optional: true, hint: 'e.g., hr-knowledge-v1' },
           { name: 'doc_id', optional: true },
@@ -1943,7 +1941,7 @@ require 'json'
       batch: true,
       display_priority: 6,
 
-      input_fields: lambda do
+      input_fields: lambda do |_object_definitions, _connection, _cfg|
         [
           { name: 'namespace', optional: true, hint: 'e.g., hr-knowledge-v1' },
           { name: 'documents', type: 'array', of: 'object', optional: false,
@@ -1953,7 +1951,7 @@ require 'json'
         ]
       end,
 
-      output_fields: lambda do |_object_definitions = nil, _config_fields = {}|
+      output_fields: lambda do |_object_definitions, _config_fields|
         [
           { name: 'count', type: 'integer' },
           { name: 'manifests', type: 'array', of: 'object', properties: [
@@ -2032,7 +2030,7 @@ require 'json'
       subtitle: 'Normalize text + optional embedding into a search request object',
       display_priority: 5,
 
-      input_fields: lambda do
+      input_fields: lambda do |_object_definitions, _connection, _cfg|
         [
           { name: 'query_text', optional: true, control_type: 'text-area' },
           { name: 'query_embedding', type: 'array', of: 'number', optional: true },
@@ -2041,7 +2039,7 @@ require 'json'
         ]
       end,
 
-      output_fields: lambda do
+      output_fields: lambda do |_object_definitions, _config_fields|
         [{ name: 'query', type: 'object' }]
       end,
 
@@ -2087,7 +2085,7 @@ require 'json'
           label: 'Output columns', sample_data_type: 'csv' }
       ],
 
-      input_fields: lambda do
+      input_fields: lambda do |_object_definitions, _connection, _cfg|
         [
           { name: 'results', type: 'array', of: 'object', optional: false }
         ]
@@ -2158,7 +2156,7 @@ require 'json'
       subtitle: 'Greedy pack by tokens with optional per-doc cap',
       display_priority: 4,
 
-      input_fields: lambda do
+      input_fields: lambda do |_object_definitions, _connection, _cfg|
         [
           { name: 'results', type: 'array', of: 'object', optional: false },
           { name: 'token_budget', type: 'integer', optional: false },
@@ -2166,7 +2164,7 @@ require 'json'
         ]
       end,
 
-      output_fields: lambda do
+      output_fields: lambda do |_object_definitions, _config_fields|
         [
           { name: 'total_tokens', type: 'integer' },
           { name: 'count', type: 'integer' },
@@ -2224,7 +2222,7 @@ require 'json'
       subtitle: 'Construct system/user messages with injected context',
       display_priority: 3,
 
-      input_fields: lambda do
+      input_fields: lambda do |_object_definitions, _connection, _cfg|
         [
           { name: 'user_query', optional: false, control_type: 'text-area' },
           { name: 'context', type: 'array', of: 'object', optional: true },
@@ -2233,7 +2231,7 @@ require 'json'
         ]
       end,
 
-      output_fields: lambda do
+      output_fields: lambda do |_object_definitions, _config_fields|
         [{ name: 'messages', type: 'array', of: 'object' }]
       end,
 
@@ -2271,7 +2269,7 @@ require 'json'
       subtitle: 'Extract [^n] citations and attach structured metadata',
       display_priority: 3,
 
-      input_fields: lambda do
+      input_fields: lambda do |_object_definitions, _connection, _cfg|
         [
           { name: 'llm_output', label: 'LLM output text', control_type: 'text-area', optional: false },
           { name: 'context', type: 'array', of: 'object', optional: true,
