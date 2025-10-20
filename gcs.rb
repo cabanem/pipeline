@@ -1402,6 +1402,27 @@ require 'uri'
         ['Drawings → SVG', 'image/svg+xml'],
         ['Drawings → PNG', 'image/png']
       ]
+    end,
+    drive_mime_types_common: lambda do |_|
+      [
+        ['Google Doc',        'application/vnd.google-apps.document'],
+        ['Google Sheet',      'application/vnd.google-apps.spreadsheet'],
+        ['Google Slide',      'application/vnd.google-apps.presentation'],
+        ['Google Drawing',    'application/vnd.google-apps.drawing'],
+        ['PDF',               'application/pdf'],
+        ['Plain text',        'text/plain'],
+        ['CSV',               'text/csv'],
+        ['Markdown',          'text/markdown'],
+        ['JSON',              'application/json'],
+        ['XML',               'application/xml'],
+        ['DOCX',              'application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
+        ['XLSX',              'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'],
+        ['PPTX',              'application/vnd.openxmlformats-officedocument.presentationml.presentation'],
+        ['PNG',               'image/png'],
+        ['JPEG',              'image/jpeg'],
+        ['SVG',               'image/svg+xml'],
+        ['ZIP',               'application/zip']
+      ]
     end
   },
 
@@ -2159,8 +2180,8 @@ require 'uri'
           properties: [
             { name: 'modified_after', type: 'date_time', optional: true, label: 'Modified after' },
             { name: 'modified_before', type: 'date_time', optional: true, label: 'Modified before' },
-            { name: 'mime_types', type: 'array', of: 'string', optional: true,
-              hint: 'Exact mimeType values (OR).' },
+            { name: 'mime_types', type: 'array', of: 'string', optional: true, label: 'MIME types', control_type: 'multiselect',
+              pick_list: 'drive_mime_types_common', hint: 'Pick one or more. We OR-join these in the query.' },
             { name: 'exclude_folders', type: 'boolean', control_type: 'checkbox',
               optional: true, default: false, label: 'Exclude folders' } ] },
         { name: 'paging', type: 'object', optional: true, label: 'Paging',
