@@ -710,11 +710,11 @@ require 'json'
           label: 'Show advanced options', hint: 'Reveal custom sizes, JSON metadata, and caps.' }
       ],
 
-      input_fields: lambda do |_object_definitions, _connection, cfg|
-        cfg ||= {}
+      input_fields: lambda do |object_definitions, connection, config_fields|
+        cfg = (config_fields || {})
         advanced = !!cfg['show_advanced']
         preset   = (cfg['preset'] || 'auto').to_s
-        fields   = [
+        fields = [
           { name: 'file_path', label: 'Source URI (recommended)',
             hint: 'Stable URI like gcs://bucket/path or drive://folder/file; used to derive deterministic doc_id.',
             optional: true },
@@ -762,7 +762,7 @@ require 'json'
           fields << { name: 'debug', label: 'Include debug notes', type: 'boolean',
                       control_type: 'checkbox', optional: true }
         end
-        fields
+        fields.compact
       end,
 
       output_fields: lambda do |object_definitions, _config_fields|
@@ -781,7 +781,7 @@ require 'json'
         ] + Array(object_definitions['envelope_fields'])
       end,
 
-      execute: lambda do |_connection, input, _expanded_input_schema = nil, _expanded_output_schema = nil, _config_fields = {}|
+      execute: lambda do |_connection, input, _schema=nil, _input_schema_name=nil, _connection_schema=nil, _config_fields={}|
         t0   = Time.now
         corr = call(:guid)
         begin
