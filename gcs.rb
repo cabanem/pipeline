@@ -121,7 +121,8 @@ require 'uri'
           { name: 'modified_time', type: 'date_time' },
           { name: 'checksum', type: 'string' },
           { name: 'web_view_url', type: 'string', hint: 'Open in Drive' },
-          { name: 'owners', type: 'array', of: 'object', properties: call(:schema_owner_fields) }
+          { name: 'owners', type: 'array', of: 'object', properties: call(:schema_owner_fields) },
+          { name: 'drive_uri', type: 'string', hint: 'drive://<fileId>' }
         ]
       end
     },
@@ -136,7 +137,8 @@ require 'uri'
           { name: 'generation', type: 'string' },
           { name: 'md5_hash', type: 'string' },
           { name: 'crc32c', type: 'string' },
-          { name: 'metadata', type: 'object' }
+          { name: 'metadata', type: 'object' },
+          { name: 'gs_uri', type: 'string', hint: 'gs://bucket/object' }
         ]
       end
     },
@@ -150,14 +152,17 @@ require 'uri'
           { name: 'text_content', type: 'string' },
           { name: 'content_bytes', type: 'string', hint: 'Base64' },
           { name: 'content_md5', type: 'string', hint: 'Computed from fetched content' },
-          { name: 'content_sha256', type: 'string', hint: 'Computed from fetched content' }
+          { name: 'content_sha256', type: 'string', hint: 'Computed from fetched content' },
+          { name: 'gs_uri', type: 'string', hint: 'gs://bucket/object' }
+
         ] + Array(object_definitions['envelope_fields'])
       end
     },
     gcs_object_with_bytes_uploaded: {
       fields: lambda do |object_definitions|
         Array(object_definitions['gcs_object_base_fields']) + [
-          { name: 'bytes_uploaded', type: 'integer' }
+          { name: 'bytes_uploaded', type: 'integer' },
+          { name: 'gs_uri', type: 'string', hint: 'gs://bucket/object' }
         ] + Array(object_definitions['envelope_fields'])
       end
     },
@@ -180,6 +185,7 @@ require 'uri'
           { name: 'content_bytes' },
           { name: 'content_md5' }, { name: 'content_sha256' },
           { name: 'ok', type: 'boolean' },
+          { name: 'gs_uri' },
           { name: 'telemetry', type: 'object', properties: [
               { name: 'http_status', type: 'integer' }
           ]}
@@ -203,7 +209,8 @@ require 'uri'
           { name: 'text_content', type: 'string' },
           { name: 'content_bytes', type: 'string', hint: 'Base64' },
           { name: 'content_md5', type: 'string', hint: 'Computed from fetched content' },
-          { name: 'content_sha256', type: 'string', hint: 'Computed from fetched content' }
+          { name: 'content_sha256', type: 'string', hint: 'Computed from fetched content' },
+          { name: 'drive_uri', type: 'string', hint: 'drive://<fileId>' }
         ] + Array(object_definitions['envelope_fields'])
       end
     },
@@ -517,7 +524,8 @@ require 'uri'
               'modified_time' => '2024-01-01T12:00:00Z',
               'checksum'      => 'd41d8cd98f00b204e9800998ecf8427e',
               'web_view_url'  => 'https://drive.google.com/file/d/1AbCdEfGhIjK/view',
-              'owners'        => [{ 'display_name' => 'Drive Bot', 'email' => 'bot@example.com' }]
+              'owners'        => [{ 'display_name' => 'Drive Bot', 'email' => 'bot@example.com' }],
+              'drive_uri'     => 'drive://1AbCdEfGhIjK'
             }
           ],
           'file_ids' => ['1AbCdEfGhIjK'],
@@ -673,6 +681,7 @@ require 'uri'
           'checksum'      => nil,
           'web_view_url'  => 'https://drive.google.com/file/d/1AbCdEfGhIjK/view',
           'owners'        => [{ 'display_name' => 'Drive Bot', 'email' => 'bot@example.com' }],
+          'drive_uri'     => 'drive://1AbCdEfGhIjK',
           'exported_as'   => 'text/plain',
           'text_content'  => 'Employees may carry over up to 40 hours...',
           'content_bytes' => nil,
@@ -777,6 +786,7 @@ require 'uri'
               'generation' => '1735689600000000',
               'md5_hash' => '1B2M2Y8AsgTpgAmY7PhCfg==',
               'crc32c' => 'AAAAAA==',
+              'gs_uri' => 'gs://my-bucket/path/to/file.txt',
               'metadata' => { 'source' => 'ingest' }
             }
           ],
@@ -918,7 +928,8 @@ require 'uri'
             'text_content'      => text_content,
             'content_bytes'     => content_bytes_b64,
             'content_md5'       => local_md5_hex,
-            'content_sha256'    => local_sha256_hex
+            'content_sha256'    => local_sha256_hex,
+            'gs_uri'            => (meta['bucket'] && meta['name']) ? "gs://#{meta['bucket']}/#{meta['name']}" : nil
           }.merge(call(:telemetry_envelope, t0, corr, true, 200, (note || 'OK')))
         rescue => e
           details = call(:google_error_extract, e)
@@ -951,6 +962,7 @@ require 'uri'
           'kms_key_name' => nil,
           'metadata' => { 'source' => 'hr', 'doc' => 'pto' },
           'media_link' => 'https://storage.googleapis.com/download/storage/v1/b/my-bucket/o/handbook.txt?generation=1699...&alt=media',
+          'gs_uri' => 'gs://my-bucket/handbook.txt',
           'md5_hash_b64' => '1B2M2Y8AsgTpgAmY7PhCfg==',
           'md5_hash_hex' => 'd41d8cd98f00b204e9800998ecf8427e',
           'crc32c_b64' => 'AAAAAA==',
@@ -1078,6 +1090,7 @@ require 'uri'
           'md5_hash' => '1B2M2Y8AsgTpgAmY7PhCfg==',
           'crc32c' => 'AAAAAA==',
           'metadata' => { 'source' => 'ingest' },
+          'gs_uri' => 'gs://my-bucket/path/to/file.txt',
           'bytes_uploaded' => 123,
           'ok' => true,
           'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 1, 'correlation_id' => 'sample' }
@@ -1663,7 +1676,8 @@ require 'uri'
         'generation'   => o['generation'].to_s,
         'md5_hash'     => o['md5Hash'],
         'crc32c'       => o['crc32c'],
-        'metadata'     => o['metadata'] || {}
+        'metadata'     => o['metadata'] || {},
+        'gs_uri'       => (o['bucket'] && o['name']) ? "gs://#{o['bucket']}/#{o['name']}" : nil
       }
     end,
     map_drive_meta: lambda do |f|
@@ -1675,7 +1689,8 @@ require 'uri'
         'modified_time' => f['modifiedTime'],
         'checksum'      => f['md5Checksum'],
         'web_view_url'  => (f['id'].present? ? "https://drive.google.com/file/d/#{f['id']}/view" : nil),
-        'owners'        => (f['owners'] || []).map { |o| { 'display_name' => o['displayName'], 'email' => o['emailAddress'] } }
+        'owners'        => (f['owners'] || []).map { |o| { 'display_name' => o['displayName'], 'email' => o['emailAddress'] } },
+        'drive_uri'     => (f['id'].present? ? "drive://#{f['id']}" : nil)
       }
     end,
 
@@ -1683,7 +1698,8 @@ require 'uri'
       {
         'id' => f['id'],
         'name' => f['name'],
-        'web_view_url' => (f['id'].present? ? "https://drive.google.com/file/d/#{f['id']}/view" : nil)
+        'web_view_url' => (f['id'].present? ? "https://drive.google.com/file/d/#{f['id']}/view" : nil),
+        'drive_uri'    => (f['id'].present? ? "drive://#{f['id']}" : nil)
       }
     end,
     do_permission_probe: lambda do |connection, bucket, canary_folder_id_or_url, canary_drive_id, gcs_prefix|
@@ -2224,7 +2240,7 @@ require 'uri'
                 type: 'string',
                 control_type: 'text', 
                 optional: true, 
-                toggle_hint: 'Provide comma-separated MIME types'
+                toggle_hint: 'Provide comma-separated MIME types',
                 hint: 'Comma-separated MIME types or a mapped list joined by commas' 
                },
               convert_input: 'util_csv_to_array_of_strings', hint: 'Pick one or more. We OR-join these in the query.' },
