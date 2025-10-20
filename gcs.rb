@@ -917,7 +917,8 @@ require 'uri'
             call(:telemetry_envelope, t0, corr, false, (details['code'] || 0),
                                       details['message'] || e.to_s, details)
           )
-        end,
+        end
+      end,
 
       sample_output: lambda do
         {
@@ -1104,6 +1105,7 @@ require 'uri'
         prefix       = call(:util_normalize_prefix, input['gcs_prefix'])
         editors_mode = (input['content_mode_for_editors'] || 'text').to_s
         editors_fmt  = input['editors_export_format']
+        abuse        = !!input['acknowledge_abuse']
 
         uploaded, failed = [], []
         # Accepts IDs or URLs (splits on whitespace, commas for ui)
@@ -1115,7 +1117,7 @@ require 'uri'
           next if file_id.blank?
 
           # Core transfer - handles errors vs binary, metadata propogation, checksums, RP buckets
-          res = call(:transfer_one_drive_to_gcs, connection, file_id, bucket, "#{prefix}", editors_mode, editors_fmt, nil, nil)
+          res = call(:transfer_one_drive_to_gcs, connection, file_id, bucket, "#{prefix}", editors_mode, editors_fmt, nil, nil, abuse)
           if res['ok']
             ok = res['ok']
             # Ensure returned object_name reflects prefix (cosmetic)
@@ -1206,13 +1208,14 @@ require 'uri'
         t0 = Time.now
         corr = SecureRandom.uuid
 
-        bucket       = input['bucket']
-        prefix   = call(:util_normalize_prefix, input['gcs_prefix'])
-        def_mode = (input['default_editors_mode'] || 'text').to_s
-        def_fmt  = input['default_editors_export_format']
-        def_ct   = input['default_content_type']
-        def_meta = input['default_custom_metadata']
+        bucket        = input['bucket']
+        prefix        = call(:util_normalize_prefix, input['gcs_prefix'])
+        def_mode      = (input['default_editors_mode'] || 'text').to_s
+        def_fmt       = input['default_editors_export_format']
+        def_ct        = input['default_content_type']
+        def_meta      = input['default_custom_metadata']
         stop_on_error = !!input['stop_on_error']
+        abuse         = !!input['acknowledge_abuse']
 
         uploaded, failed = [], []
         Array(input['items']).each_with_index do |it, idx|
@@ -1227,7 +1230,7 @@ require 'uri'
 
           editors_fmt  = (it['editors_export_format'].presence || def_fmt)
           # Single file transfer core (editors/binary branches, RP via userProject)
-          res = call(:transfer_one_drive_to_gcs, connection, file_id, bucket, (object_name || ''), editors_mode, editors_fmt, ctype, meta)
+          res = call(:transfer_one_drive_to_gcs, connection, file_id, bucket, (object_name || ''), editors_mode, editors_fmt, ctype, meta, abuse)
           if res['ok']
             ok = res['ok']
             ok[:gcs_object_name] = (object_name.presence || "#{prefix}#{ok[:gcs_object_name]}")
@@ -1367,7 +1370,7 @@ require 'uri'
     end,
     editors_modes: lambda do |_|
       [
-        ['text (export Editors to plain/csv/svg per mapping)', 'text'],
+        ['export (Editors → chosen format)', 'text'],
         ['skip (do not transfer Editors files)', 'skip']
       ]
     end,
@@ -1535,6 +1538,19 @@ require 'uri'
       return nil unless b64
       # GCS CRC32C is big-endian; decode and hexlify
       Base64.decode64(b64).unpack1('H*')
+    end,
+
+    util_guess_extension_from_mime: lambda do |mime|
+      map = {
+        'text/plain' => '.txt',
+        'text/csv' => '.csv',
+        'application/pdf' => '.pdf',
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document' => '.docx',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' => '.xlsx',
+        'image/svg+xml' => '.svg',
+        'image/png' => '.png'
+      }
+      map[mime.to_s]
     end,
 
     # --- 3. TELEMETRY --------------------
@@ -1828,7 +1844,7 @@ require 'uri'
     end,
 
     # --- 6. CORE WORKFLOWS ---------------
-    transfer_one_drive_to_gcs: lambda do |connection, file_id, bucket, object_name, editors_mode, editors_export_format, global_content_type, global_metadata|
+    transfer_one_drive_to_gcs: lambda do |connection, file_id, bucket, object_name, editors_mode, editors_export_format, global_content_type, global_metadata, acknowledge_abuse=false|
       # transfer one Drive file to GCS. Returns {:ok=>hash} or {:error=>hash}.
       user_project = connection['user_project']
       begin
@@ -1851,9 +1867,14 @@ require 'uri'
           export_mime = call(:util_editors_export_mime, meta['mimeType'], editors_export_format)
           body = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}/export")
                 .params(mimeType: export_mime, supportsAllDrives: true)
+                .headers('Accept-Encoding': 'identity')
                 .response_format_raw
                 .to_s
           cs = call(:util_compute_checksums, body)
+          # Optional: add extension if missing and caller didn’t provide one
+          if oname.to_s.strip != '' && !oname.include?('.') && (ext = call(:util_guess_extension_from_mime, export_mime))
+            oname = "#{oname}#{ext}"
+          end
           created = post("https://www.googleapis.com/upload/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o")
                     .params(uploadType: 'media', name: oname, userProject: user_project)
                     .headers('Content-Type': (global_content_type.presence || export_mime))
@@ -1873,7 +1894,8 @@ require 'uri'
         else
           ctype = (global_content_type.presence || meta['mimeType'])
           body = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}")
-                .params(alt: 'media', supportsAllDrives: true)
+                .params(alt: 'media', supportsAllDrives: true, acknowledgeAbuse: !!acknowledge_abuse)
+                .headers('Accept-Encoding': 'identity')
                 .response_format_raw
                 .to_s
           cs = call(:util_compute_checksums, body)
@@ -2141,7 +2163,10 @@ require 'uri'
         { name: 'content_mode_for_editors', control_type: 'select', pick_list: 'editors_modes',
           optional: true, default: 'text', label: 'Editors files handling' },
         { name: 'editors_export_format', label: 'Editors export format (when Editors=text)',
-          control_type: 'select', pick_list: 'editors_export_formats', optional: true }
+          control_type: 'select', pick_list: 'editors_export_formats', optional: true },
+        { name: 'acknowledge_abuse', type: 'boolean', control_type: 'checkbox', default: false,
+          label: 'Acknowledge abuse for download',
+          hint: 'Only applies to non-Editors direct downloads that require this flag.' }
       ]
     end,
     ui_transfer_batch_inputs: lambda do |_config_fields|
@@ -2155,6 +2180,8 @@ require 'uri'
           optional: true, label: 'Default Editors export format' },
         { name: 'default_content_type', optional: true, label: 'Default Content-Type' },
         { name: 'default_custom_metadata', type: 'object', optional: true, label: 'Default custom metadata' },
+        { name: 'acknowledge_abuse', type: 'boolean', control_type: 'checkbox', default: false,
+          label: 'Acknowledge abuse for download (non-Editors)', optional: true },
         { name: 'stop_on_error', type: 'boolean', control_type: 'checkbox', default: false, label: 'Stop on first error' },
         { name: 'items', type: 'array', of: 'object', label: 'Items',
           properties: call(:schema_transfer_batch_plan_item_fields), optional: false }
