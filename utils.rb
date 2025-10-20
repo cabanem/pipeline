@@ -781,7 +781,7 @@ require 'json'
         ] + Array(object_definitions['envelope_fields'])
       end,
 
-      execute: lambda do |_connection, input|
+      execute: lambda do |_connection, input, _expanded_input_schema = nil, _expanded_output_schema = nil, _config_fields = {}|
         t0   = Time.now
         corr = call(:guid)
         begin
@@ -793,7 +793,7 @@ require 'json'
           if raw_in.nil? || raw_in.to_s.strip.empty?
             # Helpful hint: user likely mapped a binary (e.g., PDF) without text extraction.
             hint = ''
-            if file_path =~ /\.pdf\z/i || file_path =~ %r{\Ags://}i || file_path =~ %r{\Adrive://}i
+            if file_path =~ /\.pdf\z/i || file_path =~ %r{\A(?:gcs|gs)://}i || file_path =~ %r{\Adrive://}i
               hint = ' (if this is a PDF or other binary, convert/extract text first; map text_content from Drive/GCS or your extractor)'
             end
             error("content is required and must be non-empty#{hint}.")
@@ -824,15 +824,18 @@ require 'json'
           total_chars = cleaned.length
           total_toks  = call(:est_tokens, cleaned)
 
-          # 2) Infer "custom" when caller provided explicit bounds; else auto/balanced/small/large by input hint (optional)
+          # 2) Infer "custom" when caller provided explicit bounds; else read preset from config_fields
           provided_max = input['max_chunk_chars']
           provided_ovl = input['overlap_chars']
-          preset = 'auto'
-          if provided_max || provided_ovl
-            preset = 'custom'
-          elsif %w[small large balanced].include?(input['preset'].to_s)
-            preset = input['preset'].to_s
-          end
+          cfg_preset = (_config_fields['preset'] || 'auto').to_s
+          preset =
+            if provided_max || provided_ovl
+              'custom'
+            elsif %w[auto small large balanced custom].include?(cfg_preset)
+              cfg_preset
+            else
+              'auto'
+            end
           if preset == 'custom'
             max_in  = input['max_chunk_chars']
             ov_in   = input['overlap_chars']
@@ -865,7 +868,8 @@ require 'json'
 
           # Harmonize with batch behavior: clamp, but surface a debug note.
           if overlap >= max_chars
-            clamp_note = "Requested overlap=#{overlap} >= max=#{max_chars}. Clamped to #{[max_chars - 1, 0].max}."
+            clamp = "Requested overlap=#{overlap} >= max=#{max_chars}. Clamped to #{[max_chars - 1, 0].max}."
+            clamp_note = [clamp_note, clamp].compact.join(' | ')
             overlap = [max_chars - 1, 0].max
           end
 
@@ -903,7 +907,8 @@ require 'json'
             'max_chunk_chars' => max_chars,
             'overlap_chars'   => overlap,
             'created_at'      => created_at,
-            'chunks'          => records
+            'chunks'          => records,
+            'duration_ms'     => ((Time.now - t0) * 1000).round
           }
           base['trace_id']  = corr if debug
           base['notes']     = [
