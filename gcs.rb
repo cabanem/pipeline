@@ -652,7 +652,6 @@ require 'uri'
         {}.merge(
           'error' => call(:normalize_error_for_pills, details, 'drive', op)
         ).merge(
-
           call(:telemetry_envelope, t0, corr, false, (details['code'] || 0),
                details['message'] || e.to_s, details)
         )
