@@ -70,11 +70,7 @@ require 'base64'
       # Let Workato trigger re-acquire on auth errors
       refresh_on: [401],
       detect_on:  [/UNAUTHENTICATED/i, /invalid[_-]?token/i, /expired/i, /insufficient/i]
-    },
-
-    base_uri: lambda do |_connection|
-      'https://aiplatform.googleapis.com'
-    end
+    }
   },
 
   # --------- CONNECTION TEST ----------------------------------------------
@@ -1635,7 +1631,7 @@ require 'base64'
       description: 'projects.locations.indexes.delete — Vertex AI Matching Engine',
       display_priority: 90,
       help: lambda do |_|
-        { body: 'Delete a vector index by resource name or short ID. Returns the LRO that tracks deletion.' )
+        { body: 'Delete a vector index by resource name or short ID. Returns the LRO that tracks deletion.' }
       end,
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
@@ -3169,12 +3165,341 @@ require 'base64'
         { 'name' => 'projects/p/locations/us-central1/operations/123', 'done' => false,
           'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 8, 'correlation_id' => 'sample' } }
       end
+    },
+    permission_probe: {
+      title: 'Admin: Permission probe',
+      subtitle: 'Quick IAM/billing/region checks for Vertex & RAG',
+      display_priority: 100,
+      help: lambda do |_|
+        { body: 'Runs lightweight calls (locations list, countTokens, indexes list, ragCorpora list) to validate auth, billing (x-goog-user-project), and region setup. Returns per-check status and suggestions.' }
+      end,
+
+      input_fields: lambda do |_|
+        [
+          # Which checks to run
+          { name: 'check_locations', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+            hint: 'GET projects/{p}/locations (verifies basic access to Vertex AI API and project)' },
+          { name: 'check_count_tokens', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+            hint: 'POST models:countTokens on a small prompt (verifies generative access & billing)' },
+          { name: 'check_indexes_list', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+            hint: 'GET indexes list in the selected region (verifies Matching Engine permissions & region)' },
+          { name: 'check_rag_corpora_list', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+            hint: 'GET ragCorpora list (verifies Vertex RAG Store permissions & region)' },
+
+          # Minimal config for the token-count smoke test
+          { name: 'gen_model', label: 'Generative model (for countTokens)', optional: true,
+            hint: 'Defaults to connection default or gemini-2.0-flash' },
+          { name: 'count_tokens_text', optional: true, hint: 'Optional custom text; default uses "ping"' },
+
+          # Debug echo
+          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true,
+            hint: 'Echo request details and Google error bodies in debug.results[].' },
+
+          # Discovery Engine (Vertex AI Search)
+          { name: 'check_discovery_engines_list', type: 'boolean', control_type: 'checkbox', optional: true, default: false,
+            hint: 'GET discovery engines in the chosen location (verifies Discovery Engine API + IAM)' },
+          { name: 'check_discovery_search_smoke', type: 'boolean', control_type: 'checkbox', optional: true, default: false,
+            hint: 'POST :search on a servingConfig with a tiny query (validates end-to-end search)' },
+          { name: 'discovery_host', label: 'Discovery Engine host', control_type: 'select', pick_list: 'discovery_hosts',
+            optional: true, hint: 'Default global; choose US multi-region if your engine lives there.' },
+          { name: 'discovery_host_custom', label: 'Custom Discovery host', optional: true,
+            hint: 'Override host manually (e.g., us-discoveryengine.googleapis.com). Takes precedence when set.' },
+          { name: 'discovery_location', label: 'Discovery location', optional: true,
+            hint: 'e.g., global, us, us-central1. Defaults to connection.location or "global" if blank.' },
+          { name: 'discovery_collection', optional: true, default: 'default_collection',
+            hint: 'Usually default_collection' },
+          { name: 'discovery_engine_id', label: 'Engine ID (for list/search)', optional: true,
+            hint: 'Required for search when serving_config is not provided.' },
+          { name: 'discovery_serving_config', label: 'Serving config (full path)', optional: true,
+            hint: 'projects/{p}/locations/{l}/collections/{c}/engines/{e}/servingConfigs/{name} (often "default_config")' },
+          { name: 'discovery_search_query', label: 'Search query (smoke)', optional: true, default: 'ping',
+            hint: 'Tiny query for the smoke test' }
+        ]
+      end,
+
+      output_fields: lambda do |_|
+        [
+          { name: 'project_id' },
+          { name: 'location' },
+          { name: 'user_project' },
+          { name: 'principal', type: 'object', properties: [
+              { name: 'client_email' }
+            ]
+          },
+          { name: 'results', type: 'array', of: 'object', properties: [
+              { name: 'check' },
+              { name: 'ok', type: 'boolean' },
+              { name: 'http_status', type: 'integer' },
+              { name: 'url' },
+              { name: 'message' },
+              { name: 'suggestion' },
+              { name: 'debug', type: 'object' }
+            ]
+          },
+          { name: 'ok', type: 'boolean' },
+          { name: 'telemetry', type: 'object', properties: [
+            { name: 'http_status', type: 'integer' },
+            { name: 'message' }, { name: 'duration_ms', type: 'integer' },
+            { name: 'correlation_id' }
+          ]}
+        ]
+      end,
+
+      execute: lambda do |connection, input|
+        t0   = Time.now
+        corr = call(:build_correlation_id)
+
+        # Normalize connection context
+        call(:ensure_project_id!, connection)
+        project = connection['project_id'].to_s
+        loc     = (connection['location'].presence || 'global').to_s.downcase
+        up      = (connection['user_project'].to_s.strip.presence)
+        sa_json = JSON.parse(connection['service_account_key_json'].to_s) rescue {}
+        client  = sa_json['client_email'].to_s
+
+        results = []
+        do_debug = call(:normalize_boolean, input['debug'])
+
+        # Helper to run a single probe with uniform capture
+        run_probe = lambda do |name|
+          begin
+            url, http_code, msg, dbg = yield
+            results << {
+              'check'       => name,
+              'ok'          => true,
+              'http_status' => http_code,
+              'url'         => url,
+              'message'     => 'OK',
+              'suggestion'  => nil,
+              'debug'       => (do_debug ? dbg : nil)
+            }
+          rescue => e
+            g   = call(:extract_google_error, e) rescue {}
+            code = call(:telemetry_parse_error_code, e)
+            url  = (g['raw'] && g['raw']['error'] && g['raw']['error']['status']) ? nil : nil
+            # Friendly suggestions by common failure modes
+            hint =
+              case code
+              when 400
+                'Bad request. Double-check path/region and request body shape.'
+              when 401
+                'Unauthenticated. Verify service account key is valid and not revoked.'
+              when 403
+                'Permission denied. Ensure the service account has required IAM roles and that the API is enabled for the project and (if set) user_project.'
+              when 404
+                'Not found. Check region (“location”) and resource IDs. Many Vertex calls require a regional (non-global) location.'
+              when 429
+                'Rate limited or quota exceeded. Consider setting user_project or request fewer ops.'
+              when 412
+                'Precondition failed. Resource may be in an invalid state.'
+              else
+                nil
+              end
+
+            results << {
+              'check'       => name,
+              'ok'          => false,
+              'http_status' => code,
+              'url'         => nil,
+              'message'     => [e.to_s, (g['message'] || nil)].compact.join(' | '),
+              'suggestion'  => hint,
+              'debug'       => (do_debug ? call(:debug_pack, true, nil, nil, g) : nil)
+            }
+          end
+        end
+
+        # 1) Locations list (works even when no models created)
+        if input['check_locations'] != false
+          run_probe.call('locations.list') do
+            url = "https://aiplatform.googleapis.com/v1/projects/#{project}/locations"
+            resp = get(url).params(pageSize: 1).headers(call(:request_headers, corr))
+            [url, call(:telemetry_success_code, resp), 'OK',
+             call(:debug_pack, do_debug, [url, {pageSize:1}].compact.join('?'), nil, resp&.body)]
+          end
+        end
+
+        # 2) Count tokens on a tiny prompt (validates generative path + billing)
+        if input['check_count_tokens'] != false
+          begin
+            model = (input['gen_model'].presence || connection['default_probe_gen_model'].presence || 'gemini-2.0-flash').to_s
+            model_path = call(:build_model_path_with_global_preview, connection, model)
+            url = call(:aipl_v1_url, connection, (loc.presence || 'global'), "#{model_path}:countTokens")
+            payload = {
+              'contents' => [
+                { 'role' => 'user', 'parts' => [ { 'text' => (input['count_tokens_text'].presence || 'ping') } ] }
+              ],
+              'systemInstruction' => call(:system_instruction_from_text, 'permission probe')
+            }
+            resp = post(url).headers(call(:request_headers, corr)).payload(call(:json_compact, payload))
+            results << {
+              'check'       => 'models.countTokens',
+              'ok'          => true,
+              'http_status' => call(:telemetry_success_code, resp),
+              'url'         => url,
+              'message'     => 'OK',
+              'suggestion'  => nil,
+              'debug'       => (do_debug ? call(:debug_pack, true, url, payload, resp&.body) : nil)
+            }
+          rescue => e
+            g = call(:extract_google_error, e) rescue {}
+            code = call(:telemetry_parse_error_code, e)
+            results << {
+              'check'       => 'models.countTokens',
+              'ok'          => false,
+              'http_status' => code,
+              'url'         => nil,
+              'message'     => [e.to_s, (g['message'] || nil)].compact.join(' | '),
+              'suggestion'  => (code == 403 ? 'Grant Vertex AI User (roles/aiplatform.user) and ensure billing/quota via x-goog-user-project if needed.' : nil),
+              'debug'       => (do_debug ? call(:debug_pack, true, nil, nil, g) : nil)
+            }
+          end
+        end
+
+        # 3) Indexes list (Matching Engine)
+        if input['check_indexes_list'] != false
+          run_probe.call('indexes.list') do
+            call(:ensure_regional_location!, connection)
+            parent = "projects/#{project}/locations/#{loc}"
+            url    = call(:aipl_v1_url, connection, loc, "#{parent}/indexes")
+            resp   = get(url).params(pageSize: 1).headers(call(:request_headers, corr))
+            [url, call(:telemetry_success_code, resp), 'OK',
+             call(:debug_pack, do_debug, [url, {pageSize:1}].compact.join('?'), nil, resp&.body)]
+          end
+        end
+
+        # 4) RAG corpora list (Vertex RAG Store)
+        if input['check_rag_corpora_list'] != false
+          run_probe.call('ragCorpora.list') do
+            call(:ensure_regional_location!, connection)
+            parent = "projects/#{project}/locations/#{loc}"
+            url    = call(:aipl_v1_url, connection, loc, "#{parent}/ragCorpora")
+            resp   = get(url).params(pageSize: 1).headers(call(:request_headers, corr))
+            [url, call(:telemetry_success_code, resp), 'OK',
+             call(:debug_pack, do_debug, [url, {pageSize:1}].compact.join('?'), nil, resp&.body)]
+          end
+        end
+  
+        # 5) Discovery engine
+        # Resolve host and location
+        de_host =
+          if input['discovery_host_custom'].to_s.strip.present?
+            input['discovery_host_custom'].to_s.strip
+          elsif input['discovery_host'].to_s.strip.present?
+            input['discovery_host'].to_s.strip
+          else
+            'discoveryengine.googleapis.com'
+          end
+        de_loc  = (input['discovery_location'].presence || loc.presence || 'global').to_s.downcase
+        de_coll = (input['discovery_collection'].presence || 'default_collection').to_s
+
+        # (A) engines.list
+        if input['check_discovery_engines_list'] == true
+          run_probe.call('discovery.engines.list') do
+            parent = "projects/#{project}/locations/#{de_loc}/collections/#{de_coll}"
+            url    = "https://#{de_host}/v1/#{parent}/engines"
+            resp   = get(url).params(pageSize: 1).headers(call(:request_headers, corr))
+            [url, call(:telemetry_success_code, resp), 'OK',
+             call(:debug_pack, do_debug, [url, {pageSize:1}].compact.join('?'), nil, resp&.body)]
+          end
+        end
+
+        # (B) search smoke test
+        if input['check_discovery_search_smoke'] == true
+          begin
+            serving = input['discovery_serving_config'].to_s.strip
+            engine  = input['discovery_engine_id'].to_s.strip
+
+            serving_path =
+              if serving.start_with?('projects/')
+                serving.sub(%r{^/}, '')
+              else
+                # build from pieces when not provided as full path
+                error('Provide discovery_engine_id or discovery_serving_config for search smoke test') if engine.empty?
+                "projects/#{project}/locations/#{de_loc}/collections/#{de_coll}/engines/#{engine}/servingConfigs/default_config"
+              end
+
+            url     = "https://#{de_host}/v1/#{serving_path}:search"
+            payload = {
+              'query'    => (input['discovery_search_query'].presence || 'ping').to_s,
+              'pageSize' => 1
+            }
+
+            resp = post(url).headers(call(:request_headers, corr)).payload(call(:json_compact, payload))
+            results << {
+              'check'       => 'discovery.search',
+              'ok'          => true,
+              'http_status' => call(:telemetry_success_code, resp),
+              'url'         => url,
+              'message'     => 'OK',
+              'suggestion'  => nil,
+              'debug'       => (do_debug ? call(:debug_pack, true, url, payload, resp&.body) : nil)
+            }
+          rescue => e
+            g    = call(:extract_google_error, e) rescue {}
+            code = call(:telemetry_parse_error_code, e)
+            hint =
+              case code
+              when 403
+                'Permission denied. Grant Discovery Engine roles (e.g., roles/discoveryengine.admin or roles/discoveryengine.searchEditor) and ensure the API is enabled.'
+              when 404
+                'Not found. Check location/collection/engine/servingConfig. Discovery Engine often uses global/us multi-region; ensure host and location align.'
+              when 400
+                'Bad request. Verify request body shape and that the servingConfig is deployed.'
+              else
+                nil
+              end
+            results << {
+              'check'       => 'discovery.search',
+              'ok'          => false,
+              'http_status' => code,
+              'url'         => nil,
+              'message'     => [e.to_s, (g['message'] || nil)].compact.join(' | '),
+              'suggestion'  => hint,
+              'debug'       => (do_debug ? call(:debug_pack, true, nil, nil, g) : nil)
+            }
+          end
+        end
+
+        # Overall
+        overall_ok = results.all? { |r| r['ok'] }
+        {
+          'project_id' => project,
+          'location'   => loc,
+          'user_project' => up,
+          'principal'  => { 'client_email' => client },
+          'results'    => results
+        }.merge(call(:telemetry_envelope, t0, corr, overall_ok, (overall_ok ? 200 : 207), (overall_ok ? 'OK' : 'PARTIAL')))
+      end,
+
+      sample_output: lambda do
+        {
+          'project_id' => 'acme-prod',
+          'location'   => 'us-central1',
+          'user_project' => 'acme-billing',
+          'principal'  => { 'client_email' => 'svc-vertex@acme.iam.gserviceaccount.com' },
+          'results' => [
+            { 'check' => 'locations.list',       'ok' => true,  'http_status' => 200, 'url' => 'https://aiplatform.googleapis.com/v1/projects/acme/locations', 'message' => 'OK' },
+            { 'check' => 'models.countTokens',   'ok' => true,  'http_status' => 200, 'url' => 'https://us-central1-aiplatform.googleapis.com/v1/projects/acme/locations/us-central1/publishers/google/models/gemini-2.0-flash:countTokens', 'message' => 'OK' },
+            { 'check' => 'indexes.list',         'ok' => true,  'http_status' => 200, 'url' => 'https://us-central1-aiplatform.googleapis.com/v1/projects/acme/locations/us-central1/indexes', 'message' => 'OK' },
+            { 'check' => 'ragCorpora.list',      'ok' => false, 'http_status' => 403, 'message' => 'PERMISSION_DENIED | caller lacks permission', 'suggestion' => 'Permission denied. Ensure the service account has required IAM roles and that the API is enabled for the project and (if set) user_project.' }
+          ],
+          'ok' => false,
+          'telemetry' => { 'http_status' => 207, 'message' => 'PARTIAL', 'duration_ms' => 27, 'correlation_id' => 'sample-corr' }
+        }
+      end
     }
 
   },
 
   # --------- PICK LISTS ---------------------------------------------------
   pick_lists: {
+
+    discovery_hosts: lambda do |_connection|
+      [
+        ['Discovery Engine (global)', 'discoveryengine.googleapis.com'],
+        ['Discovery Engine (US multi-region)', 'us-discoveryengine.googleapis.com']
+      ]
+    end,
     modes_classification: lambda do
       [%w[Embedding embedding], %w[Generative generative], %w[Hybrid hybrid]]
     end,
