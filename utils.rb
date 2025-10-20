@@ -7,7 +7,7 @@ require 'json'
 
 {
   title: 'RAG Utilities',
-  version: '0.4.0',
+  version: '0.5.0',
   description: 'Utility adapter for retrieval augmented generation systems',
 
   # --------- CONNECTION ---------------------------------------------------
@@ -777,96 +777,129 @@ require 'json'
       execute: lambda do |_connection, input, _schema = nil, _input_schema_name = nil, _connection_schema = nil, _cfg = {}|
         t0   = Time.now
         corr = call(:guid)
-        started_at  = Time.now
-        trace_id    = call(:guid)
-        raw         = input['content'].to_s
-        file_path   = input['file_path'].to_s
-        meta_simple = call(:choose_metadata_simple, input)
-        meta_adv    = input['metadata_json'].is_a?(Hash) ? input['metadata_json'] : {}
-        # Apply optional caps only if provided (advanced UI)
-        caps = {
-          'metadata_max_keys'  => (_cfg['metadata_max_keys'] || input['metadata_max_keys']),
-          'metadata_max_bytes' => (_cfg['metadata_max_bytes'] || input['metadata_max_bytes'])
-        }.compact
-        user_meta = if caps.empty?
-          call(:sanitize_metadata, meta_simple.merge(meta_adv))
-        else
-          call(:coerce_metadata, meta_simple.merge(meta_adv), {
-            'metadata_mode'      => 'flat',
-            'metadata_prefix'    => '',
-            'metadata_max_keys'  => caps['metadata_max_keys']  || 50,
-            'metadata_max_bytes' => caps['metadata_max_bytes'] || 4096
-          })
-        end
-        debug       = call(:safe_bool, input['debug'])
-
-        # 1) Normalize/Clean
-        normalized = call(:normalize_newlines, raw)
-        cleaned    = call(:strip_control_chars, normalized)
-
-        # 2) Bounds via preset/simple mode (config_fields) or manual entries
-        preset = (_cfg['preset'] || 'auto').to_s
-        if preset == 'custom' || _cfg['show_advanced']
-          max_in  = input['max_chunk_chars']
-          ov_in   = input['overlap_chars']
-          max_chars = call(:clamp_int, (max_in || 2000), 200, 8000)
-          overlap   = call(:clamp_int, (ov_in  || 200),    0, 4000)
-        else
-          case preset
-          when 'auto'
-            bounds    = call(:auto_chunk_bounds_for, cleaned.length)
-            max_chars = bounds['max']
-            overlap   = bounds['overlap']
-          when 'small'    then max_chars, overlap = 1000, 100
-          when 'large'    then max_chars, overlap = 4000, 200
-          when 'balanced' then max_chars, overlap = 2000, 200
-          else                 max_chars, overlap = 2000, 200
+        begin
+          started_at  = Time.now
+          trace_id    = call(:guid)
+          # ---- VALIDATION ----
+          raw_in      = input['content']
+          file_path   = input['file_path'].to_s
+          if raw_in.nil? || raw_in.to_s.strip.empty?
+            # Helpful hint: user likely mapped a binary (e.g., PDF) without text extraction.
+            hint = ''
+            if file_path =~ /\.pdf\z/i || file_path =~ %r{\Ags://}i || file_path =~ %r{\Adrive://}i
+              hint = ' (if this is a PDF or other binary, convert/extract text first; map text_content from Drive/GCS or your extractor)'
+            end
+            error("content is required and must be non-empty#{hint}.")
           end
-        end
-        # Hard rule: overlap must be < max_chars (don’t silently fix without telling the user)
-        if overlap >= max_chars
-          error("overlap_chars (#{overlap}) must be less than max_chunk_chars (#{max_chars}). Try overlap_chars=#{[max_chars/10,1].max}.")
-        end
+          raw         = raw_in.to_s
+          meta_simple = call(:choose_metadata_simple, input)
+          meta_adv    = input['metadata_json'].is_a?(Hash) ? input['metadata_json'] : {}
+          # Apply optional caps only if provided (advanced UI)
+          caps = {
+            'metadata_max_keys'  => (_cfg['metadata_max_keys'] || input['metadata_max_keys']),
+            'metadata_max_bytes' => (_cfg['metadata_max_bytes'] || input['metadata_max_bytes'])
+          }.compact
+          user_meta = if caps.empty?
+            call(:sanitize_metadata, meta_simple.merge(meta_adv))
+          else
+            call(:coerce_metadata, meta_simple.merge(meta_adv), {
+              'metadata_mode'      => 'flat',
+              'metadata_prefix'    => '',
+              'metadata_max_keys'  => caps['metadata_max_keys']  || 50,
+              'metadata_max_bytes' => caps['metadata_max_bytes'] || 4096
+            })
+          end
+          debug       = call(:safe_bool, input['debug'])
 
-        # 3) IDs
-        checksum   = Digest::SHA256.hexdigest(cleaned)
-        doc_id     = call(:generate_document_id, file_path, checksum)
+          # 1) Normalize/Clean
+          normalized = call(:normalize_newlines, raw)
+          cleaned    = call(:strip_control_chars, normalized)
 
-        # 4) Chunk
-        spans = call(:chunk_by_chars, cleaned, max_chars, overlap)
+          # 2) Bounds via preset/simple mode (config_fields) or manual entries
+          preset = (_cfg['preset'] || 'auto').to_s
+          if preset == 'custom' || _cfg['show_advanced']
+            max_in  = input['max_chunk_chars']
+            ov_in   = input['overlap_chars']
+            max_chars = call(:clamp_int, (max_in || 2000), 200, 8000)
+            overlap   = call(:clamp_int, (ov_in  || 200),    0, 4000)
+          else
+            case preset
+            when 'auto'
+              bounds    = call(:auto_chunk_bounds_for, cleaned.length)
+              max_chars = bounds['max']
+              overlap   = bounds['overlap']
+            when 'small'    then max_chars, overlap = 1000, 100
+            when 'large'    then max_chars, overlap = 4000, 200
+            when 'balanced' then max_chars, overlap = 2000, 200
+            else                 max_chars, overlap = 2000, 200
+            end
+          end
+          # Harmonize with batch behavior: clamp, but surface a debug note.
+          clamp_note = nil
+          if overlap >= max_chars
+            clamp_note = "Requested overlap=#{overlap} >= max=#{max_chars}. Clamped to #{[max_chars - 1, 0].max}."
+            overlap = [max_chars - 1, 0].max
+          end
 
-        # 5) Emit records
-        created_at = call(:now_iso)
-        records = spans.map do |span|
-          chunk_id = "#{doc_id}:#{span['index']}"
-          text     = span['text']
-          {
-            'doc_id'      => doc_id,
-            'chunk_id'    => chunk_id,
-            'index'       => span['index'],
-            'text'        => text,
-            'tokens'      => call(:est_tokens, text),
-            'span_start'  => span['span_start'],
-            'span_end'    => span['span_end'],
-            'source'      => { 'file_path' => file_path, 'checksum' => checksum },
-            'metadata'    => user_meta,
-            'created_at'  => created_at
+          # 3) IDs
+          checksum   = Digest::SHA256.hexdigest(cleaned)
+          doc_id     = call(:generate_document_id, file_path, checksum)
+
+          # 4) Chunk
+          spans = call(:chunk_by_chars, cleaned, max_chars, overlap)
+
+          # 5) Emit records
+          created_at = call(:now_iso)
+          records = spans.map do |span|
+            chunk_id = "#{doc_id}:#{span['index']}"
+            text     = span['text']
+            {
+              'doc_id'      => doc_id,
+              'chunk_id'    => chunk_id,
+              'index'       => span['index'],
+              'text'        => text,
+              'tokens'      => call(:est_tokens, text),
+              'span_start'  => span['span_start'],
+              'span_end'    => span['span_end'],
+              'source'      => { 'file_path' => file_path, 'checksum' => checksum },
+              'metadata'    => user_meta,
+              'created_at'  => created_at
+            }
+          end
+
+          base = {
+            'doc_id'          => doc_id,
+            'file_path'       => file_path,
+            'checksum'        => checksum,
+            'chunk_count'     => records.length,
+            'max_chunk_chars' => max_chars,
+            'overlap_chars'   => overlap,
+            'created_at'      => created_at,
+            'chunks'          => records
           }
+          base['trace_id'] = corr if debug
+          if debug
+            base['notes'] = [
+              "prep_for_indexing completed (preset=#{preset}, max=#{max_chars}, overlap=#{overlap})",
+              (clamp_note if clamp_note)
+            ].compact.join(' | ')
+          end
+          base.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+        rescue => e
+          details = { 'message' => e.to_s, 'status' => e.class.to_s }
+          # Keep output schema stable: return empty doc with envelope + error.
+          {}.merge(
+            'doc_id'      => nil,
+            'file_path'   => input['file_path'].to_s,
+            'checksum'    => nil,
+            'chunk_count' => 0,
+            'chunks'      => []
+          ).merge(
+            'error' => call(:normalize_error_for_pills, details, 'prep_for_indexing')
+          ).merge(
+            call(:telemetry_envelope, t0, corr, false, 400, e.to_s, details)
+          )
         end
-
-        base = {
-          'doc_id'          => doc_id,
-          'file_path'       => file_path,
-          'checksum'        => checksum,
-          'chunk_count'     => records.length,
-          'max_chunk_chars' => max_chars,
-          'overlap_chars'   => overlap,
-          'created_at'      => created_at,
-          'chunks'          => records
-        }
-        base['trace_id'] = corr if debug
-        base['notes']    = "prep_for_indexing completed (preset=#{preset}, max=#{max_chars}, overlap=#{overlap})" if debug
-        base.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
       end,
 
       sample_output: lambda do
