@@ -781,7 +781,7 @@ require 'json'
         ] + Array(object_definitions['envelope_fields'])
       end,
 
-      execute: lambda do |_connection, input, _schema = nil, _input_schema_name = nil, _connection_schema = nil, _cfg = {}|
+      execute: lambda do |_connection, input|
         t0   = Time.now
         corr = call(:guid)
         begin
@@ -803,8 +803,8 @@ require 'json'
           meta_adv    = input['metadata_json'].is_a?(Hash) ? input['metadata_json'] : {}
           # Apply optional caps only if provided (advanced UI)
           caps = {
-            'metadata_max_keys'  => (_cfg['metadata_max_keys'] || input['metadata_max_keys']),
-            'metadata_max_bytes' => (_cfg['metadata_max_bytes'] || input['metadata_max_bytes'])
+            'metadata_max_keys'  => input['metadata_max_keys'],
+            'metadata_max_bytes' => input['metadata_max_bytes']
           }.compact
           user_meta = if caps.empty?
             call(:sanitize_metadata, meta_simple.merge(meta_adv))
@@ -824,9 +824,16 @@ require 'json'
           total_chars = cleaned.length
           total_toks  = call(:est_tokens, cleaned)
 
-          # 2) Bounds via preset/simple mode (config_fields) or manual entries
-          preset = (_cfg['preset'] || 'auto').to_s
-          if preset == 'custom' || _cfg['show_advanced']
+          # 2) Infer "custom" when caller provided explicit bounds; else auto/balanced/small/large by input hint (optional)
+          provided_max = input['max_chunk_chars']
+          provided_ovl = input['overlap_chars']
+          preset = 'auto'
+          if provided_max || provided_ovl
+            preset = 'custom'
+          elsif %w[small large balanced].include?(input['preset'].to_s)
+            preset = input['preset'].to_s
+          end
+          if preset == 'custom'
             max_in  = input['max_chunk_chars']
             ov_in   = input['overlap_chars']
             max_chars = call(:clamp_int, (max_in || 2000), 200, 8000)
@@ -845,6 +852,7 @@ require 'json'
           end
 
           # Tiny-doc override: force single chunk if thresholds say so
+          clamp_note = nil
           nch = call(:coerce_int_or_nil, input['no_chunk_under_chars'])
           ntk = call(:coerce_int_or_nil, input['no_chunk_under_tokens'])
           tiny_by_chars  = (nch && total_chars <= nch)
@@ -856,7 +864,6 @@ require 'json'
           end
 
           # Harmonize with batch behavior: clamp, but surface a debug note.
-          clamp_note = nil
           if overlap >= max_chars
             clamp_note = "Requested overlap=#{overlap} >= max=#{max_chars}. Clamped to #{[max_chars - 1, 0].max}."
             overlap = [max_chars - 1, 0].max
@@ -898,13 +905,11 @@ require 'json'
             'created_at'      => created_at,
             'chunks'          => records
           }
-          base['trace_id'] = corr if debug
-          if debug
-            base['notes'] = [
-              "prep_for_indexing completed (preset=#{preset}, max=#{max_chars}, overlap=#{overlap})",
-              (clamp_note if clamp_note)
-            ].compact.join(' | ')
-          end
+          base['trace_id']  = corr if debug
+          base['notes']     = [
+            "prep_for_indexing completed (preset=#{preset}, max=#{max_chars}, overlap=#{overlap})",
+            (clamp_note if clamp_note)
+          ].compact.join(' | ') if debug
           base.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
         rescue => e
           details = { 'message' => e.to_s, 'status' => e.class.to_s }
