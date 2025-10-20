@@ -1,2699 +1,3848 @@
-# frozen_string_literal: true
-
-require 'time'
-require 'securerandom'
 require 'digest'
+require 'time'
 require 'json'
+require 'csv'
+require 'securerandom'
 
 {
-  title: 'RAG Utilities',
-  version: '0.5.0',
-  description: 'Utility adapter for retrieval augmented generation systems',
+  title: "RAG Utilities",
+  description: "Custom utility functions for RAG email response system",
+  version: "0.3.0",
+  help: lambda do 
+    { body: "Provides text processing, chunking, similarity, prompt building, and validation utilities for retrieval-augmented generation (RAG) systems." }
+  end,
+  author: "",
 
   # --------- CONNECTION ---------------------------------------------------
-  connection: { 
-    # Workato's runtime and DSL require the fields and authorization block,
-    # even if they're empty and there isn't a connection. 
-    fields: [],
-    authorization: { type: 'none' }
+  connection: {
+    help: lambda do
+      { body: "Configure default settings for text processing. These can be overriden in individual actions. Environment selection determines logging verbosity and processing limits." }
+    end,
+    fields: [
+      # Group: Developer API
+      { name: "developer_api_host",     label: "Workato region",        control_type: "select",   optional: true,   group: "Developer API",
+        default: "app.eu", sticky: true,  support_pills: false, hint: "Only required when using custom rules from Data Tables. Defaults to EU. See Workato data centers.",
+        options: [ # <- use options (static) on connection
+          ["US (www.workato.com)",    "www"],
+          ["EU (app.eu.workato.com)", "app.eu"],
+          ["JP (app.jp.workato.com)", "app.jp"],
+          ["SG (app.sg.workato.com)", "app.sg"],
+          ["AU (app.au.workato.com)", "app.au"],
+          ["IL (app.il.workato.com)", "app.il"],
+          ["Developer sandbox (app.trial.workato.com)", "app.trial"] ] },
+      { name: "api_token",              label: "API token (Bearer)",    control_type: "password", optional: true,   group: "Developer API", 
+        sticky: true,  hint: "Workspace admin → API clients → API keys", },
+      # Group: Labeling
+      { name: "environment",            label: "Environment",           control_type: "select",   optional: false,  group: "Labeling",
+        default: "development", sticky: true, support_pills: false, hint: "Select the environment for the connector (for your own routing/labeling).",  
+        options: [
+          ["Development", "development"],
+          ["Staging", "staging"],
+          ["Production", "production"]
+        ]},
+      # Group: RAG defaults
+      { name: "chunk_size_default",     label: "Default Chunk Size",    control_type: "number",   optional: true,   group: "RAG defaults",
+        default: 1000, type: "integer", convert_input: "integer_conversion", hint: "Default token size for text chunks" },
+      { name: "chunk_overlap_default",  label: "Default Chunk Overlap", control_type: "number",   optional: true,   group: "RAG defaults",
+        default: 100, type: "integer", convert_input: "integer_conversion", hint: "Default token overlap between chunks" },
+      { name: "similarity_threshold",   label: "Similarity Threshold",  control_type: "number",   optional: true,   group: "Similarity defaults",
+        default: 0.7, type: "number", convert_input: "float_conversion", hint: "Minimum similarity score (0-1) for cosine/euclidean; used as default gate." }
+    ],
+    authorization: {
+      type: "custom_auth",
+      apply: lambda do |connection|
+        if connection['api_token'].present?
+          headers(
+            'Authorization' => "Bearer #{connection['api_token']}",
+            'Accept'        => 'application/json'
+          )
+        end
+      end
+    },
+    base_uri: lambda do |connection|
+      host = (connection['developer_api_host'].presence || 'app.eu').to_s
+      "https://#{host}.workato.com"
+    end
   },
 
   # --------- CONNECTION TEST ----------------------------------------------
-  test: lambda do |_connection|
-    # Workato's runtime requires a connection test with a primary output "true"
-    { success: true, message: 'Connected successfully.' }
-  end,
+  test: lambda do |connection|
+    result = {
+      environment: (connection["environment"] || "development"),
+      region: (connection['developer_api_host'] || 'app.eu')
+    }
 
-  # --------- OBJECT DEFINITIONS -------------------------------------------
-  object_definitions: {
-    prep_result: {
-      fields: lambda do |object_definitions = {}|
-        [
-          { name: 'doc_id' },
-          { name: 'file_path' },
-          { name: 'checksum' },
-          { name: 'chunk_count', type: 'integer' },
-          { name: 'max_chunk_chars', type: 'integer' },
-          { name: 'overlap_chars', type: 'integer' },
-          { name: 'created_at' },
-          { name: 'duration_ms', type: 'integer' },
-          { name: 'chunks', type: 'array', of: 'object',
-            properties: (object_definitions['chunk'] || []) },
-          { name: 'trace_id', optional: true },
-          { name: 'notes', optional: true }
-        ]
+    if connection['api_token'].present?
+      begin
+        whoami = call(:execute_with_retry, connection, -> { get('/api/users/me') })
+        result[:account] = whoami["name"] || whoami["id"]
+        result[:status]  = "connected"
+      rescue RestClient::ExceptionWithResponse => e
+        result[:status] = "failed (#{e.http_code})"
+        result[:hint]   = "Likely region/token mismatch. Ensure developer_api_host='app.eu' and the API client was created in the EU workspace."
+        return result
       end
-    },
-    prep_batch: {
-      fields: lambda do |object_definitions = {}|
-        [
-          { name: 'results', type: 'array', of: 'object',
-            properties: (object_definitions['prep_result'] || []) },
-          { name: 'count', type: 'integer' },
-          { name: 'batch_trace_id', optional: true }
-        ]
-      end
-    },
-    table_row: {
-      fields: lambda do |_connection|
-        [
-          { name: 'id' },
-          { name: 'doc_id' },
-          { name: 'file_path' },
-          { name: 'checksum' },
-          { name: 'tokens', type: 'integer' },
-          { name: 'span_start', type: 'integer' },
-          { name: 'span_end',   type: 'integer' },
-          { name: 'created_at' },
-          { name: 'text' } # optional at runtime, but declare so the pill exists
-        ]
-      end
-    },
-    envelope_fields: {
-      fields: lambda do |_connection|
-        [
-          { name: 'error', type: 'object', optional: true, properties: [
-              { name: 'code', type: 'integer' },
-              { name: 'status' },
-              { name: 'reason' },
-              { name: 'domain' },
-              { name: 'location' },
-              { name: 'message' },
-              { name: 'service', hint: 'utility' },
-              { name: 'operation' }
-            ] },
-          { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object', properties: [
-              { name: 'http_status', type: 'integer' },
-              { name: 'message' },
-              { name: 'duration_ms', type: 'integer' },
-              { name: 'correlation_id' }
-            ] },
-          { name: 'upstream', type: 'object', optional: true, properties: [
-              { name: 'code', type: 'integer' },
-              { name: 'status' },
-              { name: 'reason' },
-              { name: 'domain' },
-              { name: 'location' },
-              { name: 'message' }
-            ] }
-        ]
-      end
-    },
-    span: {
-      fields: lambda do |_connection|
-        [
-          { name: 'start', type: 'integer' },
-          { name: 'end',   type: 'integer' }
-        ]
-      end
-    },
-    source: {
-      fields: lambda do |_connection|
-        [
-          { name: 'file_path' },
-          { name: 'checksum' }
-        ]
-      end
-    },
-    chunk: {
-      fields: lambda do |object_definitions = {}|
-        [
-          { name: 'doc_id' },
-          { name: 'chunk_id' },
-          { name: 'index', type: 'integer' },
-          { name: 'text' },
-          { name: 'tokens', type: 'integer' },
-          { name: 'span_start', type: 'integer' },
-          { name: 'span_end',   type: 'integer' },
-          { name: 'source', type: 'object', properties: object_definitions['source'] },
-          { name: 'metadata', type: 'object' },
-          { name: 'embedding', label: 'Embedding vector', type: 'array', of: 'number', optional: true },
-          { name: 'created_at' }
-        ]
-      end
-    },
-    citation: {
-      fields: lambda do |object_definitions|
-        [
-          { name: 'label' },
-          { name: 'chunk_id' },
-          { name: 'doc_id' },
-          { name: 'file_path' },
-          { name: 'span', type: 'object', properties: object_definitions['span'] },
-          { name: 'metadata', type: 'object' }
-        ]
-      end
-    },
-    upsert_record: {
-      fields: lambda do |_connection|
-        [
-          { name: 'id' },
-          { name: 'vector', type: 'array', of: 'number' },
-          { name: 'namespace' },
-          { name: 'metadata', type: 'object' }
-        ]
-      end
-    },
-    ingest_item: {
-      fields: lambda do |_connection|
-        [
-          { name: 'file_path', optional: true },
-          { name: 'content',   control_type: 'text-area' },
-          { name: 'max_chunk_chars', type: 'integer', optional: true },
-          { name: 'overlap_chars',   type: 'integer', optional: true },
-          { name: 'metadata', type: 'object', optional: true }
-        ]
-      end
-    },
-    vertex_prediction: {
-      fields: lambda do |_|
-        [
-          # Common Vertex shapes we want to expose for mapping:
-          { name: 'embeddings', type: 'object', properties: [
-              { name: 'values', type: 'array', of: 'number',
-                hint: 'Primary: predictions[*].embeddings.values (float array)' }
-            ]
-          },
-          # Some SDKs return an array of embeddings objects
-          { name: 'embeddings_list', label: 'embeddings[]', type: 'array', of: 'object', properties: [
-              { name: 'values', type: 'array', of: 'number',
-                hint: 'Alternate: predictions[*].embeddings[0].values' }
-            ],
-            hint: 'Use when embeddings is an array; map here instead of embeddings'
-          },
-          # Other alternates seen in Vertex responses
-          { name: 'values',   type: 'array', of: 'number', optional: true,
-            hint: 'Alternate: predictions[*].values (float array)' },
-          { name: 'embedding', type: 'array', of: 'number', optional: true,
-            hint: 'Alternate: predictions[*].embedding (float array)' }
-        ]
-      end
-    },
-    embedding_pair: {
-      fields: lambda do |_|
-        [
-          { name: 'id' },
-          { name: 'embedding', type: 'array', of: 'number' }
-        ]
-      end
-    },
-    embedding_bundle: {
-      fields: lambda do |object_definitions|
-        [
-          { name: 'embeddings', type: 'array', of: 'object',
-            properties: object_definitions['embedding_pair'],
-            hint: 'Output of “Map Vertex embeddings to ids”' },
-          { name: 'count', type: 'integer', optional: true },
-          { name: 'vector_dim', type: 'integer', optional: true },
-          { name: 'trace_id', optional: true }
-        ]
-      end
-    },
 
-    vector_item: {
-      fields: lambda do |_|
-        [
-          # Workato can’t map into bare arrays; wrap each vector as an object.
-          { name: 'values', type: 'array', of: 'number',
-            hint: 'One embedding vector (float array)' }
-        ]
+      # Management probes (optional)
+      begin
+        call(:execute_with_retry, connection, -> { get('/api/data_tables').params(page: 1, per_page: 1) })
+        result[:data_tables] = "reachable"
+      rescue RestClient::ExceptionWithResponse => e
+        result[:data_tables] = "not reachable (#{e.http_code})"
       end
-    },
-  },
+      begin
+        call(:execute_with_retry, connection, -> { get('/api/projects').params(page: 1, per_page: 1) })
+        result[:projects] = "reachable"
+      rescue RestClient::ExceptionWithResponse => e
+        result[:projects] = "not reachable (#{e.http_code})"
+      end
+      begin
+        call(:execute_with_retry, connection, -> { get('/api/folders').params(page: 1, per_page: 1) })
+        result[:folders] = "reachable"
+      rescue RestClient::ExceptionWithResponse => e
+        result[:folders] = "not reachable (#{e.http_code})"
+      end
 
-  # --------- METHODS ------------------------------------------------------
-  methods: {
-    detect_pairs_from_bundle: lambda do |bundle|
-      return [] unless bundle.is_a?(Hash)
-      list = bundle['embeddings']
-      return [] unless list.is_a?(Array)
-      list.map do |e|
-        next nil unless e.is_a?(Hash)
-        {
-          'id' => (e['id'] || e['chunk_id'] || e[:id] || e[:chunk_id]).to_s,
-          'embedding' => e['embedding'] || e[:embedding]
-        }
-      end.compact
-    end,
-    guid: lambda { SecureRandom.uuid },
-    now_iso: lambda { Time.now.utc.iso8601 },
-    generate_document_id: lambda do |file_path, checksum|
-      Digest::SHA256.hexdigest("#{file_path.to_s.strip}|#{checksum.to_s.strip}")
-    end,
-    est_tokens: lambda do |s|
-      s.to_s.strip.split(/\s+/).size
-    end,
-    clamp_int: lambda do |val, min_v, max_v|
-      v = val.to_i
-      v = min_v if v < min_v
-      v = max_v if v > max_v
-      v
-    end,
-    normalize_newlines: lambda do |s|
-      s.to_s.gsub(/\r\n?/, "\n")
-    end,
-    sanitize_metadata: lambda do |obj|
-      h = obj.is_a?(Hash) ? obj : {}
-      # Force string keys; drop non-JSON-safe values
-      Hash[h.map { |k, v| [k.to_s, v.is_a?(Hash) || v.is_a?(Array) || v.is_a?(String) || v.is_a?(Numeric) || v == true || v == false || v.nil? ? v : v.to_s] }]
-    end,
-    safe_bool: lambda do |v|
-      v == true || v.to_s.strip.downcase == 'true'
-    end,
-    safe_hash: lambda do |obj|
-      obj.is_a?(Hash) ? obj : {}
-    end,
-    require_array_of_objects: lambda do |arr, name|
-      a = arr.is_a?(Array) ? arr : nil
-      error("#{name} must be an array") unless a
-      a.each_with_index do |e, i|
-        error("#{name}[#{i}] must be an object") unless e.is_a?(Hash)
-      end
-      a
-    end,
-    resolve_chunk_id: lambda do |c|
-      id = (c['chunk_id'] || c['id'] || c['index']).to_s
-      error('Missing id for chunk') if id.empty?
-      id
-    end,
-    strip_control_chars: lambda do |s|
-      s.to_s.encode('UTF-8', invalid: :replace, undef: :replace, replace: '')
-          .gsub(/[[:cntrl:]]/) { |c| c == "\n" ? "\n" : ' ' }.gsub(/[ \t]+/, ' ').strip
-    end,
-    chunk_by_chars: lambda do |text, max_chars, overlap|
-      t = text.to_s
-      return [] if t.empty? || max_chars.to_i <= 0
-      maxc = [[max_chars.to_i, 8000].min, 200].max
-      ov   = [[overlap.to_i, maxc - 1].min, 0].max
-      out  = []
-      i    = 0
-      idx  = 0
-      n    = t.length
-      while i < n
-        hard_end = [i + maxc, n].min
-        # Try to break on whitespace near the end of the window to avoid chopping words
-        window = t[i...hard_end] || ''
-        break_at = window.rindex(/\s/) || (hard_end - i - 1)
-        break_at = 0 if break_at.negative?
-        slice_end = i + break_at + 1
-        slice_end = hard_end if slice_end <= i # fallback to hard cut
-        slice = t[i...slice_end] || ''
-        out << { 'index' => idx, 'text' => slice, 'span_start' => i, 'span_end' => slice_end }
-        idx += 1
-        i = slice_end - ov
-      end
-      out
-    end,
-    ensure_array: lambda do |v|
-      v.is_a?(Array) ? v : (v.nil? ? [] : [v])
-    end,
-    flatten_chunks_input: lambda do |input|
-      # Accept either:
-      #  - { chunks: [...] }
-      #  - { documents: [ {chunks:[...]}, ... ] }
-      all = []
-      if input['chunks'].is_a?(Array)
-        input['chunks'].each { |c| all << (c.is_a?(Hash) ? c : {}) }
-      end
-      if input['documents'].is_a?(Array)
-        input['documents'].each do |d|
-          next unless d.is_a?(Hash)
-          (d['chunks'] || []).each { |c| all << (c.is_a?(Hash) ? c : {}) }
+      # Records v1 smoke test (decisive for rules/templates)
+      begin
+        # Try to discover 1 table id to query
+        tables_resp = call(:execute_with_retry, connection, -> { get('/api/data_tables').params(page: 1, per_page: 1) })
+        arr = tables_resp.is_a?(Array) ? tables_resp : (tables_resp['data'] || [])
+        if arr.any?
+          tid = arr.first['id']
+          post("#{call(:dt_records_base, connection)}/api/v1/tables/#{tid}/query")
+            .headers('Authorization' => "Bearer #{connection['api_token']}")
+            .payload(select: ['$record_id'], limit: 1)
+          result[:data_table_records_v1] = "reachable"
+        else
+          result[:data_table_records_v1] = "no tables to test"
         end
+      rescue RestClient::ExceptionWithResponse => e
+        code = e.http_code.to_i
+        result[:data_table_records_v1] =
+          (code == 401 || code == 403) ? "not reachable (#{code}) – add role: Data table records (v1)" : "not reachable (#{code})"
       end
-      all
-    end,
-    telemetry_envelope: lambda do |started_at, correlation_id, ok, code, message, upstream=nil|
-      dur = ((Time.now - started_at) * 1000.0).to_i
-      base = {
-        'ok' => !!ok,
-        'telemetry' => {
-          'http_status'    => code.to_i,
-          'message'        => (message || (ok ? 'OK' : 'ERROR')).to_s,
-          'duration_ms'    => dur,
-          'correlation_id' => correlation_id
-        }
-      }
-      upstream.is_a?(Hash) ? base.merge('upstream' => upstream) : base
-    end,
-    normalize_error_for_pills: lambda do |details, operation|
-      d = details.is_a?(Hash) ? details.dup : {}
-      {
-        'code'      => (d['code'] || d[:code]),
-        'status'    => (d['status'] || d[:status]).to_s,
-        'reason'    => (d['reason'] || d[:reason]).to_s,
-        'domain'    => (d['domain'] || d[:domain]).to_s,
-        'location'  => (d['location'] || d[:location]).to_s,
-        'message'   => (d['message'] || d[:message] || d['error'] || d[:error]).to_s,
-        'service'   => 'utility',
-        'operation' => operation.to_s
-      }.compact
-    end,
-    schema_builder_config_fields: lambda do
-      [
-        {
-          name: 'override_output_schema',
-          type: 'boolean',
-          control_type: 'checkbox',
-          label: 'Design custom output schema',
-          hint: 'Use Schema Builder to define this action’s datapills.'
-        },
-        {
-          name: 'custom_output_schema',
-          extends_schema: true,
-          control_type: 'schema-designer',
-          schema_neutral: false,
-          sticky: true,
-          optional: true,
-          label: 'Output columns',
-          hint: 'Define the output fields (datapills) for this action.',
-          sample_data_type: 'csv'
-        }
-      ]
-    end,
-    resolve_output_schema: lambda do |default_fields, cfg, object_definitions|
-      custom = cfg.is_a?(Hash) &&
-               cfg['override_output_schema'] &&
-               cfg['custom_output_schema'].is_a?(Array) &&
-               !cfg['custom_output_schema'].empty? ?
-                 cfg['custom_output_schema'] : nil
-
-      base = custom || default_fields
-      base + Array(object_definitions['envelope_fields'])
-    end,
-    schema_builder_ingest_items_config_fields: lambda do
-      [
-        { name: 'design_item_schema', type: 'boolean', control_type: 'checkbox', label: 'Design item schema',
-          sticky: true, hint: 'Check to use Schema Builder to define the shape of each list element.' },
-        {
-          name: 'item_schema',
-          extends_schema: true,
-          control_type: 'schema-designer',
-          schema_neutral: false,
-          sticky: true,
-          optional: true,
-          label: 'Item fields',
-          hint: 'Define the fields present in each item of the list.'
-        },
-        # Which fields in the item correspond to our semantics?
-        {
-          name: 'item_content_field',
-          control_type: 'select',
-          label: 'Item field: content',
-          optional: true,
-          pick_list: 'item_schema_field_names'
-        },
-        {
-          name: 'item_file_path_field',
-          control_type: 'select',
-          label: 'Item field: file_path',
-          optional: true,
-          pick_list: 'item_schema_field_names'
-        },
-        {
-          name: 'item_metadata_field',
-          control_type: 'select',
-          label: 'Item field: metadata (object)',
-          optional: true,
-          pick_list: 'item_schema_field_names'
-        },
-        {
-          name: 'item_max_chunk_chars_field',
-          control_type: 'select',
-          label: 'Item field: max_chunk_chars',
-          optional: true,
-          pick_list: 'item_schema_field_names'
-        },
-        {
-          name: 'item_overlap_chars_field',
-          control_type: 'select',
-          label: 'Item field: overlap_chars',
-          optional: true,
-          pick_list: 'item_schema_field_names'
-        }
-      ]
-    end,
-    get_item_field: lambda do |item, cfg, declared_key, fallback_key|
-      key = (cfg[declared_key] || fallback_key).to_s
-      v = item[key]
-      v.nil? ? item[fallback_key] : v
-    end,
-    cfg_or_input: lambda do |cfg, input, key|
-      v = nil
-      v = cfg[key] if cfg.is_a?(Hash) && cfg.key?(key)
-      v = input[key] if v.nil? && input.is_a?(Hash)
-      v
-    end,
-    coerce_int_or_nil: lambda do |v|
-      return nil if v.nil? || v.to_s.strip.empty?
-      Integer(v) rescue nil
-    end,
-    chunk_preset_bounds: lambda do |preset|
-      case preset.to_s.downcase
-      when 'tiny'   then { 'max' => 600,  'overlap' => 60  }
-      when 'small'  then { 'max' => 1200, 'overlap' => 120 }
-      when 'medium' then { 'max' => 2000, 'overlap' => 200 }
-      when 'large'  then { 'max' => 3500, 'overlap' => 240 }
-      when 'max'    then { 'max' => 8000, 'overlap' => 400 }
-      else               { 'max' => 2000, 'overlap' => 200 }
-      end
-    end,
-    resolve_chunks_array: lambda do |input|
-      # Flatten documents[*].chunks or chunks[*]
-      if input['chunks'].is_a?(Array)
-        input['chunks']
-      elsif input['documents'].is_a?(Array)
-        input['documents'].flat_map { |d| (d || {})['chunks'] || [] }
-      else
-        []
-      end
-    end,
-    require_nonempty_string: lambda do |val, name|
-      s = val.to_s
-      error("#{name} is required") if s.strip.empty?
-      s
-    end,
-    json_bytesize: lambda do |v|
-      # Conservative byte estimate for JSON payloads (not perfect; good enough for caps)
-      v.to_json.to_s.bytesize rescue v.to_s.bytesize
-    end,
-    truncate_string: lambda do |s, max_bytes|
-      str = s.to_s
-      return str if max_bytes.to_i <= 0
-      b = str.encode('UTF-8', invalid: :replace, undef: :replace).bytes
-      return str if b.length <= max_bytes
-      # keep as many bytes as fit, add ellipsis
-      kept = b[0, [max_bytes - 3, 0].max]
-      kept.pack('C*').force_encoding('UTF-8').scrub + '…'
-    end,
-    flatten_object_shallow: lambda do |obj, prefix|
-      return {} unless obj.is_a?(Hash)
-      out = {}
-      pfx = prefix.to_s
-      obj.each do |k,v|
-        key = (pfx.empty? ? k.to_s : "#{pfx}#{k}")
-        out[key] = v
-      end
-      out
-    end,
-    # Metadata coercion:
-    # - mode 'none' => {}
-    # - mode 'pass' => JSON-safe (stringify keys, drop unserializable), no flattening
-    # - mode 'flat' => flatten 1 level (object only), wrap primitives/arrays under a key
-    # Caps: max_keys (default 50), max_bytes (default 4096), truncate long strings
-    coerce_metadata: lambda do |val, cfg|
-      mode       = (cfg['metadata_mode'] || 'flat').to_s
-      prefix     = (cfg['metadata_prefix'] || '').to_s
-      max_keys   = (cfg['metadata_max_keys'] || 50).to_i
-      max_bytes  = (cfg['metadata_max_bytes'] || 4096).to_i
-
-      return {} if mode == 'none' || val.nil?
-
-      base =
-        if mode == 'pass'
-          h = val.is_a?(Hash) ? val : { 'value' => val }
-          Hash[h.map { |k, v| [k.to_s, v] }]
-        else # flat (default)
-          case val
-          when Hash
-            call(:flatten_object_shallow, val, prefix)
-          when Array
-            { (prefix + 'list') => val }
-          when String, Numeric, TrueClass, FalseClass
-            { (prefix + 'value') => val }
-          else
-            { (prefix + 'value') => val.to_s }
-          end
-        end
-
-      # Enforce key cap
-      if max_keys > 0 && base.keys.length > max_keys
-        base = base.first(max_keys).to_h.merge('__meta_truncated__' => true)
-      end
-
-      # Truncate long strings and enforce byte cap
-      base.each do |k,v|
-        if v.is_a?(String)
-          base[k] = call(:truncate_string, v, [max_bytes / 8, 0].max) # per-field soft cap
-        end
-      end
-      if max_bytes > 0 && call(:json_bytesize, base) > max_bytes
-        # Drop lowest-priority keys until under cap (naive heuristic: drop by sorted key)
-        base.keys.sort.reverse.each do |k|
-          next if k == '__meta_truncated__'
-          base.delete(k)
-          if call(:json_bytesize, base) <= max_bytes
-            base['__meta_truncated__'] = true
-            break
-          end
-        end
-      end
-      base
-    end,
-    parse_file_path_meta: lambda do |file_path|
-      fp = file_path.to_s
-      return {} if fp.empty?
-      # drive://folder/file.txt or gcs://bucket/dir/file.pdf
-      m = fp.match(/\A([a-z0-9+.-]+):\/\/(.+)\z/i)
-      scheme = m ? m[1] : nil
-      rest   = m ? m[2] : fp
-      parts  = rest.split('/')
-      fname  = parts.last.to_s
-      ext    = fname.include?('.') ? fname.split('.').last : ''
-      {
-        'uri_scheme' => scheme,
-        'path'       => rest,
-        'filename'   => fname,
-        'extension'  => ext,
-        'folder'     => parts[0..-2].join('/')
-      }.delete_if { |_,v| v.to_s.empty? }
-    end,
-    build_metadata_from_ui: lambda do |cfg, input|
-      mode = (cfg['metadata_source'] || 'none').to_s
-      case mode
-      when 'none'
-        {}
-      when 'kv'
-        pairs = input['metadata_pairs'].is_a?(Array) ? input['metadata_pairs'] : []
-        out = {}
-        pairs.each do |p|
-          next unless p.is_a?(Hash)
-          k = p['key'].to_s.strip
-          next if k.empty?
-          out[k] = p['value']
-        end
-        out
-      when 'tags_csv'
-        raw = input['metadata_tags_csv'].to_s
-        tags = raw.split(',').map { |t| t.strip }.reject(&:empty?)
-        tags.empty? ? {} : { 'tags' => tags }
-      when 'auto_from_path'
-        call(:parse_file_path_meta, input['file_path'])
-      when 'advanced'
-        # For advanced users only; still JSON-safe
-        call(:coerce_metadata, input['metadata'], cfg || {})
-      else
-        {}
-      end
-    end,
-    # Size heuristics chosen to “just work”:
-    # - short docs keep chunks small to avoid over-splitting
-    # - long docs increase chunk to reduce record explosion
-    auto_chunk_bounds_for: lambda do |text_len|
-      n = text_len.to_i
-      case n
-      when 0..2_000     then { 'max' => 800,  'overlap' => 80  }   # ~1–2 pages
-      when 2_001..8_000 then { 'max' => 1_600,'overlap' => 160 }   # ~3–8 pages
-      when 8_001..25_000 then { 'max' => 2_400,'overlap' => 200 }  # ~10–30 pages
-      else                  { 'max' => 3_600,'overlap' => 240 }    # larger corpora
-      end
-    end,
-    choose_metadata_simple: lambda do |input|
-      # Priority: KV > Tags > Use path > nothing
-      pairs = input['metadata_kv'].is_a?(Array) ? input['metadata_kv'] : []
-      unless pairs.empty?
-        out = {}
-        pairs.each do |p|
-          next unless p.is_a?(Hash)
-          k = p['key'].to_s.strip
-          next if k.empty?
-          out[k] = p['value']
-        end
-        return out
-      end
-      tags_csv = input['metadata_tags_csv'].to_s
-      tags = tags_csv.split(',').map { |t| t.strip }.reject(&:empty?)
-      return({ 'tags' => tags }) unless tags.empty?
-      return call(:parse_file_path_meta, input['file_path']) if input['metadata_use_path'] == true
-      {}
-    end,
-    scalarize: lambda do |v|
-      case v
-      when String, Numeric, TrueClass, FalseClass, NilClass then v
-      else v.to_s
-      end
-    end,
-    flatten_metadata_for_table: lambda do |metadata, prefix, caps = {}|
-      meta = call(:sanitize_metadata, metadata || {})
-      flat = call(:flatten_object_shallow, meta, prefix.to_s)
-      # enforce caps similar to coerce_metadata
-      max_keys  = (caps['metadata_max_keys']  || 50).to_i
-      max_bytes = (caps['metadata_max_bytes'] || 4096).to_i
-      flat = flat.first(max_keys).to_h.merge('__meta_truncated__' => true) if max_keys > 0 && flat.length > max_keys
-      # string truncation and byte cap
-      flat.each { |k, v| flat[k] = v.is_a?(String) ? call(:truncate_string, v, [max_bytes / 8, 0].max) : v }
-      if max_bytes > 0 && call(:json_bytesize, flat) > max_bytes
-        flat.keys.sort.reverse.each do |k|
-          next if k == '__meta_truncated__'
-          flat.delete(k)
-          break if call(:json_bytesize, flat) <= max_bytes
-        end
-        flat['__meta_truncated__'] = true
-      end
-      # force primitives only
-      Hash[flat.map { |k, v| [k, call(:scalarize, v)] }]
-    end,
-    build_table_row: lambda do |chunk, profile, include_text, meta_prefix, caps|
-      base = {
-        'id'         => call(:resolve_chunk_id, chunk),
-        'doc_id'     => chunk['doc_id'],
-        'file_path'  => chunk.dig('source','file_path'),
-        'checksum'   => chunk.dig('source','checksum'),
-        'tokens'     => chunk['tokens'],
-        'span_start' => chunk['span_start'],
-        'span_end'   => chunk['span_end'],
-        'created_at' => chunk['created_at']
-      }.delete_if { |_, v| v.nil? }
-
-      case profile
-      when 'slim'
-        row = {
-          'id'        => base['id'],
-          'doc_id'    => base['doc_id'],
-          'file_path' => base['file_path']
-        }
-        row['text'] = chunk['text'].to_s if include_text
-        row
-      when 'wide'
-        row = base.dup
-        row['text'] = chunk['text'].to_s if include_text
-        meta = call(:flatten_metadata_for_table, chunk['metadata'], (meta_prefix || 'meta_'), caps || {})
-        row.merge(meta)
-      else # 'standard' (default)
-        row = base.dup
-        row['text'] = chunk['text'].to_s if include_text
-        row
-      end
+    else
+      result[:status] = "connected (no API token)"
     end
 
-  },
+    result
+  end,
 
   # --------- ACTIONS ------------------------------------------------------
   actions: {
-    
-    # --- INGESTION (SEEDING) ----------------------------------------------
-
-    # ---- 1.  Prep for indexing -------------------------------------------
-    prep_for_indexing: {
-      title: 'Ingestion - Prepare document for indexing',
-      subtitle: 'Cleans, chunks, and emits chunk records with IDs + metadata',
-      display_priority: 10,
-      help: lambda do |_|
-        { body: 'Paste text, optionally include a Source URI, pick a Chunk size (Auto is best). Add metadata via rows/tags — no JSON needed. Use “Show advanced options” for custom sizes or JSON metadata.' }
-      end,
-
-      config_fields: [
-        { name: 'preset', control_type: 'select', pick_list: 'chunking_presets', sticky: true,
-          optional: true, hint: 'Auto picks sensible sizes from content length.' },
-        { name: 'show_advanced', type: 'boolean', control_type: 'checkbox', sticky: true,
-          label: 'Show advanced options', hint: 'Reveal custom sizes, JSON metadata, and caps.' }
-      ],
-
-      input_fields: lambda do |object_definitions, connection, config_fields|
-        cfg = (config_fields || {})
-        advanced = !!cfg['show_advanced']
-        preset   = (cfg['preset'] || 'auto').to_s
-        fields = [
-          { name: 'file_path', label: 'Source URI (recommended)',
-            hint: 'Stable URI like gcs://bucket/path or drive://folder/file; used to derive deterministic doc_id.',
-            optional: true },
-          { name: 'content', label: 'Plain text content (required)', hint: 'UTF-8 text only. Convert PDFs/DOCX before calling.',
-            optional: false, control_type: 'text-area' },
-        ]
-
-        # Small file handling
-        fields << { name: 'no_chunk_under_chars', type: 'integer', optional: true,
-                    hint: 'If total characters <= this, emit 1 chunk (overlap=0).' }
-        fields << { name: 'no_chunk_under_tokens', type: 'integer', optional: true,
-                    hint: 'If total tokens <= this, emit 1 chunk (overlap=0).' }
-
-
-        # Simple metadata block (no JSON in normal path)
-        fields << {
-          name: 'metadata_kv', type: 'array', of: 'object', optional: true,
-          label: 'Metadata (key–value pairs)', hint: 'Add optional attributes as rows.',
-          properties: [{ name: 'key' }, { name: 'value' }]
+    # --- 1.  Ingestion and cleaning ---------------------------------------
+    clean_email_text: {
+      title: "Clean Email Text",
+      subtitle: "Preprocess email content for RAG",
+      description: "Clean and preprocess email body text",
+      help: lambda do
+        {
+          body: "Removes signatures, quoted text, disclaimers; normalizes whitespace; optional URL extraction."
         }
-        fields << { name: 'metadata_tags_csv', optional: true, label: 'Tags (comma separated)',
-                    hint: 'e.g., HR,policy,2025' }
-        fields << { name: 'metadata_use_path', type: 'boolean', control_type: 'checkbox', optional: true,
-                    label: 'Use details from Source URI', hint: 'Derives filename/extension/folder.' }
-
-        # Custom sizes only if preset == custom OR advanced
-        if preset == 'custom' || advanced
-          fields << { name: 'max_chunk_chars', label: 'Max characters per chunk',
-                      type: 'integer', optional: true, sticky: true, hint: 'Allowed: 200–8000. Example: 2000.' }
-          fields << { name: 'overlap_chars',   label: 'Overlap between chunks (chars)',
-                      type: 'integer', optional: true, sticky: true, hint: 'Must be < Max. Example: 200.' }
-        end
-
-        # Advanced JSON and caps (hidden unless Advanced)
-        if advanced
-          fields << { name: 'metadata_json', type: 'object', optional: true,
-                      label: 'Advanced metadata (JSON object)', hint: 'For power users only.' }
-          fields << { name: 'metadata_max_keys', type: 'integer', optional: true, sticky: true,
-                      hint: 'Default 50. 0 = unlimited (not recommended).' }
-          fields << { name: 'metadata_max_bytes', type: 'integer', optional: true, sticky: true,
-                      hint: 'Default 4096 total bytes after coercion.' }
-        end
-
-        if advanced
-          fields << { name: 'debug', label: 'Include debug notes', type: 'boolean',
-                      control_type: 'checkbox', optional: true }
-        end
-        fields.compact
       end,
 
-      output_fields: lambda do |object_definitions, _config_fields|
+      input_fields: lambda do |object_definitions|
         [
-          { name: 'doc_id' },
-          { name: 'file_path' },
-          { name: 'checksum' },
-          { name: 'chunk_count', type: 'integer' },
-          { name: 'max_chunk_chars', type: 'integer' },
-          { name: 'overlap_chars', type: 'integer' },
-          { name: 'created_at' },
-          { name: 'duration_ms', type: 'integer' },
-          { name: 'chunks', type: 'array', of: 'object', properties: object_definitions['chunk'] },
-          { name: 'trace_id', optional: true },
-          { name: 'notes', optional: true }
-        ] + Array(object_definitions['envelope_fields'])
+          {
+            name: "email_body", label: "Email body", type: "string", optional: false,
+            control_type: "text-area", hint: "Raw email body text to be cleaned"
+          }
+        ] + object_definitions["email_cleaning_options"]
       end,
 
-      execute: lambda do |_connection, input, _schema=nil, _input_schema_name=nil, _connection_schema=nil, _config_fields={}|
-        t0   = Time.now
-        corr = call(:guid)
-        begin
-          started_at  = Time.now
-          trace_id    = call(:guid)
-          # ---- VALIDATION ----
-          raw_in      = input['content']
-          file_path   = input['file_path'].to_s
-          if raw_in.nil? || raw_in.to_s.strip.empty?
-            # Helpful hint: user likely mapped a binary (e.g., PDF) without text extraction.
-            hint = ''
-            if file_path =~ /\.pdf\z/i || file_path =~ %r{\A(?:gcs|gs)://}i || file_path =~ %r{\Adrive://}i
-              hint = ' (if this is a PDF or other binary, convert/extract text first; map text_content from Drive/GCS or your extractor)'
-            end
-            error("content is required and must be non-empty#{hint}.")
-          end
-          raw         = raw_in.to_s
-          meta_simple = call(:choose_metadata_simple, input)
-          meta_adv    = input['metadata_json'].is_a?(Hash) ? input['metadata_json'] : {}
-          # Apply optional caps only if provided (advanced UI)
-          caps = {
-            'metadata_max_keys'  => input['metadata_max_keys'],
-            'metadata_max_bytes' => input['metadata_max_bytes']
-          }.compact
-          user_meta = if caps.empty?
-            call(:sanitize_metadata, meta_simple.merge(meta_adv))
-          else
-            call(:coerce_metadata, meta_simple.merge(meta_adv), {
-              'metadata_mode'      => 'flat',
-              'metadata_prefix'    => '',
-              'metadata_max_keys'  => caps['metadata_max_keys']  || 50,
-              'metadata_max_bytes' => caps['metadata_max_bytes'] || 4096
-            })
-          end
-          debug       = call(:safe_bool, input['debug'])
-
-          # 1) Normalize/Clean
-          normalized  = call(:normalize_newlines, raw)
-          cleaned     = call(:strip_control_chars, normalized)
-          total_chars = cleaned.length
-          total_toks  = call(:est_tokens, cleaned)
-
-          # 2) Infer "custom" when caller provided explicit bounds; else read preset from config_fields
-          provided_max = input['max_chunk_chars']
-          provided_ovl = input['overlap_chars']
-          cfg_preset = (_config_fields['preset'] || 'auto').to_s
-          preset =
-            if provided_max || provided_ovl
-              'custom'
-            elsif %w[auto small large balanced custom].include?(cfg_preset)
-              cfg_preset
-            else
-              'auto'
-            end
-          if preset == 'custom'
-            max_in  = input['max_chunk_chars']
-            ov_in   = input['overlap_chars']
-            max_chars = call(:clamp_int, (max_in || 2000), 200, 8000)
-            overlap   = call(:clamp_int, (ov_in  || 200),    0, 4000)
-          else
-            case preset
-            when 'auto'
-              bounds    = call(:auto_chunk_bounds_for, cleaned.length)
-              max_chars = bounds['max']
-              overlap   = bounds['overlap']
-            when 'small'    then max_chars, overlap = 1000, 100
-            when 'large'    then max_chars, overlap = 4000, 200
-            when 'balanced' then max_chars, overlap = 2000, 200
-            else                 max_chars, overlap = 2000, 200
-            end
-          end
-
-          # Tiny-doc override: force single chunk if thresholds say so
-          clamp_note = nil
-          nch = call(:coerce_int_or_nil, input['no_chunk_under_chars'])
-          ntk = call(:coerce_int_or_nil, input['no_chunk_under_tokens'])
-          tiny_by_chars  = (nch && total_chars <= nch)
-          tiny_by_tokens = (ntk && total_toks  <= ntk)
-          if tiny_by_chars || tiny_by_tokens
-            max_chars = [total_chars, 1].max
-            overlap   = 0
-            clamp_note = "Tiny-doc override: total_chars=#{total_chars}, total_tokens=#{total_toks} → 1 chunk."
-          end
-
-          # Harmonize with batch behavior: clamp, but surface a debug note.
-          if overlap >= max_chars
-            clamp = "Requested overlap=#{overlap} >= max=#{max_chars}. Clamped to #{[max_chars - 1, 0].max}."
-            clamp_note = [clamp_note, clamp].compact.join(' | ')
-            overlap = [max_chars - 1, 0].max
-          end
-
-          # 3) IDs
-          checksum   = Digest::SHA256.hexdigest(cleaned)
-          doc_id     = call(:generate_document_id, file_path, checksum)
-
-          # 4) Chunk
-          spans = call(:chunk_by_chars, cleaned, max_chars, overlap)
-
-          # 5) Emit records
-          created_at = call(:now_iso)
-          records = spans.map do |span|
-            chunk_id = "#{doc_id}:#{span['index']}"
-            text     = span['text']
-            {
-              'doc_id'      => doc_id,
-              'chunk_id'    => chunk_id,
-              'index'       => span['index'],
-              'text'        => text,
-              'tokens'      => call(:est_tokens, text),
-              'span_start'  => span['span_start'],
-              'span_end'    => span['span_end'],
-              'source'      => { 'file_path' => file_path, 'checksum' => checksum },
-              'metadata'    => user_meta,
-              'created_at'  => created_at
-            }
-          end
-
-          base = {
-            'doc_id'          => doc_id,
-            'file_path'       => file_path,
-            'checksum'        => checksum,
-            'chunk_count'     => records.length,
-            'max_chunk_chars' => max_chars,
-            'overlap_chars'   => overlap,
-            'created_at'      => created_at,
-            'chunks'          => records,
-            'duration_ms'     => ((Time.now - t0) * 1000).round
-          }
-          base['trace_id']  = corr if debug
-          base['notes']     = [
-            "prep_for_indexing completed (preset=#{preset}, max=#{max_chars}, overlap=#{overlap})",
-            (clamp_note if clamp_note)
-          ].compact.join(' | ') if debug
-          base.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
-        rescue => e
-          details = { 'message' => e.to_s, 'status' => e.class.to_s }
-          # Keep output schema stable: return empty doc with envelope + error.
-          {}.merge(
-            'doc_id'      => nil,
-            'file_path'   => input['file_path'].to_s,
-            'checksum'    => nil,
-            'chunk_count' => 0,
-            'chunks'      => []
-          ).merge(
-            'error' => call(:normalize_error_for_pills, details, 'prep_for_indexing')
-          ).merge(
-            call(:telemetry_envelope, t0, corr, false, 400, e.to_s, details)
-          )
-        end
+      output_fields: lambda do |object_definitions|
+        object_definitions["email_cleaning_result"]
       end,
 
       sample_output: lambda do
         {
-          'doc_id' => 'd9f1…',
-          'file_path' => 'drive://Reports/2025/summary.txt',
-          'checksum' => '3a2b…',
-          'chunk_count' => 2,
-          'max_chunk_chars' => 2000,
-          'overlap_chars' => 200,
-          'created_at' => '2025-10-15T12:00:00Z',
-          'chunks' => [
-            {
-              'doc_id' => 'd9f1…',
-              'chunk_id' => 'd9f1…:0',
-              'index' => 0,
-              'text' => 'First slice…',
-              'tokens' => 42,
-              'span_start' => 0,
-              'span_end' => 1800,
-              'source' => { 'file_path' => 'drive://Reports/2025/summary.txt', 'checksum' => '3a2b…' },
-              'metadata' => { 'department' => 'HR' },
-              'created_at' => '2025-10-15T12:00:00Z' }],
-          'ok' => true,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample' }
+          "cleaned_text" => "Hello team, …",
+          "extracted_query" => "Hello team, …",
+          "removed_sections" => ["--\nJohn\n"],
+          "extracted_urls" => ["https://example.com"],
+          "original_length" => 1024,
+          "cleaned_length" => 680,
+          "reduction_percentage" => 33.59
         }
-      end
-    },
-    prep_for_indexing_batch: {
-      title: 'Ingestion - Prepare multiple documents for indexing',
-      subtitle: 'Cleans + chunks N documents; returns an array of per-doc results',
-      batch: true,
-      display_priority: 10,
-
-      config_fields: [
-        {
-          name: 'design_item_schema',
-          type: 'boolean',
-          control_type: 'checkbox',
-          label: 'Design item schema',
-          hint: 'Use Schema Builder to define the shape of each list element.'
-        },
-        {
-          name: 'item_schema',
-          extends_schema: true,
-          control_type: 'schema-designer',
-          schema_neutral: false,
-          sticky: true,
-          optional: true,
-          label: 'Item fields',
-          hint: 'Define the fields present in each item of the list.'
-        },
-        { name: 'item_content_field',      control_type: 'select', label: 'Item field: content',        optional: true, pick_list: 'item_schema_field_names' },
-        { name: 'item_file_path_field',    control_type: 'select', label: 'Item field: file_path',      optional: true, pick_list: 'item_schema_field_names' },
-        { name: 'item_metadata_field',     control_type: 'select', label: 'Item field: metadata (obj)', optional: true, pick_list: 'item_schema_field_names' },
-        { name: 'item_max_chunk_chars_field', control_type: 'select', label: 'Item field: max_chunk_chars', optional: true, pick_list: 'item_schema_field_names' },
-        { name: 'item_overlap_chars_field',   control_type: 'select', label: 'Item field: overlap_chars',   optional: true, pick_list: 'item_schema_field_names' }
-      ],
-
-      input_fields: lambda do |object_definitions, _connection, config_fields|
-        # If a custom item schema is designed in the step config, use it here;
-        # otherwise fall back to the static object_definitions['ingest_item'].
-        item_props =
-          if config_fields['design_item_schema'] &&
-              config_fields['item_schema'].is_a?(Array) &&
-              !config_fields['item_schema'].empty?
-            config_fields['item_schema']
-          else
-            object_definitions['ingest_item']
-          end
-        [
-          { name: 'items', type: 'array', of: 'object', properties: item_props, optional: false,
-            hint: 'Map your list here. Use “Design item schema” if your list shape is custom.' },
-          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
-        ]
-        # Batch-level tiny-doc defaults (items can still pass explicit per-item fields if you add them)
-        .push({ name: 'no_chunk_under_chars', type: 'integer', optional: true })
-        .push({ name: 'no_chunk_under_tokens', type: 'integer', optional: true })
       end,
 
-      output_fields: lambda do |object_definitions, _config_fields|
+      execute: lambda do |connection, input|
+        local = call(:deep_copy, input)
+        result = call(:process_email_text, local)
+        call(:validate_contract, connection, result, 'email_cleaning_result')
+      end
+
+    },
+    prepare_for_ai: {
+      title: "Prepare text for AI processing",
+      subtitle: "Clean and format text with metadata for AI workflows",
+      description: "Process text based on source type, apply cleaning rules, and return contract-compliant output",
+      help: lambda do
+        { body: "Prepares text for AI processing by applying source-specific cleaning rules. Supports email, document, chat, and general text sources. Returns data in cleaned_text contract format for inter-connector compatibility." }
+      end,
+
+      input_fields: lambda do |object_definitions|
         [
           {
-            name: 'results', type: 'array', of: 'object', properties: [
-              { name: 'doc_id' },
-              { name: 'file_path' },
-              { name: 'checksum' },
-              { name: 'chunk_count', type: 'integer' },
-              { name: 'max_chunk_chars', type: 'integer' },
-              { name: 'overlap_chars', type: 'integer' },
-              { name: 'created_at' },
-              { name: 'duration_ms', type: 'integer' },
-              { name: 'chunks', type: 'array', of: 'object', properties: object_definitions['chunk'] },
-              { name: 'trace_id', optional: true },
-              { name: 'notes', optional: true }
-            ]
+            name: "text", label: "Text to process", type: "string", control_type: "text-area",
+            optional: false, hint: "Raw text content to be processed for AI"
           },
-          { name: 'count', type: 'integer' },
-          { name: 'batch_trace_id', optional: true }
-        ] + Array(object_definitions['envelope_fields'])
-      end,
-
-      execute: lambda do |_connection, input, _schema, _input_schema_name, _connection_schema, _config_fields|
-        started_batch = Time.now
-        batch_trace   = call(:guid)
-        debug         = call(:safe_bool, input['debug'])
-        items         = call(:ensure_array, input['items'])
-
-        results = items.map do |it|
-          t0          = Time.now
-          # Resolve fields using config mapping (falls back to canonical keys)
-          raw         = call(:get_item_field, it, _config_fields, 'item_content_field', 'content').to_s
-          file_path   = call(:get_item_field, it, _config_fields, 'item_file_path_field', 'file_path').to_s
-          user_meta   = call(:sanitize_metadata, call(:get_item_field, it, _config_fields, 'item_metadata_field', 'metadata'))
-          # Per-item overrides for chunking bounds (optional)
-          max_in      = call(:get_item_field, it, _config_fields, 'item_max_chunk_chars_field', 'max_chunk_chars')
-          ov_in       = call(:get_item_field, it, _config_fields, 'item_overlap_chars_field',   'overlap_chars')
-
-          normalized  = call(:normalize_newlines, raw)
-          cleaned     = call(:strip_control_chars, normalized)
-          total_chars = cleaned.length
-          total_toks  = call(:est_tokens, cleaned)
-          max_chars   = call(:clamp_int, (max_in || 2000), 200, 8000)
-          overlap     = call(:clamp_int, (ov_in  || 200),   0,   4000)
-          overlap     = [overlap, max_chars - 1].min
-          # Tiny-doc override (batch level)
-          nch = call(:coerce_int_or_nil, input['no_chunk_under_chars'])
-          ntk = call(:coerce_int_or_nil, input['no_chunk_under_tokens'])
-          if (nch && total_chars <= nch) || (ntk && total_toks <= ntk)
-            max_chars = [total_chars, 1].max
-            overlap   = 0
-          end
-          checksum    = Digest::SHA256.hexdigest(cleaned)
-          doc_id      = call(:generate_document_id, file_path, checksum)
-          spans       = call(:chunk_by_chars, cleaned, max_chars, overlap)
-          created_at  = call(:now_iso)
-          records     = spans.map do |span|
-            chunk_id = "#{doc_id}:#{span['index']}"
-            text     = span['text']
-            {
-              'doc_id'      => doc_id,
-              'chunk_id'    => chunk_id,
-              'index'       => span['index'],
-              'text'        => text,
-              'tokens'      => call(:est_tokens, text),
-              'span_start'  => span['span_start'],
-              'span_end'    => span['span_end'],
-              'source'      => { 'file_path' => file_path, 'checksum' => checksum },
-              'metadata'    => user_meta,
-              'created_at'  => created_at
-            }
-          end
-          per = {
-            'doc_id'          => doc_id,
-            'file_path'       => file_path,
-            'checksum'        => checksum,
-            'chunk_count'     => records.length,
-            'max_chunk_chars' => max_chars,
-            'overlap_chars'   => overlap,
-            'created_at'      => created_at,
-            'duration_ms'     => ((Time.now - t0) * 1000).round,
-            'chunks'          => records
-          }
-          if debug
-            per['trace_id'] = call(:guid)
-            per['notes']    = 'prep_for_indexing(item) completed'
-          end
-          per
-        end
-
-        base = { 'results' => results, 'count' => results.length }
-        base['batch_trace_id'] = batch_trace if debug
-        base.merge(call(:telemetry_envelope, started_batch, batch_trace, true, 200, 'OK'))
-      end,
-
-      sample_output: lambda do
-        {
-          'results' => [
-            {
-              'doc_id' => 'doc-abc123',
-              'file_path' => 'drive://Reports/2025/summary.txt',
-              'checksum' => '3a2b9c…',
-              'chunk_count' => 2,
-              'max_chunk_chars' => 2000,
-              'overlap_chars' => 200,
-              'created_at' => '2025-10-15T12:00:00Z',
-              'duration_ms' => 11,
-              'chunks' => [
-                {
-                  'doc_id' => 'doc-abc123',
-                  'chunk_id' => 'doc-abc123:0',
-                  'index' => 0,
-                  'text' => 'First slice…',
-                  'tokens' => 42,
-                  'span_start' => 0,
-                  'span_end' => 1799,
-                  'source' => { 'file_path' => 'drive://Reports/2025/summary.txt', 'checksum' => '3a2b9c…' },
-                  'metadata' => { 'department' => 'HR' },
-                  'created_at' => '2025-10-15T12:00:00Z'
-                }
-              ],
-              'trace_id' => 'trace-1',
-              'notes' => 'prep_for_indexing(item) completed'
-            }
-          ],
-          'count' => 1,
-          'batch_trace_id' => 'batch-trace-1234'
-        }
-      end
-    },
-
-    # ---- 2.  Build index upserts -----------------------------------------
-    build_index_upserts: {
-      title: 'Ingestion - Build index upserts',
-      subtitle: 'Provider-agnostic: [{id, vector, namespace, metadata}]',
-      display_priority: 9,
-
-      config_fields: [
-        { name: 'override_output_schema', type: 'boolean', control_type: 'checkbox',
-          label: 'Design custom output schema' },
-        { name: 'custom_output_schema', extends_schema: true, control_type: 'schema-designer',
-          schema_neutral: false, sticky: true, optional: true,
-          label: 'Output columns', sample_data_type: 'csv' }
-      ],
-
-      input_fields: lambda do |object_definitions, _connection, _config_fields|
-        [
-          { name: 'chunks', type: 'array', of: 'object', optional: false, properties: object_definitions['chunk'],
-            hint: 'Map the Chunks list from “Prepare document for indexing”.', sticky: true },
-        ]
-      end,
-
-      output_fields: lambda do |object_definitions, _config_fields|
-        default_fields = [
-          { name: 'count', type: 'integer' },
-          { name: 'records', type: 'array', of: 'object', properties: object_definitions['upsert_record'] }
-        ]
-        call(:resolve_output_schema, default_fields, _config_fields, object_definitions)
-      end,
-
-      execute: lambda do |_connection, input|
-        t0      = Time.now
-        corr    = call(:guid)
-        ns      = nil
-        prv     = nil
-        chunks  = call(:require_array_of_objects, input['chunks'], 'chunks')
-        upserts = chunks.select { |c| c['embedding'].is_a?(Array) }.map do |c|
           {
-            'id'        => call(:resolve_chunk_id, c),
-            'vector'    => c['embedding'],
-            'namespace' => ns,
-            'metadata'  => {
-              'doc_id'   => c['doc_id'],
-              'file_path'=> c.dig('source','file_path'),
-              'span'     => { 'start' => c['span_start'], 'end' => c['span_end'] },
-              'tokens'   => c['tokens'],
-              'extra'    => call(:sanitize_metadata, c['metadata'])
-            }.compact
-          }.compact
-        end
-        { 'records' => upserts, 'count' => upserts.length }.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
-      end,
-
-      sample_output: lambda do
-        {
-          'provider' => 'vertex',
-          'namespace' => 'hr-knowledge-v1',
-          'count' => 2,
-          'records' => [
-            {
-              'id' => 'doc-abc123:0',
-              'vector' => [0.01, 0.02, 0.03],
-              'namespace' => 'hr-knowledge-v1',
-              'metadata' => {
-                'doc_id' => 'doc-abc123',
-                'file_path' => 'drive://Reports/2025/summary.txt',
-                'span' => { 'start' => 0, 'end' => 1799 },
-                'tokens' => 42,
-                'extra' => { 'department' => 'HR' }
-              }
-            }
-          ]
-        }
-      end
-    },
-    build_index_upserts_batch: {
-      title: 'Ingestion - Build index upserts',
-      subtitle: 'Accepts documents[*].chunks or chunks[*]; emits provider-agnostic upserts',
-      batch: true,
-      display_priority: 9,
-
-      config_fields: [
-        { name: 'override_output_schema', type: 'boolean', control_type: 'checkbox', label: 'Design custom output schema' },
-        { name: 'custom_output_schema', extends_schema: true, control_type: 'schema-designer',
-          schema_neutral: false, sticky: true, optional: true, label: 'Output columns', sample_data_type: 'csv' }
-      ],
-
-      input_fields: lambda do |_object_definitions, _connection, _config_fields|
-        [
-          { name: 'documents', type: 'array', of: 'object', optional: true },
-          { name: 'chunks', type: 'array', of: 'object', optional: true }
-        ]
-      end,
-
-      output_fields: lambda do |object_definitions, _config_fields|
-        default_fields = [
-          { name: 'count', type: 'integer' },
-          { name: 'records', type: 'array', of: 'object', properties: object_definitions['upsert_record'] }
-        ]
-        call(:resolve_output_schema, default_fields, _config_fields, object_definitions)
-      end,
-
-      execute: lambda do |_connection, input|
-        t0  = Time.now
-        corr = call(:guid)
-        ns   = nil
-        prv  = nil
-        chunks = call(:flatten_chunks_input, input)
-        upserts = chunks.select { |c| c['embedding'].is_a?(Array) }.map do |c|
-          {
-            'id'        => call(:resolve_chunk_id, c),
-            'vector'    => c['embedding'],
-            'namespace' => ns,
-            'metadata'  => {
-              'doc_id'    => c['doc_id'],
-              'file_path' => c.dig('source','file_path'),
-              'span'      => { 'start' => c['span_start'], 'end' => c['span_end'] },
-              'tokens'    => c['tokens'],
-              'extra'     => call(:sanitize_metadata, c['metadata'])
-            }.compact
-          }.compact
-        end
-        {
-          'records' => upserts, 'count' => upserts.length
-        }.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
-      end,
-  
-      sample_output: lambda do
-        {
-          'provider' => 'vertex',
-          'namespace' => 'hr-knowledge-v1',
-          'count' => 2,
-          'records' => [
-            {
-              'id' => 'doc-abc123:0',
-              'vector' => [0.01, 0.02, 0.03],
-              'namespace' => 'hr-knowledge-v1',
-              'metadata' => {
-                'doc_id' => 'doc-abc123',
-                'file_path' => 'drive://Reports/2025/summary.txt',
-                'span' => { 'start' => 0, 'end' => 1799 },
-                'tokens' => 42,
-                'extra' => { 'department' => 'HR' }
-              }
-            }
-          ]
-        }
-      end
-    },
-    build_vertex_datapoints: {
-      title: 'Ingestion - Build Vertex datapoints',
-      subtitle: 'Chunks with embeddings → [{datapointId, featureVector, restricts, labels?, metadata?}]',
-      display_priority: 7,
-
-      input_fields: lambda do |object_definitions, _connection, _cfg|
-        [
-          { name: 'chunks', type: 'array', of: 'object', optional: false,
-            properties: object_definitions['chunk'],
-            hint: 'Use output of attach_embeddings (chunks now include embedding)' },
-          { name: 'tenant', optional: true, hint: 'Applied as restricts: {namespace: "tenant"}' },
-          { name: 'source_token', optional: true, hint: 'Applied as restricts: {namespace: "source"} (e.g., handbook)' },
-          { name: 'doc_namespace', optional: true, hint: 'Namespace name for document ids (default "doc")' },
-          { name: 'labels', type: 'object', optional: true, hint: 'Optional labels object added per datapoint' }
-        ]
-      end,
-
-      output_fields: lambda do |_object_definitions, _config_fields|
-        [
-          { name: 'count', type: 'integer' },
-          { name: 'datapoints', type: 'array', of: 'object', properties: [
-              { name: 'datapointId' },
-              { name: 'featureVector', type: 'array', of: 'number' },
-              { name: 'restricts', type: 'array', of: 'object', properties: [
-                  { name: 'namespace' },
-                  { name: 'allowTokens', type: 'array', of: 'string' },
-                  { name: 'denyTokens',  type: 'array', of: 'string' }
-                ]
-              },
-              { name: 'crowdingTag' },
-              { name: 'labels', type: 'object' },
-              { name: 'metadata', type: 'object' }
-            ]
-          }
-        ]
-      end,
-
-      execute: lambda do |_connection, input|
-        chunks = input['chunks'].is_a?(Array) ? input['chunks'] : []
-        error('chunks must be a non-empty array') if chunks.empty?
-        doc_ns = (input['doc_namespace'] || 'doc').to_s
-        tenant = input['tenant'].to_s
-        source = input['source_token'].to_s
-        labels = input['labels'].is_a?(Hash) ? input['labels'] : nil
-
-        dps = chunks.map.with_index do |c, i|
-          id   = (c['chunk_id'] || c['id'] || c['index']).to_s
-          error("chunk[#{i}] missing id/chunk_id") if id.empty?
-          vec  = c['embedding']
-          error("chunk[#{i}] missing embedding") if !vec.is_a?(Array) || vec.empty?
-          # Build restricts
-          rest = []
-          rest << { 'namespace' => doc_ns, 'allowTokens' => [c['doc_id'].to_s] } if c['doc_id'].to_s != ''
-          rest << { 'namespace' => 'tenant', 'allowTokens' => [tenant] } if !tenant.empty?
-          rest << { 'namespace' => 'source', 'allowTokens' => [source] } if !source.empty?
-          # Metadata passthrough (safe)
-          md = {
-            'doc_id'    => c['doc_id'],
-            'source'    => c['source'],
-            'span'      => { 'start' => c['span_start'], 'end' => c['span_end'] },
-            'tokens'    => c['tokens'],
-            'extra'     => c['metadata']
-          }.delete_if { |_k,v| v.nil? }
-          dp = {
-            'datapointId'   => id,
-            'featureVector' => vec.map { |x| Float(x) rescue nil }.compact,
-            'restricts'     => rest,
-            'metadata'      => md
-          }
-          dp['labels'] = labels if labels
-          dp
-        end
-        { 'count' => dps.length, 'datapoints' => dps }
-      end,
-
-      sample_output: lambda do
-        {
-          'count' => 1,
-          'datapoints' => [
-            {
-              'datapointId' => 'doc-abc123:0',
-              'featureVector' => [0.01, 0.02],
-              'restricts' => [
-                { 'namespace' => 'doc', 'allowTokens' => ['doc-abc123'] },
-                { 'namespace' => 'tenant', 'allowTokens' => ['acme'] },
-                { 'namespace' => 'source', 'allowTokens' => ['handbook'] }
-              ],
-              'metadata' => {
-                'doc_id' => 'doc-abc123',
-                'source' => { 'file_path' => 'drive://Policies/PTO.md' },
-                'span'   => { 'start' => 0, 'end' => 1799 },
-                'tokens' => 42,
-                'extra'  => { 'department' => 'HR' }
-              }
-            }
-          ]
-        }
-      end
-    },
-    map_vertex_embeddings: {
-      title: 'Ingestion - Map Vertex embeddings to ids',
-      subtitle: 'Align requests[*].id with embed_text.predictions[*].embeddings.values',
-      display_priority: 7,
-
-      input_fields: lambda do |object_definitions, _connection, _cfg|
-        [
-          { name: 'requests',  type: 'array', of: 'object', optional: false,
-            hint: 'From build_embedding_requests: [{id,text,metadata}]',
-            properties: [
-              { name: 'id' }, { name: 'text' },
-              { name: 'metadata', type: 'object' }
-            ]
-          },
-          # Option A: map the whole Vertex output object here (which contains predictions: [])
-          { name: 'predictions_root', type: 'object', optional: true, properties: [
-              { name: 'predictions', type: 'array', of: 'object',
-                properties: object_definitions['vertex_prediction'] }
+            name: "source_type", label: "Source type", control_type: "select",
+            pick_list: [
+              ["Email", "email"],
+              ["Document", "document"],
+              ["Chat", "chat"],
+              ["General", "general"]
             ],
-            hint: 'If your Vertex step outputs {predictions:[...]}, map it here.'
+            optional: false, sticky: true, support_pills: false,
+            hint: "Type of content being processed"
           },
-          # Option B: map just the predictions array directly
-          { name: 'predictions', type: 'array', of: 'object', optional: true,
-            properties: object_definitions['vertex_prediction'],
-            hint: 'Or map predictions[*] directly if you already have the array.'
-          },
-          { name: 'check_dimension', type: 'integer', optional: true,
-            hint: 'Optional: expected vector length (index dimension)' }
-        ]
-      end,
-
-      output_fields: lambda do |object_definitions, _config_fields|
-        [
-          { name: 'count', type: 'integer' },
-          { name: 'embeddings', type: 'array', of: 'object',
-            properties: object_definitions['embedding_pair'] },
-          { name: 'vector_dim', type: 'integer' },
-          # Add a wrapper object so users can map a single pill → embeddings_bundle
-          { name: 'bundle', type: 'object', properties: object_definitions['embedding_bundle'] }
-        ] + Array(object_definitions['envelope_fields'])
-      end,
-
-      execute: lambda do |_connection, input|
-        t0   = Time.now
-        corr = call(:guid)
-        reqs  = input['requests'].is_a?(Array) ? input['requests'] : []
-        preds = []
-        if input['predictions'].is_a?(Array)
-          preds = input['predictions']
-        elsif input['predictions_root'].is_a?(Hash) && input['predictions_root']['predictions'].is_a?(Array)
-          preds = input['predictions_root']['predictions']
-        end
-        error('requests and predictions length mismatch') if reqs.length != preds.length
-
-        out = []
-        dim = nil
-        reqs.each_with_index do |r, i|
-          id = (r['id'] || r[:id]).to_s
-          error("requests[#{i}].id is required") if id.empty?
-          # Try common Vertex shapes in priority order
-          vec = preds[i].dig('embeddings','values') ||
-                (preds[i]['embeddings'].is_a?(Array) && preds[i].dig('embeddings',0,'values')) ||
-                # support vertex_prediction.embeddings_list[]
-                (preds[i]['embeddings_list'].is_a?(Array) && preds[i].dig('embeddings_list',0,'values')) ||
-                preds[i]['values'] ||
-                preds[i]['embedding']
-          error("predictions[#{i}] missing embeddings.values") if !vec.is_a?(Array) || vec.empty?
-          vec = vec.map { |x| Float(x) rescue nil }.compact
-          error("predictions[#{i}] contains non-numeric values") if vec.empty?
-          dim ||= vec.length
-          error("predictions[#{i}] dimension mismatch (#{vec.length} != #{dim})") if vec.length != dim
-          if input['check_dimension'].to_i > 0
-            exp = input['check_dimension'].to_i
-            error("vector dimension #{vec.length} != expected #{exp}") if vec.length != exp
-          end
-          out << { 'id' => id, 'embedding' => vec }
-        end
-        bundle = { 'embeddings' => out, 'count' => out.length, 'vector_dim' => (dim || 0), 'trace_id' => corr }
-        {
-          'count'      => out.length,
-          'embeddings' => out,
-          'vector_dim' => (dim || 0),
-          'bundle'     => bundle
-        }.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
-      end,
-
-      sample_output: lambda do
-        {
-          'count' => 2,
-          'embeddings' => [
-            { 'id' => 'doc-abc123:0', 'embedding' => [0.01, 0.02, 0.03] },
-            { 'id' => 'doc-abc123:1', 'embedding' => [0.04, 0.05, 0.06] }
-          ],
-          'vector_dim' => 3,
-          'bundle' => {
-            'embeddings' => [
-              { 'id' => 'doc-abc123:0', 'embedding' => [0.01, 0.02, 0.03] },
-              { 'id' => 'doc-abc123:1', 'embedding' => [0.04, 0.05, 0.06] }
+          {
+            name: "task_type", label: "Task type", control_type: "select",
+            pick_list: [
+              ["Classification", "classification"],
+              ["Generation", "generation"],
+              ["Analysis", "analysis"],
+              ["Embedding", "embedding"]
             ],
-            'count' => 2,
-            'vector_dim' => 3,
-            'trace_id' => 'sample'
+            optional: false, sticky: true, support_pills: false,
+            hint: "AI task the text will be used for"
           },
-          'ok' => true,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 1, 'correlation_id' => 'sample' }
-        }
-      end
-    },
-    enrich_chunks_with_metadata: {
-      title: 'Ingestion - Enrich chunks with document metadata',
-      description: 'Merges document-level metadata (source, uri, mime, author, version) into each chunk.metadata.',
-
-      input_fields: lambda do |object_definitions, _connection, _cfg|
-        [
-          { name: 'chunks', type: 'array', of: 'object', optional: false,
-            properties: object_definitions['chunk']},
-          { name: 'document_metadata', type: 'object', optional: false,
-            properties: [
-              { name: 'document_id' }, { name: 'file_name' }, { name: 'uri' },
-              { name: 'mime_type' }, { name: 'source_system' }, { name: 'version' },
-              { name: 'ingested_at' }, { name: 'labels', type: 'array', of: 'string' }
-            ] }
-        ]
-      end,
-
-      output_fields: lambda do |object_definitions, _config_fields|
-        [
-          { name: 'chunks', type: 'array', of: 'object',
-            properties: object_definitions['chunk'] }
-        ].concat(object_definitions['envelope_fields'] )
-      end,
-
-      sample_output: lambda do |_|
-        {
-          'chunks' => [
-            { 'chunk_id' => 'doc1#0001', 'text' => '...', 'metadata' => {
-              'document_id' => 'doc1', 'uri' => 'gs://bucket/a.pdf', 'mime_type' => 'application/pdf'
-            }}
-          ],
-          'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK' }
-        }
-      end,
-      execute: lambda do |_connection, input|
-        t0   = Time.now
-        corr = call(:guid)
-        meta = input['document_metadata'] || {}
-        chunks = Array(input['chunks']).map do |c|
-          m = (c['metadata'] || {}).merge(meta) { |_k, old_v, new_v| old_v.nil? ? new_v : old_v }
-          c.merge('metadata' => m)
-        end
-        { 'chunks' => chunks }.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
-      end
-    },
-
-    # ---- 3.  Embedding  --------------------------------------------------
-    build_embedding_requests: {
-      title: 'Ingestion - Build embedding requests from chunks',
-      subtitle: '[{id, text, metadata}] for your embedding step',
-      display_priority: 8,
-      # chunks[*] -> [{id, text, metadata}] for embedding
-
-      input_fields: lambda do |object_definitions, _connection, _config_fields|
-        [
-          { name: 'chunks', type: 'array', of: 'object', optional: false, properties: object_definitions['chunk'],
-            hint: 'Map the Chunks list from “Prepare document for indexing”.' },
-          { name: 'debug',  type: 'boolean', control_type: 'checkbox', optional: true }
-        ]
-      end,
-
-      output_fields: lambda do |_object_definitions, _config_fields|
-        [
-          { name: 'count', type: 'integer' },
-          { name: 'requests', type: 'array', of: 'object', properties: [
-            { name: 'id' }, { name: 'text' }, { name: 'metadata', type: 'object' }
-          ] }
-        ]
-      end,
-
-      execute: lambda do |_connection, input|
-        chunks = call(:require_array_of_objects, input['chunks'], 'chunks')
-        reqs = chunks.map do |c|
           {
-            'id'       => call(:resolve_chunk_id, c),
-            'text'     => c['text'].to_s,
-            'metadata' => call(:sanitize_metadata, c['metadata'])
-          }
-        end
-        out = { 'requests' => reqs, 'count' => reqs.length }
-        out['trace_id'] = call(:guid) if call(:safe_bool, input['debug'])
-        out
-      end,
-
-      sample_output: lambda do
-        {
-          'count' => 2,
-          'requests' => [
-            { 'id' => 'docA:0', 'text' => '…', 'metadata' => { 'department' => 'HR' } },
-            { 'id' => 'docA:1', 'text' => '…', 'metadata' => { } }
-          ]
-        }
-      end
-    },
-    build_embedding_requests_batch: {
-      title: 'Ingestion - Build embedding requests',
-      subtitle: 'Accepts documents[*].chunks or chunks[*]; flattens to [{id,text,metadata}]',
-      batch: true,
-      display_priority: 8,
-
-      input_fields: lambda do |_object_definitions, _connection, _config_fields|
-        [
-          { name: 'documents', type: 'array', of: 'object', optional: true,
-            hint: 'Each doc should include chunks:[...]' },
-          { name: 'chunks', type: 'array', of: 'object', optional: true },
-          { name: 'debug',  type: 'boolean', control_type: 'checkbox', optional: true }
-        ]
-      end,
-
-      output_fields: lambda do |_object_definitions, _config_fields|
-        [
-          { name: 'count', type: 'integer' },
-          { name: 'requests', type: 'array', of: 'object', properties: [
-            { name: 'id' }, { name: 'text' }, { name: 'metadata', type: 'object' }
-          ] },
-          { name: 'trace_id', optional: true }
-        ]
-      end,
-
-      execute: lambda do |_connection, input|
-        chunks = call(:flatten_chunks_input, input)
-        reqs = chunks.map do |c|
-          {
-            'id'       => call(:resolve_chunk_id, c),
-            'text'     => c['text'].to_s,
-            'metadata' => call(:sanitize_metadata, c['metadata'])
-          }
-        end
-        out = { 'requests' => reqs, 'count' => reqs.length }
-        out['trace_id'] = call(:guid) if call(:safe_bool, input['debug'])
-        out
-      end,
-    
-      sample_output: lambda do
-        {
-          'count' => 2,
-          'requests' => [
-            { 'id' => 'doc-abc123:0', 'text' => 'First slice…', 'metadata' => { 'department' => 'HR' } },
-            { 'id' => 'doc-abc123:1', 'text' => 'Second slice…', 'metadata' => {} }
-          ],
-          'trace_id' => 'trace-emb-batch-1'
-        }
-      end
-    },
-    attach_embeddings: {
-      title: 'Ingestion - Attach embeddings to chunks',
-      help: lambda do |_|
-        { body: 'Fast path: map “Embeddings bundle” from previous step; Advanced allows custom keys/modes' }
-      end,
-      display_priority: 7,
-
-      input_fields: lambda do |object_definitions, _connection, cfg|
-        [
-          { name: 'chunks', type: 'array', of: 'object', optional: false, properties: object_definitions['chunk'],
-            hint: 'Map the Chunks list from “Prepare document for indexing” or later.' },
-          # --- Simple / Recommended path ---
-          { name: 'embeddings_bundle', type: 'object', optional: true, properties: object_definitions['embedding_bundle'],
-            hint: 'Map the whole output of “Map Vertex embeddings to ids”.' },
-          # --- Alternate inputs (only one is needed) ---
-          { name: 'embeddings', label: 'Embeddings [{id,embedding}]', type: 'array', of: 'object', optional: true,
-            properties: object_definitions['embedding_pair'], hint: 'Use when you already have the list of {id, embedding} objects.' },
-          { name: 'vectors', label: 'Vectors (parallel to chunks)', type: 'array', of: 'object', optional: true,
-            properties: object_definitions['vector_item'],  hint: 'Use only if you have no ids; requires Alignment = by_index.' },
-          { name: 'alignment', control_type: 'select', optional: true,
-            pick_list: 'attach_alignment_modes', hint: 'Default: by_id (safer)' },
-          { name: 'show_advanced', type: 'boolean', control_type: 'checkbox', optional: true, sticky: true,
-            label: 'Show advanced options' },
-          # --- Advanced ---
-          (cfg && cfg['show_advanced'] ? { name: 'id_key', optional: true, hint: 'Default id' } : nil),
-          (cfg && cfg['show_advanced'] ? { name: 'embedding_key', optional: true, hint: 'Default embedding' } : nil),
-          (cfg && cfg['show_advanced'] ? { name: 'strict', type: 'boolean', control_type: 'checkbox', optional: true,
-            hint: 'When true, raise on missing/duplicate ids instead of skipping.' } : nil),
-          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
-        ].compact
-      end,
-
-      output_fields: lambda do |object_definitions, _config_fields|
-        [
-          { name: 'count', type: 'integer' },
-          { name: 'chunks', type: 'array', of: 'object', properties: object_definitions['chunk'] }
-        ] + Array(object_definitions['envelope_fields'])
-      end,
-
-      execute: lambda do |_connection, input|
-      t0   = Time.now
-      corr = call(:guid)
-        align = (input['alignment'] || 'by_id').to_s
-        id_key  = (input['id_key'] || 'id').to_s
-        emb_key = (input['embedding_key'] || 'embedding').to_s
-        strict  = !!input['strict']
-
-        chunks = call(:require_array_of_objects, input['chunks'], 'chunks')
-
-        # 1) Normalize embedding pairs
-        pairs = []
-        if input['embeddings_bundle'].is_a?(Hash)
-          pairs = call(:detect_pairs_from_bundle, input['embeddings_bundle'])
-        elsif input['embeddings'].is_a?(Array)
-          pairs = input['embeddings'].map do |e|
-            next nil unless e.is_a?(Hash)
-            { 'id' => e[id_key].to_s, 'embedding' => e[emb_key] }
-          end.compact
-      elsif input['vectors'].is_a?(Array)
-          error('Alignment must be by_index when using vectors') unless align == 'by_index'
-          vecs = input['vectors'].map { |v| v.is_a?(Hash) ? v['values'] : v }
-          error('vectors length must equal chunks length') unless vecs.length == chunks.length
-          # keep vecs in scope for by_index branch
-        end
-
-        # 2) Merge
-        out_chunks =
-        if align == 'by_index'
-          if input['vectors'].is_a?(Array)
-            chunks.each_with_index.map do |c, i|
-              vec = vecs[i]  # use normalized per-index array
-              next c unless vec.is_a?(Array) && !vec.empty?
-              c.merge('embedding' => vec.map { |x| Float(x) rescue nil }.compact)
-            end
-          else
-            error('by_index alignment requires vectors[*].values (or raw float arrays)')
-          end
-          else # by_id (default)
-            idx = {}
-            dupes = []
-            pairs.each do |p|
-              pid = p['id'].to_s
-              if pid.empty?
-                error('Found embedding without id') if strict
-                next
-              end
-              dupes << pid if idx.key?(pid) && strict
-              idx[pid] = p['embedding']
-            end
-            error("Duplicate ids in embeddings: #{dupes.uniq.join(', ')}") if strict && !dupes.empty?
-            chunks.map do |c|
-              cid = call(:resolve_chunk_id, c)
-              vec = idx[cid]
-              next c unless vec.is_a?(Array) && !vec.empty?
-              c.merge('embedding' => vec.map { |x| Float(x) rescue nil }.compact)
-            end
-          end
-
-      out = { 'count' => out_chunks.length, 'chunks' => out_chunks }
-      out['trace_id'] = call(:guid) if call(:safe_bool, input['debug'])
-      out.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
-      end,
-
-      sample_output: lambda do
-      {
-        'count' => 2,
-        'chunks' => [{ 'chunk_id' => 'docA:0', 'embedding' => [0.1, 0.2] }],
-        'ok' => true,
-        'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 1, 'correlation_id' => 'sample' }
-      }
-      end
-
-    },
-    attach_embeddings_batch: {
-      title: 'Ingestion - Attach embeddings to chunks',
-      subtitle: 'Supports [{chunks,embeddings}] or top-level chunks/embeddings',
-      batch: true,
-      display_priority: 7,
-
-      input_fields: lambda do |object_definitions, _connection, cfg|
-        [
-          # Either process one big set...
-          { name: 'chunks', type: 'array', of: 'object', optional: true,
-            properties: object_definitions['chunk'], hint: 'Flat list (optional if using pairs[])' },
-          { name: 'embeddings_bundle', type: 'object', optional: true, properties: object_definitions['embedding_bundle'] },
-          { name: 'embeddings', type: 'array', of: 'object', optional: true,
-            properties: object_definitions['embedding_pair'] },
-          { name: 'vectors', type: 'array', of: 'object', optional: true, properties: object_definitions['vector_item'] },
-          { name: 'alignment', control_type: 'select', optional: true, pick_list: 'attach_alignment_modes' },
-          # ...or many sets via pairs[]
-          { name: 'pairs', type: 'array', of: 'object', optional: true,
-            hint: 'Each: {chunks, embeddings_bundle?, embeddings?, vectors?, alignment?, id_key?, embedding_key?}',
+            name: "options", label: "Processing options", type: "object", optional: true,
             properties: [
-              { name: 'chunks', type: 'array', of: 'object', properties: object_definitions['chunk'] },
-              { name: 'embeddings_bundle', type: 'object', properties: object_definitions['embedding_bundle'] },
-              { name: 'embeddings', type: 'array', of: 'object', properties: object_definitions['embedding_pair'] },
-              { name: 'vectors', type: 'array', of: 'object', properties: object_definitions['vector_item'] },
-              { name: 'alignment', control_type: 'select', pick_list: 'attach_alignment_modes' },
-              { name: 'id_key' }, { name: 'embedding_key' }
+              { name: "remove_pii", label: "Remove PII", type: "boolean", control_type: "checkbox", default: false },
+              { name: "max_length", label: "Max length", type: "integer", hint: "Maximum characters to retain" },
+              { name: "remove_quotes", label: "Remove email quotes", type: "boolean", control_type: "checkbox", default: true },
+              { name: "remove_signatures", label: "Remove signatures", type: "boolean", control_type: "checkbox", default: true },
+              { name: "remove_disclaimers", label: "Remove disclaimers", type: "boolean", control_type: "checkbox", default: true },
+              { name: "extract_urls", label: "Extract URLs", type: "boolean", control_type: "checkbox", default: false },
+              { name: "normalize_whitespace", label: "Normalize whitespace", type: "boolean", control_type: "checkbox", default: true }
             ]
-          },
-          { name: 'show_advanced', type: 'boolean', control_type: 'checkbox', optional: true, sticky: true,
-            label: 'Show advanced options' },
-          (cfg && cfg['show_advanced'] ? { name: 'id_key', optional: true, hint: 'Default id' } : nil),
-          (cfg && cfg['show_advanced'] ? { name: 'embedding_key', optional: true, hint: 'Default embedding' } : nil),
-          (cfg && cfg['show_advanced'] ? { name: 'strict', type: 'boolean', control_type: 'checkbox', optional: true } : nil),
-          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
-        ].compact
-      end,
-
-      output_fields: lambda do |object_definitions, _config_fields|
-        [
-          { name: 'count', type: 'integer' },
-          { name: 'chunks', type: 'array', of: 'object', properties: object_definitions['chunk'] },
-          { name: 'trace_id', optional: true }
-        ] + Array(object_definitions['envelope_fields'])
-      end,
-
-      execute: lambda do |_connection, input|
-        t0   = Time.now
-        corr = call(:guid)
-        id_key  = (input['id_key'] || 'id').to_s
-        emb_key = (input['embedding_key'] || 'embedding').to_s
-        strict  = !!input['strict']
-        merged = []
-
-        attach_once = lambda do |cList, opts|
-          align   = (opts['alignment'] || input['alignment'] || 'by_id').to_s
-          idk     = (opts['id_key'] || id_key).to_s
-          embk    = (opts['embedding_key'] || emb_key).to_s
-          # Build pairs from whichever embedding input is present
-          pairs =
-            if opts['embeddings_bundle'].is_a?(Hash)
-              call(:detect_pairs_from_bundle, opts['embeddings_bundle'])
-            elsif opts['embeddings'].is_a?(Array)
-              opts['embeddings'].map { |e| { 'id' => e[idk].to_s, 'embedding' => e[embk] } }.compact
-            else
-              []
-            end
-
-          if align == 'by_index'
-            vecs = call(:ensure_array, opts['vectors']).map { |v| v.is_a?(Hash) ? v['values'] : v }
-            error('vectors length must equal chunks length') unless vecs.length == cList.length
-            return cList.each_with_index.map { |c,i|
-              v = vecs[i]; v.is_a?(Array) && !v.empty? ? c.merge('embedding' => v.map { |x| Float(x) rescue nil }.compact) : c
-            }
-          else
-            # by_id
-            idx = {}
-            dups = []
-            pairs.each do |p|
-              pid = p['id'].to_s
-              if pid.empty?
-                error('Found embedding without id') if strict
-                next
-              end
-              dups << pid if idx.key?(pid) && strict
-              idx[pid] = p['embedding']
-            end
-            error("Duplicate ids in embeddings: #{dups.uniq.join(', ')}") if strict && !dups.empty?
-            return cList.map { |c|
-              vec = idx[call(:resolve_chunk_id, c)]
-              vec.is_a?(Array) && !vec.empty? ? c.merge('embedding' => vec.map { |x| Float(x) rescue nil }.compact) : c
-            }
-          end
-        end
-
-        if input['pairs'].is_a?(Array) && !input['pairs'].empty?
-          input['pairs'].each do |p|
-            next unless p.is_a?(Hash)
-            cList = call(:require_array_of_objects, p['chunks'], 'chunks')
-            merged.concat(attach_once.call(cList, p))
-          end
-        elsif input['chunks'].is_a?(Array)
-          cList = call(:require_array_of_objects, input['chunks'], 'chunks')
-          merged.concat(attach_once.call(cList, input))
-        else
-          error('Supply either top-level chunks[...] (+ embeddings*) or pairs[*].')
-        end
-
-        out = { 'count' => merged.length, 'chunks' => merged }
-        out['trace_id'] = call(:guid) if call(:safe_bool, input['debug'])
-        out.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
-      end,
-
-      sample_output: lambda do
-        {
-          'count' => 2,
-          'chunks' => [
-            {
-              'chunk_id' => 'doc-abc123:0',
-              'doc_id' => 'doc-abc123',
-              'text' => 'First slice…',
-              'embedding' => [0.11, 0.12, 0.13],
-              'span_start' => 0,
-              'span_end' => 1799,
-              'source' => { 'file_path' => 'drive://Reports/2025/summary.txt', 'checksum' => '3a2b9c…' },
-              'metadata' => { 'department' => 'HR' },
-              'created_at' => '2025-10-15T12:00:00Z'
-            }
-          ],
-          'trace_id' => 'trace-attach-batch-1',
-          'ok' => true,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 1, 'correlation_id' => 'sample' }
-        }
-      end
-    },
-
-    # ---- 3.  Emit --------------------------------------------------------
-    extract_chunks: {
-      title: 'Ingestion - Extract chunks',
-      subtitle: 'Accepts {chunks:[...]} or {results:[{chunks:[...]}]} and emits {chunks:[...]}',
-      display_priority: 6,
-
-      input_fields: lambda do |object_definitions, _connection, _config_fields|
-        [
-          { name: 'document', type: 'object', optional: true,
-            properties: (object_definitions['prep_result'] || []),
-            hint: 'Output of Prepare document for indexing (single)' },
-          { name: 'batch', type: 'object', optional: true,
-            properties: (object_definitions['prep_batch'] || []),
-            hint: 'Output of Prepare multiple documents for indexing (batch)' },
-          { name: 'chunks', type: 'array', of: 'object', optional: true,
-            properties: object_definitions['chunk'],
-            hint: 'Alternative: map a flat chunks list directly' }
-        ]
-      end,
-
-      output_fields: lambda do |object_definitions, _config_fields|
-        [
-          { name: 'chunks', type: 'array', of: 'object', properties: object_definitions['chunk'] }
-        ] + Array(object_definitions['envelope_fields'])
-      end,
-
-      execute: lambda do |_connection, input|
-        t0    = Time.now
-        corr  = call(:guid)
-        doc   = input['document'].is_a?(Hash) ? input['document'] : {}
-        batch = input['batch'].is_a?(Hash)    ? input['batch']    : {}
-
-        chunks =
-          if input['chunks'].is_a?(Array)
-            input['chunks']
-          elsif doc['chunks'].is_a?(Array)
-            doc['chunks']
-          elsif batch['results'].is_a?(Array)
-            batch['results'].flat_map { |r| (r || {})['chunks'] || [] }
-          else
-            []
-          end
-          error('No chunks found: map one of document.chunks, batch.results[].chunks, or chunks[].') if chunks.empty?
-
-
-        { 'chunks' => chunks }
-          .merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
-      end,
-      sample_output: lambda do
-        {
-          'chunks' => [
-            {
-              'doc_id' => 'doc-abc123',
-              'chunk_id' => 'doc-abc123:0',
-              'index' => 0,
-              'text' => 'First slice…',
-              'tokens' => 42,
-              'span_start' => 0,
-              'span_end' => 1799,
-              'source' => { 'file_path' => 'drive://Reports/2025/summary.txt', 'checksum' => '3a2b9c…' },
-              'metadata' => { 'department' => 'HR' },
-              'created_at' => '2025-10-15T12:00:00Z'
-            }
-          ],
-          'ok' => true,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 1, 'correlation_id' => 'sample' }
-        }
-      end
-    },
-    to_data_table_rows: {
-      title: 'Ingestion - To Data Table rows',
-      subtitle: 'Slim corpus rows from chunks for persistence',
-      display_priority: 6,
-
-      config_fields: [
-        { name: 'row_profile', control_type: 'select', pick_list: 'table_row_profiles',
-          sticky: true, optional: true, hint: 'Standard is safe default.' },
-        { name: 'show_advanced', type: 'boolean', control_type: 'checkbox', sticky: true,
-          label: 'Show advanced options', hint: 'Reveal metadata caps.' }
-      ],
-
-      input_fields: lambda do |object_definitions, _connection, cfg|
-        advanced = !!cfg['show_advanced']
-        fields = [
-          { name: 'document', type: 'object', optional: true, properties: (object_definitions['prep_result'] || []),
-            hint: 'Directly map the whole output of “Prepare document for indexing”' },
-          { name: 'batch', type: 'object', optional: true, properties: (object_definitions['prep_batch'] || []),
-            hint: 'Directly map the whole output of “Prepare multiple documents for indexing”' },
-          { name: 'table_name', optional: true, hint: 'Optional label for your downstream step; result is unaffected when absent.' },
-          { name: 'include_text', type: 'boolean', control_type: 'checkbox', optional: true,
-            hint: 'Default true' }
-        ]
-        if advanced
-          fields << { name: 'metadata_prefix', optional: true, hint: 'Prefix for flattened metadata (Wide). Default meta_' }
-          fields << { name: 'metadata_max_keys', type: 'integer', optional: true, hint: 'Cap flattened keys. Default 50' }
-          fields << { name: 'metadata_max_bytes', type: 'integer', optional: true, hint: 'Total bytes cap for flattened metadata. Default 4096' }
-        end
-        fields
-      end,
-
-      output_fields: lambda do |object_definitions, _cfg|
-        [
-          { name: 'table' },
-          { name: 'profile' },
-          { name: 'count', type: 'integer' },
-          { name: 'rows', type: 'array', of: 'object', properties: object_definitions['table_row'] }
-        ] + Array(object_definitions['envelope_fields'])
-      end,
-
-      execute: lambda do |_connection, input, _schema = nil, _input_schema_name = nil, _connection_schema = nil, cfg = {}|
-        t0    = Time.now
-        corr  = call(:guid)
-        prof  = (cfg['row_profile'] || 'standard').to_s
-        include_text = input['include_text'].nil? ? true : !!input['include_text']
-        chunks =
-          if input['document'].is_a?(Hash) && input['document']['chunks'].is_a?(Array)
-            input['document']['chunks']
-          elsif input['batch'].is_a?(Hash) && input['batch']['results'].is_a?(Array)
-            input['batch']['results'].flat_map { |r| (r || {})['chunks'] || [] }
-          else
-            call(:require_array_of_objects, input['chunks'], 'chunks')
-          end
-        caps = {
-          'metadata_max_keys'  => input['metadata_max_keys'],
-          'metadata_max_bytes' => input['metadata_max_bytes']
-        }.compact
-        meta_prefix = (input['metadata_prefix'] || 'meta_').to_s
-
-        rows = chunks.map do |c|
-          call(:build_table_row, c, prof, include_text, meta_prefix, caps)
-        end
-
-        {
-          'table'   => input['table_name'].to_s,
-          'profile' => prof,
-          'count'   => rows.length,
-          'rows'    => rows
-        }.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
-      end,
-
-      sample_output: lambda do
-        {
-          'table' => 'kb_chunks',
-          'profile' => 'standard',
-          'count' => 2,
-          'rows'  => [
-            {
-              'id' => 'doc-abc123:0',
-              'doc_id' => 'doc-abc123',
-              'file_path' => 'drive://Reports/2025/summary.txt',
-              'checksum' => '3a2b9c…',
-              'tokens' => 42,
-              'span_start' => 0,
-              'span_end' => 1799,
-              'created_at' => '2025-10-15T12:00:00Z',
-              'text' => 'First slice…'
-            }
-          ],
-          'ok'    => true,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 1, 'correlation_id' => 'sample' }
-        }
-      end
-
-    },
-    to_data_table_rows_batch: {
-      title: 'Ingestion - To Data Table rows',
-      subtitle: 'Flattens multiple documents into slim corpus rows',
-      batch: true,
-      display_priority: 6,
-
-      config_fields: [
-        { name: 'row_profile', control_type: 'select', pick_list: 'table_row_profiles',
-          sticky: true, optional: true, hint: 'Standard is safe default.' },
-        { name: 'show_advanced', type: 'boolean', control_type: 'checkbox', sticky: true,
-          label: 'Show advanced options', hint: 'Reveal schema designer and metadata caps.' },
-        { name: 'override_output_schema', type: 'boolean', control_type: 'checkbox',
-          label: 'Design custom output schema' },
-        { name: 'custom_output_schema', extends_schema: true, control_type: 'schema-designer',
-          schema_neutral: false, sticky: true, optional: true,
-          label: 'Output columns', sample_data_type: 'csv' }
-      ],
-
-      input_fields: lambda do |_object_definitions, _connection, cfg|
-        advanced = !!cfg['show_advanced']
-        fields = [
-          { name: 'documents', type: 'array', of: 'object', optional: true,
-            hint: 'Each doc contains chunks:[...]' },
-          { name: 'chunks', type: 'array', of: 'object', optional: true,
-            hint: 'You can also pass a flat chunks list.' },
-          { name: 'table_name', optional: true, hint: 'Optional label for your downstream step' },
-          { name: 'include_text', type: 'boolean', control_type: 'checkbox', optional: true,
-            hint: 'Default true' }
-        ]
-        if advanced
-          fields << { name: 'metadata_prefix', optional: true, hint: 'Prefix for flattened metadata (Wide). Default meta_' }
-          fields << { name: 'metadata_max_keys', type: 'integer', optional: true, hint: 'Cap flattened keys. Default 50' }
-          fields << { name: 'metadata_max_bytes', type: 'integer', optional: true, hint: 'Total bytes cap for flattened metadata. Default 4096' }
-        end
-        fields
-      end,
-
-      output_fields: lambda do |object_definitions, cfg|
-        default_fields = [
-          { name: 'table' },
-          { name: 'profile' },
-          { name: 'count', type: 'integer' },
-          { name: 'rows', type: 'array', of: 'object', properties: object_definitions['table_row'] }
-        ]
-        call(:resolve_output_schema, default_fields, cfg, object_definitions)
-      end,
-
-      execute: lambda do |_connection, input, _schema = nil, _input_schema_name = nil, _connection_schema = nil, cfg = {}|
-        t0    = Time.now
-        corr  = call(:guid)
-        prof  = (cfg['row_profile'] || 'standard').to_s
-        include_text = input['include_text'].nil? ? true : !!input['include_text']
-        chunks = call(:flatten_chunks_input, input)
-        caps = {
-          'metadata_max_keys'  => input['metadata_max_keys'],
-          'metadata_max_bytes' => input['metadata_max_bytes']
-        }.compact
-        meta_prefix = (input['metadata_prefix'] || 'meta_').to_s
-
-        rows = chunks.map do |c|
-          call(:build_table_row, c, prof, include_text, meta_prefix, caps)
-        end
-
-        {
-          'table'   => input['table_name'].to_s,
-          'profile' => prof,
-          'count'   => rows.length,
-          'rows'    => rows
-        }.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
-      end,
-    
-      sample_output: lambda do
-        {
-          'table' => 'kb_chunks',
-          'profile' => 'wide',
-          'count' => 2,
-          'rows' => [
-            {
-              'id' => 'doc-abc123:0',
-              'doc_id' => 'doc-abc123',
-              'file_path' => 'drive://Reports/2025/summary.txt',
-              'checksum' => '3a2b9c…',
-              'tokens' => 42,
-              'span_start' => 0,
-              'span_end' => 1799,
-              'created_at' => '2025-10-15T12:00:00Z',
-              'text' => 'First slice…',
-              'meta_department' => 'HR',
-              'meta_owner' => 'PeopleOps'
-            }
-          ],
-          'ok'    => true,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 1, 'correlation_id' => 'sample' }
-        }
-      end
-    },
-
-    make_gcs_manifest: {
-      title: 'Ingestion - Make GCS manifest',
-      subtitle: 'Build {object_name, content_type, body} for corpus snapshot',
-      display_priority: 5,
-
-      input_fields: lambda do |object_definitions, _connection, _cfg|
-        [
-          { name: 'namespace', optional: true, hint: 'e.g., hr-knowledge-v1' },
-          { name: 'doc_id', optional: true },
-          { name: 'chunks', type: 'array', of: 'object', optional: false, properties: object_definitions['chunk'],
-            hint: 'Map the Chunks list.' },
-          { name: 'prefix', optional: true, hint: 'e.g., manifests/' },
-          { name: 'format', optional: true, hint: 'json|ndjson (default json)' }
+          }
         ]
       end,
 
       output_fields: lambda do |object_definitions|
         [
-          { name: 'object_name' },
-          { name: 'content_type' },
-          { name: 'bytes', type: 'integer' },
-          { name: 'body' }
-        ] + Array(object_definitions['envelope_fields'])
-      end,
-
-      execute: lambda do |_connection, input|
-        t0 = Time.now
-        corr = call(:guid)
-        ns   = (input['namespace'] || 'default').to_s
-        did  = (input['doc_id'] || 'multi').to_s
-        pre  = (input['prefix'] || '').to_s
-        fmt  = (input['format'] || 'json').to_s.downcase
-        ts   = Time.now.utc.strftime('%Y%m%dT%H%M%SZ')
-        oname = "#{pre}#{ns}/#{did}/manifest-#{ts}.#{fmt == 'ndjson' ? 'ndjson' : 'json'}"
-
-        records = call(:require_array_of_objects, input['chunks'], 'chunks').map do |c|
-          {
-            'id'        => call(:resolve_chunk_id, c),
-            'doc_id'    => c['doc_id'],
-            'text'      => c['text'].to_s,
-            'tokens'    => c['tokens'],
-            'span'      => { 'start' => c['span_start'], 'end' => c['span_end'] },
-            'file_path' => c.dig('source','file_path'),
-            'checksum'  => c.dig('source','checksum'),
-            'metadata'  => call(:sanitize_metadata, c['metadata'])
-          }
-        end
-
-        if fmt == 'ndjson'
-          body = records.map { |r| r.to_json }.join("\n")
-          ctype = 'application/x-ndjson'
-        else
-          body = { 'namespace' => ns, 'doc_id' => did, 'generated_at' => Time.now.utc.iso8601, 'records' => records }.to_json
-          ctype = 'application/json'
-        end
-
-        {
-          'object_name'  => oname,
-          'content_type' => ctype,
-          'bytes'        => body.bytesize,
-          'body'         => body
-        }.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
-      end,
-    
-      sample_output: lambda do
-        {
-          'object_name'  => 'manifests/ns/doc/manifest-20250101T000000Z.json',
-          'content_type' => 'application/json',
-          'bytes'        => 123,
-          'body'         => '{…}',
-          'ok'           => true,
-          'telemetry'    => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 1, 'correlation_id' => 'sample' }
-        }
-      end
-    },
-    make_gcs_manifest_batch: {
-      title: 'Ingestion - Make GCS manifests',
-      subtitle: 'One manifest per document; supports json or ndjson',
-      batch: true,
-      display_priority: 6,
-
-      input_fields: lambda do |_object_definitions, _connection, _cfg|
-        [
-          { name: 'namespace', optional: true, hint: 'e.g., hr-knowledge-v1' },
-          { name: 'documents', type: 'array', of: 'object', optional: false,
-            hint: 'Each doc requires {doc_id?, chunks:[...]} (doc_id inferred if missing)' },
-          { name: 'prefix', optional: true, hint: 'e.g., manifests/' },
-          { name: 'format', optional: true, hint: 'json|ndjson (default json)' }
+          { name: "text", type: "string" },
+          { name: "removed_sections", type: "array", of: "string" },
+          { name: "word_count", type: "integer" },
+          { name: "cleaning_applied", type: "object", properties: [
+            { name: "source_type", type: "string" },
+            { name: "task_type", type: "string" },
+            { name: "operations", type: "array", of: "string" },
+            { name: "original_length", type: "integer" },
+            { name: "final_length", type: "integer" },
+            { name: "reduction_percentage", type: "number" }
+          ]},
+          { name: "metadata", type: "object", properties: [
+            { name: "source_type", type: "string" },
+            { name: "task_type", type: "string" },
+            { name: "processing_timestamp", type: "string" },
+            { name: "extracted_urls", type: "array", of: "string" }
+          ]}
         ]
-      end,
-
-      output_fields: lambda do |object_definitions, _config_fields|
-        [
-          { name: 'count', type: 'integer' },
-          { name: 'manifests', type: 'array', of: 'object', properties: [
-            { name: 'object_name' },
-            { name: 'content_type' },
-            { name: 'bytes', type: 'integer' },
-            { name: 'body' }
-          ] }
-        ]
-      end,
-
-      execute: lambda do |_connection, input|
-        ns  = (input['namespace'] || 'default').to_s
-        pre = (input['prefix'] || '').to_s
-        fmt = (input['format'] || 'json').to_s.downcase
-        ts  = Time.now.utc.strftime('%Y%m%dT%H%M%SZ')
-
-        manifests = []
-        call(:ensure_array, input['documents']).each do |doc|
-          chunks = call(:ensure_array, doc['chunks'])
-          # Derive doc_id if not present (use first chunk’s doc_id or fallback uuid)
-          did = (doc['doc_id'] || chunks.dig(0, 'doc_id') || call(:guid)).to_s
-          oname = "#{pre}#{ns}/#{did}/manifest-#{ts}.#{fmt == 'ndjson' ? 'ndjson' : 'json'}"
-
-          records = chunks.map do |c|
-            {
-              'id'        => call(:resolve_chunk_id, c),
-              'doc_id'    => c['doc_id'],
-              'text'      => c['text'].to_s,
-              'tokens'    => c['tokens'],
-              'span'      => { 'start' => c['span_start'], 'end' => c['span_end'] },
-              'file_path' => c.dig('source','file_path'),
-              'checksum'  => c.dig('source','checksum'),
-              'metadata'  => call(:sanitize_metadata, c['metadata'])
-            }
-          end
-
-          if fmt == 'ndjson'
-            body  = records.map { |r| r.to_json }.join("\n")
-            ctype = 'application/x-ndjson'
-          else
-            body  = { 'namespace' => ns, 'doc_id' => did, 'generated_at' => Time.now.utc.iso8601, 'records' => records }.to_json
-            ctype = 'application/json'
-          end
-
-          manifests << {
-            'object_name'  => oname,
-            'content_type' => ctype,
-            'bytes'        => body.bytesize,
-            'body'         => body
-          }
-        end
-
-        { 'count' => manifests.length, 'manifests' => manifests }
       end,
 
       sample_output: lambda do
         {
-          'count' => 2,
-          'manifests' => [
-            {
-              'object_name' => 'manifests/hr-knowledge-v1/doc-abc123/manifest-20251015T120000Z.json',
-              'content_type' => 'application/json',
-              'bytes' => 2048,
-              'body' => '{"namespace":"hr-knowledge-v1","doc_id":"doc-abc123","generated_at":"2025-10-15T12:00:00Z","records":[…]}'
-            }
-          ]
+          "text" => "Hello team, I need help with the project analysis...",
+          "removed_sections" => ["--\nJohn Doe\nSenior Analyst"],
+          "word_count" => 12,
+          "cleaning_applied" => {
+            "source_type" => "email",
+            "task_type" => "classification",
+            "operations" => ["remove_signatures", "normalize_whitespace"],
+            "original_length" => 150,
+            "final_length" => 65,
+            "reduction_percentage" => 56.67
+          },
+          "metadata" => {
+            "source_type" => "email",
+            "task_type" => "classification",
+            "processing_timestamp" => "2024-01-15T10:30:00Z",
+            "extracted_urls" => []
+          }
         }
+      end,
+
+      execute: lambda do |connection, input, _eis, _eos, _config|
+        call(:prepare_text_for_ai_exec, connection, input)
       end
     },
+     # --- 2.  Document ID and metadata -------------------------------------
+    generate_document_metadata: {
+      title: "Generate Document Metadata",
+      subtitle: "Extract metadata from documents",
+      description: "Generate metadata for document indexing",
+      help: lambda do
+        { body: "Token estimate uses 4 chars/token heuristic; key topics via naive frequency analysis." }
+      end,
 
-    # --- SERVE (QUERY)  ---------------------------------------------------
-    # 7.  Build vector query
-    build_vector_query: {
-      title: 'Serve - Build vector query',
-      subtitle: 'Normalize text + optional embedding into a search request object',
-      display_priority: 5,
-
-      input_fields: lambda do |_object_definitions, _connection, _cfg|
+      input_fields: lambda do
         [
-          { name: 'query_text', optional: true, control_type: 'text-area' },
-          { name: 'query_embedding', type: 'array', of: 'number', optional: true },
-          { name: 'namespace', optional: true },
-          { name: 'top_k', type: 'integer', optional: true, hint: 'Default 20' }
+          { name: "document_content", label: "Document content", type: "string", optional: false, control_type: "text-area" },
+          { name: "file_path", label: "File path", type: "string", optional: false },
+          { name: "file_type", label: "File type", type: "string", optional: true, control_type: "select", pick_list: "file_types" },
+          { name: "extract_entities", label: "Extract entities", type: "boolean", optional: true, default: true, control_type: "checkbox" },
+          { name: "generate_summary", label: "Generate summary", type: "boolean", optional: true, default: true, control_type: "checkbox" }
         ]
       end,
 
-      output_fields: lambda do |_object_definitions, _config_fields|
-        [{ name: 'query', type: 'object' }]
-      end,
-
-      execute: lambda do |_connection, input|
-        obj = {
-          'namespace' => (input['namespace'] || '').to_s,
-          'top_k' => (input['top_k'] || 20).to_i
-        }
-        if input['query_embedding'].is_a?(Array)
-          obj['mode'] = 'vector'
-          obj['embedding'] = input['query_embedding']
-        else
-          obj['mode'] = 'text'
-          obj['query_text'] = input['query_text'].to_s
-        end
-        obj['top_k'] = 1 if obj['top_k'] < 1
-        { 'query' => obj }
+      output_fields: lambda do
+        [
+          { name: "document_id", type: "string" },
+          { name: "file_hash", type: "string" },
+          { name: "word_count", type: "integer" },
+          { name: "character_count", type: "integer" },
+          { name: "estimated_tokens", type: "integer" },
+          { name: "language", type: "string" },
+          { name: "summary", type: "string" },
+          { name: "key_topics", type: "array", of: "string" },
+          { name: "entities", type: "object" },
+          { name: "created_at", type: "timestamp" },
+          { name: "processing_time_ms", type: "integer" }
+        ]
       end,
 
       sample_output: lambda do
         {
-          'query' => {
-            'namespace' => 'hr-knowledge-v1',
-            'top_k' => 20,
-            'mode' => 'text',
-            'query_text' => 'What is our PTO policy?'
-          }
+          "document_id" => "abc123", "file_hash" => "…sha256…", "word_count" => 2500, "character_count" => 14000,
+          "estimated_tokens" => 3500, "language" => "english", "summary" => "…", "key_topics" => %w[rules r ag email],
+          "entities" => { "people" => [], "organizations" => [], "locations" => [] },
+          "created_at" => Time.now.iso8601, "processing_time_ms" => 12
         }
+      end,
+
+      execute: lambda do |connection, input|
+        result = call(:extract_metadata, input)
+        call(:validate_contract, connection, result, 'document_metadata')
       end
     },
+    check_document_changes: {
+      title: "Check Document Changes",
+      subtitle: "Detect changes in documents",
+      description: "Compare document versions to detect modifications",
+      help: lambda do
+        { body: "Choose Hash only (fast), Content diff (line‑based), or Smart diff (tokens + structure)." }
+      end,
 
-    # 8.  Merge search results
-    merge_search_results: {
-      title: 'Serve - Merge search results',
-      subtitle: 'Normalize, dedupe by chunk_id, keep best score',
-      display_priority: 5,
+      input_fields: lambda do
+        [
+          { name: "current_hash", label: "Current document hash", type: "string", optional: false },
+          { name: "current_content", label: "Current content", type: "string", optional: true, control_type: "text-area" },
+          { name: "previous_hash", label: "Previous document hash", type: "string", optional: false },
+          { name: "previous_content", label: "Previous content", type: "string", optional: true, control_type: "text-area" },
+          { name: "check_type", label: "Check type", type: "string", optional: true, default: "hash", control_type: "select", pick_list: "check_types" }
+        ]
+      end,
+
+      output_fields: lambda do |object_definitions|
+        [
+          { name: "has_changed", type: "boolean", control_type: "checkbox" },
+          { name: "change_type", type: "string" },
+          { name: "change_percentage", type: "number" },
+          { name: "added_content", type: "array", of: "string" },
+          { name: "removed_content", type: "array", of: "string" },
+          { name: "modified_sections", type: "array", of: "object", properties: object_definitions["diff_section"] },
+          { name: "requires_reindexing", type: "boolean", control_type: "checkbox" }
+        ]
+      end,
+
+      sample_output: lambda do
+        {
+          "has_changed" => true, "change_type" => "content_changed", "change_percentage" => 12.5,
+          "added_content" => ["new line"], "removed_content" => ["old line"],
+          "modified_sections" => [{ "type" => "modified", "current_range" => [10,10], "previous_range" => [10,10], "current_lines" => ["A"], "previous_lines" => ["B"] }],
+          "requires_reindexing" => true
+        }
+      end,
+
+      execute: lambda do |connection, input|
+        result = call(:detect_changes, input)
+        call(:validate_contract, connection, result, 'change_detection')
+      end
+    },
+    # --- 3.  Chunking -----------------------------------------------------
+    smart_chunk_text: {
+      title: "Smart Chunk Text",
+      subtitle: "Intelligently chunk text preserving context",
+      description: "Split text into chunks with smart boundaries and overlap.",
+      help: lambda do
+        {
+          body: "Splits text into token‑approximate chunks using sentence/paragraph boundaries and overlap. Use connection defaults to avoid per‑step config."
+        }
+      end,
 
       config_fields: [
-        { name: 'override_output_schema', type: 'boolean', control_type: 'checkbox',
-          label: 'Design custom output schema' },
-        { name: 'custom_output_schema', extends_schema: true, control_type: 'schema-designer',
-          schema_neutral: false, sticky: true, optional: true,
-          label: 'Output columns', sample_data_type: 'csv' }
+        {
+          name: "use_custom_settings",
+          label: "Configuration mode",
+          control_type: "select",
+          pick_list: [
+            ["Use connection defaults", "defaults"],
+            ["Custom settings", "custom"]
+          ],
+          default: "defaults",
+          sticky: true,
+          hint: "Select 'Custom' to override connection defaults."
+        }
       ],
 
-      input_fields: lambda do |_object_definitions, _connection, _cfg|
+      input_fields: lambda do |object_definitions, connection, config|
+        fields = [
+          { name: "text", label: "Input text", type: "string",
+            optional: false, control_type: "text-area",
+            hint: "Raw text to be chunked" },
+          { name: "document_metadata", label: "Document metadata", type: "object",
+            optional: true,
+            properties: [
+              { name: "document_id", label: "Document ID", type: "string", optional: true },
+              { name: "file_name", label: "File name", type: "string", optional: true },
+              { name: "file_id", label: "File ID", type: "string", optional: true }
+            ],
+            hint: "Optional document metadata to include with each chunk" }
+        ]
+        if config["use_custom_settings"] == "custom"
+          fields.concat(object_definitions["chunking_config"])
+        end
+        fields
+      end,
+
+      output_fields: lambda do |object_definitions|
+        object_definitions["chunking_result"]
+      end,
+
+      sample_output: lambda do
+        {
+          "chunks" => [
+            { "chunk_id" => "chunk_0", "chunk_index" => 0, "text" => "Lorem ipsum…", "token_count" => 120, "start_char" => 0, "end_char" => 480, "metadata" => { "has_overlap" => false, "is_final" => false } }
+          ],
+          "total_chunks" => 1,
+          "total_tokens" => 120
+        }
+      end,
+
+      execute: lambda do |connection, input, _eis, _eos, config|
+        local = call(:deep_copy, input)
+        if config["use_custom_settings"] != "custom"
+          local['chunk_size']        ||= (connection['chunk_size_default'] || 1000)
+          local['chunk_overlap']     ||= (connection['chunk_overlap_default'] || 100)
+          local['preserve_sentences']  = true  if local['preserve_sentences'].nil?
+          local['preserve_paragraphs'] = false if local['preserve_paragraphs'].nil?
+        end
+
+        # Guards for pathological inputs
+        cs = (local['chunk_size'] || 1000).to_i
+        co = (local['chunk_overlap'] || 100).to_i
+        error("Chunk size must be > 0")        if cs <= 0
+        error("Chunk overlap must be >= 0")    if co < 0
+
+        result = call(:chunk_text_with_overlap, local)
+
+        # Add document metadata to chunks if provided
+        if local['document_metadata'].present?
+          result['chunks'].each_with_index do |chunk, idx|
+            chunk['metadata'] ||= {}
+            chunk['metadata'].merge!({
+              'document_id'   => local['document_metadata']['document_id'],
+              'file_name'     => local['document_metadata']['file_name'],
+              'file_id'       => local['document_metadata']['file_id'],
+              'total_chunks'  => result['total_chunks']
+            })
+          end
+        end
+
+        call(:validate_contract, connection, result, 'chunking_result')
+      end
+    },
+    process_document_for_rag: {
+      title: 'Process document for RAG',
+      subtitle: 'Complete document processing pipeline for RAG indexing',
+      description: lambda do |input|
+        file_name = input.dig('file_metadata', 'file_name') || 'document'
+        chunk_size = input['chunk_size'] || 1000
+        "Process #{file_name} into RAG-ready chunks (#{chunk_size} chars each)"
+      end,
+
+      help: {
+        body: 'This action provides a complete document processing pipeline for RAG (Retrieval-Augmented Generation). ' \
+              'It takes raw document content and metadata, generates a stable document ID, chunks the text with smart boundaries, ' \
+              'and produces enhanced chunks with merged metadata ready for embedding and indexing.'
+      },
+
+      input_fields: lambda do |object_definitions|
         [
-          { name: 'results', type: 'array', of: 'object', optional: false }
+          { name: 'document_content',     label: 'Document content',    type: 'string',   optional: false,
+            hint: 'Raw text content of the document to be processed' },
+          { name: 'file_metadata',        label: 'File metadata',       type: 'object',   optional: false,
+            properties: [
+              { name: 'file_id', label: 'File ID', type: 'string', optional: false },
+              { name: 'file_name', label: 'File name', type: 'string', optional: false },
+              { name: 'checksum', label: 'Checksum', type: 'string', optional: true },
+              { name: 'mime_type', label: 'MIME type', type: 'string', optional: true },
+              { name: 'size', label: 'File size', type: 'integer', optional: true },
+              { name: 'modified_time', label: 'Modified time', type: 'date_time', optional: true } ],
+            hint: 'File metadata object containing file_id, file_name, and optional checksum/mime_type' },
+          { name: 'chunk_size',           label: 'Chunk size',          type: 'integer',  optional: true,
+            default: 1000, convert_input: 'integer_conversion',
+            hint: 'Target size for each text chunk in characters (default: 1000)' },
+          { name: 'chunk_overlap',        label: 'Chunk overlap',       type: 'integer',  optional: true,
+            default: 100,  convert_input: 'integer_conversion',
+            hint: 'Number of characters to overlap between chunks (default: 100)' },
+          { name: 'additional_metadata',  label: 'Additional metadata', type: 'object',   optional: true,
+            hint: 'Additional metadata to include with each chunk' }
         ]
       end,
 
-      output_fields: lambda do |object_definitions, _config_fields|
-        default_fields = [
-          { name: 'count', type: 'integer' },
-          { name: 'results', type: 'array', of: 'object' }
-        ]
-        call(:resolve_output_schema, default_fields, _config_fields, object_definitions)
+      output_fields: lambda do |object_definitions|
+        [
+          { name: 'document_id',          label: 'Document ID',         type: 'string',
+            hint: 'Unique document identifier generated from file path and checksum' },
+          { name: 'chunks',               label: 'Enhanced chunks',     type: 'array', of: 'object',
+            properties: [
+              { name: 'chunk_id', label: 'Chunk ID', type: 'string' },
+              { name: 'text', label: 'Chunk text', type: 'string' },
+              { name: 'chunk_index', label: 'Chunk index', type: 'integer' },
+              { name: 'start_position', label: 'Start position', type: 'integer' },
+              { name: 'end_position', label: 'End position', type: 'integer' },
+              { name: 'character_count', label: 'Character count', type: 'integer' },
+              { name: 'word_count', label: 'Word count', type: 'integer' },
+              { name: 'document_id', label: 'Document ID', type: 'string' },
+              { name: 'file_name', label: 'File name', type: 'string' },
+              { name: 'file_id', label: 'File ID', type: 'string' },
+              { name: 'source', label: 'Source', type: 'string' },
+              { name: 'indexed_at', label: 'Indexed at', type: 'string' } ],
+            hint: 'Array of chunks with enhanced metadata ready for embedding' },
+          { name: 'document_metadata',    label: 'Document metadata',   type: 'object',
+            properties: [
+              { name: 'total_chunks', label: 'Total chunks', type: 'integer' },
+              { name: 'total_characters', label: 'Total characters', type: 'integer' },
+              { name: 'total_words', label: 'Total words', type: 'integer' },
+              { name: 'processing_timestamp', label: 'Processing timestamp', type: 'string' },
+              { name: 'chunk_size_used', label: 'Chunk size used', type: 'integer' },
+              { name: 'overlap_used', label: 'Overlap used', type: 'integer' } ],
+            hint: 'Summary metadata about the document processing' },
+          { name: 'ready_for_embedding',  label: 'Ready for embedding', type: 'boolean',
+            hint: 'True when document processing is complete and ready for embedding generation' } ]
       end,
 
-      execute: lambda do |_connection, input|
-        t0 = Time.now
-        corr = call(:guid)
-        results = call(:require_array_of_objects, input['results'], 'results')
-        out = {}
-        results.each do |r|
-          id = (r['chunk_id'] || r['id']).to_s
-          next if id.empty?
-          score = r['score'].to_f
-          if !out.key?(id) || score > out[id]['score'].to_f
-            out[id] = {
-              'chunk_id' => id,
-              'doc_id'   => r['doc_id'],
-              'text'     => r['text'].to_s,
-              'score'    => score,
-              'metadata' => call(:sanitize_metadata, r['metadata']),
-              'source'   => r['source']   || {}
+      execute: lambda do |connection, input|
+        # Step 1: Extract and validate inputs
+        document_content = input['document_content'].to_s
+        file_metadata = input['file_metadata'] || {}
+        cs_in = input.key?('chunk_size') ? input['chunk_size'] : 1000
+        co_in = input.key?('chunk_overlap') ? input['chunk_overlap'] : 100
+        chunk_size    = [cs_in.to_i, 100].max        # Minimum 100 chars
+        chunk_overlap = [co_in.to_i, 0].max
+        additional_metadata = input['additional_metadata'] || {}
+
+        # Validate required fields
+        error('Document content is required') if document_content.empty?
+        error('file_metadata.file_id is required') if file_metadata['file_id'].blank?
+        error('file_metadata.file_name is required') if file_metadata['file_name'].blank?
+
+        # Step 2: Generate document ID using helper
+        file_path = file_metadata['file_name']
+        checksum = file_metadata['checksum'] || 'no_checksum'
+        document_id = call('generate_document_id', file_path, checksum)
+
+        # Step 3: Call chunk_text_with_overlap action
+        chunk_input = {
+          'text' => document_content,
+          'chunk_size' => chunk_size,
+          'chunk_overlap' => (chunk_overlap / 4.0).ceil  # Convert chars to approximate tokens
+        }
+
+        chunk_result = call('chunk_text_with_overlap', chunk_input)
+        base_chunks = chunk_result['chunks'] || []
+
+        # Step 4: Process each chunk and enhance with metadata
+        enhanced_chunks = []
+        base_chunks.each_with_index do |chunk, index|
+          # Generate chunk ID
+          chunk_id = "#{document_id}_chunk_#{index}"
+
+          # Prepare chunk metadata
+          chunk_metadata = {
+            'chunk_id' => chunk_id,
+            'chunk_index' => index,
+            'start_position' => chunk['start_position'],
+            'end_position' => chunk['end_position'],
+            'character_count' => chunk['character_count'],
+            'word_count' => chunk['word_count']
+          }
+
+          # Merge with additional metadata if provided
+          chunk_metadata.merge!(additional_metadata) if additional_metadata.is_a?(Hash)
+
+          # Use helper to merge document metadata
+          merge_options = {
+            document_id: document_id,
+            file_name: file_metadata['file_name'],
+            file_id: file_metadata['file_id']
+          }
+
+          enhanced_metadata = call('merge_document_metadata', chunk_metadata, file_metadata, merge_options)
+
+          # Build enhanced chunk
+          enhanced_chunk = {
+            'chunk_id' => chunk_id,
+            'text' => chunk['text'],
+            'chunk_index' => index,
+            'start_position' => chunk['start_position'],
+            'end_position' => chunk['end_position'],
+            'character_count' => chunk['character_count'],
+            'word_count' => chunk['word_count'],
+            'document_id' => document_id,
+            'file_name' => file_metadata['file_name'],
+            'file_id' => file_metadata['file_id'],
+            'source' => enhanced_metadata['source'],
+            'indexed_at' => enhanced_metadata['indexed_at']
+          }
+
+          # Add any additional metadata fields
+          enhanced_metadata.each do |key, value|
+            unless enhanced_chunk.key?(key)
+              enhanced_chunk[key] = value
+            end
+          end
+
+          enhanced_chunks << enhanced_chunk
+        end
+
+        # Step 5: Generate document metadata
+        processing_timestamp = Time.now.iso8601
+        total_characters = document_content.length
+        total_words = document_content.split(/\s+/).length
+
+        document_metadata = {
+          'total_chunks' => enhanced_chunks.length,
+          'total_characters' => total_characters,
+          'total_words' => total_words,
+          'processing_timestamp' => processing_timestamp,
+          'chunk_size_used' => chunk_size,
+          'overlap_used' => chunk_overlap
+        }
+
+        # Step 6: Build final response
+        {
+          'document_id' => document_id,
+          'chunks' => enhanced_chunks,
+          'document_metadata' => document_metadata,
+          'ready_for_embedding' => true
+        }
+      end
+    },
+    prepare_document_batch: {
+      title: 'Prepare document batch for RAG',
+      subtitle: 'Process multiple documents and group chunks into batches',
+      description: lambda do |input|
+        documents = input['documents'] || []
+        batch_size = input['batch_size'] || 25
+        count = documents.length
+        if count > 0
+          "Process #{count} documents and group chunks into batches of #{batch_size}"
+        else
+          'Process multiple documents for RAG indexing'
+        end
+      end,
+
+      help: {
+        body: 'This action processes multiple documents through the RAG pipeline and groups their chunks into batches. ' \
+              'Each document is processed using process_document_for_rag, then all chunks are organized into ' \
+              'manageable batches for embedding generation. Provides comprehensive metrics and batch tracking.'
+      },
+
+      input_fields: lambda do |object_definitions|
+        [
+          { name: 'documents',              label: 'Documents',             type: 'array', of: 'object',
+            properties: [
+              { name: 'document_content',     label: 'Document content',  type: 'string', optional: false },
+              { name: 'file_metadata',        label: 'File metadata',     type: 'object', optional: false,
+                properties: [
+                  { name: 'file_id', label: 'File ID', type: 'string', optional: false },
+                  { name: 'file_name', label: 'File name', type: 'string', optional: false },
+                  { name: 'checksum', label: 'Checksum', type: 'string', optional: true },
+                  { name: 'mime_type', label: 'MIME type', type: 'string', optional: true },
+                  { name: 'size', label: 'File size', type: 'integer', optional: true },
+                  { name: 'modified_time', label: 'Modified time', type: 'date_time', optional: true } ] },
+              { name: 'chunk_size',           label: 'Chunk size', type: 'integer', optional: true },
+              { name: 'chunk_overlap',        label: 'Chunk overlap',       type: 'integer', optional: true },
+              { name: 'additional_metadata',  label: 'Additional metadata', type: 'object', optional: true } ],
+             optional: false, hint: 'Array of documents to process, each with content and metadata' },
+            { name: 'batch_size',             label: 'Batch size',            type: 'integer',
+              optional: true, default: 25,  convert_input: 'integer_conversion',
+              hint: 'Number of chunks per batch (default: 25, max: 100)' },
+            { name: 'default_chunk_size',     label: 'Default chunk size',    type: 'integer',
+              optional: true, default: 1000, convert_input: 'integer_conversion',
+              hint: 'Default chunk size for documents that don\'t specify one' },
+            { name: 'default_chunk_overlap',  label: 'Default chunk overlap', type: 'integer',
+              optional: true, default: 100,  convert_input: 'integer_conversion',
+              hint: 'Default chunk overlap for documents that don\'t specify one' }
+        ]
+      end,
+
+      output_fields: lambda do |object_definitions|
+        [
+          { name: 'batches',          label: 'Chunk batches',       type: 'array', of: 'object',
+            properties: [
+              { name: 'batch_id',       label: 'Batch ID',        type: 'string' },
+              { name: 'chunks',         label: 'Chunks',          type: 'array', of: 'object',
+                properties: [
+                  { name: 'chunk_id',     label: 'Chunk ID',    type: 'string' },
+                  { name: 'text',         label: 'Chunk text',  type: 'string' },
+                  { name: 'chunk_index',  label: 'Chunk index', type: 'integer' },
+                  { name: 'document_id',  label: 'Document ID', type: 'string' },
+                  { name: 'file_name',    label: 'File name',   type: 'string' },
+                  { name: 'file_id',      label: 'File ID',     type: 'string' },
+                  { name: 'source',       label: 'Source',      type: 'string' },
+                  { name: 'indexed_at',   label: 'Indexed at',  type: 'string' } ]
+              },
+              { name: 'document_count', label: 'Document count',  type: 'integer' },
+              { name: 'chunk_count',    label: 'Chunk count',     type: 'integer' },
+              { name: 'batch_index',    label: 'Batch index',     type: 'integer' } ],
+            hint: 'Array of batches, each containing chunks grouped for processing' },
+          { name: 'summary',          label: 'Processing summary',  type: 'object',
+            properties: [
+              { name: 'total_documents',      label: 'Total documents',       type: 'integer' },
+              { name: 'total_chunks',         label: 'Total chunks',          type: 'integer' },
+              { name: 'total_batches',        label: 'Total batches',         type: 'integer' },
+              { name: 'processing_timestamp', label: 'Processing timestamp',  type: 'string' },
+              { name: 'successful_documents', label: 'Successful documents',  type: 'integer' },
+              { name: 'failed_documents',     label: 'Failed documents',      type: 'integer' } ],
+            hint: 'Summary statistics about the batch processing operation' },
+          { name: 'failed_documents', label: 'Failed documents',    type: 'array', of: 'object',
+            properties: [
+              { name: 'file_name',      label: 'File name',     type: 'string' },
+              { name: 'file_id',        label: 'File ID',       type: 'string' },
+              { name: 'error_message',  label: 'Error message', type: 'string' } ],
+            hint: 'Array of documents that failed to process with error details' }
+        ]
+      end,
+
+      execute: lambda do |connection, input|
+        start_time = Time.now
+        timestamp = start_time.strftime('%Y%m%d_%H%M%S')
+
+        # Step 1: Extract and validate inputs
+        documents = input['documents'] || []
+        bs_in  = input.key?('batch_size') ? input['batch_size'] : 25
+        batch_size = [bs_in.to_i, 100].min                      # clamp to 100
+        default_chunk_size    = (input.fetch('default_chunk_size', 1000)).to_i
+        default_chunk_overlap = (input.fetch('default_chunk_overlap', 100)).to_i
+
+        return {
+          'batches' => [],
+          'summary' => {
+            'total_documents' => 0,
+            'total_chunks' => 0,
+            'total_batches' => 0,
+            'processing_timestamp' => start_time.iso8601,
+            'successful_documents' => 0,
+            'failed_documents' => 0
+          },
+          'failed_documents' => []
+        } if documents.empty?
+
+        # Step 2: Process each document and collect all chunks
+        all_chunks = []
+        successful_documents = 0
+        failed_documents = []
+
+        documents.each do |document|
+          begin
+            # Prepare input for process_document_for_rag
+            process_input = {
+              'document_content'    => document['document_content'],
+              'file_metadata'       => document['file_metadata'],
+              'chunk_size'          => document['chunk_size'] || default_chunk_size,
+              'chunk_overlap'       => document['chunk_overlap'] || default_chunk_overlap,
+              'additional_metadata' => document['additional_metadata']
+            }
+
+            # Process document using the same logic as process_document_for_rag
+            document_content    = process_input['document_content'].to_s
+            file_metadata       = process_input['file_metadata'] || {}
+            d_cs_in = process_input.key?('chunk_size') ? process_input['chunk_size'] : 1000
+            d_co_in = process_input.key?('chunk_overlap') ? process_input['chunk_overlap'] : 100
+            chunk_size    = [d_cs_in.to_i, 100].max
+            chunk_overlap = [d_co_in.to_i, 0].max
+            additional_metadata = process_input['additional_metadata'] || {}
+
+            # Validate required fields
+            next if document_content.empty? || file_metadata['file_id'].blank? || file_metadata['file_name'].blank?
+
+            # Generate document ID
+            file_path   = file_metadata['file_name']
+            checksum    = file_metadata['checksum'] || 'no_checksum'
+            document_id = call('generate_document_id', file_path, checksum)
+
+            # Chunk the text
+            chunk_input = {
+              'text'          => document_content,
+              'chunk_size'    => chunk_size,
+              'chunk_overlap' => (chunk_overlap / 4.0).ceil
+            }
+
+            chunk_result  = call('chunk_text_with_overlap', chunk_input)
+            base_chunks   = chunk_result['chunks'] || []
+
+            # Process each chunk
+            enhanced_chunks = []
+            base_chunks.each_with_index do |chunk, index|
+              chunk_id = "#{document_id}_chunk_#{index}"
+
+              chunk_metadata = {
+                'chunk_id'        => chunk_id,
+                'chunk_index'     => index,
+                'start_position'  => chunk['start_position'],
+                'end_position'    => chunk['end_position'],
+                'character_count' => chunk['character_count'],
+                'word_count'      => chunk['word_count']
+              }
+
+              chunk_metadata.merge!(additional_metadata) if additional_metadata.is_a?(Hash)
+
+              merge_options = {
+                document_id:  document_id,
+                file_name:    file_metadata['file_name'],
+                file_id:      file_metadata['file_id']
+              }
+
+              enhanced_metadata = call('merge_document_metadata', chunk_metadata, file_metadata, merge_options)
+
+              enhanced_chunk = {
+                'chunk_id'        => chunk_id,
+                'text'            => chunk['text'],
+                'chunk_index'     => index,
+                'start_position'  => chunk['start_position'],
+                'end_position'    => chunk['end_position'],
+                'character_count' => chunk['character_count'],
+                'word_count'      => chunk['word_count'],
+                'document_id'     => document_id,
+                'file_name'       => file_metadata['file_name'],
+                'file_id'         => file_metadata['file_id'],
+                'source'          => enhanced_metadata['source'],
+                'indexed_at'      => enhanced_metadata['indexed_at']
+              }
+
+              enhanced_metadata.each do |key, value|
+                unless enhanced_chunk.key?(key)
+                  enhanced_chunk[key] = value
+                end
+              end
+
+              enhanced_chunks << enhanced_chunk
+            end
+
+            result = { 'chunks' => enhanced_chunks }
+
+            # Collect chunks from this document
+            document_chunks = result['chunks'] || []
+            all_chunks.concat(document_chunks)
+            successful_documents += 1
+
+          rescue => e
+            # Track failed documents
+            file_metadata = document['file_metadata'] || {}
+            failed_documents << {
+              'file_name'     => file_metadata['file_name'] || 'unknown',
+              'file_id'       => file_metadata['file_id'] || 'unknown',
+              'error_message' => e.message
             }
           end
         end
-        merged = out.values.sort_by { |x| -x['score'].to_f }
-        { 'count' => merged.length, 'results' => merged }
-          .merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
-      end,
 
-      sample_output: lambda do
-        {
-          'count' => 2,
-          'results' => [
-            {
-              'chunk_id' => 'doc-abc123:0',
-              'doc_id' => 'doc-abc123',
-              'text' => 'First slice…',
-              'score' => 0.92,
-              'metadata' => { 'tokens' => 42 },
-              'source' => { 'file_path' => 'drive://Reports/2025/summary.txt' }
-            },
-            {
-              'chunk_id' => 'doc-xyz789:3',
-              'doc_id' => 'doc-xyz789',
-              'text' => 'Another match…',
-              'score' => 0.87,
-              'metadata' => {},
-              'source' => { 'file_path' => 'drive://Policies/PTO.md' }
-            }
-          ]
-        }
-      end
-    },
+        # Step 3: Group chunks into batches
+        batches = []
+        batch_index = 0
 
-    # 9.  Select top-k by score
-    # 10. Select context by token budget
-    select_context_by_token_budget: {
-      title: 'Serve - Select context by token budget',
-      subtitle: 'Greedy pack by tokens with optional per-doc cap',
-      display_priority: 4,
+        all_chunks.each_slice(batch_size) do |chunk_group|
+          # Generate batch ID with timestamp and index
+          batch_id = "batch_#{timestamp}_#{batch_index}"
 
-      input_fields: lambda do |_object_definitions, _connection, _cfg|
-        [
-          { name: 'results', type: 'array', of: 'object', optional: false },
-          { name: 'token_budget', type: 'integer', optional: false },
-          { name: 'max_per_doc', type: 'integer', optional: true, hint: 'Default 3' }
-        ]
-      end,
+          # Count unique document IDs in this batch
+          document_ids = chunk_group.map { |chunk| chunk['document_id'] }.uniq
+          document_count = document_ids.length
 
-      output_fields: lambda do |_object_definitions, _config_fields|
-        [
-          { name: 'total_tokens', type: 'integer' },
-          { name: 'count', type: 'integer' },
-          { name: 'context', type: 'array', of: 'object' }
-        ]
-      end,
+          # Create batch object
+          batch = {
+            'batch_id'        => batch_id,
+            'chunks'          => chunk_group,
+            'document_count'  => document_count,
+            'chunk_count'     => chunk_group.length,
+            'batch_index'     => batch_index
+          }
 
-      execute: lambda do |_connection, input|
-        budget = (input['token_budget'] || 1200).to_i
-        perdoc = (input['max_per_doc'] || 3).to_i
-        used = 0
-        per = Hash.new(0)
-        picked = []
-        results = call(:require_array_of_objects, input['results'], 'results')
-        results.each do |r|
-          doc = r['doc_id'].to_s
-          t = (r['tokens'] || r.dig('metadata','tokens') || r['text'].to_s.split(/\s+/).size).to_i
-          next if per[doc] >= perdoc
-          break if used + t > budget
-          picked << r.merge('tokens' => t)
-          used += t
-          per[doc] += 1
+          batches << batch
+          batch_index += 1
         end
-        { 'total_tokens' => used, 'count' => picked.length, 'context' => picked }
-      end,
 
-      sample_output: lambda do
+        # Step 4: Generate summary
+        processing_timestamp = Time.now.iso8601
+        summary = {
+          'total_documents'       => documents.length,
+          'total_chunks'          => all_chunks.length,
+          'total_batches'         => batches.length,
+          'processing_timestamp'  => processing_timestamp,
+          'successful_documents'  => successful_documents,
+          'failed_documents'      => failed_documents.length
+        }
+
+        # Step 5: Build final response
         {
-          'total_tokens' => 120,
-          'count' => 2,
-          'context' => [
-            {
-              'chunk_id' => 'doc-abc123:0',
-              'doc_id' => 'doc-abc123',
-              'text' => 'First slice…',
-              'tokens' => 60,
-              'metadata' => { 'section' => 'Benefits' }
-            },
-            {
-              'chunk_id' => 'doc-xyz789:1',
-              'doc_id' => 'doc-xyz789',
-              'text' => 'Second slice…',
-              'tokens' => 60,
-              'metadata' => {}
-            }
-          ]
+          'batches'           => batches,
+          'summary'           => summary,
+          'failed_documents'  => failed_documents
         }
       end
-
     },
-    # 11. Build citation map
-    # 12. Build messages for Gemini
-    build_messages_gemini: {
-      title: 'Serve - Build Gemini messages',
-      subtitle: 'Construct system/user messages with injected context',
-      display_priority: 3,
-
-      input_fields: lambda do |_object_definitions, _connection, _cfg|
-        [
-          { name: 'user_query', optional: false, control_type: 'text-area' },
-          { name: 'context', type: 'array', of: 'object', optional: true },
-          { name: 'system_preamble', optional: true, control_type: 'text-area',
-            hint: 'High-level instructions and guardrails' }
-        ]
+    chunk_gcs_batch_for_embedding: {
+      title: "Chunk GCS batch for embedding",
+      subtitle: "Input = gcs_batch_fetch_objects.successful_objects → chunks + (optional) embedding batches",
+      description: "Aligns chunking with GCS batch fetch output. Produces chunk objects and optionally ready-to-send embedding request batches.",
+      help: lambda do
+        { body: "Map the “successful_objects” array from Drive Utilities → GCS: Batch fetch objects. " \
+                "This action chunks each object’s text_content using your smart chunker and (optionally) emits embedding batches."}
       end,
 
-      output_fields: lambda do |_object_definitions, _config_fields|
-        [{ name: 'messages', type: 'array', of: 'object' }]
-      end,
-
-      execute: lambda do |_connection, input|
-        sys = (input['system_preamble'] || 'Answer using only the provided context. Cite with [^n] labels.').to_s
-        ctx_lines = (input['context'] || []).map.with_index do |c, i|
-          label = i + 1
-          "[^#{label}] #{c['text']}"
-        end
-        user = <<~U
-          Question:
-          #{input['user_query']}
-
-          Context:
-          #{ctx_lines.join("\n\n")}
-        U
-        { 'messages' => [
-            { 'role' => 'system', 'content' => sys },
-            { 'role' => 'user',   'content' => user.strip }
-          ]
+      # Let the builder choose chunking mode and whether to emit embedding batches
+      config_fields: [
+        {
+          name: "configuration_mode",
+          label: "Configuration mode",
+          control_type: "select",
+          default: "defaults",
+          sticky: true,
+          options: [
+            ["Use connection defaults (chunk size/overlap)", "defaults"],
+            ["Custom (override chunking settings)", "custom"]
+          ],
+          hint: "Defaults come from RAG Utilities connection."
+        },
+        {
+          name: "produce_embedding_batches",
+          label: "Also build embedding batches",
+          type: "boolean",
+          control_type: "checkbox",
+          default: true,
+          sticky: true,
+          hint: "When checked, builds {batches → requests[]} using your Prepare Embedding Batch contract."
         }
-      end,
+      ],
 
-      sample_output: lambda do
-        { 'messages' => [
-            { 'role' => 'system', 'content' => 'Answer using only the provided context. Cite with [^n] labels.' },
-            { 'role' => 'user', 'content' => "Question:\n...\n\nContext:\n[^1] ..." }
-        ] }
-      end
-
-    },
-    # 13. Postprocess answer
-    postprocess_answer: {
-      title: 'Serve - Postprocess LLM answer',
-      subtitle: 'Extract [^n] citations and attach structured metadata',
-      display_priority: 3,
-
-      input_fields: lambda do |_object_definitions, _connection, _cfg|
-        [
-          { name: 'llm_output', label: 'LLM output text', control_type: 'text-area', optional: false },
-          { name: 'context', type: 'array', of: 'object', optional: true,
-            hint: 'Items used to build the prompt; index order matches [^n] labels' }
-        ]
-      end,
-
-      output_fields: lambda do |_object_definitions, _config_fields|
-        [
-          { name: 'answer' },
-          { name: 'citation_count', type: 'integer' },
-          { name: 'citations', type: 'array', of: 'object', properties: [
-            { name: 'label' }, { name: 'chunk_id' }, { name: 'doc_id' }, { name: 'file_path' },
-            { name: 'span', type: 'object', properties: [{ name: 'start', type: 'integer' }, { name: 'end', type: 'integer' }] },
-            { name: 'metadata', type: 'object' }
-          ] }
-        ]
-      end,
-
-      execute: lambda do |_connection, input|
-        text = (input['llm_output'] || '').to_s
-        ctx  = (input['context'] || [])
-
-        # Find labels like [^1], [^2], etc.
-        labels = text.scan(/\[\^(\d+)\]/).flatten.map(&:to_i).uniq.sort
-
-        citations = labels.map do |n|
-          i = n - 1
-          src = ctx[i] || {}
+      input_fields: lambda do |object_definitions, connection, config|
+        fields = [
           {
-            'label'     => "[^#{n}]",
-            'chunk_id'  => (src['chunk_id'] || src['id']),
-            'doc_id'    => src['doc_id'],
-            'file_path' => src.dig('source','file_path'),
-            'span'      => { 'start' => src['span_start'], 'end' => src['span_end'] },
-            'metadata'  => call(:sanitize_metadata, src['metadata'])
+            name: "objects",
+            label: "GCS successful objects",
+            type: "array", of: "object", list_mode_toggle: true, optional: false,
+            group: "Source: GCS",
+            hint: "Map Drive Utilities → GCS: Batch fetch objects → successful_objects",
+            properties: [
+              { name: "bucket" }, { name: "name" }, { name: "size", type: "integer" },
+              { name: "content_type" }, { name: "updated" }, { name: "generation" },
+              { name: "md5_hash" }, { name: "crc32c" }, { name: "metadata", type: "object" },
+              { name: "text_content", type: "string" }, { name: "needs_processing", type: "boolean" },
+              { name: "fetch_method" }
+            ]
+          },
+          { name: "skip_empty_text", label: "Skip objects with empty text_content", type: "boolean", control_type: "checkbox", default: true, group: "Source: GCS" },
+          { name: "base_metadata", label: "Base metadata to merge into each chunk", type: "object", optional: true, group: "Source: GCS" },
+
+          # Chunking
+          { name: "preserve_sentences", label: "Preserve sentences", type: "boolean", control_type: "checkbox", default: true, group: "Chunking", ngIf: 'input.configuration_mode == "custom"' },
+          { name: "preserve_paragraphs", label: "Preserve paragraphs", type: "boolean", control_type: "checkbox", default: false, group: "Chunking", ngIf: 'input.configuration_mode == "custom"' },
+          { name: "chunk_size", label: "Chunk size (tokens)", type: "integer", default: (connection["chunk_size_default"] || 1000), convert_input: "integer_conversion", group: "Chunking", ngIf: 'input.configuration_mode == "custom"' },
+          { name: "chunk_overlap", label: "Chunk overlap (tokens)", type: "integer", default: (connection["chunk_overlap_default"] || 100), convert_input: "integer_conversion", group: "Chunking", ngIf: 'input.configuration_mode == "custom"' },
+
+          # Embedding batches (only used when produce_embedding_batches = true)
+          { name: "task_type", label: "Embedding task type", control_type: "select",
+            pick_list: [
+              ["Retrieval Document", "RETRIEVAL_DOCUMENT"],
+              ["Query", "QUERY"],
+              ["Semantic Similarity", "SEMANTIC_SIMILARITY"]
+            ],
+            default: "RETRIEVAL_DOCUMENT", sticky: true, group: "Embedding batches", ngIf: 'input.produce_embedding_batches == true' },
+          { name: "batch_size", label: "Embedding batch size", type: "integer", default: 25, convert_input: "integer_conversion", group: "Embedding batches", ngIf: 'input.produce_embedding_batches == true' },
+          { name: "include_title_in_text", label: "Include object name as title", type: "boolean", control_type: "checkbox", default: true, group: "Embedding batches", ngIf: 'input.produce_embedding_batches == true' },
+          { name: "batch_prefix", label: "Batch ID prefix", type: "string", default: "emb_batch", group: "Embedding batches", ngIf: 'input.produce_embedding_batches == true' }
+        ]
+        fields
+      end,
+
+      output_fields: lambda do |object_definitions|
+        [
+          { name: "chunks", type: "array", of: "object", properties: object_definitions["chunk_object"] },
+          { name: "chunk_count", type: "integer" },
+          { name: "objects_processed", type: "integer" },
+          { name: "skipped_objects", type: "array", of: "object", properties: [
+              { name: "bucket" }, { name: "name" }, { name: "reason" }
+          ]},
+          # Embedding batches (when produced)
+          { name: "embedding", type: "object", properties: [
+              { name: "batches", type: "array", of: "object", properties: [
+                  { name: "batch_id" }, { name: "batch_number", type: "integer" },
+                  { name: "requests", type: "array", of: "object", properties: [
+                      { name: "text", type: "string" }, { name: "metadata", type: "object" }
+                  ]},
+                  { name: "size", type: "integer" }
+              ]},
+              { name: "total_batches", type: "integer" },
+              { name: "total_texts", type: "integer" },
+              { name: "task_type" },
+              { name: "batch_generation_timestamp" }
+          ]},
+          { name: "telemetry", type: "object", properties: [
+              { name: "success", type: "boolean" }, { name: "timestamp" },
+              { name: "metadata", type: "object" },
+              { name: "trace", type: "object", properties: [
+                  { name: "correlation_id" }, { name: "duration_ms", type: "integer" }
+              ]}
+          ]}
+        ]
+      end,
+
+      sample_output: lambda do
+        {
+          "chunks" => [
+            { "chunk_id" => "doc_abc_0", "chunk_index" => 0, "text" => "…", "token_count" => 250,
+              "start_char" => 0, "end_char" => 1000,
+              "metadata" => { "document_id" => "doc_abc", "bucket" => "my-bucket", "object_name" => "path/file.txt", "source" => "gcs" }
+            }
+          ],
+          "chunk_count" => 1,
+          "objects_processed" => 1,
+          "skipped_objects" => [],
+          "embedding" => {
+            "batches" => [
+              { "batch_id" => "emb_batch_0_20250101000000", "batch_number" => 0, "requests" => [
+                  { "text" => "file.txt: …", "metadata" => { "id" => "doc_abc_0", "title" => "file.txt", "task_type" => "RETRIEVAL_DOCUMENT", "batch_id" => "emb_batch_0_20250101000000" } }
+              ], "size" => 1 }
+            ],
+            "total_batches" => 1, "total_texts" => 1, "task_type" => "RETRIEVAL_DOCUMENT",
+            "batch_generation_timestamp" => "2025-01-01T00:00:00Z"
+          },
+          "telemetry" => { "success" => true, "timestamp" => "2025-01-01T00:00:00Z", "metadata" => {}, "trace" => { "correlation_id" => "cid", "duration_ms" => 10 } }
+        }
+      end,
+
+      execute: lambda do |connection, input, _eis, _eos, config|
+        action_cid = call(:gen_correlation_id)
+        started_at = Time.now
+        local = call(:deep_copy, input)
+
+        objs = Array(local['objects'] || [])
+        error("No GCS objects provided (map gcs_batch_fetch_objects.successful_objects). cid=#{action_cid}") if objs.empty?
+
+        # Chunking settings
+        if (config['configuration_mode'] || 'defaults') != 'custom'
+          local['chunk_size']        ||= (connection['chunk_size_default'] || 1000)
+          local['chunk_overlap']     ||= (connection['chunk_overlap_default'] || 100)
+          local['preserve_sentences'] = true  if local['preserve_sentences'].nil?
+          local['preserve_paragraphs']= false if local['preserve_paragraphs'].nil?
+        end
+
+        cs = (local['chunk_size'] || 1000).to_i
+        co = (local['chunk_overlap'] || 100).to_i
+        error("Chunk size must be > 0. cid=#{action_cid}") if cs <= 0
+        error("Chunk overlap must be >= 0. cid=#{action_cid}") if co < 0
+
+        base_meta = local['base_metadata'].is_a?(Hash) ? local['base_metadata'] : {}
+        skip_empty = local['skip_empty_text'] != false
+
+        all_chunks = []
+        skipped = []
+        texts_for_embedding = []
+        processed = 0
+
+        objs.each do |o|
+          text = (o['text_content'] || '').to_s
+          if skip_empty && text.strip == ''
+            skipped << { 'bucket' => o['bucket'], 'name' => o['name'], 'reason' => 'empty_text_content' }
+            next
+          end
+
+          processed += 1
+          # Stable document id using bucket/name + md5 (or generation)
+          path = "#{o['bucket']}/#{o['name']}"
+          checksum = o['md5_hash'].to_s == '' ? (o['generation'] || 'no_checksum') : o['md5_hash']
+          doc_id = call(:generate_document_id, path, checksum)
+
+          chunk_result = call(:chunk_text_with_overlap, {
+            'text' => text,
+            'chunk_size' => cs,
+            'chunk_overlap' => co,
+            'preserve_sentences' => !!local['preserve_sentences'],
+            'preserve_paragraphs'=> !!local['preserve_paragraphs']
+          })
+
+          Array(chunk_result['chunks']).each do |c|
+            idx  = c[:chunk_index] || c['chunk_index']
+            cid  = "#{doc_id}_#{idx}"
+            meta = (c[:metadata] || c['metadata'] || {}).dup
+            meta.merge!({
+              'document_id'  => doc_id,
+              'bucket'       => o['bucket'],
+              'object_name'  => o['name'],
+              'content_type' => o['content_type'],
+              'updated'      => o['updated'],
+              'md5_hash'     => o['md5_hash'],
+              'generation'   => o['generation'],
+              'source'       => 'gcs'
+            })
+            base_meta.each { |k, v| meta[k.to_s] = v } unless base_meta.empty?
+
+            chunk = {
+              'chunk_id'    => cid,
+              'chunk_index' => idx,
+              'text'        => (c[:text] || c['text']).to_s,
+              'token_count' => c[:token_count] || c['token_count'],
+              'start_char'  => c[:start_char]  || c['start_char'],
+              'end_char'    => c[:end_char]    || c['end_char'],
+              'metadata'    => meta
+            }
+            all_chunks << chunk
+
+            # Build embedding text object
+            texts_for_embedding << {
+              'id'       => cid,
+              'content'  => chunk['text'],
+              'title'    => o['name'].to_s,
+              'metadata' => {
+                'document_id' => doc_id,
+                'chunk_index' => idx,
+                'bucket'      => o['bucket'],
+                'object_name' => o['name'],
+                'source'      => 'gcs'
+              }
+            }
+          end
+        end
+
+        embedding_out = nil
+        if config['produce_embedding_batches'] != false
+          embedding_out = call(:prepare_embedding_batch_exec, connection, {
+            'texts' => texts_for_embedding,
+            'task_type' => (local['task_type'] || 'RETRIEVAL_DOCUMENT'),
+            'batch_size' => (local['batch_size'] || 25),
+            'include_title_in_text' => (local['include_title_in_text'] != false),
+            'batch_prefix' => (local['batch_prefix'] || 'emb_batch')
+          })
+        end
+
+        {
+          'chunks'            => all_chunks,
+          'chunk_count'       => all_chunks.length,
+          'objects_processed' => processed,
+          'skipped_objects'   => skipped,
+          'embedding'         => embedding_out,
+          'telemetry'         => call(:telemetry_envelope,
+                                      true,
+                                      { action: 'chunk_gcs_batch_for_embedding',
+                                        object_count: objs.length,
+                                        processed: processed,
+                                        chunks: all_chunks.length,
+                                        embedding_batches: embedding_out ? embedding_out['total_batches'] : 0 },
+                                      started_at,
+                                      action_cid,
+                                      true)
+        }
+      end
+    },
+    # --- 4.  Embedding prep, serialization --------------------------------
+    prepare_embedding_batch: {
+      title: "Prepare Embedding Batch",
+      subtitle: "Prepare text content for embedding processing",
+      description: "Process text array into embedding request format with batch management",
+      help: lambda do
+        { body: "Accepts array of text objects with id, content, title, and metadata. Generates batch IDs and formats data according to embedding_request contract for inter-connector compatibility." }
+      end,
+
+      input_fields: lambda do |object_definitions|
+        [
+          {
+            name: "texts", label: "Text objects", type: "array", of: "object",
+            optional: false, list_mode_toggle: true,
+            properties: [
+              { name: "id", label: "Unique ID", type: "string", optional: false },
+              { name: "content", label: "Text content", type: "string", optional: false },
+              { name: "title", label: "Title", type: "string", optional: true },
+              { name: "metadata", label: "Metadata", type: "object", optional: true }
+            ]
+          },
+          {
+            name: "task_type", label: "Task type", control_type: "select",
+            pick_list: [
+              ["Retrieval Document", "RETRIEVAL_DOCUMENT"],
+              ["Query", "QUERY"],
+              ["Semantic Similarity", "SEMANTIC_SIMILARITY"]
+            ],
+            optional: false, sticky: true, support_pills: false,
+            hint: "Type of embedding task for Vertex AI processing"
+          },
+          {
+            name: "batch_size", label: "Batch size", type: "integer",
+            optional: true, default: 25, hint: "Number of texts per batch"
+          },
+          {
+            name: "include_title_in_text", label: "Include title in text",
+            type: "boolean", control_type: "checkbox", default: true,
+            hint: "Prepend title to content for embedding"
+          },
+          {
+            name: "batch_prefix", label: "Batch ID prefix", type: "string",
+            optional: true, default: "emb_batch",
+            hint: "Prefix for generated batch IDs"
+          }
+        ]
+      end,
+
+      output_fields: lambda do |object_definitions|
+        [
+          { name: "batches", type: "array", of: "object", properties: [
+            { name: "batch_id", type: "string" },
+            { name: "batch_number", type: "integer" },
+            { name: "requests", type: "array", of: "object", properties: [
+              { name: "text", type: "string" },
+              { name: "metadata", type: "object" }
+            ]},
+            { name: "size", type: "integer" }
+          ]},
+          { name: "total_batches", type: "integer" },
+          { name: "total_texts", type: "integer" },
+          { name: "task_type", type: "string" },
+          { name: "batch_generation_timestamp", type: "string" }
+        ]
+      end,
+
+      sample_output: lambda do
+        {
+          "batches" => [
+            {
+              "batch_id" => "emb_batch_0_20240115103000",
+              "batch_number" => 0,
+              "requests" => [
+                {
+                  "text" => "Product Overview: This is a sample product description...",
+                  "metadata" => {
+                    "id" => "doc_123",
+                    "title" => "Product Overview",
+                    "task_type" => "RETRIEVAL_DOCUMENT",
+                    "batch_id" => "emb_batch_0_20240115103000"
+                  }
+                }
+              ],
+              "size" => 1
+            }
+          ],
+          "total_batches" => 1,
+          "total_texts" => 1,
+          "task_type" => "RETRIEVAL_DOCUMENT",
+          "batch_generation_timestamp" => "2024-01-15T10:30:00Z"
+        }
+      end,
+
+      execute: lambda do |connection, input, _eis, _eos, _config|
+        call(:prepare_embedding_batch_exec, connection, input)
+      end
+    },
+    adapt_chunks_for_vertex: {
+      title: "Adapt chunks for Vertex",
+      subtitle: "Map chunk objects → {id, text, metadata}",
+      description: "Generate stable IDs and merge base metadata.",
+      input_fields: lambda do |object_definitions|
+        [
+          { name: "chunks", type: "array", of: "object", list_mode_toggle: true, optional: false,
+            properties: object_definitions["chunk_object"] },
+          { name: "id_strategy", control_type: "select", default: "docid_index", sticky: true,
+            pick_list: [[ "Use chunk_id", "pass_through" ],
+                        [ "Prefix + index", "prefix_index" ],
+                        [ "Document ID/Hash + index", "docid_index" ]] },
+          { name: "id_prefix", hint: "Used when Prefix + index" },
+          { name: "document_id", hint: "Used when Document ID/Hash + index (e.g. from Generate document metadata)" },
+          { name: "base_metadata", type: "object", label: "Base metadata merged into each chunk" }
+        ]
+      end,
+      output_fields: lambda do
+        [
+          { name: "records", type: "array", of: "object", properties: [
+            { name: "id" }, { name: "text" }, { name: "metadata", type: "object" }
+          ]},
+          { name: "count", type: "integer" }
+        ]
+      end,
+      execute: lambda do |_connection, input|
+        chunks    = Array(input['chunks'])
+        strategy  = (input['id_strategy'] || 'docid_index').to_s
+        base_meta = input['base_metadata'] || {}
+
+        recs = chunks.each_with_index.map do |c, idx|
+          id =
+            case strategy
+            when 'pass_through' then (c['chunk_id'].presence || "chunk_#{idx}")
+            when 'prefix_index' then [input['id_prefix'], idx].compact.join('_')
+            else                      [input['document_id'], idx].compact.join('_')
+            end
+
+          meta = (c['metadata'] || {}).merge(base_meta)
+                  .merge('chunk_index' => c['chunk_index'], 'chunk_id' => (c['chunk_id'] || id))
+
+          { 'id' => id, 'text' => c['text'].to_s, 'metadata' => meta }
+        end
+
+        { 'records' => recs, 'count' => recs.length }
+      end
+    },
+    serialize_chunks_to_jsonl: {
+      title: "Serialize chunks (JSONL)",
+      subtitle: "Emit JSONL with id/text/metadata",
+      input_fields: lambda do |object_definitions|
+        [
+          { name: "chunks", type: "array", of: "object", list_mode_toggle: true, optional: false,
+            properties: object_definitions["chunk_object"] },
+          { name: "include_metadata", type: "boolean", control_type: "checkbox", default: true },
+          { name: "id_field_name", default: "id" },
+          { name: "id_strategy", control_type: "select", default: "docid_index", sticky: true,
+            pick_list: [[ "Use chunk_id", "pass_through" ],
+                        [ "Prefix + index", "prefix_index" ],
+                        [ "Document ID/Hash + index", "docid_index" ]] },
+          { name: "id_prefix" }, { name: "document_id" }
+        ]
+      end,
+      output_fields: lambda do
+        [ { name: "jsonl", type: "string" }, { name: "lines", type: "integer" } ]
+      end,
+      execute: lambda do |_connection, input|
+        chunks = Array(input['chunks'])
+        strat  = (input['id_strategy'] || 'docid_index').to_s
+        name   = (input['id_field_name'] || 'id').to_s
+
+        lines = chunks.each_with_index.map do |c, idx|
+          id =
+            case strat
+            when 'pass_through' then (c['chunk_id'].presence || "chunk_#{idx}")
+            when 'prefix_index' then [input['id_prefix'], idx].compact.join('_')
+            else                      [input['document_id'], idx].compact.join('_')
+            end
+          row = { name => id, 'text' => c['text'].to_s }
+          row['metadata'] = c['metadata'] if input['include_metadata']
+          JSON.generate(row)
+        end
+
+        { 'jsonl' => lines.join("\n"), 'lines' => lines.length }
+      end
+    },
+    # --- 5.  Prompting/Retrieval UX ---------------------------------------
+    build_rag_prompt: {
+      title: "Build RAG Prompt",
+      subtitle: "Construct optimized RAG prompt",
+      description: "Build retrieval‑augmented generation prompt",
+      help: lambda do
+        { body: "Use a built‑in template or select a custom template from Data Tables. Custom selection requires API token & table access." }
+      end,
+
+      config_fields: [
+        { name: "prompt_mode",            label: "Prompt configuration",          control_type: "select", support_pills: false, default: "template",
+          sticky: true, pick_list: [["Template-based", "template"], ["Custom instructions", "custom"]] },
+        { name: "template_source",        label: "Template source",               control_type: "select", support_pills: false, default: "builtin",
+          pick_list: [["Built-in", "builtin"], ["Custom (Data Tables)", "custom"]], sticky: true },
+        { name: "templates_table_id",     label: "Templates table (Data Tables)", control_type: "select", support_pills: false,
+          pick_list: "tables", ngIf: 'input.template_source == "custom"', hint: "Required when Template source = Custom" },
+        { name: "template_display_field", label: "Display field name",            control_type: 'text',   support_pills: false, default: "name",
+          type: "string",  optional: true, sticky: true, ngIf: 'input.template_source == "custom"', hint: "Column shown in the dropdown" },
+        { name: "template_value_field",   label: "Value field name",              control_type: 'text',   support_pills: false, default: "",
+          type: "string",  optional: true, sticky: true, ngIf: 'input.template_source == "custom"', hint: "Stored value for the selection. Leave blank to use the Record ID." },
+        { name: "template_content_field", label: "Content field name",            control_type: 'text',   support_pills: false, default: "content",
+          type: "string",  optional: true, sticky: true, ngIf: 'input.template_source == "custom"', hint: "Column containing the prompt text" }
+      ],
+
+      input_fields: lambda do |object_definitions, _connection, config|
+        fields = [
+          { name: "query", label: "User query", type: "string", optional: false, control_type: "text-area", group: "Query" },
+          {
+            name: "context_documents", label: "Context documents",
+            type: "array", of: "object",
+            properties: object_definitions["context_document"],
+            list_mode_toggle: true, optional: false, group: "Context"
+          }
+        ]
+        if config["prompt_mode"] == "template"
+          fields << {
+            name: "prompt_template", label: "Prompt template",
+            type: "string", group: "Template settings",
+            control_type: "select", pick_list: "prompt_templates",
+            pick_list_params: {
+              template_source: (config['template_source'] || 'builtin'),
+              templates_table_id: config['templates_table_id'],
+              template_display_field: (config['template_display_field'] || 'name'),
+              template_value_field: (config['template_value_field'] || ''),
+              template_content_field: (config['template_content_field'] || 'content')
+            },
+            optional: true,
+            toggle_hint: "Select",
+            toggle_field: { name: "prompt_template", label: "Template (custom text)", type: "string", control_type: "text", toggle_hint: "Use text" }
+          }
+        else
+          fields << {
+            name: "system_instructions", label: "System instructions",
+            type: "string", control_type: "text-area", optional: true,
+            hint: "Custom system instructions for the prompt", group: "Custom settings"
           }
         end
 
-        # Strip duplicate whitespace and trim edges; leave labels intact
-        clean = text.gsub(/[ \t]+/, ' ').gsub(/\n{3,}/, "\n\n").strip
-
-        { 'answer' => clean, 'citations' => citations, 'citation_count' => citations.length }
+        fields += [
+          {
+            name: "advanced_settings", label: "Advanced settings", type: "object", optional: true,
+            group: "Advanced", hint: "Optional configuration",
+            properties: [
+              { name: "max_context_length", label: "Max context length (tokens)", type: "integer", default: 3000, convert_input: "integer_conversion", hint: "Maximum tokens for context" },
+              { name: "include_metadata", label: "Include metadata", type: "boolean", control_type: "checkbox", default: false, convert_input: "boolean_conversion", hint: "Include document metadata in prompt" }
+            ]
+          }
+        ]
+        fields
       end,
-  
+
+      output_fields: lambda do
+        [
+          { name: "formatted_prompt", type: "string" },
+          { name: "token_count", type: "integer" },
+          { name: "context_used", type: "integer" },
+          { name: "truncated", type: "boolean", control_type: "checkbox" },
+          { name: "prompt_metadata", type: "object" }
+        ]
+      end,
+
       sample_output: lambda do
         {
-          'answer' => "Our PTO policy grants 15 days annually. See [^1] and [^2] for details.",
-          'citation_count' => 2,
-          'citations' => [
-            {
-              'label' => '[^1]',
-              'chunk_id' => 'doc-abc123:0',
-              'doc_id' => 'doc-abc123',
-              'file_path' => 'drive://Policies/PTO.md',
-              'span' => { 'start' => 0, 'end' => 500 },
-              'metadata' => { 'section' => 'Overview' }
-            },
-            {
-              'label' => '[^2]',
-              'chunk_id' => 'doc-xyz789:2',
-              'doc_id' => 'doc-xyz789',
-              'file_path' => 'drive://Policies/Benefits.md',
-              'span' => { 'start' => 1200, 'end' => 1500 },
-              'metadata' => { 'section' => 'Entitlements' }
-            }
-          ]
+          "formatted_prompt" => "Context:\n…\n\nQuery: …\n\nAnswer:",
+          "token_count" => 512, "context_used" => 3, "truncated" => false,
+          "prompt_metadata" => { "template" => "standard", "using_template_content" => false }
+        }
+      end,
+
+      execute: lambda do |connection, input, _eis, _eos, config|
+        local = call(:deep_copy, input)
+        if local['advanced_settings']
+          local.merge!(local['advanced_settings'])
+          local.delete('advanced_settings')
+        end
+
+        if config["prompt_mode"] == "template"
+          source = (config["template_source"] || "builtin").to_s
+          sel    = (local["prompt_template"] || "").to_s
+
+          if source == "custom" && config["templates_table_id"].present? && sel.present?
+            inline = (sel.include?("\n") || sel.length > 200)
+
+            unless inline
+              resolved = call(:resolve_template_selection, connection, config, sel)
+              if resolved && resolved["content"].to_s.strip.length.positive?
+                local["template_content"] = resolved["content"].to_s
+                local["prompt_metadata"] = {
+                  template_source: "custom",
+                  templates_table_id: config["templates_table_id"],
+                  template_value: sel,
+                  template_display: resolved["display"]
+                }.compact
+              end
+            else
+              local["template_content"] = sel
+              local["prompt_metadata"] = { template_source: "inline" }
+            end
+          elsif sel.present? && (sel.include?("\n") || sel.length > 200)
+            local["template_content"] = sel
+            local["prompt_metadata"] = { template_source: "inline" }
+          end
+        end
+
+        call(:construct_rag_prompt, local)
+      end
+    },
+    # --- 6.  Classification (pre-AI) --------------------------------------
+    classify_by_pattern: {
+      title: "Classify by pattern matching",
+      subtitle: "Pattern-based classification without AI",
+      description: "Evaluate text against pattern rules from standard library or Data Tables",
+      help: lambda do
+        { body: "Use standard patterns or supply a Data Table of rules {rule_id, rule_type, rule_pattern, action, priority, active}. Requires API token to read Data Tables." }
+      end,
+      # CONFIG
+      config_fields: [ # Remember -- config drives inputs
+        {
+          name: "rules_source", label: "Rules source", control_type: "select",
+          pick_list: [["Standard", "standard"], ["Custom (Data Tables)", "custom"]],
+          default: "standard", sticky: true, support_pills: false,
+          hint: "Use 'Custom' to evaluate against a data table of rules."
+        },
+        {
+          name: "custom_rules_table_id", label: "Rules table (Data Tables)",
+          control_type: "select", pick_list: "tables", support_pills: false,
+          ngIf: 'input.rules_source == "custom"', sticky: true,
+          hint: "Required when rules_source is custom"
+        },
+        # Optional column mapping when teams use different column names
+        {
+          name: "enable_column_mapping",
+          label: "Custom column names?",
+          type: "boolean", control_type: "checkbox", default: false,
+          ngIf: 'input.rules_source == "custom"',
+          sticky: true, support_pills: false
+        },
+        # Mapped columns – only shown when mapping is enabled
+        { name: "col_rule_id",      label: "Rule ID column",      control_type: "select", pick_list: "table_columns",
+          ngIf: 'input.rules_source == "custom" && input.enable_column_mapping == true',
+          optional: true, sticky: true, support_pills: false },
+        { name: "col_rule_type",    label: "Rule type column",    control_type: "select", pick_list: "table_columns",
+          ngIf: 'input.rules_source == "custom" && input.enable_column_mapping == true',
+          optional: true, sticky: true, support_pills: false },
+        { name: "col_rule_pattern", label: "Rule pattern column", control_type: "select", pick_list: "table_columns",
+          ngIf: 'input.rules_source == "custom" && input.enable_column_mapping == true',
+          optional: true, sticky: true, support_pills: false },
+        { name: "col_action",       label: "Action column",       control_type: "select", pick_list: "table_columns",
+          ngIf: 'input.rules_source == "custom" && input.enable_column_mapping == true',
+          optional: true, sticky: true, support_pills: false },
+        { name: "col_priority",     label: "Priority column",     control_type: "select", pick_list: "table_columns",
+          ngIf: 'input.rules_source == "custom" && input.enable_column_mapping == true',
+          optional: true, sticky: true, support_pills: false },
+        { name: "col_active",       label: "Active column",       control_type: "select", pick_list: "table_columns",
+          ngIf: 'input.rules_source == "custom" && input.enable_column_mapping == true',
+          optional: true, sticky: true, support_pills: false }
+
+      ],
+      # INPUT
+      input_fields: lambda do |object_definitions, _connection, config|
+        fields = [
+          {
+            name: "email", label: "Email", type: "object", optional: false,
+            properties: object_definitions["email_envelope"], group: "Email"
+          },
+          {
+            name: "stop_on_first_match", label: "Stop on first match", control_type: "checkbox",
+            type: "boolean", default: true, optional: true, sticky: true,
+            hint: "When true, returns as soon as a rule matches.", group: "Execution"
+          },
+          {
+            name: "fallback_to_standard", label: "Fallback to standard patterns",
+            type: "boolean", default: true, optional: true, sticky: true, control_type: "checkbox",
+            hint: "If custom rules have no match, also evaluate built‑in standard patterns.", group: "Execution"
+          },
+          {
+            name: "max_rules_to_apply", label: "Max rules to apply",
+            type: "integer", default: 100, optional: true,
+            hint: "Guardrail for pathological rule sets.", group: "Advanced"
+          }
+        ]
+
+        # Show selected table id as read-only context when relevant
+        if (config["rules_source"] || "standard").to_s == "custom"
+          fields << {
+            name: "selected_rules_table_id",
+            label: "Selected rules table",
+            type: "string", optional: true, sticky: true,
+            hint: "From configuration above.",
+            default: config["custom_rules_table_id"],
+            control_type: "plain-text", # documented read-only
+            support_pills: false,
+            group: "Advanced"
+          }
+        end
+
+        fields
+      end,
+      # OUTPUT
+      output_fields: lambda do |object_definitions|
+        [
+          { name: "pattern_match", type: "boolean", control_type: "checkbox" },
+          { name: "rule_source", type: "string" }, # "custom", "standard", or "none"
+          { name: "selected_action", type: "string" },
+          { name: "top_match", type: "object", properties: object_definitions["rules_row"] },
+          { name: "matches", type: "array", of: "object", properties: object_definitions["rules_row"] },
+          { name: "standard_signals", type: "object", properties: object_definitions["standard_signals"] },
+          {
+            name: "debug", type: "object", properties: [
+              { name: "evaluated_rules_count", type: "integer" },
+              { name: "schema_validated", type: "boolean", control_type: "checkbox" },
+              { name: "errors", type: "array", of: "string" }
+            ]
+          }
+        ]
+      end,
+      # SAMPLE
+      sample_output: lambda do
+        {
+          "pattern_match" => true,
+          "rule_source" => "custom",
+          "selected_action" => "archive",
+          "top_match" => { "rule_id" => "R-1", "rule_type" => "subject", "rule_pattern" => "receipt", "action" => "archive", "priority" => 10, "field_matched" => "subject", "sample" => "Receipt #12345" },
+          "matches" => [],
+          "standard_signals" => { "sender_flags" => ["no[-_.]?reply"], "subject_flags" => ["\\breceipt\\b"], "body_flags" => [] },
+          "debug" => { "evaluated_rules_count" => 25, "schema_validated" => true, "errors" => [] }
+        }
+      end,
+      # EXECUTE
+      execute: lambda do |connection, input, _eis, _eos, config|
+        local = call(:deep_copy, input)
+        result = call(:evaluate_email_by_rules_exec, connection, local, config)
+        call(:validate_contract, connection, result, 'classification_result')
+      end
+
+    },
+    # --- 7.  Ops utilities ------------------------------------------------
+    calculate_metrics: {
+      title: "Calculate Performance Metrics",
+      subtitle: "Calculate system performance metrics",
+      description: "Calculate averages, percentiles, trend and anomalies from time‑series data",
+      help: lambda do
+        { body: "Computes avg/median/min/max/stddev, P95/P99, simple trend and 2σ anomalies." }
+      end,
+
+      input_fields: lambda do |object_definitions|
+        [
+          { name: "metric_type", label: "Metric type", type: "string", optional: false, control_type: "select", pick_list: "metric_types" },
+          { name: "data_points", label: "Data points", list_mode_toggle: true, type: "array", of: "object", optional: false, properties: object_definitions["metric_datapoint"] },
+          { name: "aggregation_period", label: "Aggregation period", type: "string", optional: true, default: "hour", control_type: "select", pick_list: "time_periods" },
+          { name: "include_percentiles", label: "Include percentiles", type: "boolean", control_type: "checkbox", convert_input: "boolean_conversion", optional: true, default: true }
+        ]
+      end,
+
+      output_fields: lambda do |object_definitions|
+        [
+          { name: "average", type: "number" },
+          { name: "median", type: "number" },
+          { name: "min", type: "number" },
+          { name: "max", type: "number" },
+          { name: "std_deviation", type: "number" },
+          { name: "percentile_95", type: "number" },
+          { name: "percentile_99", type: "number" },
+          { name: "total_count", type: "integer" },
+          { name: "trend", type: "string" },
+          { name: "anomalies_detected", type: "array", of: "object", properties: object_definitions["anomaly"] }
+        ]
+      end,
+
+      sample_output: lambda do
+        {
+          "average" => 12.3, "median" => 11.8, "min" => 4.2, "max" => 60.0,
+          "std_deviation" => 5.1, "percentile_95" => 22.0, "percentile_99" => 29.5,
+          "total_count" => 1440, "trend" => "increasing",
+          "anomalies_detected" => [{ "timestamp" => Time.now.iso8601, "value" => 42.0 }]
+        }
+      end,
+
+      execute: lambda do |connection, input|
+        result = call(:compute_metrics, input)
+        call(:validate_contract, connection, result, 'metrics_result')
+      end
+    },
+    optimize_batch_size: {
+      title: "Optimize Batch Size",
+      subtitle: "Calculate optimal batch size for processing",
+      description: "Recommend an optimal batch size based on historical performance",
+      help: lambda do
+        { body: "Heuristic scoring by target (throughput/latency/cost/accuracy)." }
+      end,
+
+      input_fields: lambda do
+        [
+          { name: "total_items", label: "Total items to process", type: "integer", optional: false },
+          {
+            name: "processing_history", label: "Processing history",
+            type: "array", of: "object", optional: true,
+            properties: [
+              { name: "batch_size", type: "integer" },
+              { name: "processing_time", type: "number" },
+              { name: "success_rate", type: "number" },
+              { name: "memory_usage", type: "number" }
+            ]
+          },
+          { name: "optimization_target", label: "Optimization target", type: "string", optional: true, default: "throughput", control_type: "select", pick_list: "optimization_targets" },
+          { name: "max_batch_size", label: "Maximum batch size", type: "integer", optional: true, default: 100 },
+          { name: "min_batch_size", label: "Minimum batch size", type: "integer", optional: true, default: 10 }
+        ]
+      end,
+
+      output_fields: lambda do
+        [
+          { name: "optimal_batch_size", type: "integer" },
+          { name: "estimated_batches", type: "integer" },
+          { name: "estimated_processing_time", type: "number" },
+          { name: "throughput_estimate", type: "number" },
+          { name: "confidence_score", type: "number" },
+          { name: "recommendation_reason", type: "string" }
+        ]
+      end,
+
+      sample_output: lambda do
+        {
+          "optimal_batch_size" => 50, "estimated_batches" => 20, "estimated_processing_time" => 120.5,
+          "throughput_estimate" => 41.5, "confidence_score" => 0.8, "recommendation_reason" => "Based on historical performance data"
+        }
+      end,
+
+      execute: lambda do |_connection, input|
+        call(:calculate_optimal_batch, input)
+      end
+    },
+    resolve_project_context: {
+      title: "Resolve project context from recipe",
+      subtitle: "Recipe → folder → owning project (environment-aware)",
+      description: "Given a Recipe ID, returns its folder and the project it belongs to.",
+      input_fields: lambda do
+        [
+          { name: "recipe_id", optional: false,
+            hint: "Map the Recipe ID datapill or enter an ID manually" }
+        ]
+      end,
+      output_fields: lambda do
+        [
+          { name: "recipe_id" },
+          { name: "folder_id" },
+          { name: "folder_name" },
+          { name: "is_project_folder", type: "boolean" },
+          { name: "project_id" },
+          { name: "project_name" },
+          { name: "project_folder_id" },
+          { name: "environment_host", label: "Environment host" }
+        ]
+      end,
+      execute: lambda do |connection, input|
+        error("API token is required for Developer API calls") if connection['api_token'].blank?
+        call(:resolve_project_from_recipe, connection, input["recipe_id"])
+      end
+    }
+
+  },
+
+  # --------- METHODS ------------------------------------------------------
+  methods: {
+    # ── Minimal observability/safety helpers (no Rails)
+    gen_correlation_id: lambda do
+      begin
+        SecureRandom.uuid
+      rescue NameError
+        t = (Time.now.to_f * 1000).to_i.to_s(36)
+        r = rand(36**8).to_s(36).rjust(8, '0')
+        "#{t}-#{r}"
+      end
+    end,
+
+    deep_copy: lambda do |obj|
+      if obj.is_a?(Hash)
+        obj.each_with_object({}) { |(k, v), h| h[k] = call(:deep_copy, v) }
+      elsif obj.is_a?(Array)
+        obj.map { |v| call(:deep_copy, v) }
+      else
+        obj
+      end
+    end,
+
+    telemetry_envelope: lambda do |success, metadata, started_at, correlation_id, include_trace|
+      duration_ms = ((Time.now - started_at) * 1000).round
+      base = {
+        'success'   => !!success,
+        'timestamp' => Time.now.utc.iso8601,
+        'metadata'  => metadata || {}
+      }
+      if include_trace != false
+        base['trace'] = { 'correlation_id' => correlation_id, 'duration_ms' => duration_ms }
+      end
+      base
+    end,
+
+    chunk_text_with_overlap: lambda do |input|
+      text = input['text'].to_s
+      chunk_size = (input['chunk_size'] || 1000).to_i
+      overlap    = (input['chunk_overlap'] || 100).to_i
+      preserve_sentences  = !!input['preserve_sentences']
+      preserve_paragraphs = !!input['preserve_paragraphs']
+
+      chunk_size = 1 if chunk_size <= 0
+      overlap = [[overlap, 0].max, [chunk_size - 1, 0].max].min
+
+      # rough token->char estimate
+      chars_per_chunk = [chunk_size, 1].max * 4
+      char_overlap    = overlap * 4
+
+      chunks = []
+      chunk_index = 0
+      position = 0
+      text_len = text.length
+
+      while position < text_len
+        tentative_end = [position + chars_per_chunk, text_len].min
+        chunk_end = tentative_end
+        segment = text[position...tentative_end]
+
+        if preserve_paragraphs && tentative_end < text_len
+          rel_end = call(:util_last_boundary_end, segment, /\n{2,}/)
+          chunk_end = position + rel_end if rel_end
+        end
+
+        if preserve_sentences && chunk_end == tentative_end && tentative_end < text_len
+          rel_end = call(:util_last_boundary_end, segment, /[.!?]["')\]]?\s/)
+          chunk_end = position + rel_end if rel_end
+        end
+
+        chunk_end = [position + [chars_per_chunk, 1].max, text_len].min if chunk_end <= position
+
+        chunk_text = text[position...chunk_end]
+        token_count = (chunk_text.length / 4.0).ceil
+
+        chunks << {
+          chunk_id:    "chunk_#{chunk_index}",
+          chunk_index: chunk_index,
+          text:        chunk_text,
+          token_count: token_count,
+          start_char:  position,
+          end_char:    chunk_end,
+          metadata:    { has_overlap: chunk_index.positive?, is_final: chunk_end >= text_len }
+        }
+
+        break if chunk_end >= text_len
+
+        next_position = chunk_end - char_overlap
+        position = next_position > position ? next_position : chunk_end
+        chunk_index += 1
+      end
+
+      # Recipe-friendly enhancements
+      first_chunk = chunks.first || {}
+      total_tokens = chunks.sum { |c| c[:token_count] }
+      average_chunk_size = chunks.any? ? (total_tokens.to_f / chunks.length).round : 0
+
+      {
+        chunks_count: chunks.length,
+        chunks: chunks,
+        first_chunk: first_chunk,
+        chunks_json: chunks.to_json,
+        total_chunks: chunks.length,
+        total_tokens: total_tokens,
+        average_chunk_size: average_chunk_size,
+        pass_fail: chunks.any?,
+        action_required: chunks.any? ? "ready_for_embedding" : "check_input_text"
+      }
+    end,
+
+    process_email_text: lambda do |input|
+      cleaned = (input['email_body'] || '').dup
+      original_length = cleaned.length
+      removed_sections = []
+      extracted_urls = []
+
+      cleaned.gsub!("\r\n", "\n")
+
+      if input['remove_quotes']
+        lines = cleaned.lines
+        quoted = lines.select { |l| l.lstrip.start_with?('>') }
+        removed_sections << quoted.join unless quoted.empty?
+        lines.reject! { |l| l.lstrip.start_with?('>') }
+        cleaned = lines.join
+      end
+
+      if input['remove_signatures']
+        lines = cleaned.lines
+        sig_idx = lines.rindex { |l| l =~ /^\s*(--\s*$|Best regards,|Regards,|Sincerely,|Thanks,|Sent from my)/i }
+        if sig_idx
+          removed_sections << lines[sig_idx..-1].join
+          cleaned = lines[0...sig_idx].join
+        end
+      end
+
+      if input['remove_disclaimers']
+        lines = cleaned.lines
+        disc_idx = lines.rindex { |l| l =~ /(This (e-)?mail|This message).*(confidential|intended only)/i }
+        if disc_idx && disc_idx >= lines.length - 25
+          removed_sections << lines[disc_idx..-1].join
+          cleaned = lines[0...disc_idx].join
+        end
+      end
+
+      if input['extract_urls']
+        extracted_urls = cleaned.scan(%r{https?://[^\s<>"'()]+})
+      end
+
+      if input['normalize_whitespace']
+        cleaned.gsub!(/[ \t]+/, ' ')
+        cleaned.gsub!(/\n{3,}/, "\n\n")
+        cleaned.strip!
+      end
+
+      extracted_query = cleaned.split(/\n{2,}/).find { |p| p.strip.length.positive? } || cleaned[0, 200].to_s
+
+      # Recipe-friendly enhancements
+      has_content = cleaned.strip.length > 10 # Meaningful content threshold
+      cleaning_successful = cleaned.length > 0
+
+      {
+        cleaned_text: cleaned,
+        extracted_query: extracted_query,
+        removed_sections_count: removed_sections.length,
+        removed_sections: removed_sections,
+        urls_count: extracted_urls.length,
+        extracted_urls: extracted_urls,
+        original_length: original_length,
+        cleaned_length: cleaned.length,
+        reduction_percentage: (original_length.zero? ? 0 : ((1 - cleaned.length.to_f / original_length) * 100)).round(2),
+        pass_fail: cleaning_successful,
+        action_required: has_content ? "ready_for_chunking" : "check_email_content",
+        has_content: has_content
+      }
+    end,
+
+    compute_similarity: lambda do |input, connection|
+      start_time = Time.now
+
+      a = call(:util_coerce_numeric_vector, input['vector_a'])
+      b = call(:util_coerce_numeric_vector, input['vector_b'])
+      error('Vectors must be the same length.') unless a.length == b.length
+      error('Vectors cannot be empty') if a.empty?
+
+      normalize = input.key?('normalize') ? !!input['normalize'] : true
+      type      = (input['similarity_type'] || 'cosine').to_s
+      threshold = (connection['similarity_threshold'] || 0.7).to_f
+
+      if normalize
+        norm = ->(v) { mag = Math.sqrt(v.sum { |x| x * x }); mag.zero? ? v : v.map { |x| x / mag } }
+        a = norm.call(a)
+        b = norm.call(b)
+      end
+
+      dot   = a.zip(b).sum { |x, y| x * y }
+      mag_a = Math.sqrt(a.sum { |x| x * x })
+      mag_b = Math.sqrt(b.sum { |x| x * x })
+
+      score =
+        case type
+        when 'cosine'
+          (mag_a > 0 && mag_b > 0) ? dot / (mag_a * mag_b) : 0.0
+        when 'euclidean'
+          dist = Math.sqrt(a.zip(b).sum { |x, y| (x - y)**2 })
+          1.0 / (1.0 + dist)
+        when 'dot_product'
+          dot
+        else
+          (mag_a > 0 && mag_b > 0) ? dot / (mag_a * mag_b) : 0.0
+        end
+
+      percent = %w[cosine euclidean].include?(type) ? (score * 100).round(2) : nil
+
+      similar =
+        case type
+        when 'cosine', 'euclidean'
+          score >= threshold
+        when 'dot_product'
+          if normalize
+            score >= threshold
+          else
+            error('For dot_product without normalization, provide an absolute threshold appropriate to your embedding scale.')
+          end
+        end
+
+      # Recipe-friendly enhancements
+      confidence_level = case score
+                        when 0.8..1.0 then 'high'
+                        when 0.6..0.8 then 'medium'
+                        else 'low'
+                        end
+
+      {
+        similarity_score: score.round(6),
+        similarity_percentage: percent,
+        is_similar: similar,
+        pass_fail: similar,
+        action_required: similar ? "vectors_are_similar" : "vectors_are_different",
+        confidence_level: confidence_level,
+        similarity_type: type,
+        computation_time_ms: ((Time.now - start_time) * 1000).round,
+        threshold_used: threshold,
+        vectors_normalized: normalize
+      }
+    end,
+
+    prepare_embedding_batch_exec: lambda do |connection, input|
+      texts = Array(input['texts'] || [])
+      task_type = (input['task_type'] || 'RETRIEVAL_DOCUMENT').to_s
+      batch_size = (input['batch_size'] || 25).to_i
+      include_title = input['include_title_in_text'] != false
+      batch_prefix = (input['batch_prefix'] || 'emb_batch').to_s
+
+      # Generate timestamp for unique batch IDs
+      timestamp = Time.now.utc.strftime('%Y%m%d%H%M%S')
+
+      batches = []
+      texts.each_slice(batch_size).with_index do |batch, index|
+        batch_id = "#{batch_prefix}_#{index}_#{timestamp}"
+
+        requests = batch.map do |text_obj|
+          # Build the text content
+          content = (text_obj['content'] || '').to_s
+          title = (text_obj['title'] || '').to_s
+
+          final_text = if include_title && !title.empty?
+                         "#{title}: #{content}"
+                       else
+                         content
+                       end
+
+          # Build metadata according to embedding_request contract
+          metadata = (text_obj['metadata'] || {}).dup
+          metadata.merge!({
+            'id' => text_obj['id'],
+            'title' => title,
+            'task_type' => task_type,
+            'batch_id' => batch_id
+          })
+
+          # Create embedding request object
+          request = {
+            'text' => final_text,
+            'metadata' => metadata
+          }
+
+          # Validate each request against embedding_request contract
+          call(:validate_contract, connection, request, 'embedding_request')
+
+          request
+        end
+
+        batch_info = {
+          'batch_id' => batch_id,
+          'batch_number' => index,
+          'requests' => requests,
+          'size' => requests.length
+        }
+
+        batches << batch_info
+      end
+
+      result = {
+        'batches' => batches,
+        'total_batches' => batches.length,
+        'total_texts' => texts.length,
+        'task_type' => task_type,
+        'batch_generation_timestamp' => Time.now.utc.iso8601
+      }
+
+      result
+    end,
+
+    construct_rag_prompt: lambda do |input|
+      query = input['query'].to_s
+      context_docs = Array(input['context_documents'] || [])
+      template_key = (input['prompt_template'] || 'standard').to_s
+      max_length = (input['max_context_length'] || 3000).to_i
+      include_metadata = !!input['include_metadata']
+      system_instructions = input['system_instructions'].to_s
+      template_content = input['template_content'].to_s
+
+      sorted_context = context_docs.sort_by { |doc| (doc['relevance_score'] || 0) }.reverse
+
+      context_parts = []
+      total_tokens = 0
+      sorted_context.each do |doc|
+        content = doc['content'].to_s
+        doc_tokens = (content.length / 4.0).ceil
+        break if doc_tokens > max_length && context_parts.empty?
+        next if total_tokens + doc_tokens > max_length
+
+        part = content.dup
+        part << "\nMetadata: #{JSON.generate(doc['metadata'])}" if include_metadata && doc['metadata']
+        context_parts << part
+        total_tokens += doc_tokens
+      end
+      context_text = context_parts.join("\n\n---\n\n")
+
+      base =
+        if template_content.strip.length.positive?
+          template_content
+        else
+          case template_key
+          when 'standard'
+            "Context:\n{{context}}\n\nQuery: {{query}}\n\nAnswer:"
+          when 'customer_service'
+            "You are a customer service assistant.\n\nContext:\n{{context}}\n\nCustomer Question: {{query}}\n\nResponse:"
+          when 'technical'
+            "You are a technical support specialist.\n\nContext:\n{{context}}\n\nTechnical Issue: {{query}}\n\nSolution:"
+          when 'sales'
+            "You are a sales representative.\n\nContext:\n{{context}}\n\nSales Inquiry: {{query}}\n\nResponse:"
+          else
+            header = system_instructions.strip
+            header = "Instructions:\n#{header}\n\n" if header.length.positive?
+            "#{header}Context:\n{{context}}\n\nQuery: {{query}}\n\nAnswer:"
+          end
+        end
+
+      compiled = base.dup
+      compiled.gsub!(/{{\s*context\s*}}/i, context_text)
+      compiled.gsub!(/{{\s*query\s*}}/i,   query)
+      unless base.match?(/{{\s*context\s*}}/i) || base.match?(/{{\s*query\s*}}/i)
+        compiled << "\n\nContext:\n#{context_text}\n\nQuery: #{query}\n\nAnswer:"
+      end
+
+      {
+        formatted_prompt: compiled,
+        token_count: (compiled.length / 4.0).ceil,
+        context_used: context_parts.length,
+        truncated: context_parts.length < sorted_context.length,
+        prompt_metadata: (input['prompt_metadata'] || {}).merge(
+          template: template_key,
+          using_template_content: template_content.strip.length.positive?
+        )
+      }
+    end,
+
+    validate_response: lambda do |input, _connection|
+      response = (input['response_text'] || '').to_s
+      query    = (input['original_query'] || '').to_s
+      rules    = Array(input['validation_rules'] || [])
+      min_confidence = (input['min_confidence'] || 0.7).to_f
+
+      issues = []
+      confidence = 1.0
+
+      if response.strip.empty?
+        issues << 'Response is empty'
+        confidence -= 0.5
+      elsif response.length < 10
+        issues << 'Response is too short'
+        confidence -= 0.3
+      end
+
+      query_words = query.downcase.split(/\W+/).reject(&:empty?)
+      response_words = response.downcase.split(/\W+/).reject(&:empty?)
+      overlap = query_words.empty? ? 0.0 : ((query_words & response_words).length.to_f / query_words.length)
+
+      if overlap < 0.1
+        issues << 'Response may not address the query'
+        confidence -= 0.4
+      end
+
+      if response.include?('...') || response.downcase.include?('incomplete')
+        issues << 'Response appears incomplete'
+        confidence -= 0.2
+      end
+
+      rules.each do |rule|
+        case rule['rule_type']
+        when 'contains'
+          unless response.include?(rule['rule_value'].to_s)
+            issues << "Response does not contain required text: #{rule['rule_value']}"
+            confidence -= 0.3
+          end
+        when 'not_contains'
+          if response.include?(rule['rule_value'].to_s)
+            issues << "Response contains prohibited text: #{rule['rule_value']}"
+            confidence -= 0.3
+          end
+        end
+      end
+
+      confidence = [[confidence, 0.0].max, 1.0].min
+
+      # Recipe-friendly enhancements
+      is_valid = confidence >= min_confidence
+      confidence_level = case confidence
+                        when 0.8..1.0 then 'high'
+                        when 0.6..0.8 then 'medium'
+                        else 'low'
+                        end
+
+      suggestions = issues.empty? ? [] : ['Review and improve response quality']
+
+      {
+        is_valid: is_valid,
+        confidence_score: confidence.round(2),
+        pass_fail: is_valid,
+        action_required: is_valid ? "response_approved" : "response_needs_review",
+        validation_results: { query_overlap: overlap.round(2), response_length: response.length, word_count: response_words.length },
+        issues_count: issues.length,
+        issues_found: issues,
+        requires_human_review: confidence < 0.5,
+        suggestions_count: suggestions.length,
+        suggested_improvements: suggestions,
+        confidence_level: confidence_level
+      }
+    end,
+
+    extract_metadata: lambda do |input|
+      content = input['document_content'].to_s
+      file_path = input['file_path'].to_s
+      extract_entities = input.key?('extract_entities') ? !!input['extract_entities'] : true
+      generate_summary = input.key?('generate_summary') ? !!input['generate_summary'] : true
+
+      start_time = Time.now
+
+      word_count = content.split(/\s+/).reject(&:empty?).length
+      char_count = content.length
+      estimated_tokens = (content.length / 4.0).ceil
+
+      language = content.match?(/[àáâãäåæçèéêëìíîïðñòóôõöøùúûüýþÿ]/i) ? 'non-english' : 'english'
+      summary = generate_summary ? (content[0, 200].to_s + (content.length > 200 ? '...' : '')) : ''
+
+      key_topics = []
+      if extract_entities
+        common = %w[the a an and or but in on at to for of with by from is are was were be been being this that these those there here then than into out over under after before about as it its it's their them they our we you your he she his her him not will would can could should may might must also just more most other some such]
+        words = content.downcase.scan(/[a-z0-9\-]+/).reject { |w| w.length < 4 || common.include?(w) }
+        freq = words.each_with_object(Hash.new(0)) { |w, h| h[w] += 1 }
+        key_topics = freq.sort_by { |_, c| -c }.first(5).map(&:first)
+      end
+
+      file_hash = Digest::SHA256.hexdigest(content)
+      document_id = Digest::SHA1.hexdigest("#{file_path}|#{file_hash}")
+
+      {
+        document_id: document_id,
+        file_hash: file_hash,
+        word_count: word_count,
+        character_count: char_count,
+        estimated_tokens: estimated_tokens,
+        language: language,
+        summary: summary,
+        key_topics: key_topics,
+        entities: { people: [], organizations: [], locations: [] },
+        created_at: Time.now.iso8601,
+        processing_time_ms: ((Time.now - start_time) * 1000).round
+      }
+    end,
+
+    detect_changes: lambda do |input|
+      current_hash     = input['current_hash']
+      current_content  = input['current_content']
+      previous_hash    = input['previous_hash']
+      previous_content = input['previous_content']
+      check_type       = (input['check_type'] || 'hash').to_s
+
+      if check_type == 'smart' && current_content && previous_content
+        diff = call(:util_diff_lines, current_content.to_s, previous_content.to_s)
+
+        tokens_cur  = current_content.to_s.split(/\s+/)
+        tokens_prev = previous_content.to_s.split(/\s+/)
+        union = (tokens_cur | tokens_prev).length
+        intersection = (tokens_cur & tokens_prev).length
+        smart_change = union.zero? ? 0.0 : ((1.0 - intersection.to_f / union) * 100).round(2)
+
+        changed = smart_change > 0.0 || diff[:added].any? || diff[:removed].any? || diff[:modified_sections].any?
+
+        return {
+          has_changed: changed,
+          change_type: changed ? 'smart_changed' : 'none',
+          change_percentage: smart_change,
+          added_content: diff[:added],
+          removed_content: diff[:removed],
+          modified_sections: diff[:modified_sections],
+          requires_reindexing: changed
         }
       end
 
+      has_changed = current_hash != previous_hash
+      change_type = 'none'
+      change_percentage = 0.0
+      added = []
+      removed = []
+      modified_sections = []
+
+      if has_changed
+        change_type = 'hash_changed'
+
+        if check_type == 'content' && current_content && previous_content
+          diff = call(:util_diff_lines, current_content.to_s, previous_content.to_s)
+          added = diff[:added]
+          removed = diff[:removed]
+          modified_sections = diff[:modified_sections]
+          change_percentage = diff[:line_change_percentage]
+          change_type = 'content_changed'
+        end
+      end
+
+      {
+        has_changed: has_changed,
+        change_type: change_type,
+        change_percentage: change_percentage,
+        added_content: added,
+        removed_content: removed,
+        modified_sections: modified_sections,
+        requires_reindexing: has_changed
+      }
+    end,
+
+    compute_metrics: lambda do |input|
+      data_points = Array(input['data_points'] || [])
+      values = data_points.map { |dp| dp['value'].to_f }.sort
+
+      return {
+        average: 0, median: 0, min: 0, max: 0,
+        std_deviation: 0, percentile_95: 0, percentile_99: 0,
+        total_count: 0, trend: 'stable', anomalies_detected: []
+      } if values.empty?
+
+      avg = values.sum / values.length.to_f
+      median = values.length.odd? ? values[values.length / 2] :
+               (values[values.length / 2 - 1] + values[values.length / 2]) / 2.0
+      min_v = values.first
+      max_v = values.last
+
+      variance = values.map { |v| (v - avg)**2 }.sum / values.length
+      std_dev = Math.sqrt(variance)
+
+      pct = lambda do |arr, p|
+        return 0 if arr.empty?
+        r = (p/100.0) * (arr.length - 1)
+        lo = r.floor
+        hi = r.ceil
+        lo == hi ? arr[lo] : arr[lo] + (r - lo) * (arr[hi] - arr[lo])
+      end
+      p95 = pct.call(values, 95)
+      p99 = pct.call(values, 99)
+
+      half = values.length / 2
+      first_half_avg = half.zero? ? avg : values[0...half].sum / half.to_f
+      second_half_avg = (values.length - half).zero? ? avg : values[half..-1].sum / (values.length - half).to_f
+      trend =
+        if second_half_avg > first_half_avg * 1.1 then 'increasing'
+        elsif second_half_avg < first_half_avg * 0.9 then 'decreasing'
+        else 'stable'
+        end
+
+      anomalies = data_points.select { |dp| (dp['value'].to_f - avg).abs > 2 * std_dev }
+                             .map { |dp| { timestamp: dp['timestamp'], value: dp['value'] } }
+
+      {
+        average: avg.round(2),
+        median: median.round(2),
+        min: min_v,
+        max: max_v,
+        std_deviation: std_dev.round(2),
+        percentile_95: p95.round(2),
+        percentile_99: p99.round(2),
+        total_count: values.length,
+        trend: trend,
+        anomalies_detected: anomalies
+      }
+    end,
+
+    calculate_optimal_batch: lambda do |input|
+      total_items = (input['total_items'] || 0).to_i
+      history = Array(input['processing_history'] || [])
+      target = (input['optimization_target'] || 'throughput').to_s
+      max_batch = (input['max_batch_size'] || 100).to_i
+      min_batch = (input['min_batch_size'] || 10).to_i
+
+      if history.empty?
+        optimal = [[(total_items / 10.0).ceil, max_batch].min, min_batch].max
+        return {
+          optimal_batch_size: optimal,
+          estimated_batches: (optimal.zero? ? 0 : (total_items.to_f / optimal).ceil),
+          estimated_processing_time: 0.0,
+          throughput_estimate: 0.0,
+          confidence_score: 0.5,
+          recommendation_reason: 'No history available, using default calculation'
+        }
+      end
+
+      optimal =
+        case target
+        when 'throughput'
+          best = history.max_by { |h| h['batch_size'].to_f / [h['processing_time'].to_f, 0.0001].max }
+          best['batch_size'].to_i
+        when 'latency'
+          best = history.min_by { |h| h['processing_time'].to_f / [h['batch_size'].to_f, 1].max }
+          best['batch_size'].to_i
+        when 'cost'
+          best = history.min_by { |h| (h['memory_usage'].to_f * 0.7) - (h['batch_size'].to_f / [h['processing_time'].to_f, 0.0001].max) * 0.3 }
+          best['batch_size'].to_i
+        when 'accuracy'
+          best = history.max_by { |h| (h['success_rate'].to_f * 1000) + (h['batch_size'].to_f / [h['processing_time'].to_f, 0.0001].max) }
+          best['batch_size'].to_i
+        else
+          (history.sum { |h| h['batch_size'].to_i } / [history.length, 1].max)
+        end
+
+      optimal = [[optimal, max_batch].min, min_batch].max
+      estimated_batches = (optimal.zero? ? 0 : (total_items.to_f / optimal).ceil)
+      avg_time = history.sum { |h| h['processing_time'].to_f } / [history.length, 1].max
+      estimated_time = avg_time * estimated_batches
+      throughput = estimated_time.zero? ? 0.0 : (total_items.to_f / estimated_time)
+
+      {
+        optimal_batch_size: optimal,
+        estimated_batches: estimated_batches,
+        estimated_processing_time: estimated_time.round(2),
+        throughput_estimate: throughput.round(2),
+        confidence_score: 0.8,
+        recommendation_reason: 'Based on historical performance data'
+      }
+    end,
+
+    # ---------- Helpers ----------
+
+    coerce_pos_int = lambda do |v, floor| 
+      [v.to_i, floor].max
+    end,
+
+    util_last_boundary_end: lambda do |segment, regex|
+      matches = segment.to_enum(:scan, regex).map { Regexp.last_match }
+      return nil if matches.empty?
+      matches.last.end(0)
+    end,
+
+    util_coerce_numeric_vector: lambda do |arr|
+      Array(arr).map do |x|
+        begin
+          Float(x)
+        rescue
+          error 'Vectors must contain only numerics.'
+        end
+      end
+    end,
+
+    util_diff_lines: lambda do |current_content, previous_content|
+      cur = current_content.to_s.split("\n")
+      prev = previous_content.to_s.split("\n")
+      i = 0
+      j = 0
+      window = 20
+      added = []
+      removed = []
+      modified_sections = []
+
+      while i < cur.length && j < prev.length
+        if cur[i] == prev[j]
+          i += 1
+          j += 1
+          next
+        end
+
+        idx_in_cur = ((i + 1)..[i + window, cur.length - 1].min).find { |k| cur[k] == prev[j] }
+        idx_in_prev = ((j + 1)..[j + window, prev.length - 1].min).find { |k| prev[k] == cur[i] }
+
+        if idx_in_cur
+          block = cur[i...idx_in_cur]
+          added.concat(block)
+          modified_sections << { type: 'added', current_range: [i, idx_in_cur - 1], previous_range: [j - 1, j - 1], current_lines: block }
+          i = idx_in_cur
+        elsif idx_in_prev
+          block = prev[j...idx_in_prev]
+          removed.concat(block)
+          modified_sections << { type: 'removed', current_range: [i - 1, i - 1], previous_range: [j, idx_in_prev - 1], previous_lines: block }
+          j = idx_in_prev
+        else
+          modified_sections << { type: 'modified', current_range: [i, i], previous_range: [j, j], current_lines: [cur[i]], previous_lines: [prev[j]] }
+          added << cur[i]
+          removed << prev[j]
+          i += 1
+          j += 1
+        end
+      end
+
+      if i < cur.length
+        block = cur[i..-1]
+        added.concat(block)
+        modified_sections << { type: 'added', current_range: [i, cur.length - 1], previous_range: [j - 1, j - 1], current_lines: block }
+      elsif j < prev.length
+        block = prev[j..-1]
+        removed.concat(block)
+        modified_sections << { type: 'removed', current_range: [i - 1, i - 1], previous_range: [j, prev.length - 1], previous_lines: block }
+      end
+
+      total_lines = [cur.length, prev.length].max
+      line_change_percentage = total_lines.zero? ? 0.0 : (((added.length + removed.length).to_f / total_lines) * 100).round(2)
+
+      { added: added, removed: removed, modified_sections: modified_sections, line_change_percentage: line_change_percentage }
+    end,
+    
+    generate_document_id: lambda do |file_path, checksum|
+      # Create stable document ID using SHA256 hash of "path|checksum"
+      require 'digest'
+
+      path_str = file_path.to_s.strip
+      checksum_str = checksum.to_s.strip
+
+      # Combine path and checksum with pipe separator
+      combined = "#{path_str}|#{checksum_str}"
+
+      # Generate SHA256 hash and return as hex string
+      Digest::SHA256.hexdigest(combined)
+    end,
+
+    calculate_chunk_boundaries: lambda do |text, chunk_size, overlap_tokens = 0|
+      # Convert text to string and ensure we have content
+      text_str = text.to_s
+      return [] if text_str.empty?
+
+      # Calculate overlap in characters (tokens * 4 approximation)
+      overlap_chars = overlap_tokens * 4
+
+      # Start with basic chunk positions
+      boundaries = []
+      start_pos = 0
+
+      while start_pos < text_str.length
+        # Calculate end position for this chunk
+        end_pos = start_pos + chunk_size
+
+        # If this is the last chunk, take everything remaining
+        if end_pos >= text_str.length
+          boundaries << { start: start_pos, end: text_str.length }
+          break
+        end
+
+        # Smart boundary detection - look for sentence endings
+        # Search backward from end_pos for sentence boundary
+        search_start = [end_pos - 200, start_pos].max  # Don't search too far back
+        chunk_text = text_str[search_start...end_pos + 100] || ""
+
+        # Look for sentence endings: period, exclamation, question mark followed by whitespace
+        sentence_matches = chunk_text.scan(/[.!?]\s+/).map.with_index do |match, idx|
+          match_pos = search_start + chunk_text.index(match, idx * 2)
+          match_pos + match.length
+        end
+
+        # Find the best sentence boundary near our target end position
+        best_boundary = sentence_matches.select { |pos| pos <= end_pos + 50 && pos > start_pos + chunk_size / 2 }.last
+
+        if best_boundary
+          # Use sentence boundary
+          actual_end = best_boundary
+        else
+          # Fallback to word boundary
+          # Look for last word boundary before end_pos
+          word_boundary_text = text_str[start_pos...end_pos + 50] || ""
+          word_matches = word_boundary_text.scan(/\s+/).map.with_index do |match, idx|
+            match_pos = start_pos + word_boundary_text.index(match, idx * 2)
+            match_pos
+          end
+
+          word_boundary = word_matches.select { |pos| pos <= end_pos }.last
+          actual_end = word_boundary ? word_boundary : end_pos
+        end
+
+        # Ensure we don't go past the text
+        actual_end = [actual_end, text_str.length].min
+
+        boundaries << { start: start_pos, end: actual_end }
+
+        # Calculate next start position with overlap
+        start_pos = [actual_end - overlap_chars, actual_end].min
+
+        # Ensure we make progress
+        start_pos = actual_end if start_pos <= boundaries.last[:start]
+      end
+
+      boundaries
+    end,
+
+    merge_document_metadata: lambda do |chunk_metadata, document_metadata, options = {}|
+      # Extract required information
+      document_id = options[:document_id] || document_metadata[:id] || document_metadata['id']
+      file_name = options[:file_name] || document_metadata[:name] || document_metadata['name']
+      file_id = options[:file_id] || document_metadata[:file_id] || document_metadata['file_id']
+
+      # Start with chunk metadata
+      merged = chunk_metadata.is_a?(Hash) ? chunk_metadata.dup : {}
+
+      # Add document metadata
+      if document_metadata.is_a?(Hash)
+        merged.merge!(document_metadata)
+      end
+
+      # Add required fields
+      merged[:document_id] = document_id if document_id
+      merged[:file_name] = file_name if file_name
+      merged[:file_id] = file_id if file_id
+
+      # Add source and timestamp
+      merged[:source] = 'google_drive'
+      merged[:indexed_at] = Time.now.iso8601
+
+      # Convert symbol keys to strings for consistency
+      result = {}
+      merged.each do |key, value|
+        result[key.to_s] = value
+      end
+
+      result
+    end,
+
+    # ---------- Project resolution helpers ----------
+    get_recipe_details: lambda do |connection, recipe_id|
+      path = "/api/recipes/#{recipe_id}"
+      call(:execute_with_retry, connection, -> { get(path) })
+    rescue RestClient::ExceptionWithResponse => e
+      hdrs = e.response&.headers || {}
+      cid  = hdrs["x-correlation-id"] || hdrs[:x_correlation_id]
+      error("Failed to load recipe #{recipe_id} (#{e.http_code}). cid=#{cid} body=#{e.response&.body}")
+    end,
+
+    folders_index_cached: lambda do |connection|
+      return @__folders_by_id if defined?(@__folders_by_id) && @__folders_by_id.present?
+      page = 1
+      acc  = {}
+      loop do
+        resp = call(:execute_with_retry, connection, -> { get('/api/folders').params(page: page, per_page: 100) })
+        rows = resp.is_a?(Array) ? resp : (resp["data"] || [])
+        rows.each { |f| acc[f["id"]] = f }
+        break if rows.size < 100
+        page += 1
+      end
+      @__folders_by_id = acc
+    end,
+
+    projects_index_cached: lambda do |connection|
+      return @__projects_by_id if defined?(@__projects_by_id) && @__projects_by_id.present?
+      page = 1
+      acc  = {}
+      loop do
+        resp = call(:execute_with_retry, connection, -> { get('/api/projects').params(page: page, per_page: 100) })
+        rows = resp.is_a?(Array) ? resp : (resp["data"] || [])
+        rows.each { |p| acc[p["id"]] = p }
+        break if rows.size < 100
+        page += 1
+      end
+      @__projects_by_id = acc
+    end,
+
+    resolve_project_from_recipe: lambda do |connection, recipe_id|
+      rec = call(:get_recipe_details, connection, recipe_id)
+      f_id = rec["folder_id"]
+      error("Recipe #{recipe_id} did not include folder_id") if f_id.blank?
+
+      folders = call(:folders_index_cached, connection)
+      folder  = folders[f_id]
+      error("Folder #{f_id} not found or not visible to this token") if folder.blank?
+
+      result = {
+        recipe_id: recipe_id,
+        folder_id: f_id,
+        folder_name: folder["name"],
+        is_project_folder: !!folder["is_project"],
+        project_id: nil,
+        project_name: nil,
+        project_folder_id: nil,
+        environment_host: connection["developer_api_host"]
+      }
+
+      if folder["is_project"]
+        projects = call(:projects_index_cached, connection)
+        proj = projects.values.find { |p| p["folder_id"] == f_id }
+        result[:project_id]        = proj&.dig("id")
+        result[:project_name]      = proj&.dig("name")
+        result[:project_folder_id] = f_id
+      else
+        result[:project_id] = folder["project_id"]
+        if result[:project_id].present?
+          projects = call(:projects_index_cached, connection)
+          proj = projects[result[:project_id]]
+          result[:project_name]      = proj&.dig("name")
+          result[:project_folder_id] = proj&.dig("folder_id")
+        end
+      end
+      result
+    end,
+
+    # ---------- HTTP helpers & endpoints ----------
+    devapi_base: lambda do |connection|
+      host = (connection['developer_api_host'].presence || 'app.eu').to_s
+      "https://#{host}.workato.com"
+    end,
+
+    dt_records_base: lambda do |_connection|
+      "https://data-tables.workato.com"
+    end,
+
+    execute_with_retry: lambda do |connection, operation = nil, &block|
+      retries     = 0
+      max_retries = 3
+
+      begin
+        op = block || operation
+        error('Internal error: execute_with_retry called without an operation') unless op
+        op.call
+      rescue RestClient::ExceptionWithResponse => e
+        code = e.http_code.to_i
+        if ([429] + (500..599).to_a).include?(code) && retries < max_retries
+          hdrs  = e.response&.headers || {}
+          ra    = hdrs["Retry-After"] || hdrs[:retry_after]
+          delay = if ra.to_s =~ /^\d+$/ then ra.to_i
+                  elsif ra.present?
+                    begin
+                      [(Time.httpdate(ra) - Time.now).ceil, 1].max
+                    rescue
+                      60
+                    end
+                  else
+                    2 ** retries
+                  end
+          sleep([delay, 30].min + rand(0..3))
+          retries += 1
+          retry
+        end
+        raise
+      rescue RestClient::Exceptions::OpenTimeout, RestClient::Exceptions::ReadTimeout => e
+        if retries < max_retries
+          sleep((2 ** retries) + rand(0..2))
+          retries += 1
+          retry
+        end
+        raise e
+      end
+    end,
+
+    validate_table_id: lambda do |table_id|
+      error("Table ID is required") if table_id.blank?
+      uuid = /\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/i
+      error("Table ID must be a UUID") unless table_id.to_s.match?(uuid)
+    end,
+
+    infer_rules_column_mapping: lambda do |_connection, schema, existing_mapping = {}|
+      names = Array(schema).map { |c| (c['name'] || '').to_s }
+      # start with any explicit mapping; fill gaps heuristically
+      mapping = (existing_mapping || {}).dup
+
+      synonyms = {
+        'rule_id'      => %w[rule_id id key],
+        'rule_type'    => %w[rule_type type field target applies_to scope],
+        'rule_pattern' => %w[rule_pattern pattern regex regexp matcher match expression expr contains],
+        'action'       => %w[action category label outcome route bucket folder],
+        'priority'     => %w[priority prio rank order weight score],
+        'active'       => %w[active enabled is_active status state]
+      }
+
+      synonyms.each do |key, alts|
+        next if mapping[key].to_s.strip != ''
+        found = names.find { |n| alts.any? { |alt| n.casecmp(alt).zero? } }
+        mapping[key] = found if found
+      end
+
+      mapping
+    end,
+
+    # Return [ [name, name], ... ] for picklists
+    dt_table_columns: lambda do |connection, table_id|
+      table = call(:devapi_get_table, connection, table_id)
+      schema = table['schema'] || table.dig('data', 'schema') || []
+      cols = Array(schema).map { |c| n = (c['name'] || '').to_s; [n, n] }.reject { |a| a[0].empty? }
+      cols.presence || [[ "No columns found", nil ]]
+    end,
+
+    pick_tables: lambda do |connection|
+      page = 1
+      acc  = []
+      loop do
+        resp = call(:execute_with_retry, connection, -> { get('/api/data_tables').params(page: page, per_page: 100) })
+        arr = resp.is_a?(Array) ? resp : (resp['data'] || [])
+        acc.concat(arr)
+        break if arr.size < 100
+        page += 1
+      end
+      acc.map { |t| [t['name'] || t['id'].to_s, t['id']] }
+    rescue RestClient::ExceptionWithResponse => e
+      hdrs = e.response&.headers || {}
+      cid  = hdrs["x-correlation-id"] || hdrs[:x_correlation_id]
+      msg  = e.response&.body || e.message
+      hint = "Check API token and Developer API host (#{connection['developer_api_host'] || 'app.eu'})."
+      error("Failed to load tables (#{e.http_code}) cid=#{cid} #{hint} #{msg}")
+    end,
+
+    devapi_get_table: lambda do |connection, table_id|
+      call(:execute_with_retry, connection, lambda { get("/api/data_tables/#{table_id}") })
+    end,
+
+    validate_rules_schema!: lambda do |_connection, schema, required_names, mapping = {}|
+      names = Array(schema).map { |c| (c['name'] || '').to_s }
+      expected = required_names.map { |n| (mapping[n] || n).to_s }
+      missing = expected.reject { |n| names.include?(n) }
+      if missing.any?
+        cid = call(:gen_correlation_id)
+        error("Rules table missing required fields: #{missing.join(', ')}. " \
+              "Columns found=#{names.join(', ')}. " \
+              "Tip: enable 'Custom column names?' or rename columns to match. cid=#{cid}")
+      end
+    end,
+
+    schema_field_id_map: lambda do |_connection, schema|
+      Hash[Array(schema).map { |c| [(c['name'] || '').to_s, (c['field_id'] || c['id'] || '').to_s] }]
+    end,
+
+    # Pull and normalize rules with optional column mapping
+    dt_query_rules_all: lambda do |connection, table_id, required_fields, max_rules, schema = nil, mapping = {}|
+      base = call(:dt_records_base, connection)
+      url  = "#{base}/api/v1/tables/#{table_id}/query"
+
+      schema ||= begin
+        table = call(:devapi_get_table, connection, table_id)
+        table['schema'] || table.dig('data', 'schema') || []
+      end
+
+      name_to_uuid = call(:schema_field_id_map, connection, schema)
+      names = Array(schema).map { |c| (c['name'] || '').to_s }
+
+      # Column resolver honoring mapping
+      col = ->(key) { (mapping[key] || key).to_s }
+
+      # Only select columns that actually exist
+      base_select = required_fields.map { |k| col.call(k) }
+      select_fields = (base_select + ['$record_id', '$created_at', '$updated_at']).uniq
+      select_fields = select_fields.select { |n| n.start_with?('$') || names.include?(n) }
+
+      # Optional columns
+      active_col = col.call('active');   has_active   = names.include?(active_col)
+      prio_col   = col.call('priority'); has_priority = names.include?(prio_col)
+
+      where = has_active ? { active_col => { '$eq' => true } } : nil
+      order = has_priority ? { by: prio_col, order: 'asc', case_sensitive: false } : nil
+
+      records = []
+      cont = nil
+      loop do
+        body = { select: select_fields, where: where, order: order, limit: 200, continuation_token: cont }.compact
+        # ADD AUTHORIZATION HEADER HERE
+        resp = call(:execute_with_retry, connection, lambda { 
+          post(url)
+            .headers('Authorization' => "Bearer #{connection['api_token']}")
+            .payload(body) 
+        })
+        recs = resp['records'] || resp['data'] || []
+        records.concat(recs)
+        cont = resp['continuation_token']
+        break if cont.blank? || records.length >= max_rules
+      end
+
+      # Decode each record to a name->value row using schema
+      decoded = records.map do |r|
+        doc = r['document'] || []
+        row = {}
+        doc.each do |cell|
+          fid  = (cell['field_id'] || '').to_s
+          name = name_to_uuid.key(fid) || cell['name']
+          row[name.to_s] = cell['value']
+        end
+        row['$record_id']  = r['record_id']  if r['record_id']
+        row['$created_at'] = r['created_at'] if r['created_at']
+        row['$updated_at'] = r['updated_at'] if r['updated_at']
+        row
+      end
+
+      # Normalize → canonical keys; default active=true if missing, priority=1000 if missing
+      normalized = decoded.map do |row|
+        {
+          'rule_id'      => (row[col.call('rule_id')]      || '').to_s,
+          'rule_type'    => (row[col.call('rule_type')]    || '').to_s.downcase,
+          'rule_pattern' => (row[col.call('rule_pattern')] || '').to_s,
+          'action'       => (row[col.call('action')]       || '').to_s,
+          'priority'     => names.include?(col.call('priority')) ? call(:coerce_int, connection, row[col.call('priority')], 1000) : 1000,
+          'active'       => names.include?(col.call('active'))   ? call(:coerce_bool, connection, row[col.call('active')])    : true,
+          'created_at'   => row['$created_at']
+        }
+      end
+
+      normalized
+        .select { |r| r['active'] == true }
+        .sort_by { |r| r['priority'] || 1000 }
+        .first(max_rules)
+    end,
+
+    coerce_bool: lambda do |_connection, v|
+      return true  if v == true || v.to_s.strip.downcase == 'true' || v.to_s == '1'
+      return false if v == false || v.to_s.strip.downcase == 'false' || v.to_s == '0'
+      !!v
+    end,
+
+    coerce_int: lambda do |_connection, v, default|
+      Integer(v)
+    rescue
+      default.to_i
+    end,
+
+    safe_regex: lambda do |_connection, pattern|
+      p = pattern.to_s.strip
+      max_len = 512
+      p = p[0, max_len]
+      if p.start_with?('/') && p.end_with?('/') && p.length >= 2
+        Regexp.new(p[1..-2], Regexp::IGNORECASE)
+      elsif p.start_with?('re:')
+        Regexp.new(p.sub(/^re:/i, ''), Regexp::IGNORECASE)
+      else
+        Regexp.new(Regexp.escape(p), Regexp::IGNORECASE)
+      end
+    rescue RegexpError => e
+      error("Invalid regex pattern in rules: #{e.message}")
+    end,
+
+    normalize_email: lambda do |_connection, email|
+      {
+        from_email: (email['from_email'] || '').to_s,
+        from_name:  (email['from_name']  || '').to_s,
+        subject:    (email['subject']    || '').to_s,
+        body:       (email['body']       || '').to_s,
+        headers:    email['headers'].is_a?(Hash) ? email['headers'] : {},
+        message_id: (email['message_id'] || '').to_s
+      }
+    end,
+
+    evaluate_standard_patterns: lambda do |_connection, email|
+      from = "#{email[:from_name]} <#{email[:from_email]}>"
+      subj = email[:subject].to_s
+      body = email[:body].to_s
+
+      sender_rx = [ /\bno[-_.]?reply\b/i, /\bdo[-_.]?not[-_.]?reply\b/i, /\bdonotreply\b/i, /\bnewsletter\b/i, /\bmailer\b/i, /\bautomated\b/i ]
+      subject_rx = [ /\border\s*(no\.|#)?\s*\d+/i, /\b(order|purchase)\s+confirmation\b/i, /\bconfirmation\b/i, /\breceipt\b/i, /\binvoice\b/i, /\b(password\s*reset|verification\s*code|two[-\s]?factor)\b/i ]
+      body_rx = [ /\bunsubscribe\b/i, /\bmanage (your )?preferences\b/i, /\bautomated (message|email)\b/i, /\bdo not reply\b/i, /\bview (this|in) browser\b/i ]
+
+      matches = []
+      flags_sender  = sender_rx.select { |rx| from.match?(rx) }.map(&:source)
+      flags_subject = subject_rx.select { |rx| subj.match?(rx) }.map(&:source)
+      flags_body    = body_rx.select  { |rx| body.match?(rx) }.map(&:source)
+
+      flags_sender.each do |src|
+        m = from.match(Regexp.new(src, Regexp::IGNORECASE))
+        matches << { rule_id: "std:sender:#{src}", rule_type: "sender", rule_pattern: src, action: nil, priority: 1000, field_matched: "sender", sample: m&.to_s }
+      end
+      flags_subject.each do |src|
+        m = subj.match(Regexp.new(src, Regexp::IGNORECASE))
+        matches << { rule_id: "std:subject:#{src}", rule_type: "subject", rule_pattern: src, action: nil, priority: 1000, field_matched: "subject", sample: m&.to_s }
+      end
+      flags_body.each do |src|
+        m = body.match(Regexp.new(src, Regexp::IGNORECASE))
+        matches << { rule_id: "std:body:#{src}", rule_type: "body", rule_pattern: src, action: nil, priority: 1000, field_matched: "body", sample: m&.to_s }
+      end
+
+      { matches: matches, sender_flags: flags_sender, subject_flags: flags_subject, body_flags: flags_body }
+    end,
+
+    apply_rules_to_email: lambda do |connection, email, rules, stop_on_first|
+      from    = "#{email[:from_name]} <#{email[:from_email]}>"
+      subject = email[:subject].to_s
+      body    = email[:body].to_s
+
+      out       = []
+      evaluated = 0
+
+      rules.each do |r|
+        rt      = r['rule_type']
+        pattern = r['rule_pattern']
+        next if rt.blank? || pattern.blank?
+
+        rx = call(:safe_regex, connection, pattern)
+
+        field = case rt
+                when 'sender'  then 'sender'
+                when 'subject' then 'subject'
+                when 'body'    then 'body'
+                else next
+                end
+
+        haystack = case field
+                  when 'sender'  then from
+                  when 'subject' then subject
+                  when 'body'    then body
+                  end
+
+        evaluated += 1
+        m = haystack.match(rx)
+        if m
+          out << { rule_id: r['rule_id'], rule_type: rt, rule_pattern: pattern, action: r['action'], priority: r['priority'], field_matched: field, sample: m.to_s }
+          break if stop_on_first
+        end
+      end
+
+      { matches: out.sort_by { |h| [h[:priority] || 1000, h[:rule_id].to_s] }, evaluated_count: evaluated }
+    end,
+
+    # Orchestrate logic with mapping support + unconditional table-id validation
+    evaluate_email_by_rules_exec: lambda do |connection, input, config|
+      action_cid = call(:gen_correlation_id)
+      started_at = Time.now
+
+      email = call(:normalize_email, connection, input['email'] || {})
+
+      source   = (config && config['rules_source'] || input['rules_source'] || 'standard').to_s
+      table_id = (config && config['custom_rules_table_id'] || input['custom_rules_table_id']).to_s.presence
+
+      stop_on      = input.key?('stop_on_first_match') ? !!input['stop_on_first_match'] : true
+      fallback_std = input.key?('fallback_to_standard') ? !!input['fallback_to_standard'] : true
+      max_rules    = (input['max_rules_to_apply'] || 500).to_i.clamp(1, 10_000)
+
+      selected_action = nil
+      used_source     = 'none'
+      matches         = []
+      evaluated_count = 0
+
+      std = call(:evaluate_standard_patterns, connection, email)
+
+      if source == 'custom'
+        error("api_token is required in connector connection to read custom rules from Data Tables. cid=#{action_cid}") unless connection['api_token'].present?
+        call(:validate_table_id, table_id)
+
+        # Load table + schema
+        table_info = call(:devapi_get_table, connection, table_id)
+        schema     = table_info['schema'] || table_info.dig('data', 'schema') || []
+
+        # Build mapping: explicit mapping first; auto‑infer any missing pieces
+        mapping = {}
+        if config['enable_column_mapping']
+          %w[col_rule_id col_rule_type col_rule_pattern col_action col_priority col_active].each do |ck|
+            v = (config[ck] || '').to_s.strip
+            next if v.empty?
+            key = ck.sub(/^col_/, '')
+            mapping[key] = v
+          end
+        end
+        mapping = call(:infer_rules_column_mapping, connection, schema, mapping)
+
+        # Minimal required fields to evaluate rules. Priority/active are optional.
+        required = %w[rule_type rule_pattern]
+        call(:validate_rules_schema!, connection, schema, required, mapping)
+
+        rules     = call(:dt_query_rules_all, connection, table_id, (required + ['action', 'rule_id']).uniq, max_rules, schema, mapping)
+        applied   = call(:apply_rules_to_email, connection, email, rules, stop_on)
+        matches   = applied[:matches]
+        evaluated_count = applied[:evaluated_count]
+
+        if matches.any?
+          used_source     = 'custom'
+          selected_action = matches.first[:action]
+        elsif fallback_std && std[:matches].any?
+          used_source = 'standard'
+          matches     = std[:matches]
+        end
+      else
+        matches     = std[:matches]
+        used_source = matches.any? ? 'standard' : 'none'
+      end
+
+      result = {
+        pattern_match: matches.any?,
+        rule_source:   used_source,
+        selected_action: selected_action,
+        top_match:     matches.first,
+        matches:       matches,
+        standard_signals: {
+          sender_flags:  std[:sender_flags],
+          subject_flags: std[:subject_flags],
+          body_flags:    std[:body_flags]
+        },
+        debug: {
+          evaluated_rules_count: evaluated_count,
+          schema_validated:      (source == 'custom'),
+          errors: []
+        },
+        telemetry: call(:telemetry_envelope,
+                        true,
+                        { action: 'classify_by_pattern',
+                          rule_source: used_source,
+                          evaluated_rules: evaluated_count,
+                          has_custom_table: (source == 'custom'),
+                          table_id: table_id },
+                        started_at,
+                        action_cid,
+                        true)
+      }
+
+      result
+    end,
+
+    # Prepare text for AI processing with source-specific cleaning
+    prepare_text_for_ai_exec: lambda do |connection, input|
+      text = (input['text'] || '').to_s
+      source_type = (input['source_type'] || 'general').to_s
+      task_type = (input['task_type'] || 'general').to_s
+      options = input['options'] || {}
+
+      original_length = text.length
+      operations_applied = []
+      removed_sections = []
+      extracted_urls = []
+
+      # Apply source-specific processing
+      if source_type == 'email'
+        # Use existing process_email_text method for email content
+        email_result = call(:process_email_text, {
+          'email_body' => text,
+          'remove_quotes' => options['remove_quotes'] != false,
+          'remove_signatures' => options['remove_signatures'] != false,
+          'remove_disclaimers' => options['remove_disclaimers'] != false,
+          'extract_urls' => options['extract_urls'] == true,
+          'normalize_whitespace' => options['normalize_whitespace'] != false
+        })
+
+        text = email_result[:cleaned_text] || email_result['cleaned_text'] || text
+        removed_sections = email_result[:removed_sections] || email_result['removed_sections'] || []
+        extracted_urls = email_result[:extracted_urls] || email_result['extracted_urls'] || []
+
+        operations_applied << 'email_preprocessing'
+        operations_applied << 'remove_quotes' if options['remove_quotes'] != false
+        operations_applied << 'remove_signatures' if options['remove_signatures'] != false
+        operations_applied << 'remove_disclaimers' if options['remove_disclaimers'] != false
+        operations_applied << 'normalize_whitespace' if options['normalize_whitespace'] != false
+      else
+        # General text processing for document, chat, general types
+        if options['normalize_whitespace'] != false
+          text.gsub!(/[ \t]+/, ' ')
+          text.gsub!(/\n{3,}/, "\n\n")
+          text.strip!
+          operations_applied << 'normalize_whitespace'
+        end
+
+        if options['extract_urls'] == true
+          extracted_urls = text.scan(%r{https?://[^\s<>"'()]+})
+          operations_applied << 'extract_urls'
+        end
+      end
+
+      # Apply max_length if specified
+      if options['max_length'] && options['max_length'].to_i > 0
+        max_len = options['max_length'].to_i
+        if text.length > max_len
+          text = text[0, max_len]
+          operations_applied << 'truncate_to_max_length'
+        end
+      end
+
+      # Basic PII removal if requested
+      if options['remove_pii'] == true
+        # Simple email and phone number masking
+        text.gsub!(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/, '[EMAIL]')
+        text.gsub!(/\b\d{3}[-.]?\d{3}[-.]?\d{4}\b/, '[PHONE]')
+        operations_applied << 'remove_pii'
+      end
+
+      final_length = text.length
+      word_count = text.split(/\s+/).length
+
+      # Build contract-compliant output
+      result = {
+        'text' => text,
+        'removed_sections' => removed_sections,
+        'word_count' => word_count,
+        'cleaning_applied' => {
+          'source_type' => source_type,
+          'task_type' => task_type,
+          'operations' => operations_applied,
+          'original_length' => original_length,
+          'final_length' => final_length,
+          'reduction_percentage' => original_length.zero? ? 0 : ((1 - final_length.to_f / original_length) * 100).round(2)
+        },
+        'metadata' => {
+          'source_type' => source_type,
+          'task_type' => task_type,
+          'processing_timestamp' => Time.now.utc.iso8601,
+          'extracted_urls' => extracted_urls
+        }
+      }
+
+      # Validate contract compliance
+      call(:validate_contract, connection, result, 'cleaned_text')
+
+      result
+    end,
+
+    # ----- Templates (Data Tables) -----
+    pick_templates_from_table: lambda do |connection, config|
+      error('api_token is required in connector connection to read templates from Data Tables') unless connection['api_token'].present?
+
+      table_id  = (config['templates_table_id'] || '').to_s.strip
+      call(:validate_table_id, table_id)
+
+      display  = (config['template_display_field']  || 'name').to_s
+      valuef   = (config['template_value_field']    || '').to_s
+      contentf = (config['template_content_field']  || 'content').to_s
+
+      table_info = call(:devapi_get_table, connection, table_id)
+      schema     = table_info['schema'] || table_info.dig('data', 'schema') || []
+      names      = Array(schema).map { |c| (c['name'] || '').to_s }
+      missing    = [display, contentf].reject { |n| names.include?(n) }
+      error("Templates table missing required fields: #{missing.join(', ')}") unless missing.empty?
+
+      base   = call(:dt_records_base, connection)
+      url    = "#{base}/api/v1/tables/#{table_id}/query"
+      select = [display, contentf]
+      select << valuef if valuef.present?
+      select << 'active' if names.include?('active')
+      where  = names.include?('active') ? { 'active' => { '$eq' => true } } : nil
+      order  = { by: display, order: 'asc', case_sensitive: false }
+
+      records = []
+      cont = nil
+      loop do
+        body = { select: select.uniq, where: where, order: order, limit: 200, continuation_token: cont }.compact
+        resp = call(:execute_with_retry, connection, lambda { 
+          post(url)
+            .headers('Authorization' => "Bearer #{connection['api_token']}")
+            .payload(body) 
+        })
+        recs = resp['records'] || resp['data'] || []
+        records.concat(recs)
+        cont = resp['continuation_token']
+        break if cont.blank? || records.length >= 2000
+      end
+
+      name_to_uuid = call(:schema_field_id_map, connection, schema)
+      rows = records.map do |r|
+        doc = r['document'] || []
+        row = {}
+        doc.each do |cell|
+          fid  = (cell['field_id'] || '').to_s
+          name = name_to_uuid.key(fid) || cell['name']
+          row[name.to_s] = cell['value']
+        end
+        row['$record_id'] = r['record_id'] if r['record_id']
+        row
+      end
+
+      opts = rows.map do |row|
+        disp = (row[display] || row['$record_id']).to_s
+        val  = valuef.present? ? row[valuef].to_s : row['$record_id'].to_s
+        [disp, val]
+      end
+
+      opts.empty? ? [[ "No templates found in selected table", nil ]] : opts
+    rescue RestClient::ExceptionWithResponse => e
+      hdrs = e.response&.headers || {}
+      cid  = hdrs["x-correlation-id"] || hdrs[:x_correlation_id]
+      msg  = e.response&.body || e.message
+      error("Failed to load templates (#{e.http_code}) cid=#{cid} #{msg}")
+    end,
+
+    resolve_template_selection: lambda do |connection, config, selected_value|
+      table_id   = (config['templates_table_id'] || '').to_s
+      valuef     = (config['template_value_field']   || '').to_s
+      contentf   = (config['template_content_field'] || 'content').to_s
+      displayf   = (config['template_display_field'] || 'name').to_s
+
+      table_info = call(:devapi_get_table, connection, table_id)
+      schema     = table_info['schema'] || table_info.dig('data', 'schema') || []
+
+      base = call(:dt_records_base, connection)
+
+      if valuef.present?
+        body = { select: [valuef, displayf, contentf, '$record_id'].uniq, where: { valuef => { '$eq' => selected_value } }, limit: 1 }
+        resp = call(:execute_with_retry, connection, lambda { 
+          post("#{base}/api/v1/tables/#{table_id}/query")
+            .headers('Authorization' => "Bearer #{connection['api_token']}")
+            .payload(body) 
+        })
+        rec  = (resp['records'] || resp['data'] || [])[0]
+        return nil unless rec
+        row  = call(:dt_decode_record_doc, connection, schema, rec)
+        { 'value' => selected_value, 'display' => row[displayf], 'content' => row[contentf], 'record_id' => row['$record_id'] }
+      else
+        rec = call(:execute_with_retry, connection, lambda { get("#{base}/api/v1/tables/#{table_id}/records/#{selected_value}") })
+        row = call(:dt_decode_record_doc, connection, schema, rec)
+        { 'value' => selected_value, 'display' => row[displayf], 'content' => row[contentf], 'record_id' => selected_value }
+      end
+    end,
+
+    dt_decode_record_doc: lambda do |connection, schema, record|
+      name_to_uuid = call(:schema_field_id_map, connection, schema)
+      doc = record['document'] || []
+      row = {}
+      doc.each do |cell|
+        fid  = (cell['field_id'] || '').to_s
+        name = name_to_uuid.key(fid) || cell['name']
+        row[name.to_s] = cell['value']
+      end
+      row['$record_id']  = record['record_id']  if record['record_id']
+      row['$created_at'] = record['created_at'] if record['created_at']
+      row['$updated_at'] = record['updated_at'] if record['updated_at']
+      row
+    end,
+
+    validate_contract: lambda do |connection, data, contract_type|
+      cid = call(:gen_correlation_id)
+
+      # Normalize keys to strings without mutating caller input
+      normalized = {}
+      if data.respond_to?(:each)
+        data.each { |k, v| normalized[k.to_s] = v }
+      else
+        error("Contract validation failed. Data must be a hash-like object. cid=#{cid}")
+      end
+
+      contracts = {
+        # Existing contracts
+        'cleaned_text' => {
+          required_fields: ['text', 'removed_sections', 'word_count', 'cleaning_applied'],
+          field_types: {
+            'text' => String, 'removed_sections' => Array, 'word_count' => Integer, 'cleaning_applied' => Hash
+          }
+        },
+        'embedding_request' => {
+          required_fields: ['text', 'metadata'],
+          field_types: { 'text' => String, 'metadata' => Hash }
+        },
+        'classification_request' => {
+          required_fields: ['content', 'rules_source'],
+          field_types: { 'content' => String, 'rules_source' => String }
+        },
+        'classification_response' => {
+          required_fields: ['selected_category', 'confidence'],
+          field_types: { 'selected_category' => String, 'confidence' => Float, 'alternatives' => Array, 'usage_metrics' => Hash }
+        },
+        'classification_result' => {
+          required_fields: ['pattern_match', 'rule_source', 'matches', 'debug'],
+          field_types: { 'rule_source' => String, 'matches' => Array, 'debug' => Hash }
+        },
+        'prompt_request' => {
+          required_fields: ['context_documents', 'user_query'],
+          field_types: { 'context_documents' => Array, 'user_query' => String }
+        },
+
+        # NEW: cover result types actually used by your actions
+        'email_cleaning_result' => {
+          required_fields: %w[cleaned_text original_length cleaned_length],
+          field_types: {
+            'cleaned_text' => String,
+            'removed_sections' => Array,
+            'extracted_urls' => Array,
+            'removed_sections_count' => Integer,
+            'urls_count' => Integer,
+            'original_length' => Integer,
+            'cleaned_length' => Integer,
+            'reduction_percentage' => Float
+          }
+        },
+        'chunking_result' => {
+          required_fields: %w[chunks total_chunks],
+          field_types: {
+            'chunks' => Array,
+            'first_chunk' => Hash,
+            'chunks_json' => String,
+            'total_chunks' => Integer,
+            'total_tokens' => Integer
+          }
+        },
+        'similarity_result' => {
+          required_fields: %w[similarity_score is_similar similarity_type],
+          field_types: {
+            'similarity_score' => Float,
+            'similarity_percentage' => Float,
+            'similarity_type' => String,
+            'computation_time_ms' => Integer,
+            'threshold_used' => Float
+          }
+        },
+        'document_metadata' => {
+          required_fields: %w[document_id file_hash word_count character_count estimated_tokens created_at],
+          field_types: {
+            'document_id' => String,
+            'file_hash' => String,
+            'word_count' => Integer,
+            'character_count' => Integer,
+            'estimated_tokens' => Integer,
+            'language' => String,
+            'summary' => String
+          }
+        },
+        'change_detection' => {
+          required_fields: %w[change_type],
+          field_types: {
+            'change_type' => String,
+            'added_content' => Array,
+            'removed_content' => Array,
+            'modified_sections' => Array
+          }
+        },
+        'metrics_result' => {
+          required_fields: %w[average median min max total_count],
+          field_types: {
+            'average' => Float, 'median' => Float, 'min' => Float, 'max' => Float,
+            'std_deviation' => Float, 'percentile_95' => Float, 'percentile_99' => Float, 'total_count' => Integer
+          }
+        }
+      }
+
+      contract = contracts[contract_type.to_s]
+      error("Unknown contract type: #{contract_type}. cid=#{cid}") unless contract
+
+      missing = contract[:required_fields].select { |f| !normalized.key?(f) }
+      error("Contract validation failed. Missing required fields: #{missing.join(', ')}. cid=#{cid}") unless missing.empty?
+
+      type_errors = []
+      contract[:field_types].each do |field, expected_type|
+        next unless normalized.key?(field)
+        val = normalized[field]
+        case expected_type.name
+        when 'String'
+          type_errors << "#{field} must be a string" unless val.is_a?(String)
+        when 'Integer'
+          type_errors << "#{field} must be an integer" unless val.is_a?(Integer)
+        when 'Float'
+          type_errors << "#{field} must be a float" unless val.is_a?(Float) || val.is_a?(Integer)
+        when 'Hash'
+          type_errors << "#{field} must be a hash/object" unless val.is_a?(Hash)
+        when 'Array'
+          type_errors << "#{field} must be an array" unless val.is_a?(Array)
+        end
+      end
+      error("Contract validation failed. Type errors: #{type_errors.join(', ')}. cid=#{cid}") unless type_errors.empty?
+
+      normalized # return a normalized copy; do not mutate caller input
+    end
+
+  },
+
+  # --------- OBJECT DEFINITIONS -------------------------------------------
+  object_definitions: {
+    chunk_object: {
+      fields: lambda do
+        [
+          { name: "chunk_id", type: "string" },
+          { name: "chunk_index", type: "integer" },
+          { name: "text", type: "string" },
+          { name: "token_count", type: "integer" },
+          { name: "start_char", type: "integer" },
+          { name: "end_char", type: "integer" },
+          { name: "metadata", type: "object" }
+        ]
+      end
+    },
+
+    embedding_object: {
+      fields: lambda do
+        [
+          { name: "id", type: "string", sticky: true },
+          { name: "vector", type: "array", of: "number", sticky: true },
+          { name: "metadata", type: "object", sticky: true }
+        ]
+      end
+    },
+
+    metric_datapoint: {
+      fields: lambda do
+        [
+          { name: "timestamp", type: "timestamp", sticky: true },
+          { name: "value", type: "number", sticky: true },
+          { name: "metadata", type: "object", sticky: true }
+        ]
+      end
+    },
+
+    email_envelope: {
+      fields: lambda do
+        [
+          { name: "from_email", label: "From email", sticky: true },
+          { name: "from_name",  label: "From name", sticky: true },
+          { name: "subject",    label: "Subject", sticky: true },
+          { name: "body",       label: "Body", control_type: "text-area", sticky: true },
+          { name: "headers",    label: "Headers", type: "object", sticky: true },
+          { name: "message_id", label: "Message ID", sticky: true },
+          { name: "to",         label: "To", type: "array", of: "string", sticky: true },
+          { name: "cc",         label: "Cc", type: "array", of: "string", sticky: true }
+        ]
+      end
+    },
+
+    rules_row: {
+      fields: lambda do
+        [
+          { name: "rule_id" }, { name: "rule_type" }, { name: "rule_pattern" },
+          { name: "action" }, { name: "priority", type: "integer" }, { name: "field_matched" },
+          { name: "sample" }
+        ]
+      end
+    },
+
+    standard_signals: {
+      fields: lambda do
+        [
+          { name: "sender_flags",  type: "array", of: "string" },
+          { name: "subject_flags", type: "array", of: "string" },
+          { name: "body_flags",    type: "array", of: "string" }
+        ]
+      end
+    },
+
+    validation_rule: {
+      fields: lambda do
+        [
+          { name: "rule_type", sticky: true },
+          { name: "rule_value", sticky: true }
+        ]
+      end
+    },
+
+    context_document: {
+      fields: lambda do
+        [
+          { name: "content", type: "string", sticky: true },
+          { name: "relevance_score", type: "number", sticky: true },
+          { name: "source", type: "string", sticky: true },
+          { name: "metadata", type: "object", sticky: true }
+        ]
+      end
+    },
+
+    diff_section: {
+      fields: lambda do
+        [
+          { name: "type" },
+          { name: "current_range", type: "array", of: "integer" },
+          { name: "previous_range", type: "array", of: "integer" },
+          { name: "current_lines", type: "array", of: "string" },
+          { name: "previous_lines", type: "array", of: "string" }
+        ]
+      end
+    },
+
+    anomaly: {
+      fields: lambda do
+        [
+          { name: "timestamp", type: "timestamp" },
+          { name: "value", type: "number" }
+        ]
+      end
+    },
+
+    vertex_datapoint: {
+      fields: lambda do
+        [
+          { name: "datapoint_id", type: "string" },
+          { name: "feature_vector", type: "array", of: "number" },
+          { name: "restricts", type: "object" }
+        ]
+      end
+    },
+
+
+    vertex_batch: {
+      fields: lambda do |connection, _config, object_definitions|
+        [
+          { name: "batch_id", type: "string" },
+          { name: "batch_number", type: "integer" },
+          { name: "datapoints", type: "array", of: "object", properties: object_definitions["vertex_datapoint"] },
+          { name: "size", type: "integer" }
+        ]
+      end
+    },
+
+    chunking_config: {
+      fields: lambda do
+        [
+          { name: "chunk_size", label: "Chunk size (tokens)", type: "integer", default: 1000, convert_input: "integer_conversion", sticky: true, hint: "Maximum tokens per chunk" },
+          { name: "chunk_overlap", label: "Chunk overlap (tokens)", type: "integer", default: 100, convert_input: "integer_conversion", sticky: true, hint: "Token overlap between chunks" },
+          { name: "preserve_sentences", label: "Preserve sentences", type: "boolean", control_type: "checkbox", default: true, convert_input: "boolean_conversion", sticky: true, hint: "Don't break mid‑sentence" },
+          { name: "preserve_paragraphs", label: "Preserve paragraphs", type: "boolean", control_type: "checkbox", default: false, convert_input: "boolean_conversion", sticky: true, hint: "Try to keep paragraphs intact" }
+        ]
+      end
+    },
+
+    chunking_result: {
+      fields: lambda do |connection, _config, object_definitions|
+        [
+          { name: "chunks_count", type: "integer", label: "Number of chunks",
+            hint: "Total number of chunks created" },
+          { name: "chunks", type: "array", of: "object", properties: object_definitions["chunk_object"] },
+          { name: "first_chunk", type: "object", properties: object_definitions["chunk_object"],
+            label: "First chunk (quick access)",
+            hint: "First chunk for quick recipe access" },
+          { name: "chunks_json", type: "string", label: "Chunks as JSON string",
+            hint: "All chunks serialized as JSON for bulk operations" },
+          { name: "total_chunks", type: "integer" },
+          { name: "total_tokens", type: "integer" },
+          { name: "average_chunk_size", type: "integer", label: "Average chunk size",
+            hint: "Average number of tokens per chunk" },
+          { name: "pass_fail", type: "boolean", label: "Chunking success",
+            hint: "True if chunking completed successfully" },
+          { name: "action_required", type: "string", label: "Action required",
+            hint: "Next recommended action based on results" }
+        ]
+      end
+    },
+
+    email_cleaning_options: {
+      fields: lambda do
+        [
+          { name: "remove_signatures",  label: "Remove signatures",     type: "boolean", default: true,  control_type: "checkbox", convert_input: "boolean_conversion", sticky: true, group: "Options" },
+          { name: "remove_quotes",      label: "Remove quoted text",    type: "boolean", default: true,  control_type: "checkbox", convert_input: "boolean_conversion", sticky: true, group: "Options" },
+          { name: "remove_disclaimers", label: "Remove disclaimers",    type: "boolean", default: true,  control_type: "checkbox", convert_input: "boolean_conversion", sticky: true, group: "Options" },
+          { name: "normalize_whitespace", label: "Normalize whitespace", type: "boolean", default: true, control_type: "checkbox", convert_input: "boolean_conversion", sticky: true, group: "Options" },
+          { name: "extract_urls",       label: "Extract URLs",          type: "boolean", default: false, control_type: "checkbox", convert_input: "boolean_conversion", sticky: true, group: "Options" }
+        ]
+      end
+    },
+
+    email_cleaning_result: {
+      fields: lambda do
+        [
+          { name: "cleaned_text", type: "string" },
+          { name: "extracted_query", type: "string" },
+          { name: "removed_sections_count", type: "integer", label: "Removed sections count",
+            hint: "Number of sections removed during cleaning" },
+          { name: "removed_sections", type: "array", of: "string" },
+          { name: "urls_count", type: "integer", label: "URLs count",
+            hint: "Number of URLs extracted" },
+          { name: "extracted_urls", type: "array", of: "string" },
+          { name: "original_length", type: "integer" },
+          { name: "cleaned_length", type: "integer" },
+          { name: "reduction_percentage", type: "number" },
+          { name: "pass_fail", type: "boolean", label: "Cleaning success",
+            hint: "True if cleaning completed successfully" },
+          { name: "action_required", type: "string", label: "Action required",
+            hint: "Next recommended action based on results" },
+          { name: "has_content", type: "boolean", label: "Has meaningful content",
+            hint: "True if cleaned text contains meaningful content" }
+        ]
+      end
+    },
+
+    similarity_result: {
+      fields: lambda do
+        [
+          { name: "similarity_score",       type: "number", label: "Similarity score", hint: "0–1 for cosine/euclidean; unbounded for dot product" },
+          { name: "similarity_percentage",  type: "number", label: "Similarity percentage", hint: "0–100; only for cosine/euclidean" },
+          { name: "is_similar",             type: "boolean", control_type: "checkbox", label: "Is similar", hint: "Whether the vectors meet the threshold" },
+          { name: "pass_fail",              type: "boolean", label: "Similarity check", hint: "True if vectors are considered similar" },
+          { name: "action_required",        type: "string", label: "Action required", hint: "Next recommended action based on similarity" },
+          { name: "confidence_level",       type: "string", label: "Confidence level", hint: "high, medium, or low based on score" },
+          { name: "similarity_type",        type: "string", label: "Similarity type", hint: "cosine, euclidean, or dot_product" },
+          { name: "computation_time_ms",    type: "integer", label: "Computation time (ms)" },
+          { name: "threshold_used",         type: "number", label: "Threshold used", optional: true },
+          { name: "vectors_normalized",     type: "boolean", control_type: "checkbox", label: "Vectors normalized", optional: true }
+        ]
+      end
+    },
+
+    document_metadata: {
+      fields: lambda do
+        [
+          { name: "document_id", type: "string", label: "Document ID" },
+          { name: "file_hash", type: "string", label: "File hash" },
+          { name: "word_count", type: "integer", label: "Word count" },
+          { name: "character_count", type: "integer", label: "Character count" },
+          { name: "estimated_tokens", type: "integer", label: "Estimated tokens" },
+          { name: "language", type: "string", label: "Language" },
+          { name: "summary", type: "string", label: "Summary" },
+          { name: "key_topics", type: "array", of: "string", label: "Key topics" },
+          { name: "entities", type: "object", label: "Entities" },
+          { name: "created_at", type: "timestamp", label: "Created at" },
+          { name: "processing_time_ms", type: "integer", label: "Processing time (ms)" }
+        ]
+      end
+    },
+
+    metrics_result: {
+      fields: lambda do
+        [
+          { name: "average", type: "number", label: "Average" },
+          { name: "median", type: "number", label: "Median" },
+          { name: "min", type: "number", label: "Minimum" },
+          { name: "max", type: "number", label: "Maximum" },
+          { name: "std_deviation", type: "number", label: "Standard deviation" },
+          { name: "percentile_95", type: "number", label: "95th percentile" },
+          { name: "percentile_99", type: "number", label: "99th percentile" },
+          { name: "total_count", type: "integer", label: "Total count" },
+          { name: "trend", type: "string", label: "Trend" },
+          { name: "anomalies_detected", type: "array", of: "object", label: "Anomalies detected",
+            properties: [
+              { name: "timestamp", type: "timestamp" },
+              { name: "value", type: "number" }
+            ]
+          }
+        ]
+      end
+    },
+
+    change_detection: {
+      fields: lambda do
+        [
+          { name: "has_changed", type: "boolean", control_type: "checkbox", label: "Has changed" },
+          { name: "change_type", type: "string", label: "Change type" },
+          { name: "change_percentage", type: "number", label: "Change percentage" },
+          { name: "added_content", type: "array", of: "string", label: "Added content" },
+          { name: "removed_content", type: "array", of: "string", label: "Removed content" },
+          { name: "modified_sections", type: "array", of: "object", label: "Modified sections",
+            properties: [
+              { name: "type", type: "string" },
+              { name: "current_range", type: "array", of: "integer" },
+              { name: "previous_range", type: "array", of: "integer" },
+              { name: "current_lines", type: "array", of: "string" },
+              { name: "previous_lines", type: "array", of: "string" }
+            ]
+          },
+          { name: "requires_reindexing", type: "boolean", control_type: "checkbox", label: "Requires reindexing" }
+        ]
+      end
+    },
+    classification_result: {
+      fields: lambda do
+        [
+          { name: "pattern_match", type: "boolean", control_type: "checkbox", label: "Pattern match" },
+          { name: "rule_source", type: "string", label: "Rule source" },
+          { name: "selected_action", type: "string", label: "Selected action" },
+          { name: "top_match", type: "object", label: "Top match",
+            properties: [
+              { name: "rule_id", type: "string" },
+              { name: "rule_type", type: "string" },
+              { name: "rule_pattern", type: "string" },
+              { name: "action", type: "string" },
+              { name: "priority", type: "integer" },
+              { name: "field_matched", type: "string" },
+              { name: "sample", type: "string" }
+            ]
+          },
+          { name: "matches", type: "array", of: "object", label: "Matches" },
+          { name: "standard_signals", type: "object", label: "Standard signals",
+            properties: [
+              { name: "sender_flags", type: "array", of: "string" },
+              { name: "subject_flags", type: "array", of: "string" },
+              { name: "body_flags", type: "array", of: "string" }
+            ]
+          },
+          { name: "debug", type: "object", label: "Debug",
+            properties: [
+              { name: "evaluated_rules_count", type: "integer" },
+              { name: "schema_validated", type: "boolean", control_type: "checkbox" },
+              { name: "errors", type: "array", of: "string" }
+            ]
+          },
+          { name: "telemetry", type: "object", label: "Telemetry",
+            properties: [
+              { name: "success", type: "boolean" },
+              { name: "timestamp", type: "string" },
+              { name: "metadata", type: "object" },
+              { name: "trace", type: "object",
+                properties: [
+                  { name: "correlation_id", type: "string" },
+                  { name: "duration_ms", type: "integer" }
+                ]
+              }
+            ]
+          }
+        ]
+      end
     }
   },
 
   # --------- PICK LISTS ---------------------------------------------------
   pick_lists: {
 
-    attach_alignment_modes: lambda do |_connection=nil, _cfg={}|
+    environments: lambda do
       [
-        ['Match by id (recommended)', 'by_id'],
-        ['Match by index (vectors[i] -> chunks[i])', 'by_index']
+        ["Development", "dev"],
+        ["Staging", "staging"],
+        ["Production", "prod"]
       ]
     end,
 
-    item_schema_field_names: lambda do |_connection, _config_fields = {}|
-      fields = _config_fields['item_schema'].is_a?(Array) ? _config_fields['item_schema'] : []
-      names  = fields.map { |f| f['name'].to_s }.reject(&:empty?).uniq
-      names.map { |n| [n, n] }
-    end,
-
-    input_source_modes: lambda do |_connection = nil, _cfg = {}|
+    similarity_types: lambda do
       [
-        ['Chunks list (chunks[*])', 'chunks'],
-        ['Documents list (documents[*].chunks[*])', 'documents']
+        ["Cosine similarity", "cosine"],
+        ["Euclidean distance", "euclidean"],
+        ["Dot product", "dot_product"]
       ]
     end,
 
-    chunking_presets: lambda do |_connection = nil, _cfg = {}|
+    format_types: lambda do
       [
-        ['Auto (recommended)', 'auto'],
-        ['Balanced (2k max, 200 overlap)', 'balanced'],
-        ['Small (1k max, 100 overlap)', 'small'],
-        ['Large (4k max, 200 overlap)', 'large'],
-        ['Custom (enter values below)', 'custom']
+        ["JSON", "json"],
+        ["JSONL", "jsonl"],
+        ["CSV", "csv"]
       ]
     end,
 
-    metadata_modes: lambda do |_connection = nil, _cfg = {}|
+    prompt_templates: lambda do |connection, config = {}|
+      cfg = config || {}
+      template_source        = (cfg['template_source'] || cfg[:template_source] || 'builtin').to_s
+      templates_table_id     = cfg['templates_table_id'] || cfg[:templates_table_id]
+      template_display_field = (cfg['template_display_field'] || cfg[:template_display_field] || 'name').to_s
+      template_value_field   = (cfg['template_value_field'] || cfg[:template_value_field]).to_s
+      template_content_field = (cfg['template_content_field'] || cfg[:template_content_field] || 'content').to_s
+
+      if template_source == 'custom'
+        if connection['api_token'].blank? || templates_table_id.to_s.strip.empty?
+          [[ "Configure API token and Templates table in action config", nil ]]
+        else
+          call(:pick_templates_from_table, connection, {
+            'templates_table_id'      => templates_table_id,
+            'template_display_field'  => template_display_field,
+            'template_value_field'    => template_value_field,
+            'template_content_field'  => template_content_field
+          })
+        end
+      else
+        [
+          ["Standard RAG",      "standard"],
+          ["Customer service",  "customer_service"],
+          ["Technical support", "technical"],
+          ["Sales inquiry",     "sales"]
+        ]
+      end
+    end,
+
+    file_types: lambda do
       [
-        ['Ignore (no metadata included)', 'none'],
-        ['Flat & safe (recommended)',     'flat'],
-        ['Pass-through (no transformation)', 'pass']
+        ["PDF", "pdf"], ["Word Document", "docx"], ["Text File", "txt"], ["Markdown", "md"], ["HTML", "html"]
       ]
     end,
 
-    metadata_sources: lambda do |_connection = nil, _cfg = {}|
+    check_types: lambda do
       [
-        ['None', 'none'],
-        ['Key–value list', 'kv'],
-        ['Tags (comma-separated)', 'tags_csv'],
-        ['Auto from file_path', 'auto_from_path'],
-        ['Advanced (enter JSON object)', 'advanced']
+        ["Hash only", "hash"],
+        ["Content diff", "content"],
+        ["Smart diff", "smart"]
       ]
     end,
 
-    table_row_profiles: lambda do |_connection = nil, _cfg = {}|
+    metric_types: lambda do
       [
-        ['Slim (id, doc_id, file_path, +text?)', 'slim'],
-        ['Standard (adds checksum, tokens, span, created_at)', 'standard'],
-        ['Wide (Standard + flattened metadata)', 'wide']
+        ["Response time", "response_time"],
+        ["Token usage", "token_usage"],
+        ["Cache hit rate", "cache_hit"],
+        ["Error rate", "error_rate"],
+        ["Throughput", "throughput"]
       ]
     end,
-  },
 
-  # --------- TRIGGERS -----------------------------------------------------
-  triggers: {}
+    time_periods: lambda do
+      [
+        ["Minute", "minute"], ["Hour", "hour"], ["Day", "day"], ["Week", "week"]
+      ]
+    end,
 
+    optimization_targets: lambda do
+      [
+        ["Throughput", "throughput"], ["Latency", "latency"], ["Cost", "cost"], ["Accuracy", "accuracy"]
+      ]
+    end,
+
+    devapi_regions: lambda do
+      [
+        ["US (www.workato.com)", "www"],
+        ["EU (app.eu.workato.com)", "app.eu"],
+        ["JP (app.jp.workato.com)", "app.jp"],
+        ["SG (app.sg.workato.com)", "app.sg"],
+        ["AU (app.au.workato.com)", "app.au"],
+        ["IL (app.il.workato.com)", "app.il"]
+      ]
+    end,
+
+    tables: lambda do |connection|
+      if connection['api_token'].blank?
+        [[ "Please configure API token in connector connection", nil ]]
+      else
+        call(:pick_tables, connection)
+      end
+    end,
+
+    table_columns: lambda do |connection, config = {}|
+      cfg = config || {}
+      if connection['api_token'].blank?
+        [[ "Please configure API token in connector connection", nil ]]
+      else
+        tbl = (cfg.is_a?(Hash) ? (cfg['custom_rules_table_id'] || cfg[:custom_rules_table_id]) : nil).to_s
+        if tbl.empty?
+          [[ "Select a Data Table above first", nil ]]
+        else
+          call(:dt_table_columns, connection, tbl)
+        end
+      end
+    end
+
+  }
 }
