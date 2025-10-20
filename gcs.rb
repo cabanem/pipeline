@@ -711,12 +711,16 @@ require 'uri'
         corr = SecureRandom.uuid
         filters = input['filters'] || {}
         paging  = input['paging']  || {}
+        bucket_in    = input['bucket'].to_s
+        # Normalize: strip gs:// and any accidental path suffix.
+        bucket       = bucket_in.sub(/\Ags:\/\//, '').split('/').first.to_s
+        error('400 Bad Request - Provide only the bucket name (no gs:// or path).') if bucket.blank? || bucket != bucket_in
 
         # Enforce GCS maxResults bounds (1..1000)
         page_size = [[(paging['max_results'] || 1000).to_i, 1].max, 1000].min
 
         # Use fields projection for lean response, faster UI
-        res = get("https://storage.googleapis.com/storage/v1/b/#{URI.encode_www_form_component(input['bucket'])}/o")
+        res = get("https://storage.googleapis.com/storage/v1/b/#{URI.encode_www_form_component({bucket})}/o")
               .params(
                 prefix: filters['prefix'],
                 delimiter: filters['delimiter'],
@@ -811,7 +815,10 @@ require 'uri'
           t0 = Time.now
           corr = SecureRandom.uuid
 
-          bucket        = input['bucket']
+          bucket_in    = input['bucket'].to_s
+          # Normalize: strip gs:// and any accidental path suffix.
+          bucket       = bucket_in.sub(/\Ags:\/\//, '').split('/').first.to_s
+          error('400 Bad Request - Provide only the bucket name (no gs:// or path).') if bucket.blank? || bucket != bucket_in
           object_raw    = input['object_name'] || input['object'] # tolerate old field name
           object        = URI.encode_www_form_component(object_raw)
           content_mode  = (input['content_mode'] || 'text').to_s
@@ -984,7 +991,10 @@ require 'uri'
         t0 = Time.now
         corr = SecureRandom.uuid
 
-        bucket  = input['bucket']
+        bucket_in    = input['bucket'].to_s
+        # Normalize: strip gs:// and any accidental path suffix.
+        bucket       = bucket_in.sub(/\Ags:\/\//, '').split('/').first.to_s
+        error('400 Bad Request - Provide only the bucket name (no gs:// or path).') if bucket.blank? || bucket != bucket_in
         name    = input['object_name']
         mode    = input['content_mode']
         strip   = input.dig('postprocess', 'util_strip_urls') ? true : false
@@ -1101,7 +1111,10 @@ require 'uri'
         t0 = Time.now
         corr = SecureRandom.uuid
 
-        bucket       = input['bucket']
+        bucket_in    = input['bucket'].to_s
+        # Normalize: strip gs:// and any accidental path suffix.
+        bucket       = bucket_in.sub(/\Ags:\/\//, '').split('/').first.to_s
+        error('400 Bad Request - Provide only the bucket name (no gs:// or path).') if bucket.blank? || bucket != bucket_in
         prefix       = call(:util_normalize_prefix, input['gcs_prefix'])
         editors_mode = (input['content_mode_for_editors'] || 'text').to_s
         editors_fmt  = input['editors_export_format']
@@ -1208,7 +1221,10 @@ require 'uri'
         t0 = Time.now
         corr = SecureRandom.uuid
 
-        bucket        = input['bucket']
+        bucket_in    = input['bucket'].to_s
+        # Normalize: strip gs:// and any accidental path suffix.
+        bucket       = bucket_in.sub(/\Ags:\/\//, '').split('/').first.to_s
+        error('400 Bad Request - Provide only the bucket name (no gs:// or path).') if bucket.blank? || bucket != bucket_in
         prefix        = call(:util_normalize_prefix, input['gcs_prefix'])
         def_mode      = (input['default_editors_mode'] || 'text').to_s
         def_fmt       = input['default_editors_export_format']
@@ -2073,7 +2089,7 @@ require 'uri'
       # Assemble inputs for GCS PUT
       mode = (config_fields['content_mode'] || 'text').to_s
       base = [
-        { name: 'bucket', optional: false, label: 'Bucket' },
+        { name: 'bucket', optional: false, label: 'Destination bucket', hint: 'Bucket name only (e.g., my-bucket). Do not include gs:// or a path.' },
         { name: 'object_name', optional: false, label: 'Object name' },
         call(:ui_content_mode_field, 'content_modes_write', 'text')
       ]
@@ -2083,7 +2099,7 @@ require 'uri'
       # Assemble inputs for GCS GET
       mode = (config_fields['content_mode'] || 'none').to_s
       base = [
-        { name: 'bucket', optional: false, label: 'Bucket' },
+        { name: 'bucket', optional: false, label: 'Destination bucket', hint: 'Bucket name only (e.g., my-bucket). Do not include gs:// or a path.' },
         { name: 'object_name', optional: false, label: 'Object name' },
         call(:ui_content_mode_field, 'content_modes', 'none')
       ]
@@ -2092,7 +2108,7 @@ require 'uri'
     ui_gcs_list_inputs: lambda do |_config_fields|
       # Assemble inputs for GCS LIST
       [
-        { name: 'bucket', optional: false, label: 'Bucket' },
+        { name: 'bucket', optional: false, label: 'Destination bucket', hint: 'Bucket name only (e.g., my-bucket). Do not include gs:// or a path.' },
         { name: 'filters', type: 'object', optional: true, label: 'Filters',
           properties: [
             { name: 'prefix', optional: true, label: 'Prefix' },
@@ -2155,7 +2171,7 @@ require 'uri'
     ui_transfer_inputs: lambda do |_config_fields|
       # Assemble inputs for Drive -> GCS transfer
       [
-        { name: 'bucket', optional: false, label: 'Destination bucket' },
+        { name: 'bucket', optional: false, label: 'Destination bucket', hint: 'Bucket name only (e.g., my-bucket). Do not include gs:// or a path.' },
         { name: 'gcs_prefix', optional: true, label: 'Destination prefix',
           hint: 'E.g. "ingest/". Drive file name is used for object name.' },
         { name: 'drive_file_ids', type: 'array', of: 'string', optional: false,
@@ -2172,7 +2188,7 @@ require 'uri'
     ui_transfer_batch_inputs: lambda do |_config_fields|
       # Assemble inputs for batch Drive -> GCS transfer
       [
-        { name: 'bucket', optional: false, label: 'Destination bucket' },
+        { name: 'bucket', optional: false, label: 'Destination bucket', hint: 'Bucket name only (e.g., my-bucket). Do not include gs:// or a path.' },
         { name: 'gcs_prefix', optional: true, label: 'Destination prefix' },
         { name: 'default_editors_mode', control_type: 'select', pick_list: 'editors_modes',
           optional: true, default: 'text', label: 'Default Editors handling' },
