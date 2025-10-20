@@ -1,6 +1,10 @@
 # frozen_string_literal: true
 require 'openssl'
 require 'base64'
+require 'json'
+require 'time'
+require 'securerandom'
+
 
 {
   title: 'Vertex AI Adapter',
@@ -70,7 +74,14 @@ require 'base64'
       # Let Workato trigger re-acquire on auth errors
       refresh_on: [401],
       detect_on:  [/UNAUTHENTICATED/i, /invalid[_-]?token/i, /expired/i, /insufficient/i]
-    }
+    },
+  
+    base_uri: lambda do |connection|
+      loc  = (connection['location'].presence || 'global').to_s.downcase
+      host = call(:aipl_service_host, connection, loc) # e.g. aiplatform.googleapis.com or us-central1-aiplatform.googleapis.com
+      "https://#{host}/v1/"
+    end,
+
   },
 
   # --------- CONNECTION TEST ----------------------------------------------
@@ -3168,10 +3179,10 @@ require 'base64'
     },
     permission_probe: {
       title: 'Admin: Permission probe',
-      subtitle: 'Quick IAM/billing/region checks for Vertex & RAG',
+      subtitle: 'Quick IAM/billing/region checks for Vertex, RAG Store & Discovery Engine',
       display_priority: 100,
       help: lambda do |_|
-        { body: 'Runs lightweight calls (locations list, countTokens, indexes list, ragCorpora list) to validate auth, billing (x-goog-user-project), and region setup. Returns per-check status and suggestions.' }
+        { body: 'Runs lightweight calls (locations.list, models.countTokens, indexes.list, ragCorpora.list, optional Discovery Engine engines.list & search) to validate auth, billing, and region. Returns per-check status and suggestions.' }
       end,
 
       input_fields: lambda do |_|
@@ -3792,6 +3803,29 @@ require 'base64'
         "projects/#{connection['project_id']}/locations/#{loc}/publishers/google/models/#{m}"
       end
     end,
+    build_rag_corpus_path: lambda do |connection, corpus|
+      v = corpus.to_s.strip
+      return '' if v.empty?
+      return v.sub(%r{^/v1/}, '') if v.start_with?('projects/')
+      call(:ensure_project_id!, connection)
+      loc = (connection['location'] || '').to_s.downcase
+      error("RAG corpus requires regional location; got '#{loc}'") if loc.blank? || loc == 'global'
+      "projects/#{connection['project_id']}/locations/#{loc}/ragCorpora/#{v}"
+    end,
+    build_rag_file_path: lambda do |connection, rag_file|
+      v = rag_file.to_s.strip
+      return '' if v.empty?
+      return v.sub(%r{^/v1/}, '') if v.start_with?('projects/')
+      # allow short form: {corpus_id}/ragFiles/{file_id}
+      if v.start_with?('ragCorpora/')
+        call(:ensure_project_id!, connection)
+        loc = (connection['location'] || '').to_s.downcase
+        error("RAG file requires regional location; got '#{loc}'") if loc.blank? || loc == 'global'
+        return "projects/#{connection['project_id']}/locations/#{loc}/#{v}"
+      end
+      # otherwise expect full name
+      error('rag_file must be a full resource name like projects/{p}/locations/{l}/ragCorpora/{c}/ragFiles/{id}')
+    end,
 
     # --- Guards, normalization --------------------------------------------
     ensure_project_id!: lambda do |connection|
@@ -3985,6 +4019,17 @@ require 'base64'
       return [] if v.nil? || v == false
       return v  if v.is_a?(Array)
       [v]
+    end,
+    safe_json: lambda do |body|
+      begin
+        case body
+        when String then JSON.parse(body)
+        when Hash, Array then body # already JSON-like
+        else JSON.parse(body.to_s)
+        end
+      rescue
+        nil
+      end
     end,
     safe_integer: lambda do |v|
       return nil if v.nil?; Integer(v) rescue v.to_i
@@ -4307,6 +4352,16 @@ require 'base64'
   # --------- CUSTOM ACTION SUPPORT ----------------------------------------
   custom_action: true,
   custom_action_help: {
-    body: 'Create custom Vertex AI operations using the established connection'
+    body: <<~HELP
+      Use relative Vertex v1 paths; we prefix the correct regional base automatically.
+
+      • Base: https://{location-}aiplatform.googleapis.com/v1/
+      • Enter paths WITHOUT leading "v1/". Examples:
+        - projects/{project}/locations/{location}/indexes
+        - projects/{project}/locations/{location}/publishers/google/models/gemini-2.0-flash:generateContent
+      • Absolute URLs (incl. Discovery Engine) bypass the base.
+
+      Auth and x-goog-user-project are applied from the connection.
+    HELP
   }
 }
