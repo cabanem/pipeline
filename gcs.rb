@@ -574,9 +574,14 @@ require 'uri'
           # Editors branch → export to requested/compat MIME
           if call(:util_is_google_editors_mime?, meta['mimeType'])
             export_mime = call(:util_editors_export_mime, meta['mimeType'], input['editors_export_format'])
+            # Guardrail: text mode must export textual MIME only
+            unless call(:util_is_textual_mime?, export_mime)
+              error("415 Unsupported Media Type - Selected Editors export is binary (#{export_mime}). Choose a textual format.")
+            end
             bytes = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}/export")
                     .params(mimeType: export_mime, supportsAllDrives: true)
-                    .response_format_raw # treat response as new
+                    .headers('Accept-Encoding': 'identity')
+                    .response_format_raw
             raw  = bytes.to_s
             text = call(:util_force_utf8, raw)
             text = call(:util_strip_urls, text) if strip
@@ -588,7 +593,7 @@ require 'uri'
             # Regular file (only allow textual MIME in this case)
             if call(:util_is_textual_mime?, meta['mimeType'])
               bytes = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}")
-                      .params(alt: 'media', supportsAllDrives: true)
+                      .params(alt: 'media', supportsAllDrives: true, acknowledgeAbuse: !!input['acknowledge_abuse'])
                       .headers('Accept-Encoding': 'identity')
                       .response_format_raw
               raw  = bytes.to_s
@@ -603,26 +608,51 @@ require 'uri'
             end
           end
         elsif mode == 'bytes'
-          # Editors cannot be downloaded as bytes; force export via text
           if call(:util_is_google_editors_mime?, meta['mimeType'])
-            error('400 Bad Request - Editors files require content_mode=text (export).')
+            # Export Editors to requested/derived MIME and return bytes (Base64)
+            export_mime = call(:util_editors_export_mime, meta['mimeType'], input['editors_export_format'])
+            bytes = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}/export")
+                    .params(mimeType: export_mime, supportsAllDrives: true)
+                    .headers('Accept-Encoding': 'identity')
+                    .response_format_raw
+            raw = bytes.to_s
+            cs  = call(:util_compute_checksums, raw)
+            result.merge(
+              exported_as: export_mime,
+              content_bytes: Base64.strict_encode64(raw),
+              content_md5: cs['md5'],
+              content_sha256: cs['sha256']
+            ).merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+          else
+            # Regular binary download path
+            bytes = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}")
+                    .params(alt: 'media', supportsAllDrives: true, acknowledgeAbuse: !!input['acknowledge_abuse'])
+                    .headers('Accept-Encoding': 'identity')
+                    .response_format_raw
+            raw = bytes.to_s
+            cs  = call(:util_compute_checksums, raw)
+            result.merge(content_bytes: Base64.strict_encode64(raw), content_md5: cs['md5'], content_sha256: cs['sha256'])
+                  .merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
           end
-          bytes = get("https://www.googleapis.com/drive/v3/files/#{meta['id']}")
-                  .params(alt: 'media', supportsAllDrives: true, acknowledgeAbuse: false)
-                  .response_format_raw
-          raw = bytes.to_s
-          cs  = call(:util_compute_checksums, raw)
-          result.merge(content_bytes: Base64.strict_encode64(raw), content_md5: cs['md5'], content_sha256: cs['sha256'])
-                .merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
         else
           error("400 Bad Request - Unknown content_mode: #{mode}")
         end
       rescue => e
         details = call(:google_error_extract, e)
+        op =
+          if mode == 'bytes' && call(:util_is_google_editors_mime?, (meta && meta['mimeType']))
+            'files.export'
+          elsif mode == 'bytes'
+            'files.get(media)'
+          elsif mode == 'text' && call(:util_is_google_editors_mime?, (meta && meta['mimeType']))
+            'files.export'
+          else
+            'files.get|export'
+          end
         {}.merge(
-          'error' => call(:normalize_error_for_pills, details, 'drive',
-                          (mode == 'bytes' ? 'files.get(media)' : 'files.get|export'))
+          'error' => call(:normalize_error_for_pills, details, 'drive', op)
         ).merge(
+
           call(:telemetry_envelope, t0, corr, false, (details['code'] || 0),
                details['message'] || e.to_s, details)
         )
@@ -1391,10 +1421,36 @@ require 'uri'
     end,
 
     util_is_textual_mime?: lambda do |mime|
-      m = (mime || '').downcase
-      m.start_with?('text/') ||
-      m.include?('charset=') ||
-      %w[application/json application/xml image/svg+xml application/javascript].include?(m)
+      return false if mime.nil? || mime.strip.empty?
+
+      # Strip parameters (e.g., "; charset=utf-8") and normalize
+      bare = mime.split(';', 2).first.to_s.strip.downcase
+
+      type, subtype = bare.split('/', 2)
+      return false if type.nil? || subtype.nil?
+
+      # Fast-path textual families
+      return true if type == 'text'                          # text/*
+      return true if subtype.end_with?('+json')              # application/*+json (RFC 6839)
+      return true if subtype.end_with?('+xml')               # application/*+xml
+      return true if bare == 'application/json'
+      return true if bare == 'application/xml'
+      return true if bare == 'application/xhtml+xml'
+      return true if bare == 'image/svg+xml'                 # SVG is XML/textual
+      return true if bare == 'application/javascript' || bare == 'text/javascript'
+
+      # Common delimited/text formats used in exports
+      return true if bare == 'text/csv' || bare == 'application/csv'
+      return true if bare == 'text/tab-separated-values' || bare == 'text/tsv'
+      return true if bare == 'text/markdown' || bare == 'text/x-markdown'
+      return true if bare == 'text/plain'
+
+      # Other texty-but-not-text/* types you might encounter
+      return true if bare == 'application/rtf'
+      return true if bare == 'text/calendar'
+
+      # Be conservative: do NOT treat as text by default
+      false
     end,
 
     util_is_google_editors_mime?: lambda do |mime|
@@ -2035,17 +2091,19 @@ require 'uri'
         { name: 'file_id_or_url', optional: false, label: 'File ID or URL' },
         call(:ui_content_mode_field, 'content_modes', 'none')
       ]
-      extra =
-        if mode == 'text'
-          [
-            { name: 'editors_export_format', label: 'Editors export format',
-              control_type: 'select', pick_list: 'editors_export_formats', optional: true,
-              hint: 'Only used when the file is a Google Editors type. Default: PDF for Docs, XLSX for Sheets, PDF for Slides, SVG for Drawings.' }
-          ] + call(:ui_read_postprocess_if_text, mode)
-        else
-          []
-        end
-      base + extra
+      editors_picker = [
+        { name: 'editors_export_format', label: 'Editors export format',
+          control_type: 'select', pick_list: 'editors_export_formats', optional: true,
+          hint: 'Used for Google Editors files when exporting (text or bytes).' }
+      ]
+      abuse_opt = [
+        { name: 'acknowledge_abuse', type: 'boolean', control_type: 'checkbox',
+          optional: true, default: false, label: 'Acknowledge abuse for download',
+          hint: 'Only applies to direct download (non-Editors). Enable if Drive requires it.' }
+      ]
+      text_post = call(:ui_read_postprocess_if_text, mode)
+      # Show editors picker for both text and bytes; show postprocess only for text
+      base + (mode == 'none' ? [] : editors_picker) + text_post + abuse_opt
     end,
     ui_drive_list_inputs: lambda do |_config_fields|
       # Assemble inputs for Drive LIST
