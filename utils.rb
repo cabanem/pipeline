@@ -41,6 +41,9 @@ require 'securerandom'
           ["Production", "production"]
         ]},
       # Group: RAG defaults
+      # Tokenization heuristic
+      { name: "chars_per_token", label: "Chars per token (heuristic)", type: "number", control_type: "number", optional: true, sticky: true, default: 4.0,
+        convert_input: "float_conversion", hint: "Average characters per token for your content/model (3.6–4.2 typical in English). Used for chunk sizing." },
       { name: "chunk_size_default",     label: "Default Chunk Size",    control_type: "number",   optional: true,   group: "RAG defaults",
         default: 1000, type: "integer", convert_input: "integer_conversion", hint: "Default token size for text chunks" },
       { name: "chunk_overlap_default",  label: "Default Chunk Overlap", control_type: "number",   optional: true,   group: "RAG defaults",
@@ -487,10 +490,10 @@ require 'securerandom'
               { name: 'size', label: 'File size', type: 'integer', optional: true },
               { name: 'modified_time', label: 'Modified time', type: 'date_time', optional: true } ],
             hint: 'File metadata object containing file_id, file_name, and optional checksum/mime_type' },
-          { name: 'chunk_size',           label: 'Chunk size',          type: 'integer',  optional: true,
+          { name: 'chunk_size',           label: 'Chunk size',          type: 'integer',  optional: true, convert_input: 'integer_conversion',
             default: 1000, convert_input: 'integer_conversion',
             hint: 'Target size for each text chunk in characters (default: 1000)' },
-          { name: 'chunk_overlap',        label: 'Chunk overlap',       type: 'integer',  optional: true,
+          { name: 'chunk_overlap',        label: 'Chunk overlap',       type: 'integer',  optional: true, convert_input: 'integer_conversion',
             default: 100,  convert_input: 'integer_conversion',
             hint: 'Number of characters to overlap between chunks (default: 100)' },
           { name: 'additional_metadata',  label: 'Additional metadata', type: 'object',   optional: true,
@@ -550,14 +553,20 @@ require 'securerandom'
         checksum = file_metadata['checksum'] || 'no_checksum'
         document_id = call('generate_document_id', file_path, checksum)
 
-        # Step 3: Call chunk_text_with_overlap action
+        # Step 3: Chunk (convert chars→tokens using connection heuristic)
+        cpt = (connection['chars_per_token'].to_f > 0) ? connection['chars_per_token'].to_f : 4.0
+        size_tokens    = (chunk_size.to_f    / cpt).ceil
+        overlap_tokens = (chunk_overlap.to_f / cpt).ceil
+        # tiny-doc fast path: no overlap (optional)
+        if document_content.length <= 1000
+          overlap_tokens = 0
+        end
         chunk_input = {
           'text' => document_content,
-          'chunk_size' => chunk_size,
-          'chunk_overlap' => (chunk_overlap / 4.0).ceil  # Convert chars to approximate tokens
+          'chunk_size' => size_tokens,
+          'chunk_overlap' => overlap_tokens
         }
-
-        chunk_result = call('chunk_text_with_overlap', chunk_input)
+        chunk_result = call('chunk_text_with_overlap', chunk_input, connection)
         base_chunks = chunk_result['chunks'] || []
 
         # Step 4: Process each chunk and enhance with metadata
@@ -732,8 +741,8 @@ require 'securerandom'
         documents = input['documents'] || []
         bs_in  = input.key?('batch_size') ? input['batch_size'] : 25
         batch_size = [bs_in.to_i, 100].min                      # clamp to 100
-        default_chunk_size    = (input.fetch('default_chunk_size', 1000)).to_i
-        default_chunk_overlap = (input.fetch('default_chunk_overlap', 100)).to_i
+        default_chunk_size    = (input.fetch('default_chunk_size', 1000)).to_i      # chars
+        default_chunk_overlap = (input.fetch('default_chunk_overlap', 100)).to_i    # chars
 
         return {
           'batches' => [],
@@ -763,14 +772,18 @@ require 'securerandom'
               'chunk_overlap'       => document['chunk_overlap'] || default_chunk_overlap,
               'additional_metadata' => document['additional_metadata']
             }
-
+            cpt = (connection['chars_per_token'].to_f > 0) ? connection['chars_per_token'].to_f : 4.0
             # Process document using the same logic as process_document_for_rag
             document_content    = process_input['document_content'].to_s
             file_metadata       = process_input['file_metadata'] || {}
             d_cs_in = process_input.key?('chunk_size') ? process_input['chunk_size'] : 1000
             d_co_in = process_input.key?('chunk_overlap') ? process_input['chunk_overlap'] : 100
-            chunk_size    = [d_cs_in.to_i, 100].max
-            chunk_overlap = [d_co_in.to_i, 0].max
+            d_cs_chars = [process_input.fetch('chunk_size',  default_chunk_size).to_i, 100].max
+            d_co_chars = [process_input.fetch('chunk_overlap', default_chunk_overlap).to_i, 0].max
+            # tiny-doc fast path
+            d_co_chars = 0 if document_content.length <= 1000
+            size_tokens    = (d_cs_chars.to_f / cpt).ceil
+            overlap_tokens = (d_co_chars.to_f / cpt).ceil
             additional_metadata = process_input['additional_metadata'] || {}
 
             # Validate required fields
@@ -784,11 +797,10 @@ require 'securerandom'
             # Chunk the text
             chunk_input = {
               'text'          => document_content,
-              'chunk_size'    => chunk_size,
-              'chunk_overlap' => (chunk_overlap / 4.0).ceil
+              'chunk_size'    => size_tokens,
+              'chunk_overlap' => overlap_tokens
             }
-
-            chunk_result  = call('chunk_text_with_overlap', chunk_input)
+            chunk_result  = call('chunk_text_with_overlap', chunk_input, connection)
             base_chunks   = chunk_result['chunks'] || []
 
             # Process each chunk
@@ -1755,7 +1767,7 @@ require 'securerandom'
       base
     end,
 
-    chunk_text_with_overlap: lambda do |input|
+    chunk_text_with_overlap: lambda do |input, connection = {}|
       text = input['text'].to_s
       chunk_size = (input['chunk_size'] || 1000).to_i
       overlap    = (input['chunk_overlap'] || 100).to_i
@@ -1765,9 +1777,11 @@ require 'securerandom'
       chunk_size = 1 if chunk_size <= 0
       overlap = [[overlap, 0].max, [chunk_size - 1, 0].max].min
 
-      # rough token->char estimate
-      chars_per_chunk = [chunk_size, 1].max * 4
-      char_overlap    = overlap * 4
+      # token ↔ char estimate using connection heuristic
+      cpt = (connection && connection['chars_per_token']).to_f
+      cpt = 4.0 if cpt <= 0.0
+      chars_per_chunk = ([chunk_size, 1].max * cpt).round
+      char_overlap    = (overlap * cpt).round
 
       chunks = []
       chunk_index = 0
