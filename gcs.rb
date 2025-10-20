@@ -372,9 +372,15 @@ require 'uri'
         if filters['modified_before'].present?
           q << "modifiedTime <= '#{call(:util_to_iso8601_utc, filters['modified_before'])}'"
         end
-        # MIME filters or group. Caller provides exact mimeType vals
-        if filters['mime_types'].present?
-          ors = filters['mime_types'].map { |mt| "mimeType='#{mt}'" }.join(' or ')
+        # MIME filters (accept array or CSV string)
+        mts = case v = filters['mime_types']
+              when Array then v
+              when String then v.to_s.split(/\s*,\s*/)
+              else []
+              end
+        mts = mts.map(&:to_s).map(&:strip).reject(&:empty?).uniq
+        if mts.any?
+          ors = mts.map { |mt| "mimeType='#{mt}'" }.join(' or ')
           q << "(#{ors})"
         end
         # Folder filters - exclude folders when caller declines them (folders have special MIME)
@@ -720,7 +726,7 @@ require 'uri'
         page_size = [[(paging['max_results'] || 1000).to_i, 1].max, 1000].min
 
         # Use fields projection for lean response, faster UI
-        res = get("https://storage.googleapis.com/storage/v1/b/#{URI.encode_www_form_component({bucket})}/o")
+        res = get("https://storage.googleapis.com/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o")
               .params(
                 prefix: filters['prefix'],
                 delimiter: filters['delimiter'],
@@ -1577,6 +1583,20 @@ require 'uri'
       Base64.decode64(b64).unpack1('H*')
     end,
 
+    util_csv_to_array_of_strings: lambda do |val|
+      # Accepts Array, CSV string, nil, or scalar; returns Array<String>
+      case val
+      when Array
+        val.flatten.compact.map(&:to_s).map(&:strip).reject(&:empty?).uniq
+      when String
+        val.to_s.split(/\s*,\s*/).map(&:strip).reject(&:empty?).uniq
+      when nil
+        []
+      else
+        [val.to_s].reject(&:empty?)
+      end
+    end,
+
     util_guess_extension_from_mime: lambda do |mime|
       map = {
         'text/plain' => '.txt',
@@ -2180,8 +2200,11 @@ require 'uri'
           properties: [
             { name: 'modified_after', type: 'date_time', optional: true, label: 'Modified after' },
             { name: 'modified_before', type: 'date_time', optional: true, label: 'Modified before' },
-            { name: 'mime_types', type: 'array', of: 'string', optional: true, label: 'MIME types', control_type: 'multiselect',
-              pick_list: 'drive_mime_types_common', hint: 'Pick one or more. We OR-join these in the query.' },
+            { name: 'mime_types', label: 'MIME types', type: 'array', of: 'string', ontrol_type: 'multiselect',
+              pick_list: 'drive_mime_types_common', delimiter: ',', optional: true, toggle_hint: 'Pick from list',
+              toggle_field: { name: 'mime_types', label: 'MIME types (CSV/text)', type: 'string', control_type: 'plain-text',
+                optional: true, hint: 'Comma-separated MIME types or a mapped list joined by commas' },
+              convert_input: 'util_csv_to_array_of_strings', hint: 'Pick one or more. We OR-join these in the query.' },
             { name: 'exclude_folders', type: 'boolean', control_type: 'checkbox',
               optional: true, default: false, label: 'Exclude folders' } ] },
         { name: 'paging', type: 'object', optional: true, label: 'Paging',
