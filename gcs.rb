@@ -1248,15 +1248,16 @@ require 'uri'
           ctype        = (it['content_type'].presence || def_ct)
           meta         = (it['custom_metadata'].presence || def_meta)
           target_name  = (it['target_object_name'].presence || nil)
-          object_name  = target_name.present? ? "#{prefix}#{target_name}" : nil
+          # Always pass something that includes the prefix:
+          # - If caller provided a target name, combine prefix + target
+          # - Else pass the prefix alone; helper will append the Drive file name
+          base_name    = target_name.present? ? "#{prefix}#{target_name}" : "#{prefix}"
 
           editors_fmt  = (it['editors_export_format'].presence || def_fmt)
           # Single file transfer core (editors/binary branches, RP via userProject)
-          res = call(:transfer_one_drive_to_gcs, connection, file_id, bucket, (object_name || ''), editors_mode, editors_fmt, ctype, meta, abuse)
+          res = call(:transfer_one_drive_to_gcs, connection, file_id, bucket, base_name, editors_mode, editors_fmt, ctype, meta, abuse)
           if res['ok']
-            ok = res['ok']
-            ok[:gcs_object_name] = (object_name.presence || "#{prefix}#{ok[:gcs_object_name]}")
-            uploaded << ok
+            uploaded << res['ok']   # already contains the final GCS name with prefix
           else
             failed << res['error']
             break if stop_on_error
@@ -1905,9 +1906,18 @@ require 'uri'
       # transfer one Drive file to GCS. Returns {:ok=>hash} or {:error=>hash}.
       user_project = connection['user_project']
       begin
-        meta = call(:meta_get_resolve_shortcut, file_id)
+        meta  = call(:meta_get_resolve_shortcut, file_id)
         fname = meta['name'].to_s
-        oname = (object_name.presence || fname)
+        iname = object_name.to_s
+        # If caller passed only a prefix (ends with "/"), append the Drive file name
+        oname =
+          if iname.end_with?('/')
+            "#{iname}#{fname}"
+          elsif iname.empty?
+            fname
+          else
+            iname
+          end
 
         # Editors branch
         if call(:util_is_google_editors_mime?, meta['mimeType'])
@@ -1928,8 +1938,9 @@ require 'uri'
                 .response_format_raw
                 .to_s
           cs = call(:util_compute_checksums, body)
-          # Optional: add extension if missing and caller didn’t provide one
-          if oname.to_s.strip != '' && !oname.include?('.') && (ext = call(:util_guess_extension_from_mime, export_mime))
+          # Optional: add extension if the final basename has none
+          base = oname.split('/').last.to_s
+          if !base.include?('.') && (ext = call(:util_guess_extension_from_mime, export_mime))
             oname = "#{oname}#{ext}"
           end
           created = post("https://www.googleapis.com/upload/storage/v1/b/#{URI.encode_www_form_component(bucket)}/o")
@@ -2200,10 +2211,22 @@ require 'uri'
           properties: [
             { name: 'modified_after', type: 'date_time', optional: true, label: 'Modified after' },
             { name: 'modified_before', type: 'date_time', optional: true, label: 'Modified before' },
-            { name: 'mime_types', label: 'MIME types', type: 'array', of: 'string', ontrol_type: 'multiselect',
-              pick_list: 'drive_mime_types_common', delimiter: ',', optional: true, toggle_hint: 'Pick from list',
-              toggle_field: { name: 'mime_types', label: 'MIME types (CSV/text)', type: 'string', control_type: 'plain-text',
-                optional: true, hint: 'Comma-separated MIME types or a mapped list joined by commas' },
+            { name: 'mime_types', label: 'MIME types',
+              control_type: 'multiselect', 
+              pick_list: 'drive_mime_types_common',
+              delimiter: ',',
+              optional: true, 
+              type: 'string', 
+              toggle_hint: 'Select from the list',
+              toggle_field: {
+                name: 'mime_types',
+                label: 'MIME types',
+                type: 'string',
+                control_type: 'text', 
+                optional: true, 
+                toggle_hint: 'Provide comma-separated MIME types'
+                hint: 'Comma-separated MIME types or a mapped list joined by commas' 
+               },
               convert_input: 'util_csv_to_array_of_strings', hint: 'Pick one or more. We OR-join these in the query.' },
             { name: 'exclude_folders', type: 'boolean', control_type: 'checkbox',
               optional: true, default: false, label: 'Exclude folders' } ] },
