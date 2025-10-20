@@ -722,6 +722,13 @@ require 'json'
             optional: false, control_type: 'text-area' },
         ]
 
+        # Small file handling
+        fields << { name: 'no_chunk_under_chars', type: 'integer', optional: true,
+                    hint: 'If total characters <= this, emit 1 chunk (overlap=0).' }
+        fields << { name: 'no_chunk_under_tokens', type: 'integer', optional: true,
+                    hint: 'If total tokens <= this, emit 1 chunk (overlap=0).' }
+
+
         # Simple metadata block (no JSON in normal path)
         fields << {
           name: 'metadata_kv', type: 'array', of: 'object', optional: true,
@@ -812,8 +819,10 @@ require 'json'
           debug       = call(:safe_bool, input['debug'])
 
           # 1) Normalize/Clean
-          normalized = call(:normalize_newlines, raw)
-          cleaned    = call(:strip_control_chars, normalized)
+          normalized  = call(:normalize_newlines, raw)
+          cleaned     = call(:strip_control_chars, normalized)
+          total_chars = cleaned.length
+          total_toks  = call(:est_tokens, cleaned)
 
           # 2) Bounds via preset/simple mode (config_fields) or manual entries
           preset = (_cfg['preset'] || 'auto').to_s
@@ -834,6 +843,18 @@ require 'json'
             else                 max_chars, overlap = 2000, 200
             end
           end
+
+          # Tiny-doc override: force single chunk if thresholds say so
+          nch = call(:coerce_int_or_nil, input['no_chunk_under_chars'])
+          ntk = call(:coerce_int_or_nil, input['no_chunk_under_tokens'])
+          tiny_by_chars  = (nch && total_chars <= nch)
+          tiny_by_tokens = (ntk && total_toks  <= ntk)
+          if tiny_by_chars || tiny_by_tokens
+            max_chars = [total_chars, 1].max
+            overlap   = 0
+            clamp_note = "Tiny-doc override: total_chars=#{total_chars}, total_tokens=#{total_toks} → 1 chunk."
+          end
+
           # Harmonize with batch behavior: clamp, but surface a debug note.
           clamp_note = nil
           if overlap >= max_chars
@@ -975,6 +996,9 @@ require 'json'
             hint: 'Map your list here. Use “Design item schema” if your list shape is custom.' },
           { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
         ]
+        # Batch-level tiny-doc defaults (items can still pass explicit per-item fields if you add them)
+        .push({ name: 'no_chunk_under_chars', type: 'integer', optional: true })
+        .push({ name: 'no_chunk_under_tokens', type: 'integer', optional: true })
       end,
 
       output_fields: lambda do |object_definitions, _config_fields|
@@ -1017,9 +1041,18 @@ require 'json'
 
           normalized  = call(:normalize_newlines, raw)
           cleaned     = call(:strip_control_chars, normalized)
+          total_chars = cleaned.length
+          total_toks  = call(:est_tokens, cleaned)
           max_chars   = call(:clamp_int, (max_in || 2000), 200, 8000)
           overlap     = call(:clamp_int, (ov_in  || 200),   0,   4000)
           overlap     = [overlap, max_chars - 1].min
+          # Tiny-doc override (batch level)
+          nch = call(:coerce_int_or_nil, input['no_chunk_under_chars'])
+          ntk = call(:coerce_int_or_nil, input['no_chunk_under_tokens'])
+          if (nch && total_chars <= nch) || (ntk && total_toks <= ntk)
+            max_chars = [total_chars, 1].max
+            overlap   = 0
+          end
           checksum    = Digest::SHA256.hexdigest(cleaned)
           doc_id      = call(:generate_document_id, file_path, checksum)
           spans       = call(:chunk_by_chars, cleaned, max_chars, overlap)
