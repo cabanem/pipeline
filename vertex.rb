@@ -7,7 +7,8 @@ require 'securerandom'
 
 
 {
-  title: 'Vertex AI Adapter',
+  title: 'Vertex AI',
+  subtitle: 'Vertex AI',
   version: '0.9.1',
   description: 'Vertex AI via service account (JWT)',
   help: {
@@ -520,6 +521,188 @@ require 'securerandom'
         }
       end
     },
+    email_extract_salient_span: {
+      title: 'Email: Extract salient span',
+      subtitle: 'Pull the most important sentence/paragraph from an email',
+      display_priority: 11,
+      help: lambda do |_|
+        { body: 'Heuristically trims boilerplate/quotes, then asks the model for the single most important span (<= 500 chars), with rationale, tags, and optional call-to-action metadata.' }
+      end,
+
+      retry_on_request: ['GET','HEAD'],
+      retry_on_response: [408,429,500,502,503,504],
+      max_retries: 3,
+
+      input_fields: lambda do |object_definitions, connection, config_fields|
+        [
+          { name: 'subject', optional: true },
+          { name: 'body',    optional: false, hint: 'Raw email body (HTML or plain text). Quoted replies and signatures are pruned automatically.' },
+
+          { name: 'generative_model', label: 'Generative model', control_type: 'text', optional: true, default: 'gemini-2.0-flash' },
+          { name: 'max_span_chars', type: 'integer', optional: true, default: 500, hint: 'Hard cap for the extracted span.' },
+          { name: 'include_entities', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+            hint: 'Try to extract named people/teams/products mentioned in the salient span.' },
+          { name: 'temperature', type: 'number', optional: true, hint: 'Default 0 (deterministic).' },
+
+          # Debug
+          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
+        ]
+      end,
+
+      output_fields: lambda do |object_definitions, connection|
+        [
+          { name: 'salient_span' },
+          { name: 'reason' },
+          { name: 'importance', type: 'number' },
+          { name: 'tags', type: 'array', of: 'string' },
+          { name: 'call_to_action' },
+          { name: 'deadline_iso' },
+          { name: 'entities', type: 'array', of: 'object', properties: [
+              { name: 'type' }, { name: 'text' }
+            ]
+          },
+          { name: 'focus_preview' },   # the pruned text the model actually saw
+          { name: 'responseId' },
+          { name: 'usage', type: 'object', properties: [
+              { name: 'promptTokenCount', type: 'integer' },
+              { name: 'candidatesTokenCount', type: 'integer' },
+              { name: 'totalTokenCount', type: 'integer' }
+            ]
+          },
+          { name: 'ok', type: 'boolean' },
+          { name: 'telemetry', type: 'object', properties: [
+            { name: 'http_status', type: 'integer' },
+            { name: 'message' }, { name: 'duration_ms', type: 'integer' },
+            { name: 'correlation_id' }
+          ]},
+          { name: 'debug', type: 'object' }
+        ]
+      end,
+
+      execute: lambda do |connection, input|
+        t0   = Time.now
+        corr = call(:build_correlation_id)
+        url = nil; req_body = nil
+        begin
+          # 1) Heuristic focus text (strip quotes, signatures, legal footers, tracking junk)
+          subj  = (input['subject'] || '').to_s
+          body  = (input['body']    || '').to_s
+          error('body is required') if body.strip.empty?
+
+          plain = call(:email_minify, subj, body)               # HTML → text, whitespace/emoji control
+          focus = call(:email_focus_trim, plain, 8000)          # keep the meat; drop quoted chains & footers
+
+          # 2) Build schema-constrained prompt
+          max_span = call(:clamp_int, (input['max_span_chars'] || 500), 80, 2000)
+          want_entities = call(:normalize_boolean, input['include_entities'])
+
+          system_text = "You are extracting the single most important sentence or short paragraph from an email. " \
+                        "Return valid JSON only. Keep the extracted span under #{max_span} characters without truncating mid-sentence. " \
+                        "importance is a calibrated score in [0,1]. If there is a clear action requested, set call_to_action; " \
+                        "if there is a clear deadline date/time, return ISO 8601 in deadline_iso; otherwise leave null."
+
+          schema_props = {
+            'salient_span'   => { 'type' => 'string' },
+            'reason'         => { 'type' => 'string' },
+            'importance'     => { 'type' => 'number' },
+            'tags'           => { 'type' => 'array', 'items' => { 'type' => 'string' } },
+            'call_to_action' => { 'type' => 'string' },
+            'deadline_iso'   => { 'type' => 'string' }
+          }
+          if want_entities
+            schema_props['entities'] = {
+              'type'  => 'array',
+              'items' => { 'type' => 'object', 'additionalProperties' => false,
+                'properties' => { 'type' => { 'type' => 'string' }, 'text' => { 'type' => 'string' } },
+                'required'   => ['text']
+              }
+            }
+          end
+
+          gen_cfg = {
+            'temperature'      => (input['temperature'].present? ? call(:safe_float, input['temperature']) : 0),
+            'maxOutputTokens'  => 512,
+            'responseMimeType' => 'application/json',
+            'responseSchema'   => {
+              'type'                 => 'object',
+              'additionalProperties' => false,
+              'properties'           => schema_props,
+              'required'             => ['salient_span','importance']
+            }
+          }
+
+          model = (input['generative_model'].presence || 'gemini-2.0-flash').to_s
+          model_path = call(:build_model_path_with_global_preview, connection, model)
+
+          contents = [
+            { 'role' => 'user', 'parts' => [
+                { 'text' => [
+                    ("Subject: #{subj}".strip unless subj.strip.empty?),
+                    "Email (trimmed):\n#{focus}"
+                  ].compact.join("\n\n")
+                }
+              ]
+            }
+          ]
+
+          payload = {
+            'contents'          => contents,
+            'systemInstruction' => { 'role' => 'system', 'parts' => [ { 'text' => system_text } ] },
+            'generationConfig'  => gen_cfg
+          }
+
+          loc = (connection['location'].presence || 'global').to_s.downcase
+          url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
+          resp = post(url).headers(call(:request_headers, corr)).payload(call(:json_compact, payload))
+
+          text   = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
+          parsed = call(:safe_parse_json, text)
+
+          out = {
+            'salient_span'   => parsed['salient_span'],
+            'reason'         => parsed['reason'],
+            'importance'     => parsed['importance'],
+            'tags'           => parsed['tags'],
+            'call_to_action' => parsed['call_to_action'],
+            'deadline_iso'   => parsed['deadline_iso'],
+            'entities'       => parsed['entities'],
+            'focus_preview'  => focus,
+            'responseId'     => resp['responseId'],
+            'usage'          => resp['usageMetadata']
+          }.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+
+          unless call(:normalize_boolean, connection['prod_mode'])
+            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
+          end
+          out
+        rescue => e
+          g   = call(:extract_google_error, e)
+          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
+          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
+          unless call(:normalize_boolean, connection['prod_mode'])
+            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
+          end
+          out
+        end
+      end,
+
+      sample_output: lambda do
+        {
+          'salient_span'   => 'Can you approve the Q4 budget increase by Friday, October 24?',
+          'reason'         => 'Explicit ask with a concrete deadline that blocks downstream work.',
+          'importance'     => 0.92,
+          'tags'           => ['approval','budget','deadline'],
+          'call_to_action' => 'Approve Q4 budget increase',
+          'deadline_iso'   => '2025-10-24T17:00:00Z',
+          'entities'       => [ { 'type' => 'team', 'text' => 'Finance' } ],
+          'focus_preview'  => 'Subject: Budget approval needed\n\nHi — we need your approval...',
+          'responseId'     => 'resp-xyz',
+          'usage'          => { 'promptTokenCount' => 175, 'candidatesTokenCount' => 96, 'totalTokenCount' => 271 },
+          'ok'             => true,
+          'telemetry'      => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 18, 'correlation_id' => 'sample' }
+        }
+      end
+    },
 
     # 2)  RAG store engine (Vertex AI)
     rag_files_import: {
@@ -651,7 +834,7 @@ require 'securerandom'
         ]
       end,
 
-      output_fields: lambda do |connection, object_definitions|
+      output_fields: lambda do |object_definitions, connection|
         [
           { name: 'question' },
           { name: 'contexts', type: 'array', of: 'object', properties: [
@@ -1094,7 +1277,7 @@ require 'securerandom'
           { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
         ]
       end,
-      output_fields: lambda do |connection, object_definitions|
+      output_fields: lambda do |object_definitions, connection|
         [
           { name: 'items', type: 'array', of: 'object', properties: [
             { name: 'name' }, { name: 'displayName' }, { name: 'sourceUri' },
@@ -1164,7 +1347,7 @@ require 'securerandom'
       input_fields: lambda do |_|
         [ { name: 'rag_file', optional: false, hint: 'Full name: projects/.../ragCorpora/{id}/ragFiles/{fileId}' } ]
       end,
-      output_fields: lambda do |connection, object_definitions|
+      output_fields: lambda do |object_definitions, connection|
         [
           { name: 'name' }, { name: 'displayName' }, { name: 'sourceUri' },
           { name: 'mimeType' }, { name: 'sizeBytes', type: 'integer' },
@@ -2487,11 +2670,11 @@ require 'securerandom'
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
 
-      input_fields: lambda do |connection, config_fields, object_definitions|
+      input_fields: lambda do |object_definitions, connection, config_fields|
         object_definitions['gen_generate_content_input']
       end,
 
-      output_fields: lambda do |connection, object_definitions|
+      output_fields: lambda do |object_definitions, connection|
          Array(object_definitions['generate_content_output']) + Array(object_definitions['envelope_fields'])
       end,
 
@@ -2571,7 +2754,7 @@ require 'securerandom'
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
 
-      input_fields: lambda do |connection, _config_fields, object_definitions|
+      input_fields: lambda do |object_definitions, connection, _config_fields|
         [
           { name: 'contents', type: 'array', of: 'object', properties: object_definitions['content'], optional: false },
           { name: 'model', label: 'Model', optional: false, control_type: 'text' },
@@ -2584,7 +2767,7 @@ require 'securerandom'
         ]
       end,
 
-      output_fields: lambda do |object_definitions|
+      output_fields: lambda do |object_definitions, connection|
         Array(object_definitions['generate_content_output']) + Array(object_definitions['envelope_fields'])
       end,
 
@@ -3089,7 +3272,7 @@ require 'securerandom'
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
 
-      input_fields: lambda do |connection, _config_fields, object_definitions|
+      input_fields: lambda do |object_definitions, connection, config_fields|
         [
           { name: 'model', label: 'Model', optional: false, control_type: 'text' },
           { name: 'contents', type: 'array', of: 'object', properties: object_definitions['content'], optional: false },
@@ -3097,7 +3280,7 @@ require 'securerandom'
         ]
       end,
 
-      output_fields: lambda do |object_definitions|
+      output_fields: lambda do |object_definitions, connection|
         [
           { name: 'totalTokens', type: 'integer' },
           { name: 'totalBillableCharacters', type: 'integer' },
@@ -3566,7 +3749,6 @@ require 'securerandom'
         end
       end
     }
-
 
   },
 
@@ -4479,6 +4661,44 @@ require 'securerandom'
         next nil if parts.empty?
         { 'role' => role, 'parts' => parts }
       end.compact
+    end,
+
+    # Strip HTML → text, collapse whitespace, normalize dashes/quotes a bit
+    email_minify: lambda do |subject, body|
+      txt = body.to_s.dup
+
+      # crude HTML to text (Workato runtime lacks Nokogiri; keep it simple)
+      txt = txt.gsub(/<\/(p|div|br)>/i, "\n")
+              .gsub(/<[^>]+>/, ' ')
+              .gsub(/\r/, '')
+              .gsub(/[ \t]+/, ' ')
+              .gsub(/\n{3,}/, "\n\n")
+              .strip
+
+      # prepend subject if useful for salience
+      if subject.to_s.strip.length > 0
+        "Subject: #{subject.to_s.strip}\n\n#{txt}"
+      else
+        txt
+      end
+    end,
+    # Remove reply chains, signatures, legal footers; keep top-most author content
+    email_focus_trim: lambda do |plain_text, max_chars = 8000|
+      t = plain_text.to_s
+
+      # Remove common quoted-reply sections
+      t = t.split(/\n-{2,}\s*Original Message\s*-{2,}\n/i).first || t
+      t = t.split(/\nOn .* wrote:\n/).first       || t
+      t = t.split(/\nFrom: .*?\nSent: .*?\nTo:/m).first || t
+      t = t.gsub(/(^|\n)>[^\n]*\n?/, "\n")        # strip lines starting with '>'
+
+      # Drop common signature delimiters / legal footers
+      t = t.split(/\n--\s*\n/).first || t
+      t = t.gsub(/\nThis message .*? confidentiality.*$/mi, '') # rough legal footer killer
+
+      t = t.strip
+      # Keep head of the message if extremely long
+      t.length > max_chars ? t[0, max_chars] : t
     end
 
   },
