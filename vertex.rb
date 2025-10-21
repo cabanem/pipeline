@@ -2496,43 +2496,56 @@ require 'securerandom'
       end,
 
       execute: lambda do |connection, input|
-        # Correlation id and duration for logs / analytics
-        t0 = Time.now
+        t0   = Time.now
         corr = call(:build_correlation_id)
 
-        # Compute model path
-        model_path = call(:build_model_path_with_global_preview, connection, input['model'])
-
-        # Build payload
-        contents = call(:sanitize_contents_roles, input['contents'])
-        error('At least one non-system message is required in contents') if contents.blank?
-
-        sys_inst  = call(:system_instruction_from_text, input['system_preamble'])
-        gen_cfg   = call(:sanitize_generation_config, input['generation_config'])
-
-        payload = {
-          'contents'          => contents,
-          'systemInstruction' => sys_inst,
-          'tools'             => input['tools'],
-          'toolConfig'        => input['toolConfig'],
-          'safetySettings'    => input['safetySettings'],
-          'generationConfig'  => gen_cfg
-        }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
-
-        # Call endpoint
-        loc = (connection['location'].presence || 'global').to_s.downcase
-        url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
         begin
+          # Model path and region must agree
+          model_path = call(:build_model_path_with_global_preview, connection, input['model'])
+          loc_from_model = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
+
+          # Build payload (hardened)
+          contents = call(:sanitize_contents!, input['contents'])
+          error('At least one non-system message with non-empty parts is required in contents') if contents.blank?
+
+          sys_inst = call(:system_instruction_from_text, input['system_preamble'])
+
+          gen_cfg  = call(:sanitize_generation_config, input['generation_config'])
+
+          tools    = call(:sanitize_tools!, input['tools'])
+          tool_cfg = call(:safe_obj, input['toolConfig'])
+          safety   = call(:sanitize_safety!, input['safetySettings'])
+
+          payload = {
+            'contents'          => contents,
+            'systemInstruction' => sys_inst,
+            'tools'             => tools,
+            'toolConfig'        => tool_cfg,
+            'safetySettings'    => safety,
+            'generationConfig'  => gen_cfg
+          }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
+
+          url  = call(:aipl_v1_url, connection, loc_from_model, "#{model_path}:generateContent")
           resp = post(url)
                   .headers(call(:request_headers, corr))
                   .payload(call(:json_compact, payload))
+
+          # Guard: empty candidates (safety block or other)
+          cands = call(:safe_array, resp['candidates'])
+          if cands.empty?
+            # Surface a friendlier error but keep telemetry envelope
+            err_msg = (resp.dig('promptFeedback','blockReason') || 'No candidates returned').to_s
+            return {}.merge(call(:telemetry_envelope, t0, corr, false, 200, err_msg))
+          end
+
           code = call(:telemetry_success_code, resp)
           resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+
         rescue => e
-          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
+          g = call(:extract_google_error, e)
+          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
+          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
         end
-
-
       end,
 
       sample_output: lambda do
@@ -4422,7 +4435,52 @@ require 'securerandom'
       else
         obj
       end
+    end,
+    sanitize_hash: lambda do |v|
+      v.is_a?(Hash) ? v : (v.is_a?(String) ? (JSON.parse(v) rescue nil) : nil)
+    end,
+    safe_obj: lambda do |v|
+      call(:sanitize_hash, v)
+    end,
+    safe_array_of_hashes: lambda do |v|
+      arr = call(:safe_array, v)
+      arr.map { |x| call(:sanitize_hash, x) }.compact
+    end,
+    sanitize_tools!: lambda do |raw|
+      a = call(:safe_array_of_hashes, raw)
+      a = a.map do |t|
+        # allow simple shorthands like {"googleSearch":{}} or {"retrieval":{"vertexAiSearch":{"datastore":"..."}}}
+        keep = t.slice('googleSearch', 'retrieval', 'codeExecution', 'functionDeclarations')
+        keep.empty? ? nil : keep
+      end.compact
+      a.empty? ? nil : a
+    end,
+    sanitize_safety!: lambda do |raw|
+      a = call(:safe_array_of_hashes, raw).map do |h|
+        c = h['category'] || h[:category]
+        th = h['threshold'] || h[:threshold]
+        (c && th) ? { 'category' => c.to_s, 'threshold' => th.to_s } : nil
+      end.compact
+      a.empty? ? nil : a
+    end,
+    sanitize_contents!: lambda do |raw|
+      call(:safe_array, raw).map do |c|
+        h = c.is_a?(Hash) ? c.transform_keys(&:to_s) : {}
+        role = (h['role'] || 'user').to_s.downcase
+        next nil if role == 'system' # system handled via systemInstruction
+        error("Invalid role: #{role}") unless %w[user model].include?(role)
+        parts = call(:safe_array, h['parts']).map do |p|
+          ph = p.is_a?(Hash) ? p.transform_keys(&:to_s) : {}
+          # keep any part that has at least something meaningful
+          ph if ph['text'].to_s != '' || ph['inlineData'].is_a?(Hash) || ph['fileData'].is_a?(Hash) ||
+                ph['functionCall'].is_a?(Hash) || ph['functionResponse'].is_a?(Hash) ||
+                ph['executableCode'].is_a?(Hash) || ph['codeExecutionResult'].is_a?(Hash)
+        end.compact
+        next nil if parts.empty?
+        { 'role' => role, 'parts' => parts }
+      end.compact
     end
+
   },
 
   # --------- TRIGGERS -----------------------------------------------------
