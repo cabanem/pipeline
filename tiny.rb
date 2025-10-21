@@ -34,7 +34,7 @@ require 'uri'
     ],
 
     base_uri: lambda do |connection|
-      loc = (connection['location'].presence || 'global').downcase
+      loc = (connection['location'] || 'global').to_s.downcase
       host = if loc == 'global'
                'https://discoveryengine.googleapis.com'
              else
@@ -43,7 +43,6 @@ require 'uri'
              end
       host
     end,
-
 
     authorization: {
       type: 'custom_auth',
@@ -99,7 +98,8 @@ require 'uri'
 
       apply: lambda do |connection|
         headers('Authorization' => "Bearer #{connection['access_token']}")
-        if (qp = connection['quota_project'].to_s.strip).present?
+        qp = (connection['quota_project'] || '').to_s.strip
+        if qp != ''
           headers('x-goog-user-project' => qp)
         end
       end,
@@ -109,9 +109,11 @@ require 'uri'
     },
 
     test: lambda do |connection|
-      # Cheap auth probe: call public discovery doc *with* auth header attached.
-      # If token is bad, Google still returns 401 and triggers refresh_on/detect_on.
-      get('/$discovery/rest').params(version: connection['api_version'] || 'v1')
+      # Always hit the GLOBAL discovery document regardless of regional base_uri.
+      # Using an absolute URL bypasses base_uri so this works for any location.
+      get('https://discoveryengine.googleapis.com/$discovery/rest')
+        .params(version: (connection['api_version'] || 'v1'))
+        .after_error_response(/.*/) { |code, body, _h, msg| error("Auth probe #{code}: #{msg}\n#{body}") }
     end
   },
 
