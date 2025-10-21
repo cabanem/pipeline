@@ -145,10 +145,12 @@ require 'uri'
     answer_request: {
       fields: lambda do |_|
         [
-          { name: 'query', type: 'object', properties: [
-              { name: 'text', label: 'Query text' }
+          { name: 'query', type: 'object', display_priority: 10, properties: [
+              { name: 'text', label: 'Query text', hint: 'Required. The natural-language question.',
+                sticky: true, display_priority: 1 }
             ], optional: false },
-          { name: 'userPseudoId', optional: false },
+          { name: 'userPseudoId', label: 'User pseudo ID', hint: 'Stable, non-PII, ≤128 chars.',
+            sticky: true, display_priority: 11, optional: false },
           { name: 'session' },
           { name: 'relatedQuestionsSpec',   type: 'object', properties: [] },
           { name: 'safetySpec',             type: 'object', properties: [] },
@@ -206,16 +208,32 @@ require 'uri'
       title: 'servingConfigs:answer',
       subtitle: 'Answer over an Engine serving config',
       description: 'POST .../servingConfigs/*:answer',
-      help: 'Required: query.query (string) and userPseudoId (string).',
+      help: 'Required: query.text (string) and userPseudoId (string). Simple mode shows only the essentials; Advanced mode reveals optional specs as raw objects with templates and validation.',
 
       input_fields: lambda do |object_definitions, connection|
-        [
-          { name: 'project_id', optional: false },
-          { name: 'location', optional: false, default: (connection['location'] || 'global') },
-          { name: 'collection_id', optional: false, default: 'default_collection' },
-          { name: 'engine_id', optional: false },
-          { name: 'serving_config_id', optional: false, default: 'default_serving_config' }
-        ] + object_definitions['answer_request']
+        base = [
+          { name: 'project_id', optional: false, sticky: true, display_priority: 1, hint: 'GCP Project ID (not number).' },
+          { name: 'location', optional: false, default: (connection['location'] || 'global'), hint: 'Discovery Engine location (e.g., global, us, eu).', sticky: true, display_priority: 2 },
+          { name: 'collection_id', optional: false, default: 'default_collection', sticky: true, display_priority: 3 },
+          { name: 'engine_id', optional: false, sticky: true, display_priority: 4 },
+          { name: 'serving_config_id', optional: false, default: 'default_serving_config', sticky: true, display_priority: 5,
+            hint: 'Usually default_serving_config unless you created a custom one.' },
+          # UX toggle
+          { name: 'simple_mode', label: 'Simple mode', type: 'boolean', control_type: 'checkbox',
+            default: true, sticky: true, display_priority: 6,
+            hint: 'Checked: only the essentials. Uncheck to show all advanced spec objects.' },
+          # Simple-mode flats (we’ll map these into the proper body in execute)
+          { name: 'query_text', label: 'Question', optional: false, display_condition: "simple_mode",
+            hint: 'Plain text question. Will be sent as query.text.' , display_priority: 7 },
+          { name: 'user_pseudo_id', label: 'User pseudo ID', optional: false, display_condition: "simple_mode",
+            hint: 'Stable, opaque, non-PII. ≤128 chars. Used for sessioning/metrics.', display_priority: 8 },
+          # Visual cue: show the fully-resolved REST path
+          { name: 'path_preview', label: 'Request path (preview)', optional: true, sticky: true,
+            hint: 'Read-only preview of the target REST path', control_type: 'text',
+            render_input: 'false', parse_output: 'false', display_priority: 50 }
+        ]
+        # Advanced fields appear only when simple_mode is false
+        base + object_definitions['answer_request'].map { |f| f.merge(display_condition: "!simple_mode") }
       end,
       output_fields: lambda do |object_definitions|
         object_definitions['answer_response']
@@ -226,13 +244,51 @@ require 'uri'
               "/collections/#{input['collection_id']}/engines/#{input['engine_id']}" \
               "/servingConfigs/#{input['serving_config_id']}:answer"
 
+        # Update the preview field for visibility in UI (best-effort; doesn’t affect request)
+        input['path_preview'] = path
+
+        # ---- Validation (fail fast with helpful messages)
+        if input['simple_mode']
+          qt = (input['query_text'] || '').to_s.strip
+          up = (input['user_pseudo_id'] || '').to_s
+          raise 'Question is required (query_text).' if qt.empty?
+          raise 'user_pseudo_id is required.' if up.empty?
+          raise 'user_pseudo_id must be ≤ 128 characters.' if up.length > 128
+        else
+          # Advanced path: require query.text and userPseudoId
+          qobj = input['query'] || {}
+          qtxt = (qobj['text'] || '').to_s.strip
+          up   = (input['userPseudoId'] || '').to_s
+          raise 'query.text is required.' if qtxt.empty?
+          raise 'userPseudoId is required.' if up.empty?
+          raise 'userPseudoId must be ≤ 128 characters.' if up.length > 128
+        end
         body = input.reject { |k,_|
-          %w[project_id location collection_id engine_id serving_config_id].include?(k)
+          %w[project_id location collection_id engine_id serving_config_id simple_mode path_preview
+            query_text user_pseudo_id].include?(k)
         }
+
+        # Map simple-mode flats into canonical structure when present
+        if input['simple_mode']
+          body['query']        = { 'text' => input['query_text'] }
+          body['userPseudoId'] = input['user_pseudo_id']
+        end
         body.delete_if { |_k, v| v.nil? }
 
         post(path).payload(body).after_error_response(/.*/) do |code, body_txt, _h, msg|
-          error("Discovery Engine answer error #{code}: #{msg}\n#{body_txt}")
+          # Normalize common 4xx into actionable hints
+          friendly =
+            if code.to_i == 400 && body_txt.to_s.include?('Unknown name "query"')
+              'Body must use query.text (not query.query).'
+            elsif code.to_i == 400 && body_txt.to_s.include?('userPseudoId')
+              'userPseudoId is required and must be ≤ 128 chars.'
+            else
+              nil
+            end
+          err = "Discovery Engine answer error #{code}: #{msg}"
+          err += " — #{friendly}" if friendly
+          err += "\n#{body_txt}"
+          error(err)
         end
       end,
       sample_output: lambda do
