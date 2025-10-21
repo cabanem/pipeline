@@ -315,7 +315,12 @@ require 'uri'
       input_fields: lambda do |_|
         [
           { name: 'method', control_type: 'select', pick_list: 'http_methods', optional: false, default: 'GET' },
-          { name: 'path', optional: false, hint: 'e.g. /v1/projects/.../something' },
+          # Let the user choose a method name from the Discovery doc; we’ll map it to path/verb below
+          { name: 'method_name', label: 'Discovery method name', control_type: 'select', pick_list: 'de_method_names',
+            optional: true, hint: 'Ex: projects.locations.collections.engines.servingConfigs.search' },
+          # Manual override still supported
+          { name: 'path', optional: true, hint: 'e.g. /v1/projects/.../something (overrides method_name)' },
+
           { name: 'query', type: 'object', properties: [], hint: 'Optional query params' },
           { name: 'body',  type: 'object', properties: [], hint: 'Optional JSON body for POST/PATCH' }
         ]
@@ -325,24 +330,35 @@ require 'uri'
         [{ name: 'raw', type: 'object', properties: [] }]
       end,
 
-      execute: lambda do |_connection, input|
-        # Pull doc & flatten methods
-        doc = call(:discovery_get_rest_doc, input['api'], input['version'])
-        methods = call(:discovery_flatten_rest_methods, doc)
-        # Find the selected method
-        target = methods.find { |m| (m['name'] || '') == (input['method_name'] || '') }
-        error("Unknown method #{input['method_name']} for #{input['api']}:#{input['version']}") unless target
-        http_method = (target['httpMethod'] || 'GET').upcase
-        path = "/#{input['version']}#{target['path']}" # discovery doc paths omit leading version
-        req = case http_method
-              when 'GET'    then get(path).params(input['params'] || {})
-              when 'DELETE' then delete(path).params(input['params'] || {})
-              when 'POST'   then post(path).payload(input['body'] || {}).params(input['params'] || {})
-              when 'PATCH'  then patch(path).payload(input['body'] || {}).params(input['params'] || {})
-              when 'PUT'    then put(path).payload(input['body'] || {}).params(input['params'] || {})
-              else error("Unsupported method #{http_method}")
-              end
-        req.after_error_response(/.*/) { |code, body, _h, msg| error("Raw call #{code}: #{msg}\n#{body}") }
+      execute: lambda do |connection, input|
+        meth = input['method'].to_s.upcase
+        path = (input['path'] || '').to_s
+
+        if path == '' && (mn = (input['method_name'] || '').to_s) != ''
+          # Resolve method_name -> (httpMethod, path) via Discovery doc
+          api = 'discoveryengine'
+          ver = (connection['api_version'] || 'v1').to_s
+          doc = call(:discovery_get_rest_doc, api, ver)
+          methods = call(:discovery_flatten_rest_methods, doc)
+          target = methods.find { |m| (m['name'] || '') == mn }
+          error("Unknown method_name #{mn} for #{api}:#{ver}") unless target
+          # Prefer the verb from the doc; caller’s "method" remains a manual override if they set it explicitly
+          meth = (target['httpMethod'] || meth || 'GET').to_s.upcase
+          path = "/#{ver}#{(target['path'] || '').to_s.sub(/\A\//, '')}"
+        end
+
+        error('Path must start with /v1 or /v1alpha') unless path.start_with?('/v1')
+        request = case meth
+                  when 'GET'    then get(path).params(input['query'] || {})
+                  when 'DELETE' then delete(path).params(input['query'] || {})
+                  when 'POST'   then post(path).payload(input['body'] || {}).params(input['query'] || {})
+                  when 'PATCH'  then patch(path).payload(input['body'] || {}).params(input['query'] || {})
+                  when 'PUT'    then put(path).payload(input['body'] || {}).params(input['query'] || {})
+                  else error("Unsupported method #{meth}")
+                  end
+        request.after_error_response(/.*/) do |code, body, _headers, message|
+          error("Discovery Engine raw error #{code}: #{message}\n#{body}")
+        end
       end,
 
       sample_output: lambda do
@@ -372,7 +388,31 @@ require 'uri'
         # Safe fallback if directory is unreachable
         [['v1', 'v1'], ['v1alpha', 'v1alpha']]
       end
-    end
+    end,
+
+    # Live list of Discovery Engine REST methods from the Google Discovery doc
+    de_method_names: lambda do |connection|
+      api  = 'discoveryengine'
+      ver  = (connection['api_version'] || 'v1').to_s
+      begin
+        doc     = call(:discovery_get_rest_doc, api, ver)
+        methods = call(:discovery_flatten_rest_methods, doc)
+        # Return [["projects.locations...servingConfigs.search", same], ...]
+        out = methods.map { |m| name = (m['name'] || '').to_s; [name, name] }
+        out = out.sort_by { |a| a[0] }
+        # Fallback if empty
+        out.empty? ? [['projects.locations.collections.engines.servingConfigs.search',
+                       'projects.locations.collections.engines.servingConfigs.search']] : out
+      rescue => e
+        # Safe static fallback if Discovery Directory is unreachable
+        [
+          ['projects.locations.collections.engines.servingConfigs.search',
+           'projects.locations.collections.engines.servingConfigs.search'],
+          ['projects.locations.collections.engines.servingConfigs.answer',
+           'projects.locations.collections.engines.servingConfigs.answer']
+        ]
+      end
+    end,
 
   },
 
