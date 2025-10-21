@@ -351,22 +351,25 @@ require 'securerandom'
               { name: 'examples',  type: 'array', of: 'string' }
             ],
             hint: 'At least 2. You can also pass simple strings (names only).' },
-
           { name: 'embedding_model', label: 'Embedding model', control_type: 'text', optional: true,
             default: 'text-embedding-005', },
-
           { name: 'generative_model', label: 'Generative model', control_type: 'text', optional: true },
-
           { name: 'min_confidence', type: 'number', optional: true, default: 0.25,
             hint: '0–1. If top score falls below this, fallback is used.' },
-
           { name: 'fallback_category', optional: true, default: 'Other' },
-
           { name: 'top_k', type: 'integer', optional: true, default: 3,
             hint: 'In hybrid mode, pass top-K candidates to the LLM referee.' },
-
           { name: 'return_explanation', type: 'boolean', optional: true, default: false,
-            hint: 'If true and a generative model is provided, returns a short reasoning + distribution.' }
+            hint: 'If true and a generative model is provided, returns a short reasoning + distribution.' },
+          # Salience fields
+          { name: 'use_salience', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+            hint: 'If enabled, classify based on a short salient span (better signal on long threads).' },
+          { name: 'salience_model', control_type: 'text', optional: true, default: 'gemini-2.0-flash',
+            hint: 'Model used to extract the salient span.' },
+          { name: 'salience_max_span_chars', type: 'integer', optional: true, default: 500 },
+          { name: 'salience_temperature', type: 'number', optional: true, hint: 'Default 0' },
+          { name: 'confidence_blend', type: 'number', optional: true, default: 0.15,
+            hint: 'How much to blend salience importance into the final confidence (0–0.5 typical).' },
         ]
       end,
 
@@ -382,23 +385,39 @@ require 'securerandom'
           { name: 'referee', type: 'object', properties: [
               { name: 'category' }, { name: 'confidence', type: 'number' }, { name: 'reasoning' },
               { name: 'distribution', type: 'array', of: 'object', properties: [
-                  { name: 'category' }, { name: 'prob', type: 'number' }
-                ]
-              }
-            ]
-          }
+                  { name: 'category' }, { name: 'prob', type: 'number' } ] }
+            ]},
+          { name: 'preproc', type: 'object', properties: [
+              { name: 'focus_preview' },
+              { name: 'salient_span' },
+              { name: 'reason' },
+              { name: 'importance', type: 'number' }]},
         ] + Array(object_definitions['envelope_fields'])
       end,
 
       execute: lambda do |connection, input|
-        # Build correlation ID, now (for traceability)
         t0   = Time.now
         corr = call(:build_correlation_id)
         begin
           subj = (input['subject'] || '').to_s.strip
           body = (input['body']    || '').to_s.strip
-          email_text = call(:build_email_text, subj, body)
-          error('Provide subject and/or body') if email_text.blank?
+          error('Provide subject and/or body') if subj.empty? && body.empty?
+
+          use_sal = call(:normalize_boolean, input['use_salience'])
+          preproc = nil
+          if use_sal
+            preproc = call(:extract_salient_span!, connection, subj, body,
+                          (input['salience_model'].presence || 'gemini-2.0-flash'),
+                          (input['salience_max_span_chars'].presence || 500).to_i,
+                          (input['salience_temperature'].presence || 0))
+          end
+
+          email_text =
+            if use_sal && preproc && preproc['salient_span'].to_s.strip.length > 0
+              preproc['salient_span'].to_s
+            else
+              call(:build_email_text, subj, body)
+            end
 
           # Normalize categories
           raw_cats = input['categories']
@@ -416,7 +435,8 @@ require 'securerandom'
           mode      = (input['mode'] || 'embedding').to_s.downcase
           min_conf  = (input['min_confidence'].presence || 0.25).to_f
 
-          # Embedding/hybrid
+          result = nil
+
           if %w[embedding hybrid].include?(mode)
             emb_model      = (input['embedding_model'].presence || 'text-embedding-005')
             emb_model_path = call(:build_embedding_model_path, connection, emb_model)
@@ -464,10 +484,7 @@ require 'securerandom'
               if result['confidence'].to_f < min_conf && input['fallback_category'].present?
                 result['chosen'] = input['fallback_category']
               end
-
             end
-
-            result.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
 
           elsif mode == 'generative'
             error('generative_model is required when mode=generative') if input['generative_model'].blank?
@@ -479,18 +496,27 @@ require 'securerandom'
                 referee['category']
               end
 
-            result = { 
-              'mode' => mode,
-              'chosen' => chosen,
+            result = {
+              'mode'       => mode,
+              'chosen'     => chosen,
               'confidence' => referee['confidence'],
-              'referee' => referee 
+              'referee'    => referee
             }
-
-            result.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
 
           else
             error("Unknown mode: #{mode}")
           end
+
+          # --- post-processing / salience blend & attachments ---
+          if preproc && preproc['importance']
+            blend = [[(input['confidence_blend'] || 0.15).to_f, 0.0].max, 0.5].min
+            result['confidence'] = [[result['confidence'].to_f + blend * (preproc['importance'].to_f - 0.5), 0.0].max, 1.0].min
+          end
+          result['preproc'] = preproc if preproc
+
+          # Attach telemetry and RETURN the hash
+          result = result.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+          result
         rescue => e
           {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
         end
@@ -4699,6 +4725,55 @@ require 'securerandom'
       t = t.strip
       # Keep head of the message if extremely long
       t.length > max_chars ? t[0, max_chars] : t
+    end,
+    extract_salient_span!: lambda do |connection, subject, body, model='gemini-2.0-flash', max_span=500, temperature=0|
+      plain = call(:email_minify, subject, body)
+      focus = call(:email_focus_trim, plain, 8000)
+
+      system_text = "Extract the single most important sentence or short paragraph from an email. " \
+                    "Return valid JSON only. Keep the extracted span under #{max_span} characters. " \
+                    "importance is a calibrated score in [0,1]."
+
+      gen_cfg = {
+        'temperature'      => temperature.to_f,
+        'maxOutputTokens'  => 512,
+        'responseMimeType' => 'application/json',
+        'responseSchema'   => {
+          'type' => 'object', 'additionalProperties' => false,
+          'properties' => {
+            'salient_span' => { 'type' => 'string' },
+            'reason'       => { 'type' => 'string' },
+            'importance'   => { 'type' => 'number' }
+          },
+          'required' => ['salient_span','importance']
+        }
+      }
+
+      model_path = call(:build_model_path_with_global_preview, connection, model)
+      contents = [
+        { 'role' => 'user', 'parts' => [ { 'text' =>
+          [
+            (subject.to_s.strip.empty? ? nil : "Subject: #{subject.to_s.strip}"),
+            "Email (trimmed):\n#{focus}"
+          ].compact.join("\n\n")
+        } ] }
+      ]
+      loc = (connection['location'].presence || 'global').to_s.downcase
+      url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
+      resp = post(url).headers(call(:request_headers, call(:build_correlation_id))).payload({
+        'contents' => contents,
+        'systemInstruction' => { 'role' => 'system', 'parts' => [ { 'text' => system_text } ] },
+        'generationConfig'  => gen_cfg
+      })
+
+      text   = resp.dig('candidates',0,'content','parts',0,'text').to_s
+      parsed = call(:safe_parse_json, text)
+      {
+        'focus_preview' => focus,
+        'salient_span'  => parsed['salient_span'].to_s,
+        'reason'        => parsed['reason'],
+        'importance'    => parsed['importance'].to_f
+      }
     end
 
   },
