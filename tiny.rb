@@ -14,82 +14,98 @@ require 'uri'
   # --------- CONNECTION ---------------------------------------------------
   connection: {
     fields: [
-      { name: 'service_account_key_json', label: 'Service account JSON key',
-        control_type: 'text-area', optional: false,
-        hint: 'Paste the full JSON from Google Cloud (includes client_email, private_key, token_uri).' },
-
-      { name: 'quota_project', label: 'Quota/Billing project (optional)',
-        optional: true, hint: 'Sets x-goog-user-project if needed for billing/quota.' },
-
-      { name: 'location', optional: true, default: 'global',
-        hint: 'Usually global for Vertex AI Search.' },
-
-      { name: 'api_version', control_type: 'select', pick_list: 'api_versions',
-        optional: false, default: 'v1',
-        hint: 'Use v1 for GA. Use v1alpha if your feature is only in preview.' },
-
-      { name: 'scope', optional: true,
+      {
+        name: 'service_account_key_json',
+        label: 'Service account JSON key',
+        control_type: 'text-area',
+        optional: false,
+        hint: 'Paste full key JSON (client_email, private_key, token_uri).'
+      },
+      {
+        name: 'quota_project',
+        label: 'Quota/Billing project (optional)',
+        optional: true,
+        hint: 'Sets x-goog-user-project if needed.'
+      },
+      {
+        name: 'location',
+        label: 'Location',
+        optional: true,
+        hint: 'global or a region like us; affects base URI',
+        default: 'global'
+      },
+      {
+        name: 'api_version',
+        label: 'API version',
+        control_type: 'select',
+        optional: false,
+        default: 'v1',
+        options: [
+          %w[v1 v1],
+          %w[v1alpha v1alpha]
+        ]
+      },
+      {
+        name: 'scope',
+        label: 'OAuth scope',
+        optional: true,
         default: 'https://www.googleapis.com/auth/cloud-platform',
-        hint: 'Leave as cloud-platform unless you need narrower scopes.' }
+        hint: 'Keep cloud-platform unless you need narrower.'
+      }
     ],
 
     base_uri: lambda do |connection|
-      loc = (connection['location'] || 'global').to_s.downcase
-      host = if loc == 'global'
-               'https://discoveryengine.googleapis.com'
-             else
-               # Regional vanity host, e.g. us-discoveryengine.googleapis.com
-               "https://#{loc}-discoveryengine.googleapis.com"
-             end
-      host
+      loc = (connection['location'] || 'global').to_s.strip.downcase
+      if loc == '' || loc == 'global'
+        'https://discoveryengine.googleapis.com'
+      else
+        "https://#{loc}-discoveryengine.googleapis.com"
+      end
     end,
 
     authorization: {
       type: 'custom_auth',
 
       acquire: lambda do |connection|
-        # --- 1) Build a signed JWT assertion ---
-        key = JSON.parse(connection['service_account_key_json'] || '{}')
-        raise 'Missing client_email/private_key in service_account_key_json' \
-          unless key['client_email'] && key['private_key']
+        key_json = (connection['service_account_key_json'] || '').strip
+        raise 'Missing service_account_key_json' if key_json == ''
 
-        now   = Time.now.to_i
-        iat   = now
-        exp   = now + 3600
-        iss   = key['client_email']
-        aud   = 'https://oauth2.googleapis.com/token'   # IMPORTANT: token endpoint
-        scope = (connection['scope'] || 'https://www.googleapis.com/auth/cloud-platform')
+        key = JSON.parse(key_json)
+        client_email = (key['client_email'] || '').strip
+        private_key  = (key['private_key']  || '').strip
+        raise 'Key JSON missing client_email' if client_email == ''
+        raise 'Key JSON missing private_key'  if private_key  == ''
 
-        header = { alg: 'RS256', typ: 'JWT' }
-        claim  = {
-          iss: iss,
-          scope: scope,
-          aud: aud,
-          iat: iat,
-          exp: exp
+        now = Time.now.to_i
+        claim = {
+          iss: client_email,
+          scope: (connection['scope'] || 'https://www.googleapis.com/auth/cloud-platform'),
+          aud: 'https://oauth2.googleapis.com/token',
+          iat: now,
+          exp: now + 3600
         }
 
-        def urlsafe_b64(data)
-          Base64.urlsafe_encode64(data).gsub('=', '')
-        end
+        header = { alg: 'RS256', typ: 'JWT' }
+        enc = lambda { |obj| Base64.urlsafe_encode64(obj.to_json).gsub('=', '') }
+        signing_input = "#{enc.call(header)}.#{enc.call(claim)}"
 
-        signing_input = [urlsafe_b64(header.to_json), urlsafe_b64(claim.to_json)].join('.')
-        rsa = OpenSSL::PKey::RSA.new(key['private_key'])
+        rsa = OpenSSL::PKey::RSA.new(private_key)
         signature = rsa.sign(OpenSSL::Digest::SHA256.new, signing_input)
-        assertion = [signing_input, urlsafe_b64(signature)].join('.')
+        assertion = "#{signing_input}.#{Base64.urlsafe_encode64(signature).gsub('=', '')}"
 
-        # --- 2) Exchange for an access token ---
         token_resp = post('https://oauth2.googleapis.com/token')
-                       .request_format_www_form_urlencoded
-                       .payload(
-                         grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-                         assertion: assertion
-                       ).after_error_response(/.*/) do |code, body, headers, message|
-                         error("#{code} acquiring token: #{message}\n#{body}")
-                       end
+                      .request_format_www_form_urlencoded
+                      .payload(
+                        grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+                        assertion: assertion
+                      )
+                      .after_error_response(/.*/) { |code, body, _h, msg| error("Token error #{code}: #{msg}\n#{body}") }
 
-        access_token = token_resp['access_token']
+        access_token = (token_resp['access_token'] || '').to_s
         expires_in   = (token_resp['expires_in'] || 3600).to_i
+        raise 'No access_token in token response' if access_token == ''
+
+        # Workato expects these keys for custom_auth
         {
           access_token: access_token,
           expires_at: (Time.now + expires_in - 60).utc.strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -99,23 +115,21 @@ require 'uri'
       apply: lambda do |connection|
         headers('Authorization' => "Bearer #{connection['access_token']}")
         qp = (connection['quota_project'] || '').to_s.strip
-        if qp != ''
-          headers('x-goog-user-project' => qp)
-        end
+        headers('x-goog-user-project' => qp) unless qp == ''
       end,
 
       refresh_on: [401],
       detect_on:  [401]
-    },
-
-    test: lambda do |connection|
-      # Always hit the GLOBAL discovery document regardless of regional base_uri.
-      # Using an absolute URL bypasses base_uri so this works for any location.
-      get('https://discoveryengine.googleapis.com/$discovery/rest')
-        .params(version: (connection['api_version'] || 'v1'))
-        .after_error_response(/.*/) { |code, body, _h, msg| error("Auth probe #{code}: #{msg}\n#{body}") }
-    end
+    }
   },
+
+  test: lambda do |connection|
+    ver = (connection['api_version'] || 'v1').to_s
+    get('https://discoveryengine.googleapis.com/$discovery/rest')
+      .params(version: ver)
+      .after_error_response(/.*/) { |code, body, _h, msg| error("Auth probe #{code}: #{msg}\n#{body}") }
+  end,
+
 
   # --------- OBJECT DEFINITIONS -------------------------------------------
   object_definitions: {
