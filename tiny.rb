@@ -178,7 +178,7 @@ require 'uri'
     search_request: {
       fields: lambda do |_|
         [
-          { name: 'query' },
+          { name: 'query', type: 'string', hint: 'Plain string search query.' },
           { name: 'pageSize',   type: 'integer' },
           { name: 'pageToken' },
           { name: 'userPseudoId' },
@@ -227,10 +227,6 @@ require 'uri'
             hint: 'Plain text question. Will be sent as query.text.' , display_priority: 7 },
           { name: 'user_pseudo_id', label: 'User pseudo ID', optional: false, display_condition: "simple_mode",
             hint: 'Stable, opaque, non-PII. ≤128 chars. Used for sessioning/metrics.', display_priority: 8 },
-          # Visual cue: show the fully-resolved REST path
-          { name: 'path_preview', label: 'Request path (preview)', optional: true, sticky: true,
-            hint: 'Read-only preview of the target REST path', control_type: 'text',
-            render_input: 'false', parse_output: 'false', display_priority: 50 }
         ]
         # Advanced fields appear only when simple_mode is false
         base + object_definitions['answer_request'].map { |f| f.merge(display_condition: "!simple_mode") }
@@ -248,24 +244,29 @@ require 'uri'
         input['path_preview'] = path
 
         # ---- Validation (fail fast with helpful messages)
+        # Path param guards (fail fast with actionable errors)
+        %w[project_id location collection_id engine_id serving_config_id].each do |reqk|
+          error("#{reqk} is required.") if (input[reqk] || '').to_s.strip.empty?
+        end
+
         if input['simple_mode']
           qt = (input['query_text'] || '').to_s.strip
           up = (input['user_pseudo_id'] || '').to_s
-          raise 'Question is required (query_text).' if qt.empty?
-          raise 'user_pseudo_id is required.' if up.empty?
-          raise 'user_pseudo_id must be ≤ 128 characters.' if up.length > 128
+          error('Question is required (query_text).') if qt.empty?
+          error('user_pseudo_id is required.') if up.empty?
+          error('user_pseudo_id must be ≤ 128 characters.') if up.length > 128
         else
           # Advanced path: require query.text and userPseudoId
           qobj = input['query'] || {}
           qtxt = (qobj['text'] || '').to_s.strip
           up   = (input['userPseudoId'] || '').to_s
-          raise 'query.text is required.' if qtxt.empty?
-          raise 'userPseudoId is required.' if up.empty?
-          raise 'userPseudoId must be ≤ 128 characters.' if up.length > 128
+          error('query.text is required.') if qtxt.empty?
+          error('userPseudoId is required.') if up.empty?
+          error('userPseudoId must be ≤ 128 characters.') if up.length > 128
         end
         body = input.reject { |k,_|
-          %w[project_id location collection_id engine_id serving_config_id simple_mode path_preview
-            query_text user_pseudo_id].include?(k)
+          %w[project_id location collection_id engine_id serving_config_id simple_mode
+             query_text user_pseudo_id].include?(k)
         }
 
         # Map simple-mode flats into canonical structure when present
@@ -364,8 +365,12 @@ require 'uri'
       end,
 
       execute: lambda do |connection, input|
-        meth = input['method'].to_s.upcase
-        path = (input['path'] || '').to_s
+          meth = (target['httpMethod'] || meth || 'GET').to_s.upcase
+          # Discovery 'path' already includes the version prefix (e.g., "v1/projects/...").
+          # Just ensure it starts with a single leading slash.
+          tpath = (target['path'] || '').to_s
+          tpath = tpath.start_with?('/') ? tpath : "/#{tpath}"
+          path  = tpath
 
         if path == '' && (mn = (input['method_name'] || '').to_s) != ''
           # Resolve method_name -> (httpMethod, path) via Discovery doc
