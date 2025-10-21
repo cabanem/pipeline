@@ -3411,7 +3411,8 @@ require 'securerandom'
         if input['check_discovery_engines_list'] == true
           run_probe.call('discovery.engines.list') do
             parent = "projects/#{project}/locations/#{de_loc}/collections/#{de_coll}"
-            url    = call(:discovery_url, connection, de_loc, "#{parent}/engines")
+            host_override = (input['discovery_host_custom'].presence || input['discovery_host'].presence)
+            url = call(:discovery_url, connection, de_loc, "#{parent}/engines", nil, host_override)
             resp   = get(url).params(pageSize: 1).headers(call(:request_headers, corr))
             [url, call(:telemetry_success_code, resp), 'OK',
              call(:debug_pack, do_debug, [url, {pageSize:1}].compact.join('?'), nil, resp&.body)]
@@ -3433,7 +3434,8 @@ require 'securerandom'
                 "projects/#{project}/locations/#{de_loc}/collections/#{de_coll}/engines/#{engine}/servingConfigs/default_config"
               end
 
-            url     = call(:discovery_url, connection, de_loc, "#{serving_path}:search")
+            host_override = (input['discovery_host_custom'].presence || input['discovery_host'].presence)
+            url = call(:discovery_url, connection, de_loc, "#{serving_path}:search", nil, host_override)
             payload = {
               'query'    => (input['discovery_search_query'].presence || 'ping').to_s,
               'pageSize' => 1
@@ -3527,15 +3529,20 @@ require 'securerandom'
       execute: lambda do |connection, input|
         t0 = Time.now; corr = call(:build_correlation_id)
         begin
-          loc = (connection['location'].presence || 'global').to_s.downcase
-          host =
-            if input['service'].to_s == 'discovery'
-              call(:discovery_host, connection, loc)
-            else
-              call(:aipl_service_host, connection, loc)
-            end
-          path = input['resource'].to_s.sub(%r{^/v1/}, '')
-          url  = "https://#{host}/v1/#{path}:testIamPermissions"
+          loc  = (connection['location'].presence || 'global').to_s.downcase
+          path = input['resource'].to_s
+                  .sub(%r{^/(v1|v1alpha|v1beta)/}i, '')  # strip any accidental version prefix
+                  .sub(%r{^/}, '')                       # strip leading '/'
+
+          if input['service'].to_s == 'discovery'
+            # Honor per-action host selection, go through discovery_url to pick v1alpha
+            host_override = nil # no per-action fields here; rely on connection defaults
+            url  = call(:discovery_url, connection, loc, "#{path}:testIamPermissions", nil, host_override)
+          else
+            # Vertex: keep existing v1 builder
+            url  = "https://#{call(:aipl_service_host, connection, loc)}/v1/#{path}:testIamPermissions"
+          end
+
           body = { 'permissions' => call(:safe_array, input['permissions']) }
           resp = post(url).headers(call(:request_headers, corr)).payload(call(:json_compact, body))
           code = call(:telemetry_success_code, resp)
@@ -3893,9 +3900,10 @@ require 'securerandom'
       host = (l == 'us') ? 'us-discoveryengine.googleapis.com' : 'discoveryengine.googleapis.com'
       (connection['discovery_host_custom'].presence || host)
     end,
-    discovery_url: lambda do |connection, loc, path, version=nil|
-      ver = (version.presence || connection['discovery_api_version'].presence || 'v1alpha').to_s
-      "https://#{call(:discovery_host, connection, loc)}/#{ver}/#{path.sub(%r{^/}, '')}"
+    discovery_url: lambda do |connection, loc, path, version=nil, host_override=nil|
+      ver  = (version.presence || connection['discovery_api_version'].presence || 'v1alpha').to_s
+      host = host_override.presence || call(:discovery_host, connection, loc)
+      "https://#{host}/#{ver}/#{path.sub(%r{^/}, '')}"
     end,
 
     # --- Guards, normalization --------------------------------------------
