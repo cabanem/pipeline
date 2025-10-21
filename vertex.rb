@@ -622,13 +622,18 @@ require 'securerandom'
           max_span = call(:clamp_int, (input['max_span_chars'] || 500), 80, 2000)
           want_entities = call(:normalize_boolean, input['include_entities'])
 
-          system_text = "You are extracting the single most important sentence or short paragraph from an email. " \
-                        "Return valid JSON only. Keep the extracted span under #{max_span} characters without truncating mid-sentence. " \
-                        "importance is a calibrated score in [0,1]. If there is a clear action requested, set call_to_action; " \
-                        "if there is a clear deadline date/time, return ISO 8601 in deadline_iso; otherwise leave null."
+          system_text = "You extract the single most important sentence or short paragraph from an email. " \
+                        "Rules: (1) Return VALID JSON only. (2) Do NOT output greetings, signatures, legal footers, " \
+                        "auto-replies, or vague pleasantries (e.g., 'Hello', 'Thanks', 'Please see below'). " \
+                        "(3) Keep under #{max_span} characters; do not truncate mid-sentence. " \
+                        "(4) importance is a calibrated score in [0,1]. If a clear action is requested, set call_to_action; " \
+                        "if a clear deadline exists, return ISO-8601 in deadline_iso; otherwise leave null."
 
           schema_props = {
-            'salient_span'   => { 'type' => 'string' },
+            'salient_span'   => {
+              'type' => 'string',
+              'minLength' => 12
+            },
             'reason'         => { 'type' => 'string' },
             'importance'     => { 'type' => 'number' },
             'tags'           => { 'type' => 'array', 'items' => { 'type' => 'string' } },
@@ -677,15 +682,28 @@ require 'securerandom'
             'generationConfig'  => gen_cfg
           }
 
-          loc = (connection['location'].presence || 'global').to_s.downcase
+          loc = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
           url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
-          resp = post(url).headers(call(:request_headers, corr)).payload(call(:json_compact, payload))
+          req_body = call(:json_compact, payload)
+          resp = post(url).headers(call(:request_headers, corr)).payload(req_body)
 
           text   = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
           parsed = call(:safe_parse_json, text)
+          # Post-parse repair: filter obvious salutations/low-content and enforce the cap
+          span = parsed['salient_span'].to_s.strip
+          if span.empty? || span =~ /\A(hi|hello|hey)\b[:,\s]*\z/i || span.length < 8
+            # Fallback: pick first substantive sentence from focus
+            head = (focus || '').to_s
+            # Drop leading greeting lines
+            head = head.sub(/\A\s*(subject:\s*[^\n]+\n+)?\s*(hi|hello|hey)[^a-z0-9]*\n+/i, '')
+            cand = head.split(/(?<=[.!?])\s+/).find { |s| s.strip.length >= 12 && s !~ /\A(hi|hello|hey)\b/i } || head[0, max_span]
+            span = cand[0, max_span].to_s.strip
+          else
+            span = span[0, max_span]
+          end
 
           out = {
-            'salient_span'   => parsed['salient_span'],
+            'salient_span'   => span,
             'reason'         => parsed['reason'],
             'importance'     => parsed['importance'],
             'tags'           => parsed['tags'],
@@ -2973,14 +2991,29 @@ require 'securerandom'
           model_for_count = (input['count_tokens_model'].presence || input['model']).to_s
 
           begin
-            # Greedy keep: salience first, then highest-score chunks
-            pool = items.sort_by { |c| -1 * (c['score'] || 0.0).to_f }
-            kept = []
-            loop do
-              break if pool.empty?
-              try = kept + [pool.first]
+            # 2b-new) Diversity-aware selection
+            strategy = (input['trim_strategy'].presence || 'drop_low_score').to_s
+            # Always pin salience to the front if present
+            base = []
+            base << items.shift if items.first && items.first['source'] == 'salience'
 
-              # Build what the model will actually see
+            ordered =
+              case strategy
+              when 'diverse_mmr'
+                # Start from score-desc (to seed reasonable pool), then reorder with MMR-like objective
+                rest = items.sort_by { |c| -1 * (c['score'] || 0.0).to_f }
+                call(:mmr_diverse_order, rest, alpha: 0.7, per_source_cap: 3)
+              when 'drop_low_score'
+                items.sort_by { |c| -1 * (c['score'] || 0.0).to_f }
+              else
+                items # fallback preserves input order
+              end
+
+            pool = base + ordered
+            kept = base.dup
+            pool[base.length..-1].to_a.each do |cand|
+              try = kept + [cand]
+
               test_blob = call(:format_context_chunks, try)
               test_contents = [
                 { 'role' => 'user', 'parts' => [
@@ -2988,17 +3021,9 @@ require 'securerandom'
                   ]
                 }
               ]
-
-              # Count tokens for prompt side
               cnt = call(:count_tokens_quick!, connection, model_for_count, test_contents, input['system_preamble'])
               if cnt && cnt['totalTokens'].to_i <= budget_prompt
-                kept = try
-                pool.shift
-                next
-              else
-                # adding this item would exceed budget, drop it and try next
-                pool.shift
-                next
+                kept << cand
               end
             end
             items = kept
@@ -3875,7 +3900,9 @@ require 'securerandom'
   # --------- PICK LISTS ---------------------------------------------------
   pick_lists: {
     trim_strategies: lambda do
-      [['Drop lowest score first','drop_low_score'], ['Truncate by characters','truncate_chars']]
+      [['Drop lowest score first','drop_low_score'],
+      ['Diverse (MMR-like)','diverse_mmr'],
+      ['Truncate by characters','truncate_chars']]
     end,
     discovery_hosts: lambda do |_connection|
       [
@@ -4887,6 +4914,47 @@ require 'securerandom'
       rescue
         nil
       end
+    end,
+    text_tokenize_words: lambda do |s|
+      s.to_s.downcase.scan(/[a-z0-9]+/)
+    end,
+    jaccard_overlap: lambda do |a_tokens, b_tokens|
+      a = a_tokens; b = b_tokens
+      return 0.0 if a.empty? || b.empty?
+      ai = a & b
+      au = (a | b)
+      (ai.length.to_f / au.length.to_f)
+    end,
+    mmr_diverse_order: lambda do |items, alpha: 0.7, per_source_cap: 3|
+      # items: [{ 'id','text','score','source', ... }]
+      pool = (items || []).map do |c|
+        c = c.dup
+        c['_tokens'] = call(:text_tokenize_words, c['text'])
+        c
+      end
+      kept, kept_by_source = [], Hash.new(0)
+      while pool.any?
+        best = nil
+        best_adj = -1.0/0.0
+        pool.each do |cand|
+          src = cand['source'].to_s
+          next if per_source_cap && kept_by_source[src] >= per_source_cap && src != 'salience'
+          overlap = 0.0
+          kept.each do |k|
+            overlap = [overlap, call(:jaccard_overlap, cand['_tokens'], k['_tokens'])].max
+          end
+          adj = alpha * (cand['score'] || 0.0).to_f - (1.0 - alpha) * overlap
+          if adj > best_adj
+            best = cand; best_adj = adj
+          end
+        end
+        break unless best
+        kept << best
+        kept_by_source[best['source'].to_s] += 1
+        pool.delete(best)
+      end
+      kept.each { |c| c.delete('_tokens') }
+      kept
     end
 
   },
