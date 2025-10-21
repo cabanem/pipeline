@@ -141,20 +141,23 @@ require 'uri'
 
   # --------- OBJECT DEFINITIONS -------------------------------------------
   object_definitions: {
+
     answer_request: {
       fields: lambda do |_|
         [
           { name: 'query', type: 'object', properties: [
-              { name: 'query', label: 'Query string' }
-            ]},
-          { name: 'userPseudoId', label: 'User pseudo ID' },
-          { name: 'session', label: 'Session (optional)' },
-          { name: 'relatedQuestionsSpec', type: 'object', properties: [] },
-          { name: 'safetySpec', type: 'object', properties: [] },
-          { name: 'answerGenerationSpec', type: 'object', properties: [] },
-          { name: 'searchSpec', type: 'object', properties: [] },
-          { name: 'requestParams', type: 'object', properties: [] },
-          { name: 'userLabels', type: 'object', properties: [] }
+              { name: 'text', label: 'Query text' }
+            ], optional: false },
+          { name: 'userPseudoId', optional: false },
+          { name: 'session' },
+          { name: 'relatedQuestionsSpec',   type: 'object', properties: [] },
+          { name: 'safetySpec',             type: 'object', properties: [] },
+          { name: 'answerGenerationSpec',   type: 'object', properties: [] },
+          { name: 'searchSpec',             type: 'object', properties: [] },
+          { name: 'groundingSpec',          type: 'object', properties: [] },
+          { name: 'queryUnderstandingSpec', type: 'object', properties: [] },
+          { name: 'endUserSpec',            type: 'object', properties: [] },
+          { name: 'userLabels',             type: 'object', properties: [] }
         ]
       end
     },
@@ -162,10 +165,10 @@ require 'uri'
     answer_response: {
       fields: lambda do |_|
         [
-          { name: 'answer', type: 'object', properties: [] },
-          { name: 'relatedQuestions', type: 'array', of: 'object', properties: [] },
-          { name: 'searchResults', type: 'array', of: 'object', properties: [] },
-          { name: 'conversation', type: 'object', properties: [] }
+          { name: 'answer',           type: 'object', properties: [] },
+          { name: 'relatedQuestions', type: 'array',  of: 'object', properties: [] },
+          { name: 'searchResults',    type: 'array',  of: 'object', properties: [] },
+          { name: 'conversation',     type: 'object', properties: [] }
         ]
       end
     },
@@ -173,11 +176,11 @@ require 'uri'
     search_request: {
       fields: lambda do |_|
         [
-          { name: 'query', label: 'Query string' },
-          { name: 'pageSize', type: 'integer' },
+          { name: 'query' },
+          { name: 'pageSize',   type: 'integer' },
           { name: 'pageToken' },
           { name: 'userPseudoId' },
-          { name: 'params', type: 'object', properties: [] },
+          { name: 'params',     type: 'object', properties: [] },
           { name: 'filter' },
           { name: 'orderBy' }
         ]
@@ -187,13 +190,14 @@ require 'uri'
     search_response: {
       fields: lambda do |_|
         [
-          { name: 'results', type: 'array', of: 'object', properties: [] },
-          { name: 'totalSize', type: 'integer' },
+          { name: 'results',         type: 'array', of: 'object', properties: [] },
+          { name: 'totalSize',       type: 'integer' },
           { name: 'attributionToken' },
           { name: 'nextPageToken' }
         ]
       end
     }
+
   },
 
   # --------- ACTIONS ------------------------------------------------------
@@ -210,51 +214,27 @@ require 'uri'
           { name: 'location', optional: false, default: (connection['location'] || 'global') },
           { name: 'collection_id', optional: false, default: 'default_collection' },
           { name: 'engine_id', optional: false },
-          # IMPORTANT: default_serving_config (NOT default_search)
-          { name: 'serving_config_id', optional: false, default: 'default_serving_config' },
-
-          # Answer-shaped inputs
-          { name: 'query', type: 'object', properties: [
-              { name: 'query', label: 'Query string' }
-            ], optional: false },
-          { name: 'userPseudoId', optional: false },
-
-          { name: 'answerGenerationSpec', type: 'object', properties: [] },
-          { name: 'searchSpec',           type: 'object', properties: [] },
-          { name: 'safetySpec',           type: 'object', properties: [] },
-          { name: 'requestParams',        type: 'object', properties: [] },
-          { name: 'userLabels',           type: 'object', properties: [] }
-        ]
+          { name: 'serving_config_id', optional: false, default: 'default_serving_config' }
+        ] + object_definitions['answer_request']
       end,
-
       output_fields: lambda do |object_definitions|
         object_definitions['answer_response']
       end,
-
       execute: lambda do |connection, input|
         version = (connection['api_version'] || 'v1')
         path = "/#{version}/projects/#{input['project_id']}/locations/#{input['location']}" \
               "/collections/#{input['collection_id']}/engines/#{input['engine_id']}" \
               "/servingConfigs/#{input['serving_config_id']}:answer"
 
-        # build a clean answer body; avoid Hash#compact for runtime portability
-        body = {
-          'query'               => input['query'],
-          'userPseudoId'        => input['userPseudoId'],
-          'answerGenerationSpec'=> input['answerGenerationSpec'],
-          'searchSpec'          => input['searchSpec'],
-          'safetySpec'          => input['safetySpec'],
-          'requestParams'       => input['requestParams'],
-          'userLabels'          => input['userLabels']
+        body = input.reject { |k,_|
+          %w[project_id location collection_id engine_id serving_config_id].include?(k)
         }
-        # remove nils manually
         body.delete_if { |_k, v| v.nil? }
 
-        post(path).payload(body).after_error_response(/.*/) do |code, body_txt, headers, message|
-          error("Discovery Engine answer error #{code}: #{message}\n#{body_txt}")
+        post(path).payload(body).after_error_response(/.*/) do |code, body_txt, _h, msg|
+          error("Discovery Engine answer error #{code}: #{msg}\n#{body_txt}")
         end
       end,
-
       sample_output: lambda do
         {
           'answer' => { 'summary' => { 'text' => '...' } },
@@ -278,28 +258,25 @@ require 'uri'
           { name: 'serving_config_id', optional: false, default: 'default_serving_config' }
         ] + object_definitions['search_request']
       end,
-
       output_fields: lambda do |object_definitions|
         object_definitions['search_response']
       end,
-
       execute: lambda do |connection, input|
         version = (connection['api_version'] || 'v1')
         path = "/#{version}/projects/#{input['project_id']}/locations/#{input['location']}" \
-               "/collections/#{input['collection_id']}/engines/#{input['engine_id']}" \
-               "/servingConfigs/#{input['serving_config_id']}:search"
+              "/collections/#{input['collection_id']}/engines/#{input['engine_id']}" \
+              "/servingConfigs/#{input['serving_config_id']}:search"
 
-        body = input.reject { |k, _| %w[project_id location collection_id engine_id serving_config_id].include?(k) }
-        post(path).payload(body).after_error_response(/.*/) do |code, body, headers, message|
-          error("Discovery Engine search error #{code}: #{message}\n#{body}")
+        body = input.reject { |k,_|
+          %w[project_id location collection_id engine_id serving_config_id].include?(k)
+        }
+        post(path).payload(body).after_error_response(/.*/) do |code, body_txt, _h, msg|
+          error("Discovery Engine search error #{code}: #{msg}\n#{body_txt}")
         end
       end,
-
       sample_output: lambda do
         {
-          'results' => [
-            { 'id' => 'doc-1', 'document' => { 'id' => 'doc-1', 'structData' => {} } }
-          ],
+          'results' => [{ 'id' => 'doc-1', 'document' => { 'id' => 'doc-1', 'structData' => {} } }],
           'totalSize' => 1,
           'nextPageToken' => nil
         }
