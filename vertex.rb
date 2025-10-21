@@ -77,8 +77,10 @@ require 'securerandom'
     },
   
     base_uri: lambda do |connection|
-      loc  = (connection['location'].presence || 'global').to_s.downcase
-      host = call(:aipl_service_host, connection, loc) # e.g. aiplatform.googleapis.com or us-central1-aiplatform.googleapis.com
+      # This block cannot call a method, the context WithGlobalDSL does not expose 'call'
+      loc  = (connection['location'].to_s.strip.downcase)
+      loc  = 'global' if loc.empty?
+      host = (loc == 'global') ? 'aiplatform.googleapis.com' : "#{loc}-aiplatform.googleapis.com"
       "https://#{host}/v1/"
     end,
 
@@ -142,7 +144,7 @@ require 'securerandom'
     },
     content: {
       # Per contract: role ∈ {user, model}
-      fields: lambda do |object_definitions|
+      fields: lambda do |_connection, _config_fields, object_definitions|
         [
           { name: 'role', control_type: 'select', pick_list: 'roles', optional: false },
           { name: 'parts', type: 'array', of: 'object',
@@ -3825,6 +3827,15 @@ require 'securerandom'
       end
       # otherwise expect full name
       error('rag_file must be a full resource name like projects/{p}/locations/{l}/ragCorpora/{c}/ragFiles/{id}')
+    end,
+    discovery_host: lambda do |connection, loc=nil|
+      l = (loc || connection['location']).to_s.downcase
+      # AI Applications commonly use 'global' or 'us' multi-region
+      host = (l == 'us') ? 'us-discoveryengine.googleapis.com' : 'discoveryengine.googleapis.com'
+      (connection['discovery_host_custom'].presence || host)
+    end,
+    discovery_v1alpha_url: lambda do |connection, loc, path|
+      "https://#{call(:discovery_host, connection, loc)}/v1alpha/#{path.sub(%r{^/}, '')}"
     end,
 
     # --- Guards, normalization --------------------------------------------
