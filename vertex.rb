@@ -29,6 +29,8 @@ require 'securerandom'
         hint: 'GCP project ID (inferred from key if blank)' },
       { name: 'user_project',               optional: true,   control_type: 'text',      label: 'User project for quota/billing',
         extends_schema: true, hint: 'Sets x-goog-user-project for billing/quota. Service account must have roles/serviceusage.serviceUsageConsumer on this project.' },
+      { name: 'discovery_api_version', label: 'Discovery API version', control_type: 'select', optional: true, default: 'v1alpha',
+        pick_list: 'discovery_versions', hint: 'v1alpha for AI Applications; switch to v1beta/v1 if/when you migrate.' },
 
       # Defaults for test probe
       { name: 'set_defaults_for_probe',     optional: false,  control_type: 'checkbox', 
@@ -3409,7 +3411,7 @@ require 'securerandom'
         if input['check_discovery_engines_list'] == true
           run_probe.call('discovery.engines.list') do
             parent = "projects/#{project}/locations/#{de_loc}/collections/#{de_coll}"
-            url    = "https://#{de_host}/v1/#{parent}/engines"
+            url    = call(:discovery_url, connection, de_loc, "#{parent}/engines")
             resp   = get(url).params(pageSize: 1).headers(call(:request_headers, corr))
             [url, call(:telemetry_success_code, resp), 'OK',
              call(:debug_pack, do_debug, [url, {pageSize:1}].compact.join('?'), nil, resp&.body)]
@@ -3431,7 +3433,7 @@ require 'securerandom'
                 "projects/#{project}/locations/#{de_loc}/collections/#{de_coll}/engines/#{engine}/servingConfigs/default_config"
               end
 
-            url     = "https://#{de_host}/v1/#{serving_path}:search"
+            url     = call(:discovery_url, connection, de_loc, "#{serving_path}:search")
             payload = {
               'query'    => (input['discovery_search_query'].presence || 'ping').to_s,
               'pageSize' => 1
@@ -3594,6 +3596,14 @@ require 'securerandom'
 
     iam_services: lambda do
       [['Vertex AI','vertex'], ['AI Applications (Discovery)','discovery']]
+    end,
+
+    discovery_versions: lambda do
+      [
+        ['v1alpha', 'v1alpha'],
+        ['v1beta',  'v1beta'],
+        ['v1',      'v1']
+      ]
     end
 
   },
@@ -3883,8 +3893,9 @@ require 'securerandom'
       host = (l == 'us') ? 'us-discoveryengine.googleapis.com' : 'discoveryengine.googleapis.com'
       (connection['discovery_host_custom'].presence || host)
     end,
-    discovery_v1alpha_url: lambda do |connection, loc, path|
-      "https://#{call(:discovery_host, connection, loc)}/v1alpha/#{path.sub(%r{^/}, '')}"
+    discovery_url: lambda do |connection, loc, path, version=nil|
+      ver = (version.presence || connection['discovery_api_version'].presence || 'v1alpha').to_s
+      "https://#{call(:discovery_host, connection, loc)}/#{ver}/#{path.sub(%r{^/}, '')}"
     end,
 
     # --- Guards, normalization --------------------------------------------
