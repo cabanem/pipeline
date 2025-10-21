@@ -2901,7 +2901,24 @@ require 'securerandom'
           { name: 'system_preamble', optional: true,
             hint: 'Optional guardrails (e.g., “only answer from context; say I don’t know otherwise”).' },
 
-          { name: 'temperature', type: 'number', optional: true, hint: 'Override temperature (default 0).' }
+          { name: 'temperature', type: 'number', optional: true, hint: 'Override temperature (default 0).' },
+
+          { name: 'salience_text', label: 'Salience (from prior step)', optional: true,
+            hint: 'Short span to prioritize (e.g., email_extract_salient_span.salient_span)' },
+          { name: 'salience_id', optional: true, hint: 'Optional ID to show in citations (e.g., "salience")' },
+          { name: 'salience_score', type: 'number', optional: true, hint: 'Optional pseudo-score to order with chunks' },
+
+          # Prompt budgeting (optional but recommended)
+          { name: 'max_prompt_tokens', type: 'integer', optional: true, default: 3000,
+            hint: 'Hard cap on prompt tokens (excludes output). If exceeded, chunks are dropped.' },
+          { name: 'reserve_output_tokens', type: 'integer', optional: true, default: 512,
+            hint: 'Reserve this many tokens for the model’s answer.' },
+          { name: 'count_tokens_model', optional: true,
+            hint: 'If set, use this model for countTokens (defaults to `model`).' },
+          { name: 'trim_strategy', control_type: 'select', optional: true, default: 'drop_low_score',
+            pick_list: 'trim_strategies',
+            hint: 'How to shrink when over budget: drop_low_score or truncate_chars' }
+
         ]
       end,
       
@@ -2933,13 +2950,83 @@ require 'securerandom'
           max_chunks = call(:clamp_int, (input['max_chunks'] || 20), 1, 100)
           chunks     = call(:safe_array, input['context_chunks']).first(max_chunks)
 
-
           error('context_chunks must be a non-empty array') if chunks.blank?
 
+          # 2a) Build a unified list with salience (if provided) at the top
+          sal_text = (input['salience_text'].to_s.strip)
+          sal_id   = (input['salience_id'].presence || 'salience').to_s
+          sal_scr  = (input['salience_score'].presence || 1.0).to_f
+          items = []
+
+          if sal_text.present?
+            items << { 'id' => sal_id, 'text' => sal_text, 'score' => sal_scr, 'source' => 'salience' }
+          end
+
+          # Then the mapped chunks (already limited by max_chunks)
+          items.concat(chunks)
+
+          # 2b) Token budgeting (prefer countTokens; fallback to char-trim)
+          target_total  = (input['max_prompt_tokens'].presence || 3000).to_i
+          reserve_out   = (input['reserve_output_tokens'].presence || 512).to_i
+          budget_prompt = [target_total - reserve_out, 400].max # never go below 400 for the prompt
+
+          model_for_count = (input['count_tokens_model'].presence || input['model']).to_s
+
+          begin
+            # Greedy keep: salience first, then highest-score chunks
+            pool = items.sort_by { |c| -1 * (c['score'] || 0.0).to_f }
+            kept = []
+            loop do
+              break if pool.empty?
+              try = kept + [pool.first]
+
+              # Build what the model will actually see
+              test_blob = call(:format_context_chunks, try)
+              test_contents = [
+                { 'role' => 'user', 'parts' => [
+                    { 'text' => "Question:\n#{input['question']}\n\nContext:\n#{test_blob}" }
+                  ]
+                }
+              ]
+
+              # Count tokens for prompt side
+              cnt = call(:count_tokens_quick!, connection, model_for_count, test_contents, input['system_preamble'])
+              if cnt && cnt['totalTokens'].to_i <= budget_prompt
+                kept = try
+                pool.shift
+                next
+              else
+                # adding this item would exceed budget, drop it and try next
+                pool.shift
+                next
+              end
+            end
+            items = kept
+          rescue
+            # Fallback: char-based hard cap (~4 chars per token heuristic)
+            approx_chars = (budget_prompt * 4)
+            cur = []
+            total_chars = 0
+            items.each do |c|
+              t = c['text'].to_s
+              if (total_chars + t.length) <= approx_chars
+                cur << c
+                total_chars += t.length
+              else
+                break
+              end
+            end
+            items = cur
+          end
+
+          # 2c) Rebuild the final blob from the budgeted set
+          ctx_blob = call(:format_context_chunks, items)
+
           # Build a deterministic, schema-ed JSON response
+          reserve_out = (input['reserve_output_tokens'].presence || 512).to_i  # <-- make sure this binding is visible here
           gen_cfg = {
-            'temperature'      => (input['temperature'].present? ? call(:safe_float, input['temperature']) : 0),
-            'maxOutputTokens'   => 1024,
+            'temperature'       => (input['temperature'].present? ? call(:safe_float, input['temperature']) : 0),
+            'maxOutputTokens'   => reserve_out,  # <-- use reserved output tokens
             'responseMimeType'  => 'application/json',
             'responseSchema'    => {
               'type'  => 'object',
@@ -2969,11 +3056,17 @@ require 'securerandom'
               'Answer using ONLY the provided context chunks. ' \
               'If the context is insufficient, reply with “I don’t know.” Keep answers concise and cite chunk IDs.')
 
-          # Format a single USER message containing the question + all chunks
-          context_blob = call(:format_context_chunks, chunks)
+          # If budgeting dropped everything, keep at least the salience (truncated) to avoid empty context
+          if ctx_blob.to_s.strip.empty? && input['salience_text'].to_s.strip.present?
+            keep = input['salience_text'].to_s.strip
+            # rough trim so we don't blow the budget entirely
+            ctx_blob = call(:format_context_chunks, [{ 'id' => (input['salience_id'].presence || 'salience'), 'text' => keep[0, 4000], 'score' => 1.0, 'source' => 'salience' }])
+          end
+
+          # Use the BUDGETED blob, not the original chunks
           contents = [
             { 'role' => 'user', 'parts' => [
-                { 'text' => "Question:\n#{input['question']}\n\nContext:\n#{context_blob}" }
+                { 'text' => "Question:\n#{input['question']}\n\nContext:\n#{ctx_blob}" }
               ]
             }
           ]
@@ -2984,12 +3077,13 @@ require 'securerandom'
             'generationConfig'  => gen_cfg
           }
 
-          loc  = (connection['location'].presence || 'global').to_s.downcase
-          url  = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
+          # Derive location from model_path to avoid region/global mismatch
+          loc_from_model = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
+          url  = call(:aipl_v1_url, connection, loc_from_model, "#{model_path}:generateContent")
 
           resp = post(url)
-                   .headers(call(:request_headers, corr))
-                   .payload(call(:json_compact, payload))
+                  .headers(call(:request_headers, corr))
+                  .payload(call(:json_compact, payload))
 
           text = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
           parsed = call(:safe_parse_json, text)
@@ -3780,7 +3874,9 @@ require 'securerandom'
 
   # --------- PICK LISTS ---------------------------------------------------
   pick_lists: {
-
+    trim_strategies: lambda do
+      [['Drop lowest score first','drop_low_score'], ['Truncate by characters','truncate_chars']]
+    end,
     discovery_hosts: lambda do |_connection|
       [
         ['Discovery Engine (global)', 'discoveryengine.googleapis.com'],
@@ -4774,6 +4870,23 @@ require 'securerandom'
         'reason'        => parsed['reason'],
         'importance'    => parsed['importance'].to_f
       }
+    end,
+    count_tokens_quick!: lambda do |connection, model_id, contents, system_text=nil|
+      # Build path for whichever model we’re counting
+      model_path = call(:build_model_path_with_global_preview, connection, model_id)
+      loc = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
+      url = call(:aipl_v1_url, connection, loc, "#{model_path}:countTokens")
+
+      payload = {
+        'contents' => contents,
+        'systemInstruction' => call(:system_instruction_from_text, system_text)
+      }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
+
+      begin
+        post(url).headers(call(:request_headers, call(:build_correlation_id))).payload(call(:json_compact, payload))
+      rescue
+        nil
+      end
     end
 
   },
