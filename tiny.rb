@@ -210,7 +210,13 @@ require 'uri'
       description: 'POST .../servingConfigs/*:answer',
       help: 'Required: query.text (string) and userPseudoId (string). Simple mode shows only the essentials; Advanced mode reveals optional specs as raw objects with templates and validation.',
 
-      input_fields: lambda do |object_definitions, connection|
+      config_fields: [
+        { name: 'simple_mode', label: 'Simple mode', type: 'boolean', control_type: 'checkbox',
+          default: true, sticky: true, hint: 'Checked: only the essentials. Uncheck to show all advanced spec objects.' }
+      ],
+      input_fields: lambda do |object_definitions, connection, cfg|
+        cfg ||= {}
+        simple = !!cfg['simple_mode']
         base = [
           { name: 'project_id', optional: false, sticky: true, display_priority: 1, hint: 'GCP Project ID (not number).' },
           { name: 'location', optional: false, default: (connection['location'] || 'global'), hint: 'Discovery Engine location (e.g., global, us, eu).', sticky: true, display_priority: 2 },
@@ -218,45 +224,43 @@ require 'uri'
           { name: 'engine_id', optional: false, sticky: true, display_priority: 4 },
           { name: 'serving_config_id', optional: false, default: 'default_serving_config', sticky: true, display_priority: 5,
             hint: 'Usually default_serving_config unless you created a custom one.' },
-          # UX toggle
-          { name: 'simple_mode', label: 'Simple mode', type: 'boolean', control_type: 'checkbox',
-            default: true, sticky: true, display_priority: 6,
-            hint: 'Checked: only the essentials. Uncheck to show all advanced spec objects.' },
-          # Simple-mode flats (we’ll map these into the proper body in execute)
-          { name: 'query_text', label: 'Question', optional: false, display_condition: "simple_mode",
-            hint: 'Plain text question. Will be sent as query.text.' , display_priority: 7 },
-          { name: 'user_pseudo_id', label: 'User pseudo ID', optional: false, display_condition: "simple_mode",
-            hint: 'Stable, opaque, non-PII. ≤128 chars. Used for sessioning/metrics.', display_priority: 8 },
         ]
-        # Advanced fields appear only when simple_mode is false
-        base + object_definitions['answer_request'].map { |f| f.merge(display_condition: "!simple_mode") }
+        simple_fields = [
+          { name: 'query_text', label: 'Question', optional: false,
+            hint: 'Plain text question. Will be sent as query.text.' , display_priority: 7 },
+          { name: 'user_pseudo_id', label: 'User pseudo ID', optional: false, control_type: 'text',
+            hint: 'Stable, opaque, non-PII. ≤128 chars. Used for sessioning/metrics.', display_priority: 8 }
+        ]
+        advanced_fields = object_definitions['answer_request']
+        base + (simple ? simple_fields : advanced_fields)
       end,
       output_fields: lambda do |object_definitions|
         object_definitions['answer_response']
       end,
       execute: lambda do |connection, input|
-        version = (connection['api_version'] || 'v1')
-        path = "/#{version}/projects/#{input['project_id']}/locations/#{input['location']}" \
+        version = (connection['api_version'] || 'v1').to_s
+
+        # ---- Required path params (fail fast with actionable errors)
+        %w[project_id location collection_id engine_id serving_config_id].each do |k|
+          error("#{k} is required.") if (input[k] || '').to_s.strip.empty?
+        end
+
+        loc_for_path = (input['location'] || '').to_s.strip.downcase
+        path = "/#{version}/projects/#{input['project_id']}/locations/#{loc_for_path}" \
               "/collections/#{input['collection_id']}/engines/#{input['engine_id']}" \
               "/servingConfigs/#{input['serving_config_id']}:answer"
 
-        # Update the preview field for visibility in UI (best-effort; doesn’t affect request)
-        input['path_preview'] = path
+        # ---- Determine effective mode from presence of Simple fields
+        simple_mode = input.key?('query_text') || input.key?('user_pseudo_id')
 
-        # ---- Validation (fail fast with helpful messages)
-        # Path param guards (fail fast with actionable errors)
-        %w[project_id location collection_id engine_id serving_config_id].each do |reqk|
-          error("#{reqk} is required.") if (input[reqk] || '').to_s.strip.empty?
-        end
-
-        if input['simple_mode']
+        # ---- Validate required content fields
+        if simple_mode
           qt = (input['query_text'] || '').to_s.strip
           up = (input['user_pseudo_id'] || '').to_s
           error('Question is required (query_text).') if qt.empty?
           error('user_pseudo_id is required.') if up.empty?
           error('user_pseudo_id must be ≤ 128 characters.') if up.length > 128
         else
-          # Advanced path: require query.text and userPseudoId
           qobj = input['query'] || {}
           qtxt = (qobj['text'] || '').to_s.strip
           up   = (input['userPseudoId'] || '').to_s
@@ -264,28 +268,33 @@ require 'uri'
           error('userPseudoId is required.') if up.empty?
           error('userPseudoId must be ≤ 128 characters.') if up.length > 128
         end
-        body = input.reject { |k,_|
-          %w[project_id location collection_id engine_id serving_config_id simple_mode
-             query_text user_pseudo_id].include?(k)
-        }
 
-        # Map simple-mode flats into canonical structure when present
-        if input['simple_mode']
+        # ---- Build request body
+        exclude_keys = %w[
+          project_id location collection_id engine_id serving_config_id
+          simple_mode query_text user_pseudo_id
+        ]
+        body = input.reject { |k, _| exclude_keys.include?(k) }
+
+        # Map Simple-mode flats into canonical API shape
+        if simple_mode
           body['query']        = { 'text' => input['query_text'] }
           body['userPseudoId'] = input['user_pseudo_id']
         end
+
+        # Prune nils to keep the payload tidy (don’t over-aggressively prune empties)
         body.delete_if { |_k, v| v.nil? }
 
+        # ---- Call API
         post(path).payload(body).after_error_response(/.*/) do |code, body_txt, _h, msg|
-          # Normalize common 4xx into actionable hints
+          # Normalize a few frequent 400s into clear hints
           friendly =
             if code.to_i == 400 && body_txt.to_s.include?('Unknown name "query"')
               'Body must use query.text (not query.query).'
             elsif code.to_i == 400 && body_txt.to_s.include?('userPseudoId')
               'userPseudoId is required and must be ≤ 128 chars.'
-            else
-              nil
             end
+
           err = "Discovery Engine answer error #{code}: #{msg}"
           err += " — #{friendly}" if friendly
           err += "\n#{body_txt}"
