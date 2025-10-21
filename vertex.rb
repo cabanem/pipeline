@@ -2935,11 +2935,10 @@ require 'securerandom'
             hint: 'If set, use this model for countTokens (defaults to `model`).' },
           { name: 'trim_strategy', control_type: 'select', optional: true, default: 'drop_low_score',
             pick_list: 'trim_strategies',
-            hint: 'How to shrink when over budget: drop_low_score or truncate_chars' }
-
+            hint: 'How to shrink when over budget: drop_low_score, diverse_mmr, or truncate_chars' }
         ]
       end,
-      
+
       output_fields: lambda do |object_definitions|
         [
           { name: 'answer' },
@@ -2961,13 +2960,13 @@ require 'securerandom'
         # Correlation id and duration for logs/analytics
         t0 = Time.now
         corr = call(:build_correlation_id)
+        url = nil; req_body = nil
 
         begin
           model_path = call(:build_model_path_with_global_preview, connection, input['model'])
 
           max_chunks = call(:clamp_int, (input['max_chunks'] || 20), 1, 100)
           chunks     = call(:safe_array, input['context_chunks']).first(max_chunks)
-
           error('context_chunks must be a non-empty array') if chunks.blank?
 
           # 2a) Build a unified list with salience (if provided) at the top
@@ -2975,83 +2974,61 @@ require 'securerandom'
           sal_id   = (input['salience_id'].presence || 'salience').to_s
           sal_scr  = (input['salience_score'].presence || 1.0).to_f
           items = []
-
           if sal_text.present?
             items << { 'id' => sal_id, 'text' => sal_text, 'score' => sal_scr, 'source' => 'salience' }
           end
-
-          # Then the mapped chunks (already limited by max_chunks)
           items.concat(chunks)
 
-          # 2b) Token budgeting (prefer countTokens; fallback to char-trim)
+          # 2b) Token budgeting targets
           target_total  = (input['max_prompt_tokens'].presence || 3000).to_i
           reserve_out   = (input['reserve_output_tokens'].presence || 512).to_i
           budget_prompt = [target_total - reserve_out, 400].max # never go below 400 for the prompt
-
           model_for_count = (input['count_tokens_model'].presence || input['model']).to_s
 
-          begin
-            # 2b-new) Diversity-aware selection
-            strategy = (input['trim_strategy'].presence || 'drop_low_score').to_s
-            # Always pin salience to the front if present
-            base = []
-            base << items.shift if items.first && items.first['source'] == 'salience'
+          # 2b-new) Selection pipeline: truncate -> (order w/ strategy) -> drop dupes -> O(log n) token-count selection
+          strategy = (input['trim_strategy'].presence || 'drop_low_score').to_s
 
-            ordered =
-              case strategy
-              when 'diverse_mmr'
-                # Start from score-desc (to seed reasonable pool), then reorder with MMR-like objective
-                rest = items.sort_by { |c| -1 * (c['score'] || 0.0).to_f }
-                call(:mmr_diverse_order, rest, alpha: 0.7, per_source_cap: 3)
-              when 'drop_low_score'
-                items.sort_by { |c| -1 * (c['score'] || 0.0).to_f }
-              else
-                items # fallback preserves input order
-              end
+          # Pin salience if present
+          base = []
+          base << items.shift if items.first && items.first['source'] == 'salience'
 
-            pool = base + ordered
-            kept = base.dup
-            pool[base.length..-1].to_a.each do |cand|
-              try = kept + [cand]
+          # Early truncation to tame token growth
+          items = items.map { |c| c.merge('text' => call(:truncate_chunk_text, c['text'], 800)) }
 
-              test_blob = call(:format_context_chunks, try)
-              test_contents = [
-                { 'role' => 'user', 'parts' => [
-                    { 'text' => "Question:\n#{input['question']}\n\nContext:\n#{test_blob}" }
-                  ]
-                }
-              ]
-              cnt = call(:count_tokens_quick!, connection, model_for_count, test_contents, input['system_preamble'])
-              if cnt && cnt['totalTokens'].to_i <= budget_prompt
-                kept << cand
-              end
+          ordered =
+            case strategy
+            when 'diverse_mmr'
+              seed = items.sort_by { |c| [-(c['score'] || 0.0).to_f, c['id'].to_s] }
+              call(:mmr_diverse_order, seed, alpha: 0.7, per_source_cap: 3)
+            when 'drop_low_score'
+              items.sort_by { |c| [-(c['score'] || 0.0).to_f, c['id'].to_s] }
+            when 'truncate_chars'
+              items # keep incoming order (after truncation)
+            else
+              items
             end
-            items = kept
-          rescue
-            # Fallback: char-based hard cap (~4 chars per token heuristic)
-            approx_chars = (budget_prompt * 4)
-            cur = []
-            total_chars = 0
-            items.each do |c|
-              t = c['text'].to_s
-              if (total_chars + t.length) <= approx_chars
-                cur << c
-                total_chars += t.length
-              else
-                break
-              end
-            end
-            items = cur
+
+          ordered = call(:drop_near_duplicates, ordered, 0.9)
+          pool = base + ordered
+
+          sys_text = input['system_preamble'].presence ||
+            'Answer using ONLY the provided context chunks. If the context is insufficient, reply with “I don’t know.” Keep answers concise and cite chunk IDs.'
+
+          kept = call(:select_prefix_by_budget, connection, pool, input['question'], sys_text, budget_prompt, model_for_count)
+          items = kept
+
+          # 2c) Build the final blob; if empty, try to keep a trimmed salience
+          ctx_blob = call(:format_context_chunks, items)
+          if ctx_blob.to_s.strip.empty? && sal_text.present?
+            ctx_blob = call(:format_context_chunks, [
+              { 'id' => sal_id, 'text' => sal_text[0, 4000], 'score' => 1.0, 'source' => 'salience' }
+            ])
           end
 
-          # 2c) Rebuild the final blob from the budgeted set
-          ctx_blob = call(:format_context_chunks, items)
-
-          # Build a deterministic, schema-ed JSON response
-          reserve_out = (input['reserve_output_tokens'].presence || 512).to_i  # <-- make sure this binding is visible here
+          # 3) Request
           gen_cfg = {
             'temperature'       => (input['temperature'].present? ? call(:safe_float, input['temperature']) : 0),
-            'maxOutputTokens'   => reserve_out,  # <-- use reserved output tokens
+            'maxOutputTokens'   => reserve_out,
             'responseMimeType'  => 'application/json',
             'responseSchema'    => {
               'type'  => 'object',
@@ -3076,41 +3053,34 @@ require 'securerandom'
             }
           }
 
-          sys_inst = call(:system_instruction_from_text,
-            input['system_preamble'].presence ||
-              'Answer using ONLY the provided context chunks. ' \
-              'If the context is insufficient, reply with “I don’t know.” Keep answers concise and cite chunk IDs.')
-
-          # If budgeting dropped everything, keep at least the salience (truncated) to avoid empty context
-          if ctx_blob.to_s.strip.empty? && input['salience_text'].to_s.strip.present?
-            keep = input['salience_text'].to_s.strip
-            # rough trim so we don't blow the budget entirely
-            ctx_blob = call(:format_context_chunks, [{ 'id' => (input['salience_id'].presence || 'salience'), 'text' => keep[0, 4000], 'score' => 1.0, 'source' => 'salience' }])
-          end
-
-          # Use the BUDGETED blob, not the original chunks
+          sys_inst = call(:system_instruction_from_text, sys_text)
           contents = [
-            { 'role' => 'user', 'parts' => [
-                { 'text' => "Question:\n#{input['question']}\n\nContext:\n#{ctx_blob}" }
-              ]
-            }
+            { 'role' => 'user', 'parts' => [ { 'text' => "Question:\n#{input['question']}\n\nContext:\n#{ctx_blob}" } ] }
           ]
-
-          payload = {
-            'contents'          => contents,
-            'systemInstruction' => sys_inst,
-            'generationConfig'  => gen_cfg
-          }
+          payload = { 'contents' => contents, 'systemInstruction' => sys_inst, 'generationConfig' => gen_cfg }
 
           # Derive location from model_path to avoid region/global mismatch
           loc_from_model = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
           url  = call(:aipl_v1_url, connection, loc_from_model, "#{model_path}:generateContent")
+          req_body = call(:json_compact, payload)
 
-          resp = post(url)
-                  .headers(call(:request_headers, corr))
-                  .payload(call(:json_compact, payload))
+          resp = post(url).headers(call(:request_headers, corr)).payload(req_body)
 
           text = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
+
+          # One controlled retry if nothing came back (e.g., safety or schema hiccup)
+          if text.to_s.strip.empty?
+            retry_payload = payload.dup
+            retry_payload['generationConfig'] = {
+              'temperature' => 0,
+              'maxOutputTokens' => reserve_out,
+              'responseMimeType' => 'text/plain'
+            }
+            resp2 = post(url).headers(call(:request_headers, corr)).payload(call(:json_compact, retry_payload))
+            text = resp2.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
+            resp = resp2 if text.present?
+          end
+
           parsed = call(:safe_parse_json, text)
 
           {
@@ -3119,8 +3089,13 @@ require 'securerandom'
             'responseId' => resp['responseId'],
             'usage'      => resp['usageMetadata']
           }.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+
         rescue => e
-          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
+          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
+          unless call(:normalize_boolean, connection['prod_mode'])
+            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
+          end
+          out
         end
       end,
 
@@ -4955,6 +4930,47 @@ require 'securerandom'
       end
       kept.each { |c| c.delete('_tokens') }
       kept
+    end,
+    collapse_ws: lambda { |s| s.to_s.gsub(/\s+/, ' ').strip },
+    truncate_chunk_text: lambda do |text, max_chars=800|
+      t = call(:collapse_ws, text)
+      t.length > max_chars ? t[0, max_chars] : t
+    end,
+    drop_near_duplicates: lambda do |items, jaccard=0.9|
+      kept = []
+      items.each do |c|
+        toks = call(:text_tokenize_words, c['text'])
+        next if kept.any? { |k| call(:jaccard_overlap, toks, k['_toks']) >= jaccard }
+        c = c.dup; c['_toks'] = toks; kept << c
+      end
+      kept.each { |k| k.delete('_toks') }
+      kept
+    end,
+    tokens_fit?: lambda do |connection, model_for_count, question, sys, chunks_blob, budget|
+      contents = [{ 'role' => 'user', 'parts' => [{ 'text' => "Question:\n#{question}\n\nContext:\n#{chunks_blob}" }]}]
+      cnt = call(:count_tokens_quick!, connection, model_for_count, contents, sys)
+      cnt && cnt['totalTokens'].to_i <= budget
+    end,
+    select_prefix_by_budget: lambda do |connection, ordered_items, question, sys, budget, model_for_count|
+      # Exponential ramp to find upper bound, then binary search → O(log n) countTokens calls
+      lo = 0
+      hi = [1, ordered_items.length].min
+      fmt = lambda { |k| call(:format_context_chunks, ordered_items.first(k)) }
+      while hi <= ordered_items.length && call(:tokens_fit?, connection, model_for_count, question, sys, fmt.call(hi), budget)
+        lo = hi
+        hi = [hi * 2, ordered_items.length].min
+        break if hi == lo
+      end
+      return ordered_items.first(lo) if hi == lo
+      while lo < hi
+        mid = (lo + hi + 1) / 2
+        if call(:tokens_fit?, connection, model_for_count, question, sys, fmt.call(mid), budget)
+          lo = mid
+        else
+          hi = mid - 1
+        end
+      end
+      ordered_items.first(lo)
     end
 
   },
