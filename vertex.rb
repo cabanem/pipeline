@@ -3182,7 +3182,7 @@ require 'securerandom'
     permission_probe: {
       title: 'Admin: Permission probe',
       subtitle: 'Quick IAM/billing/region checks for Vertex, RAG Store & Discovery Engine',
-      display_priority: 100,
+      display_priority: 1,
       help: lambda do |_|
         { body: 'Runs lightweight calls (locations.list, models.countTokens, indexes.list, ragCorpora.list, optional Discovery Engine engines.list & search) to validate auth, billing, and region. Returns per-check status and suggestions.' }
       end,
@@ -3500,7 +3500,51 @@ require 'securerandom'
           'telemetry' => { 'http_status' => 207, 'message' => 'PARTIAL', 'duration_ms' => 27, 'correlation_id' => 'sample-corr' }
         }
       end
+    },
+    test_iam_permissions: {
+      title: 'Admin: Test IAM permissions',
+      display_priority: 1,
+      input_fields: lambda do |_|
+        [
+          { name: 'service', control_type: 'select', pick_list: 'iam_services', optional: false,
+            hint: 'vertex or discovery' },
+          { name: 'resource', optional: false, hint: 'Full resource name starting with projects/...'},
+          { name: 'permissions', type: 'array', of: 'string', optional: false }
+        ]
+      end,
+      output_fields: lambda do |_|
+        [
+          { name: 'permissions', type: 'array', of: 'string' },
+          { name: 'ok', type: 'boolean' },
+          { name: 'telemetry', type: 'object', properties: [
+            { name: 'http_status', type: 'integer' }, { name: 'message' },
+            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
+          ]}
+        ]
+      end,
+      execute: lambda do |connection, input|
+        t0 = Time.now; corr = call(:build_correlation_id)
+        begin
+          loc = (connection['location'].presence || 'global').to_s.downcase
+          host =
+            if input['service'].to_s == 'discovery'
+              call(:discovery_host, connection, loc)
+            else
+              call(:aipl_service_host, connection, loc)
+            end
+          path = input['resource'].to_s.sub(%r{^/v1/}, '')
+          url  = "https://#{host}/v1/#{path}:testIamPermissions"
+          body = { 'permissions' => call(:safe_array, input['permissions']) }
+          resp = post(url).headers(call(:request_headers, corr)).payload(call(:json_compact, body))
+          code = call(:telemetry_success_code, resp)
+          { 'permissions' => (resp['permissions'] || []), 'ok' => true }
+            .merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+        rescue => e
+          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
+        end
+      end
     }
+
 
   },
 
@@ -3546,7 +3590,12 @@ require 'securerandom'
         ['Dot product',     'DOT_PRODUCT'],
         ['Euclidean',       'EUCLIDEAN_DISTANCE']
       ]
+    end,
+
+    iam_services: lambda do
+      [['Vertex AI','vertex'], ['AI Applications (Discovery)','discovery']]
     end
+
   },
 
   # --------- METHODS ------------------------------------------------------
