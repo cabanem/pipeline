@@ -228,7 +228,7 @@ require 'uri'
       end,
 
       output_fields: lambda do |object_definitions|
-        object_definitions['answer_response']['fields']
+        object_definitions['answer_response']
       end,
 
       execute: lambda do |connection, input|
@@ -276,11 +276,11 @@ require 'uri'
           { name: 'collection_id', optional: false, default: 'default_collection' },
           { name: 'engine_id', optional: false },
           { name: 'serving_config_id', optional: false, default: 'default_serving_config' }
-        ] + object_definitions['search_request']['fields']
+        ] + object_definitions['search_request']
       end,
 
       output_fields: lambda do |object_definitions|
-        object_definitions['search_response']['fields']
+        object_definitions['search_response']
       end,
 
       execute: lambda do |connection, input|
