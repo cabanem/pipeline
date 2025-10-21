@@ -182,6 +182,9 @@ require 'uri'
           { name: 'pageSize',   type: 'integer' },
           { name: 'pageToken' },
           { name: 'userPseudoId' },
+          { name: 'queryExpansionSpec', type: 'object', properties: [] },
+          { name: 'spellCorrectionSpec', type: 'object', properties: [] },
+          { name: 'userInfo', type: 'object', properties: [] },
           { name: 'params',     type: 'object', properties: [] },
           { name: 'filter' },
           { name: 'orderBy' }
@@ -222,7 +225,7 @@ require 'uri'
           { name: 'location', optional: false, default: (connection['location'] || 'global'), hint: 'Discovery Engine location (e.g., global, us, eu).', sticky: true, display_priority: 2 },
           { name: 'collection_id', optional: false, default: 'default_collection', sticky: true, display_priority: 3 },
           { name: 'engine_id', optional: false, sticky: true, display_priority: 4 },
-          { name: 'serving_config_id', optional: false, default: 'default_serving_config', sticky: true, display_priority: 5,
+          { name: 'serving_config_id', optional: false, default: 'default_search', sticky: true, display_priority: 5,
             hint: 'Usually default_serving_config unless you created a custom one.' },
         ]
         simple_fields = [
@@ -315,29 +318,72 @@ require 'uri'
       subtitle: 'Search over an Engine serving config',
       description: 'POST .../servingConfigs/*:search',
 
-      input_fields: lambda do |object_definitions, connection|
-        [
-          { name: 'project_id', optional: false },
-          { name: 'location', optional: false, default: (connection['location'] || 'global') },
-          { name: 'collection_id', optional: false, default: 'default_collection' },
-          { name: 'engine_id', optional: false },
-          { name: 'serving_config_id', optional: false, default: 'default_serving_config' }
-        ] + object_definitions['search_request']
+      config_fields: [
+        { name: 'simple_mode', label: 'Simple mode', type: 'boolean', control_type: 'checkbox',
+          default: true, sticky: true,
+          hint: 'Checked: only the essentials. Uncheck to show all advanced fields.' }
+      ],
+      input_fields: lambda do |object_definitions, connection, cfg|
+        cfg ||= {}
+        simple = !!cfg['simple_mode']
+        base = [
+          { name: 'project_id', optional: false, sticky: true },
+          { name: 'location', optional: false, default: (connection['location'] || 'global'), sticky: true },
+          { name: 'collection_id', optional: false, default: 'default_collection', sticky: true },
+          { name: 'engine_id', optional: false, sticky: true },
+          { name: 'serving_config_id', optional: false, default: 'default_search', sticky: true,
+            hint: 'Search uses default_search by default.' }
+        ]
+        simple_fields = [
+          { name: 'query_text', label: 'Query', optional: false,
+            hint: 'Plain string. Sent as query.' },
+          { name: 'pageSize', type: 'integer', optional: true, hint: 'Default 10 if omitted.' }
+        ]
+        advanced_fields = object_definitions['search_request']
+        base + (simple ? simple_fields : advanced_fields)
       end,
       output_fields: lambda do |object_definitions|
         object_definitions['search_response']
       end,
       execute: lambda do |connection, input|
-        version = (connection['api_version'] || 'v1')
-        path = "/#{version}/projects/#{input['project_id']}/locations/#{input['location']}" \
+        version = (connection['api_version'] || 'v1').to_s
+        %w[project_id location collection_id engine_id serving_config_id].each do |k|
+          error("#{k} is required.") if (input[k] || '').to_s.strip.empty?
+        end
+        loc_for_path = (input['location'] || '').to_s.strip.downcase
+        path = "/#{version}/projects/#{input['project_id']}/locations/#{loc_for_path}" \
               "/collections/#{input['collection_id']}/engines/#{input['engine_id']}" \
               "/servingConfigs/#{input['serving_config_id']}:search"
 
-        body = input.reject { |k,_|
-          %w[project_id location collection_id engine_id serving_config_id].include?(k)
-        }
+        # Decide mode from presence of simple fields
+        simple_mode = input.key?('query_text') || input.key?('pageSize')
+        if simple_mode
+          q = (input['query_text'] || '').to_s
+          error('Query is required (query_text).') if q.strip.empty?
+        else
+          # Advanced requires plain string "query"
+          error('query is required (string).') if (input['query'] || '').to_s.strip.empty?
+        end
+
+        exclude = %w[project_id location collection_id engine_id serving_config_id query_text simple_mode]
+        body = input.reject { |k,_| exclude.include?(k) }
+        if simple_mode
+          body['query'] ||= input['query_text']
+        end
+        body.delete_if { |_k, v| v.nil? }
+
         post(path).payload(body).after_error_response(/.*/) do |code, body_txt, _h, msg|
-          error("Discovery Engine search error #{code}: #{msg}\n#{body_txt}")
+          # Add one friendly nudge for common mistakes
+          hint =
+            if code.to_i == 400 && body_txt.to_s.include?('Invalid JSON')
+              'Check that your JSON keys are quoted and braces match.'
+            elsif code.to_i == 400 && body_txt.to_s.include?('Unknown name "query" at')
+              'Search requests need top-level "query": "string".'
+            end
+          err = "Discovery Engine search error #{code}: #{msg}"
+          err += " — #{hint}" if hint
+          err += "\n#{body_txt}"
+          error(err)
         end
       end,
       sample_output: lambda do
