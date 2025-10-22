@@ -77,9 +77,10 @@ require 'json'
           elsif input['discovery_doc_json'].present?
             JSON.parse(input['discovery_doc_json'])
           elsif input['discovery_doc_url'].present?
-            response = get(input['discovery_doc_url'])
-            body = response.respond_to?(:response_body) ? response.response_body : response
-            JSON.parse(body)
+            # Terminate the Workato HTTP builder with a response formatter.
+            # Returns a parsed Ruby Hash when the server sends JSON.
+            doc = get(input['discovery_doc_url']).response_format_json
+            doc
           else
             error('You must provide discovery_doc_json or discovery_doc_url.')
           end
@@ -211,7 +212,7 @@ require 'json'
             error('Provide openapi_json or openapi_obj.')
           end
 
-        validation = _call(:validate_openapi!, spec, expect_version: (input['expect_version'].presence || '3.'))
+        validation = _call(:validate_openapi!, spec, (input['expect_version'].presence || '3.'))
         {
           openapi_version: spec['openapi'],
           title: spec.dig('info', 'title'),
@@ -429,13 +430,13 @@ require 'json'
         location = p['location'].to_s
         location = 'query' unless %w[path query header].include?(location) # default to query
 
-        out << {
+        out << _call(:hcompact, {
           'name'        => name,
           'in'          => location,
           'required'    => !!p['required'],
           'description' => p['description'],
           'schema'      => _call(:param_schema_from_discovery, p)
-        }.compact
+        })
       end
       out
     end,
