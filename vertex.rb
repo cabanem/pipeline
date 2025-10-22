@@ -1228,9 +1228,10 @@ require 'securerandom'
           path = call(:build_rag_corpus_path, connection, input['rag_corpus'])
           loc  = connection['location'].to_s.downcase
           url  = call(:aipl_v1_url, connection, loc, path)
-          resp = get(url).headers(call(:request_headers, corr))
-          code = call(:telemetry_success_code, resp)
-          resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          raw  = call(:http_call!, 'GET', url).headers(call(:request_headers, corr))
+          code = call(:telemetry_success_code, raw)
+          body = call(:http_body_json, raw)
+          body.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
         rescue => e
           {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
         end
@@ -1283,9 +1284,9 @@ require 'securerandom'
             preview = call(:request_preview_pack, "#{url}#{qstr}", 'GET', call(:request_headers, corr), nil)
             return { 'ok' => true }.merge(preview).merge(call(:telemetry_envelope_ex, t0, corr, true, 200, 'DRY_RUN', { 'action' => 'rag_corpora_list' }))
           end
-          resp = call(:http_call!, 'GET', url).params(qs).headers(call(:request_headers, corr))
-          code = call(:telemetry_success_code, resp)
-          body = call(:http_body_json, resp)
+          raw  = call(:http_call!, 'GET', url).params(qs).headers(call(:request_headers, corr))
+          code = call(:telemetry_success_code, raw)
+          body = call(:http_body_json, raw)
           out = {
             'items' => call(:safe_array, body['ragCorpora']),
             'next_page_token' => body['nextPageToken'],
@@ -1293,8 +1294,7 @@ require 'securerandom'
           }.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
           unless call(:normalize_boolean, connection['prod_mode'])
             qstr = (qs && qs.any?) ? ('?' + qs.map { |k,v| "#{k}=#{v}" }.join('&')) : ''
-            # Keep full wrapper in debug for inspecting status/headers/body
-            out['debug'] = call(:debug_pack, input['debug'], "#{url}#{qstr}", nil, resp) if call(:normalize_boolean, input['debug'])
+            out['debug'] = call(:debug_pack, input['debug'], "#{url}#{qstr}", nil, body) if call(:normalize_boolean, input['debug'])
           end
           out
         rescue => e
@@ -1391,9 +1391,9 @@ require 'securerandom'
             preview = call(:request_preview_pack, "#{url}#{qstr}", 'GET', call(:request_headers, corr), nil)
             return { 'ok' => true }.merge(preview).merge(call(:telemetry_envelope_ex, t0, corr, true, 200, 'DRY_RUN', { 'action' => 'rag_files_list' }))
           end
-          resp = call(:http_call!, 'GET', url).params(qs).headers(call(:request_headers, corr))
-          code = call(:telemetry_success_code, resp)
-          body = call(:http_body_json, resp)
+          raw  = call(:http_call!, 'GET', url).params(qs).headers(call(:request_headers, corr))
+          code = call(:telemetry_success_code, raw)
+          body = call(:http_body_json, raw)
           items = call(:safe_array, body['ragFiles']).map do |it|
             h  = (it || {}).to_h
             lbl = (h['labels'] || {}).to_h
@@ -1832,7 +1832,6 @@ require 'securerandom'
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
-
       input_fields: lambda do |_|
         [
           { name: 'displayName', optional: false },
@@ -1844,7 +1843,6 @@ require 'securerandom'
           { name: 'requestId', optional: true, hint: 'Optional idempotency token (RFC4122). If omitted we won’t send it.' }
         ]
       end,
-
       output_fields: lambda do |_|
         [
           { name: 'name' }, { name: 'done', type: 'boolean' },
@@ -1857,7 +1855,6 @@ require 'securerandom'
           { name: 'debug', type: 'object' }
         ]
       end,
-
       execute: lambda do |connection, input|
         t0   = Time.now
         corr = call(:build_correlation_id)
@@ -1892,12 +1889,13 @@ require 'securerandom'
 
           req_body = call(:json_compact, body)
 
-          resp = post(url).params(params).headers(call(:request_headers, corr)).payload(req_body)
-          code = call(:telemetry_success_code, resp)
-          out  = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          raw  = call(:http_call!, 'POST', url).params(params).headers(call(:request_headers, corr)).payload(req_body)
+          code = call(:telemetry_success_code, raw)
+          body = call(:http_body_json, raw)
+          out  = body.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
           # Assess environment (dev/prod)
           unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
+            out['debug'] = call(:debug_pack, input['debug'], url, req_body, body) if call(:normalize_boolean, input['debug'])
           end
           # Return
           out
@@ -2000,7 +1998,6 @@ require 'securerandom'
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
-
       input_fields: lambda do |_|
         [
           { name: 'displayName', optional: false },
@@ -2011,7 +2008,6 @@ require 'securerandom'
 
         ]
       end,
-
       output_fields: lambda do |_|
         [
           { name: 'name' }, { name: 'done', type: 'boolean' },
@@ -2024,7 +2020,6 @@ require 'securerandom'
           { name: 'debug', type: 'object' }
         ]
       end,
-
       execute: lambda do |connection, input|
         t0 = Time.now
         corr = call(:build_correlation_id)
@@ -2053,12 +2048,13 @@ require 'securerandom'
           req_id = input['requestId'].to_s.strip
           params[:requestId] = req_id unless req_id.empty?
 
-          resp = post(url).params(params).headers(call(:request_headers, corr)).payload(req_body)
-          code = call(:telemetry_success_code, resp)
-          out  = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          raw  = call(:http_call!, 'POST', url).params(params).headers(call(:request_headers, corr)).payload(req_body)
+          code = call(:telemetry_success_code, raw)
+          body = call(:http_body_json, raw)
+          out  = body.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
           # Assess environment (dev/prod)
           unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
+            out['debug'] = call(:debug_pack, input['debug'], url, req_body, body) if call(:normalize_boolean, input['debug'])
           end
           # Return
           out
@@ -2458,10 +2454,9 @@ require 'securerandom'
           loc = connection['location'].to_s.downcase
           url = call(:aipl_v1_url, connection, loc, index_path)
 
-          resp = get(url).headers(call(:request_headers, corr))
-
-          code = call(:telemetry_success_code, resp)
-          body = call(:http_body_json, resp)
+          raw  = call(:http_call!, 'GET', url).headers(call(:request_headers, corr))
+          code = call(:telemetry_success_code, raw)
+          body = call(:http_body_json, raw)
 
           # --- Parse helpful probe fields out of metadata ---
           md = (body['metadata'] || {}).to_h
@@ -3992,14 +3987,17 @@ require 'securerandom'
       end
     end,
     http_body_json: lambda do |resp|
-      # Accepts:
-      #  - Hash wrapper with 'body' (Workato HTTP response)
-      #  - Already-parsed Hash/Array
-      #  - Raw JSON string
+      # Accepts Workato HTTP response object OR already-parsed Hash/Array/String.
+      # Normalizes to a Hash (or {}).
       if resp.is_a?(Hash) && resp.key?('body')
-        call(:safe_json, resp['body']) || {}
-      else
+        parsed = call(:safe_json, resp['body'])
+        parsed.nil? ? {} : parsed
+      elsif resp.is_a?(String)
         call(:safe_json, resp) || {}
+      elsif resp.is_a?(Hash) || resp.is_a?(Array)
+        resp
+      else
+        {}
       end
     end,
     request_preview_pack: lambda do |url, verb, headers, payload|
@@ -4054,7 +4052,8 @@ require 'securerandom'
       env
     end,
     telemetry_success_code: lambda do |resp|
-      (resp['status'] || resp['status_code'] || 200).to_i
+      # Works with Workato HTTP response (has status/status_code) or defaults to 200
+      (resp.is_a?(Hash) && (resp['status'] || resp['status_code'])) ? (resp['status'] || resp['status_code']).to_i : 200
     end,
     telemetry_parse_error_code: lambda do |err|
       # Prefer Workato HTTP error objects first
