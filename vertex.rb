@@ -97,10 +97,9 @@ require 'securerandom'
       call(:ensure_project_id!, connection)
       # Build model path (global preview)
       model_path = call(:build_model_path_with_global_preview, connection, connection['default_probe_gen_model'])
-      # Define location (prefer connection, fallback to global)
-      loc = (connection['location'].presence || 'global').to_s.downcase
-      # POST to endpoint
-      url = call(:aipl_v1_url, connection, loc, "#{model_path}:countTokens")
+      # Set location (derive from model)
+      loc_from_model = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
+      url = call(:aipl_v1_url, connection, loc_from_model, "#{model_path}:countTokens")
       post(url)
         .headers(call(:request_headers, call(:build_correlation_id)))
         .payload({
@@ -1019,17 +1018,26 @@ require 'securerandom'
           # Dry-run mode returns both planned requests (retrieve + generate)
           # Build the generation payload now to include in preview if needed.
           # (The actual gen payload is rebuilt below once chunks are known.)
-
           if call(:normalize_boolean, input['validate_only'])
-            preview1 = call(:request_preview_pack, retr_url, 'POST', call(:request_headers, corr), retr_req_body)
-            # minimal stand-in for gen request (model path unresolved until runtime)
-            preview = { 'request_preview' => { 'retrieve' => preview1['request_preview'] } }
-            return preview.merge(call(:telemetry_envelope_ex, t0, corr, true, 200, 'DRY_RUN', { 'action' => 'rag_answer' }))
+            preview_retr = call(:request_preview_pack, retr_url, 'POST', call(:request_headers, corr), retr_req_body)
+            # Build generation preview too (uses same model_path logic)
+            preview_gen  = call(:request_preview_pack, 
+                                call(:aipl_v1_url, connection, 
+                                     (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase,
+                                     "#{model_path}:generateContent"),
+                                'POST', 
+                                call(:request_headers, corr), 
+                                call(:json_compact, {
+                                  'contents' => [{ 'role'=>'user','parts'=>[{ 'text' => "Question:\n#{input['question']}\n\nContext:\n<trimmed in runtime>" }]}],
+                                  'systemInstruction' => sys_inst, 
+                                  'generationConfig'  => gen_cfg
+                                }))
+            return { 'ok'=>true, 'request_preview'=> { 'retrieve'=>preview_retr['request_preview'], 'generate'=>preview_gen['request_preview'] } }
+                     .merge(call(:telemetry_envelope_ex, t0, corr, true, 200, 'DRY_RUN', { 'action' => 'rag_answer' }))
           end
 
           retr_resp = call(:http_call!, 'POST', retr_url)
                         .headers(call(:request_headers, corr))
-                        .payload(call(:json_compact, retrieve_payload))
                         .payload(retr_req_body)
           raw_ctxs = call(:normalize_retrieve_contexts!, retr_resp)
 
@@ -1084,10 +1092,14 @@ require 'securerandom'
             'generationConfig'  => gen_cfg
           }
 
+          # Derive location from model path to avoid region/global mismatch
+          loc_from_model = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
+          gen_url  = call(:aipl_v1_url, connection, loc_from_model, "#{model_path}:generateContent")
           gen_req_body = call(:json_compact, gen_payload)
           gen_resp  = call(:http_call!, 'POST', gen_url)
-                       .headers(call(:request_headers, corr))
-                       .payload(gen_req_body)
+                        .headers(call(:request_headers, corr))
+                        .payload(gen_req_body)
+
 
           text = gen_resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
           parsed = call(:safe_parse_json, text)
@@ -1267,7 +1279,8 @@ require 'securerandom'
           qs['pageSize']  = input['page_size'].to_i if input['page_size'].to_i > 0
           qs['pageToken'] = input['page_token'] if input['page_token'].present?
           if call(:normalize_boolean, input['validate_only'])
-            preview = call(:request_preview_pack, [url, qs].compact.join('?'), 'GET', call(:request_headers, corr), nil)
+            qstr   = (qs && qs.any?) ? ('?' + qs.map { |k,v| "#{k}=#{v}" }.join('&')) : ''
+            preview = call(:request_preview_pack, "#{url}#{qstr}", 'GET', call(:request_headers, corr), nil)
             return { 'ok' => true }.merge(preview).merge(call(:telemetry_envelope_ex, t0, corr, true, 200, 'DRY_RUN', { 'action' => 'rag_corpora_list' }))
           end
           resp = call(:http_call!, 'GET', url).params(qs).headers(call(:request_headers, corr))
@@ -1372,7 +1385,8 @@ require 'securerandom'
           qs['pageSize']  = input['page_size'].to_i if input['page_size'].to_i > 0
           qs['pageToken'] = input['page_token'] if input['page_token'].present?
           if call(:normalize_boolean, input['validate_only'])
-            preview = call(:request_preview_pack, [url, qs].compact.join('?'), 'GET', call(:request_headers, corr), nil)
+            qstr   = (qs && qs.any?) ? ('?' + qs.map { |k,v| "#{k}=#{v}" }.join('&')) : ''
+            preview = call(:request_preview_pack, "#{url}#{qstr}", 'GET', call(:request_headers, corr), nil)
             return { 'ok' => true }.merge(preview).merge(call(:telemetry_envelope_ex, t0, corr, true, 200, 'DRY_RUN', { 'action' => 'rag_files_list' }))
           end
           resp = call(:http_call!, 'GET', url).params(qs).headers(call(:request_headers, corr))
@@ -2623,7 +2637,8 @@ require 'securerandom'
           qs['pageSize']  = input['page_size'].to_i if input['page_size'].to_i > 0
           qs['pageToken'] = input['page_token'] if input['page_token'].present?
           if call(:normalize_boolean, input['validate_only'])
-            preview = call(:request_preview_pack, [url, qs].compact.join('?'), 'GET', call(:request_headers, corr), nil)
+            qstr   = (qs && qs.any?) ? ('?' + qs.map { |k,v| "#{k}=#{v}" }.join('&')) : ''
+            preview = call(:request_preview_pack, "#{url}#{qstr}", 'GET', call(:request_headers, corr), nil)
             return { 'ok' => true }.merge(preview).merge(call(:telemetry_envelope_ex, t0, corr, true, 200, 'DRY_RUN', { 'action' => 'index_list' }))
           end
 
@@ -2843,11 +2858,9 @@ require 'securerandom'
             hint: 'projects/.../locations/.../collections/.../engines/.../servingConfigs/default_config' }
         ]
       end,
-
       output_fields: lambda do |object_definitions, connection|
         Array(object_definitions['generate_content_output']) + Array(object_definitions['envelope_fields'])
       end,
-
       execute: lambda do |connection, input|
         # Correlation id and duration for logs / analytics
         t0 = Time.now
@@ -2893,8 +2906,8 @@ require 'securerandom'
         }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
 
         # Call endpoint
-        loc = (connection['location'].presence || 'global').to_s.downcase
-        url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
+        loc_from_model = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
+        url = call(:aipl_v1_url, connection, loc_from_model, "#{model_path}:generateContent")
         begin
           resp = post(url)
                   .headers(call(:request_headers, corr))
@@ -3432,7 +3445,6 @@ require 'securerandom'
           { name: 'system_preamble', label: 'System preamble (text)', optional: true }
         ]
       end,
-
       output_fields: lambda do |object_definitions, connection|
         [
           { name: 'totalTokens', type: 'integer' },
@@ -3440,7 +3452,6 @@ require 'securerandom'
           { name: 'promptTokensDetails', type: 'array', of: 'object' }
         ] + Array(object_definitions['envelope_fields'])
       end,
-
       execute:  lambda do |connection, input|
         # Correlation id and duration for logs / analytics
         t0 = Time.now
@@ -3454,8 +3465,8 @@ require 'securerandom'
         error('At least one non-system message is required in contents') if contents.blank?
         sys_inst   = call(:system_instruction_from_text, input['system_preamble'])
 
-        loc = (connection['location'].presence || 'global').to_s.downcase
-        url = call(:aipl_v1_url, connection, loc, "#{model_path}:countTokens")
+        loc_from_model = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
+        url = call(:aipl_v1_url, connection, loc_from_model, "#{model_path}:countTokens")
 
         begin
           resp = post(url)
@@ -3472,7 +3483,6 @@ require 'securerandom'
           {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
         end
       end,
-
       sample_output: lambda do
         { 'totalTokens' => 31, 'totalBillableCharacters' => 96,
           'promptTokensDetails' => [ { 'modality' => 'TEXT', 'tokenCount' => 31 } ],
