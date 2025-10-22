@@ -318,27 +318,7 @@ require 'securerandom'
           { name: 'value' }
         ]
       end
-    },
-
-    # Stabilized output shaper for neighbors
-    shape_neighbors: lambda do |resp|
-      body = call(:safe_json, resp&.body) || {}
-      list = Array(body['nearestNeighbors']).map do |nn|
-        neighbors = Array(nn['neighbors']).map do |n|
-          {
-            'datapoint' => n['datapoint'],
-            'distance'  => n['distance'].to_f.round(6),
-            'crowdingTagCount' => n['crowdingTagCount'].to_i
-          }
-        end
-        # Deterministic order: by distance ASC, then datapointId
-        { 'neighbors' => neighbors.sort_by { |x|
-            [x['distance'], x.dig('datapoint','datapointId').to_s]
-          }
-        }
-      end
-      { 'nearestNeighbors' => list }
-    end
+    }
 
   },
 
@@ -347,12 +327,12 @@ require 'securerandom'
 
     # 1)  Email categorization
     gen_categorize_email: {
-      title: 'Categorize email',
+      title: 'Email: Categorize email',
       subtitle: 'Classify an email into a category',
       help: lambda do |_|
         { body: 'Classify an email into one of the provided categories using embeddings (default) or a generative referee.'}
       end,
-      display_priority: 10,
+      display_priority: 100,
       retry_on_request: ['GET', 'HEAD'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
@@ -392,7 +372,6 @@ require 'securerandom'
             hint: 'How much to blend salience importance into the final confidence (0–0.5 typical).' },
         ]
       end,
-
       output_fields: lambda do |object_definitions|
         [
           { name: 'mode' },
@@ -414,7 +393,6 @@ require 'securerandom'
               { name: 'importance', type: 'number' }]},
         ] + Array(object_definitions['envelope_fields'])
       end,
-
       execute: lambda do |connection, input|
         t0   = Time.now
         corr = call(:build_correlation_id)
@@ -541,7 +519,6 @@ require 'securerandom'
           {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
         end
       end,
-
       sample_output: lambda do
         {
           'mode' => 'embedding',
@@ -570,7 +547,7 @@ require 'securerandom'
     email_extract_salient_span: {
       title: 'Email: Extract salient span',
       subtitle: 'Pull the most important sentence/paragraph from an email',
-      display_priority: 11,
+      display_priority: 100,
       help: lambda do |_|
         { body: 'Heuristically trims boilerplate/quotes, then asks the model for the single most important span (<= 500 chars), with rationale, tags, and optional call-to-action metadata.' }
       end,
@@ -772,7 +749,7 @@ require 'securerandom'
     rag_files_import: {
       title: 'RAG: Import files to corpus',
       subtitle: 'projects.locations.ragCorpora.ragFiles:import',
-      display_priority: 9,
+      display_priority: 90,
       retry_on_request: ['GET','HEAD'], # removed "POST" to preserve idempotency, prevent duplication of jobs
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
@@ -883,7 +860,7 @@ require 'securerandom'
     rag_retrieve_contexts: {
       title: 'RAG: Retrieve contexts',
       subtitle: 'projects.locations:retrieveContexts (Vertex RAG Store)',
-      display_priority: 9,
+      display_priority: 90,
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
@@ -975,7 +952,7 @@ require 'securerandom'
     rag_answer: {
       title: 'RAG: Retrieve + answer (one-shot)',
       subtitle: 'Retrieve contexts from a corpus and generate a cited answer',
-      display_priority: 9,
+      display_priority: 90,
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
@@ -1144,7 +1121,7 @@ require 'securerandom'
     rag_corpora_create: {
       title: 'RAG: Create corpus',
       subtitle: 'projects.locations.ragCorpora.create',
-      display_priority: 9,
+      display_priority: 90,
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
       input_fields: lambda do |_|
@@ -1213,7 +1190,7 @@ require 'securerandom'
     rag_corpora_get: {
       title: 'RAG: Get corpus',
       subtitle: 'projects.locations.ragCorpora.get',
-      display_priority: 9,
+      display_priority: 90,
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
       input_fields: lambda do |_|
@@ -1250,7 +1227,7 @@ require 'securerandom'
     rag_corpora_list: {
       title: 'RAG: List corpora',
       subtitle: 'projects.locations.ragCorpora.list',
-      display_priority: 9,
+      display_priority: 90,
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
       input_fields: lambda do |_|
@@ -1313,7 +1290,7 @@ require 'securerandom'
     rag_corpora_delete: {
       title: 'RAG: Delete corpus',
       subtitle: 'projects.locations.ragCorpora.delete',
-      display_priority: 9,
+      display_priority: 90,
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
       input_fields: lambda do |_|
@@ -1349,7 +1326,7 @@ require 'securerandom'
     rag_files_list: {
       title: 'RAG: List files in corpus',
       subtitle: 'projects.locations.ragCorpora.ragFiles.list',
-      display_priority: 9,
+      display_priority: 90,
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
       input_fields: lambda do |_|
@@ -1429,7 +1406,7 @@ require 'securerandom'
     rag_files_get: {
       title: 'RAG: Get file',
       subtitle: 'projects.locations.ragCorpora.ragFiles.get',
-      display_priority: 9,
+      display_priority: 90,
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
       input_fields: lambda do |_|
@@ -1482,7 +1459,7 @@ require 'securerandom'
     rag_files_delete: {
       title: 'RAG: Delete file',
       subtitle: 'projects.locations.ragCorpora.ragFiles.delete',
-      display_priority: 9,
+      display_priority: 90,
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
       input_fields: lambda do |_|
@@ -1518,9 +1495,9 @@ require 'securerandom'
 
     # 3)  Vector search
     indexes_upsert_datapoints: {
-      title: 'Vector Index - Upsert datapoints',
+      title: 'Vector Search: Upsert datapoints',
       subtitle: 'Upsert datapoints in a vector index',
-      display_priority: 90,
+      display_priority: 85,
       description: 'indexes.upsertDatapoints — Vertex AI Matching Engine',
       help: lambda do |_|
         { body: "Insert or update datapoints in a vector index (idempotent by datapointId). Accepts friendly labels/metadata and "\
@@ -1675,7 +1652,7 @@ require 'securerandom'
       title: 'Vector Search: Query neighbors',
       subtitle: 'Query neighbors using vector search',
       description: 'indexEndpoints.findNeighbors — Vertex AI Matching Engine',
-      display_priority: 80,
+      display_priority: 85,
       help: lambda do |_|
         { body: "Query nearest neighbors on a deployed index. Provide either a query featureVector or a reference "  \
                 "datapoint, with optional string filters, per-crowding limits, and distanceMeasure override. Returns "\
@@ -1825,10 +1802,10 @@ require 'securerandom'
       end
     },
     indexes_create: {
-      title: 'Vector Index - Create index',
+      title: 'Vector Search: Create index',
       subtitle: 'Create an vector index in Vertex AI Matching Engine',
       description: 'projects.locations.indexes.create — Vertex AI Matching Engine',
-      display_priority: 90,
+      display_priority: 85,
       help: lambda do |_|
         { body: "Create a vector index resource with displayName/description/metadata. Optionally "\
                 "pass indexId and requestId (for idempotency). Returns the long-running operation "\
@@ -1925,10 +1902,10 @@ require 'securerandom'
       end
     },
     indexes_delete: {
-      title: 'Vector Index - Delete index',
+      title: 'Vector Search: Delete index',
       subtitle: 'Delete an index (Vertex AI Matching Engine)',
       description: 'projects.locations.indexes.delete — Vertex AI Matching Engine',
-      display_priority: 90,
+      display_priority: 85,
       help: lambda do |_|
         { body: 'Delete a vector index by resource name or short ID. Returns the LRO that tracks deletion.' }
       end,
@@ -1995,10 +1972,10 @@ require 'securerandom'
 
     # 4)  Vector index
     index_endpoints_create: {
-      title: 'Vector Index - Create index endpoint',
+      title: 'Vector Index: Create index endpoint',
       subtitle: 'Create an index endpoint',
       description: 'projects.locations.indexEndpoints.create — Vertex AI Matching Engine',
-      display_priority: 90,
+      display_priority: 80,
       help: lambda do |_| 
         { body: 'Create an IndexEndpoint to host deployed indexes. Supports displayName, description, and labels. Returns the LRO for endpoint creation.' }
       end,
@@ -2086,10 +2063,10 @@ require 'securerandom'
       end
     },
     index_endpoints_delete: {
-      title: 'Vector Index - Delete index endpoint',
+      title: 'Vector Index: Delete index endpoint',
       subtitle: 'Delete an index endpoint',
       description: 'projects.locations.indexEndpoints.delete — Vertex AI Matching Engine',
-      display_priority: 90,
+      display_priority: 80,
       help: lambda do |_|
         {body: 'Delete an IndexEndpoint by resource name or short ID. Returns the LRO for teardown.'}
       end,
@@ -2157,10 +2134,10 @@ require 'securerandom'
       end
     },
     index_endpoints_deploy: {
-      title: 'Vector Index - Deploy index to endpoint',
+      title: 'Vector Index: Deploy index to endpoint',
       subtitle: 'Deploy an index to a vector endpoint',
       description: 'projects.locations.indexEndpoints.deployIndex — Vertex AI Matching Engine',
-      display_priority: 90,
+      display_priority: 80,
       help: lambda do |_|
         {body: 'Deploy an index to an IndexEndpoint under a chosen deployedIndexId. Supports optional displayName, labels, and privateEndpoints. Returns the LRO for deployment.' }
       end,
@@ -2256,7 +2233,7 @@ require 'securerandom'
       end
     },
     index_endpoints_undeploy: {
-      title: 'Vector Index - Undeploy index from endpoint',
+      title: 'Vector Index: Undeploy index from endpoint',
       subtitle: 'Undeploy an index from an endpoint',
       description: 'projects.locations.indexEndpoints.undeployIndex — Vertex AI Matching Engine',
       display_priority: 90,
@@ -2336,10 +2313,10 @@ require 'securerandom'
       end
     },
     indexes_remove_datapoints: {
-      title: 'Vector Index - Remove datapoints',
+      title: 'Vector Index: Remove datapoints',
       subtitle: 'Remove datapoints from a deployed vector index',
       description: 'indexes.removeDatapoints — Vertex AI Matching Engine',
-      display_priority: 90,
+      display_priority: 80,
       help: lambda do |_| 
         { body: 'Bulk-remove datapoints from an index by datapointIds[]. Validates input and returns a success envelope once the request is accepted.' }
       end,
@@ -2393,10 +2370,10 @@ require 'securerandom'
       end
     },
     index_get: {
-      title: 'Vector Index - Get',
+      title: 'Vector Index: Get',
       subtitle: 'projects.locations.indexes.get',
       description: 'Fetch a vector index and extract key fields',
-      display_priority: 7,
+      display_priority: 80,
       help: lambda do |_|
         {body: 'Fetch a vector index and extract key probe fields (dimensions, distance metric, algorithm, shard/neighbor settings, and state). Useful for connection tests and recipe conditionals.' }
       end,
@@ -2569,9 +2546,9 @@ require 'securerandom'
       end
     },
     index_list: {
-      title: 'Vector Index - List',
+      title: 'Vector Index: List',
       subtitle: 'projects.locations.indexes.list',
-      display_priority: 7,
+      display_priority: 80,
       help: lambda do |_| 
         { body: 'List vector indexes in the current project/location with pagination. '\
                 'Also returns parsed convenience fields (dimensions, distance metric, '\
@@ -2765,7 +2742,7 @@ require 'securerandom'
       help: lambda do |_|
         { body: 'Provide a prompt to generate content from an LLM. Uses "POST :generateContent".'}
       end,
-      display_priority: 8,
+      display_priority: 99,
       retry_on_request: ['GET','HEAD'], # removed "POST" to preserve idempotency, prevent duplication of jobs
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
@@ -2849,7 +2826,7 @@ require 'securerandom'
     gen_generate_grounded: {
       title: 'Generative: Generate (grounded)',
       subtitle: 'Generate with grounding via Google Search or Vertex AI Search',
-      display_priority: 8,
+      display_priority: 99,
       retry_on_request: [ 'GET', 'HEAD' ],
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
@@ -2948,7 +2925,7 @@ require 'securerandom'
       help: lambda do |_|
         { body: 'Answer a question using caller-supplied context chunks (RAG-lite). Returns structured JSON with citations.' }
       end,
-      display_priority: 8,
+      display_priority: 99,
       retry_on_request: ['GET', 'HEAD'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
@@ -3255,7 +3232,7 @@ require 'securerandom'
 
     # 7)  Predict
     endpoint_predict: {
-      title: 'Prediction - Endpoint predict (custom model)',
+      title: 'Prediction: Endpoint predict (custom model)',
       subtitle: 'POST :predict to a Vertex AI Endpoint',
       display_priority: 6,
       retry_on_request: ['GET', 'HEAD'],
@@ -3309,7 +3286,7 @@ require 'securerandom'
       end
     },
     batch_prediction_create: {
-      title: 'Prediction - Create prediction job',
+      title: 'Prediction: Create prediction job',
       subtitle: 'Create projects.locations.batchPredictionJobs',
       batch: true,
       display_priority: 6,
@@ -3390,7 +3367,7 @@ require 'securerandom'
       end
     },
     batch_prediction_get: {
-      title: 'Prediction - Fetch prediction job (get)',
+      title: 'Prediction: Fetch prediction job (get)',
       subtitle: 'Get a batch prediction job by ID',
       batch: true,
       display_priority: 6,
@@ -4015,6 +3992,25 @@ require 'securerandom'
          }
        }
      end,
+      # Stabilized output shaper for neighbors
+      shape_neighbors: lambda do |resp|
+        body = call(:safe_json, resp&.body) || {}
+        list = Array(body['nearestNeighbors']).map do |nn|
+          neighbors = Array(nn['neighbors']).map do |n|
+            {
+              'datapoint' => n['datapoint'],
+              'distance'  => n['distance'].to_f.round(6),
+              'crowdingTagCount' => n['crowdingTagCount'].to_i
+            }
+          end
+          # Deterministic order: by distance ASC, then datapointId
+          { 'neighbors' => neighbors.sort_by { |x|
+              [x['distance'], x.dig('datapoint','datapointId').to_s]
+            }
+          }
+        end
+        { 'nearestNeighbors' => list }
+      end,
 
     # --- Telemetry and resilience -----------------------------------------
     telemetry_envelope: lambda do |started_at, correlation_id, ok, code, message|
