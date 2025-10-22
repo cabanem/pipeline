@@ -1285,14 +1285,15 @@ require 'securerandom'
           end
           resp = call(:http_call!, 'GET', url).params(qs).headers(call(:request_headers, corr))
           code = call(:telemetry_success_code, resp)
-          body = call(:safe_json, resp&.body) || {}
+          body = call(:safe_json, resp) || {}
           out = {
             'items' => call(:safe_array, body['ragCorpora']),
             'next_page_token' => body['nextPageToken'],
             'ok' => true
           }.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
           unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], [url, qs].compact.join('?'), nil, resp&.body) if call(:normalize_boolean, input['debug'])
+            qstr = (qs && qs.any?) ? ('?' + qs.map { |k,v| "#{k}=#{v}" }.join('&')) : ''
+            out['debug'] = call(:debug_pack, input['debug'], "#{url}#{qstr}", nil, resp) if call(:normalize_boolean, input['debug'])
           end
           out
         rescue => e
@@ -1391,7 +1392,7 @@ require 'securerandom'
           end
           resp = call(:http_call!, 'GET', url).params(qs).headers(call(:request_headers, corr))
           code = call(:telemetry_success_code, resp)
-          body = call(:safe_json, resp&.body) || {}
+          body = call(:safe_json, resp) || {}
           items = call(:safe_array, body['ragFiles']).map do |it|
             h  = (it || {}).to_h
             lbl = (h['labels'] || {}).to_h
@@ -1409,7 +1410,8 @@ require 'securerandom'
             'ok' => true
           }.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
           unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], [url, qs].compact.join('?'), nil, resp&.body) if call(:normalize_boolean, input['debug'])
+            qstr = (qs && qs.any?) ? ('?' + qs.map { |k,v| "#{k}=#{v}" }.join('&')) : ''
+            out['debug'] = call(:debug_pack, input['debug'], "#{url}#{qstr}", nil, resp) if call(:normalize_boolean, input['debug'])
           end
           out
         rescue => e
@@ -1455,7 +1457,7 @@ require 'securerandom'
           url  = call(:aipl_v1_url, connection, loc, name)
           resp = get(url).headers(call(:request_headers, corr))
           code = call(:telemetry_success_code, resp)
-          body = call(:safe_json, resp&.body) || {}
+          body = call(:safe_json, resp) || {}
           lbl = (body['labels'] || {}).to_h
           md  = (body['metadata'] || {}).to_h
           out = body.merge(
@@ -2393,7 +2395,6 @@ require 'securerandom'
       end,
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
-
       input_fields: lambda do |_|
         [
           { name: 'index', optional: false,
@@ -2403,7 +2404,6 @@ require 'securerandom'
             hint: 'Echo request URL/response for troubleshooting (disabled when connection.prod_mode = true)' }
         ]
       end,
-
       output_fields: lambda do |_|
         [
           { name: 'ok', type: 'boolean' },
@@ -2442,7 +2442,6 @@ require 'securerandom'
           { name: 'debug', type: 'object' }
         ]
       end,
-
       execute: lambda do |connection, input|
         t0 = Time.now
         corr = call(:build_correlation_id)
@@ -2457,11 +2456,10 @@ require 'securerandom'
           loc = connection['location'].to_s.downcase
           url = call(:aipl_v1_url, connection, loc, index_path)
 
-          resp = get(url)
-                  .headers(call(:request_headers, corr))
+          resp = get(url).headers(call(:request_headers, corr))
 
           code = call(:telemetry_success_code, resp)
-          body = call(:safe_json, resp&.body) || {}
+          body = call(:safe_json, resp) || {}
 
           # --- Parse helpful probe fields out of metadata ---
           md = (body['metadata'] || {}).to_h
@@ -2509,7 +2507,7 @@ require 'securerandom'
           }.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
 
           unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, nil, resp&.body) if call(:normalize_boolean, input['debug'])
+            out['debug'] = call(:debug_pack, input['debug'], url, nil, resp) if call(:normalize_boolean, input['debug'])
           end
 
           out
@@ -2642,12 +2640,10 @@ require 'securerandom'
             return { 'ok' => true }.merge(preview).merge(call(:telemetry_envelope_ex, t0, corr, true, 200, 'DRY_RUN', { 'action' => 'index_list' }))
           end
 
-          resp = call(:http_call!, 'GET', url)
-                  .params(qs)
-                  .headers(call(:request_headers, corr))
+          resp = call(:http_call!, 'GET', url).params(qs).headers(call(:request_headers, corr))
 
           code = call(:telemetry_success_code, resp)
-          body = call(:safe_json, resp&.body) || {}
+          body = call(:safe_json, resp) || {}
           list = call(:safe_array, body['indexes'])
 
           items = list.map do |it|
@@ -2697,7 +2693,8 @@ require 'securerandom'
           }.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
 
           unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], [url, qs].compact.join('?'), nil, resp&.body) if call(:normalize_boolean, input['debug'])
+            qstr = (qs && qs.any?) ? ('?' + qs.map { |k,v| "#{k}=#{v}" }.join('&')) : ''
+            out['debug'] = call(:debug_pack, input['debug'], "#{url}#{qstr}", nil, resp) if call(:normalize_boolean, input['debug'])
           end
 
           out
@@ -4004,7 +4001,7 @@ require 'securerandom'
      end,
       # Stabilized output shaper for neighbors
       shape_neighbors: lambda do |resp|
-        body = call(:safe_json, resp&.body) || {}
+        body = call(:safe_json, resp) || {}
         list = Array(body['nearestNeighbors']).map do |nn|
           neighbors = Array(nn['neighbors']).map do |n|
             {
