@@ -78,7 +78,8 @@ require 'json'
             JSON.parse(input['discovery_doc_json'])
           elsif input['discovery_doc_url'].present?
             response = get(input['discovery_doc_url'])
-            JSON.parse(response&.response_body || response)
+            body = response.respond_to?(:response_body) ? response.response_body : response
+            JSON.parse(body)
           else
             error('You must provide discovery_doc_json or discovery_doc_url.')
           end
@@ -117,7 +118,7 @@ require 'json'
         spec = _call(:deep_compact, spec)
 
         # Validate
-        validation = _call(:validate_openapi!, spec, expect_version: openapi_version)
+        validation = _call(:validate_openapi!, spec, openapi_version)
 
         {
           started_at: t0.iso8601,
@@ -145,7 +146,7 @@ require 'json'
             info: { title: 'Sample API', version: 'v1' },
             servers: [{ url: 'https://example.googleapis.com/' }],
             paths: {
-              '/v1/things/{thingId}': {
+              '/v1/things/{thingId}' => {
                 get: {
                   operationId: 'sample.getThing',
                   parameters: [
@@ -263,18 +264,18 @@ require 'json'
   },
 
   methods: {
+
     derive_server_url: lambda do |doc|
       root = doc['rootUrl'].to_s.strip
       svc  = doc['servicePath'].to_s.strip
-      url =
-        if root.present? && svc.present?
-          "#{root}#{svc}"
-        elsif root.present?
-          root
-        else
-          nil
-        end
-      url&.gsub(/\/\/+/, '/ ')&.gsub('http:/ ', 'http://')&.gsub('https:/ ', 'https://')&.strip
+      raw = if root.present? && svc.present?
+              "#{root}#{svc}"
+            elsif root.present?
+              root
+            else
+              nil
+            end
+      _call(:normalize_url_like, raw)
     end,
 
     inject_security_schemes!: lambda do |spec, doc|
@@ -353,17 +354,9 @@ require 'json'
 
     inject_paths!: lambda do |spec, doc|
       paths = spec['paths']
-
-      # Top-level methods
-      _call(:collect_methods, doc).each do |m|
-        _call(:add_method_to_paths!, paths, m, doc)
-      end
-
-      # Nested resources.*.methods
-      resources = doc['resources'] || {}
-      _call(:walk_resources, resources) do |method_obj|
-        _call(:add_method_to_paths!, paths, method_obj, doc)
-      end
+      meths = _call(:collect_methods, doc) +
+              _call(:collect_resource_methods, (doc['resources'] || {}))
+      meths.each { |m| _call(:add_method_to_paths!, paths, m, doc) }
     end,
 
     collect_methods: lambda do |doc|
@@ -372,14 +365,16 @@ require 'json'
       end
     end,
 
-    walk_resources: lambda do |resources, &blk|
-      return unless resources.is_a?(Hash)
+    collect_resource_methods: lambda do |resources|
+      out = []
+      return out unless resources.is_a?(Hash)
       resources.each do |_rname, robj|
         (robj['methods'] || {}).each do |mid, mobj|
-          blk.call({ 'methodId' => mid }.merge(mobj || {}))
+          out << ({ 'methodId' => mid }.merge(mobj || {}))
         end
-        _call(:walk_resources, robj['resources'], &blk) if robj['resources'].is_a?(Hash)
+        out.concat(_call(:collect_resource_methods, robj['resources'])) if robj['resources'].is_a?(Hash)
       end
+      out
     end,
 
     add_method_to_paths!: lambda do |paths, m, doc|
@@ -413,13 +408,13 @@ require 'json'
       # Responses (basic 200 mapping)
       responses = _call(:translate_responses, m['response'])
 
-      operation = {
+      operation = _call(:hcompact, {
         'operationId' => op_id,
         'description' => m['description'],
         'parameters'  => params.empty? ? nil : _call(:dedupe_parameters, params),
         'requestBody' => request_body,
         'responses'   => responses
-      }.compact
+      })
 
       paths[path][http_method] = operation
     end,
@@ -475,19 +470,13 @@ require 'json'
     translate_responses: lambda do |resp|
       # Simple 200 response with schema if present
       schema = _call(:schema_ref_or_inline, resp)
-      content =
-        if schema
-          { 'application/json' => { 'schema' => schema } }
-        else
-          nil
-        end
-
-      {
-        '200' => {
+      content = schema ? { 'application/json' => { 'schema' => schema } } : nil
+      _call(:hcompact, {
+        '200' => _call(:hcompact, {
           'description' => 'OK',
           'content'     => content
-        }.compact
-      }
+        })
+      })
     end,
 
     schema_ref_or_inline: lambda do |obj|
@@ -525,8 +514,9 @@ require 'json'
       end
     end,
 
-    validate_openapi!: lambda do |spec, expect_version: '3.'|
-      errors, warnings = _call(:collect_validation_errors, spec, expect_version)
+    validate_openapi!: lambda do |spec, expect_version=nil|
+      ev = expect_version || '3.'
+      errors, warnings = _call(:collect_validation_errors, spec, ev)
       {
         'passed' => errors.empty?,
         'error_count' => errors.size,
@@ -686,6 +676,20 @@ require 'json'
       _check_refs.call(spec, '#')
 
       [errors, warnings]
+    end,
+
+    hcompact: lambda do |h|
+      return h unless h.is_a?(Hash)
+      h.reject { |_k, v| v.nil? }
+    end,
+
+    normalize_url_like: lambda do |url|
+      return nil if url.to_s.strip.empty?
+      s = url.to_s.strip
+      s = s.gsub('://', '::__')
+      s = s.gsub(%r{//+}, '/')
+      s = s.gsub('::__', '://')
+      s
     end
 
   }
