@@ -782,7 +782,6 @@ require 'securerandom'
             hint: 'Echo request URL/body and Google error body for troubleshooting' }
         ]
       end,
-
       output_fields: lambda do |_|
         [
           { name: 'name' },           # LRO: projects/.../operations/...
@@ -798,7 +797,6 @@ require 'securerandom'
           ]}
         ]
       end,
-
       execute: lambda do |connection, input|
         # Build correlation ID, now (for traceability)
         t0 = Time.now
@@ -820,14 +818,15 @@ require 'securerandom'
           loc = (connection['location'] || '').downcase
           url = call(:aipl_v1_url, connection, loc, "#{corpus}/ragFiles:import")
           req_body = call(:json_compact, payload)
-          resp = post(url)
+          raw  = call(:http_call!, 'POST', url)
                    .headers(call(:request_headers, corr))
                    .payload(req_body)
-          code = call(:telemetry_success_code, resp)
-          out = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          code = call(:telemetry_success_code, raw)
+          body = call(:http_body_json, raw)
+          out  = body.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
           if call(:normalize_boolean, input['debug'])
             ops_root = "https://#{call(:aipl_service_host, connection, loc)}/v1/projects/#{connection['project_id']}/locations/#{loc}/operations"
-            dbg = call(:debug_pack, true, url, req_body, nil) || {}
+            dbg = call(:debug_pack, true, url, req_body, body) || {}
             dbg['ops_list_url'] = ops_root
             out['debug'] = dbg
           end
@@ -873,7 +872,6 @@ require 'securerandom'
           { name: 'max_contexts', type: 'integer', optional: true, default: 20 }
         ]
       end,
-
       output_fields: lambda do |object_definitions, connection|
         [
           { name: 'question' },
@@ -897,7 +895,6 @@ require 'securerandom'
           ]}
         ]
       end,
-
       execute: lambda do |connection, input|
         # Build correlation ID, now (for traceability)
         t0 = Time.now
@@ -915,18 +912,19 @@ require 'securerandom'
           payload = call(:build_rag_retrieve_payload, input['question'], corpus, input['restrict_to_file_ids'])
 
           url  = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
-          resp = post(url)
-                   .headers(call(:request_headers, corr))
-                   .payload(call(:json_compact, payload))
+          raw  = call(:http_call!, 'POST', url)
+                    .headers(call(:request_headers, corr))
+                    .payload(call(:json_compact, payload))
+          body  = call(:http_body_json, raw)
+          raw   = call(:normalize_retrieve_contexts!, body)
 
-          raw   = call(:normalize_retrieve_contexts!, resp)
           maxn  = call(:clamp_int, (input['max_contexts'] || 20), 1, 200)
           mapped = call(:map_context_chunks, raw, maxn)
 
           {
             'question' => input['question'],
             'contexts' => mapped
-          }.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+          }.merge(call(:telemetry_envelope, t0, corr, true, call(:telemetry_success_code, raw), 'OK'))
         rescue => e
           g = call(:extract_google_error, e)
           msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
@@ -1015,25 +1013,34 @@ require 'securerandom'
           retr_url  = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
           retr_req_body = call(:json_compact, retrieve_payload)
 
-          # Dry-run mode returns both planned requests (retrieve + generate)
-          # Build the generation payload now to include in preview if needed.
-          # (The actual gen payload is rebuilt below once chunks are known.)
+          # Precompute model path & generation scaffold used by both real and validate-only flows
+          model_path = call(:build_model_path_with_global_preview, connection, input['model'])
+          gen_cfg = {
+            'temperature'       => (input['temperature'].present? ? call(:safe_float, input['temperature']) : 0),
+            'maxOutputTokens'   => 1024,
+            'responseMimeType'  => 'application/json',
+            'responseSchema'    => {
+              'type'=>'object','additionalProperties'=>false,
+              'properties'=>{'answer'=>{'type'=>'string'},'citations'=>{'type'=>'array','items'=>{'type'=>'object','additionalProperties'=>false,'properties'=>{'chunk_id'=>{'type'=>'string'},'source'=>{'type'=>'string'},'uri'=>{'type'=>'string'},'score'=>{'type'=>'number'}}}}},
+              'required'=>['answer']
+            }
+          }
+          sys_text = (input['system_preamble'].presence ||
+            'Answer using ONLY the retrieved context chunks. If the context is insufficient, reply with “I don’t know.” Keep answers concise and include citations with chunk_id, source, uri, and score.')
+          sys_inst = { 'role'=>'system','parts'=>[{'text'=>sys_text}] }
+
+          # Dry-run: return previews of both calls
           if call(:normalize_boolean, input['validate_only'])
             preview_retr = call(:request_preview_pack, retr_url, 'POST', call(:request_headers, corr), retr_req_body)
-            # Build generation preview too (uses same model_path logic)
-            preview_gen  = call(:request_preview_pack, 
-                                call(:aipl_v1_url, connection, 
-                                     (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase,
-                                     "#{model_path}:generateContent"),
-                                'POST', 
-                                call(:request_headers, corr), 
-                                call(:json_compact, {
-                                  'contents' => [{ 'role'=>'user','parts'=>[{ 'text' => "Question:\n#{input['question']}\n\nContext:\n<trimmed in runtime>" }]}],
-                                  'systemInstruction' => sys_inst, 
-                                  'generationConfig'  => gen_cfg
-                                }))
+            loc_from_model = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
+            gen_url        = call(:aipl_v1_url, connection, loc_from_model, "#{model_path}:generateContent")
+            preview_gen    = call(:request_preview_pack, gen_url, 'POST', call(:request_headers, corr), call(:json_compact, {
+              'contents' => [{ 'role'=>'user','parts'=>[{ 'text' => "Question:\n#{input['question']}\n\nContext:\n<trimmed in runtime>" }]}],
+              'systemInstruction' => sys_inst,
+              'generationConfig'  => gen_cfg
+            }))
             return { 'ok'=>true, 'request_preview'=> { 'retrieve'=>preview_retr['request_preview'], 'generate'=>preview_gen['request_preview'] } }
-                     .merge(call(:telemetry_envelope_ex, t0, corr, true, 200, 'DRY_RUN', { 'action' => 'rag_answer' }))
+                   .merge(call(:telemetry_envelope_ex, t0, corr, true, 200, 'DRY_RUN', { 'action' => 'rag_answer' }))
           end
 
           retr_resp = call(:http_call!, 'POST', retr_url)
@@ -1045,7 +1052,7 @@ require 'securerandom'
           chunks = call(:map_context_chunks, raw_ctxs, maxn)
           error('No contexts retrieved; check corpus/permissions/region') if chunks.empty?
 
-          # 2) Generate structured answer with your existing schema pattern
+          # 2) Generate structured answer with parsed context
           model_path = call(:build_model_path_with_global_preview, connection, input['model'])
 
           gen_cfg = {
@@ -1096,20 +1103,21 @@ require 'securerandom'
           loc_from_model = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
           gen_url  = call(:aipl_v1_url, connection, loc_from_model, "#{model_path}:generateContent")
           gen_req_body = call(:json_compact, gen_payload)
-          gen_resp  = call(:http_call!, 'POST', gen_url)
+          gen_raw   = call(:http_call!, 'POST', gen_url)
                         .headers(call(:request_headers, corr))
                         .payload(gen_req_body)
 
 
-          text = gen_resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
+          gen_body  = call(:http_body_json, gen_raw)
+          text      = gen_body.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
           parsed = call(:safe_parse_json, text)
 
           {
             'answer'     => (parsed['answer'] || text),
             'citations'  => (parsed['citations'] || []),
-            'responseId' => gen_resp['responseId'],
-            'usage'      => gen_resp['usageMetadata']
-          }.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+            'responseId' => gen_body['responseId'],
+            'usage'      => gen_body['usageMetadata']
+          }.merge(call(:telemetry_envelope, t0, corr, true, call(:telemetry_success_code, gen_raw), 'OK'))
         rescue => e
           g = call(:extract_google_error, e)
           msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
@@ -1172,11 +1180,12 @@ require 'securerandom'
             'labels'      => input['labels']
           }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
           req_body = call(:json_compact, body)
-          resp = post(url).params(corpusId: input['corpusId'].to_s).headers(call(:request_headers, corr)).payload(req_body)
-          code = call(:telemetry_success_code, resp)
-          out  = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          raw  = call(:http_call!, 'POST', url).params(corpusId: input['corpusId'].to_s).headers(call(:request_headers, corr)).payload(req_body)
+          code = call(:telemetry_success_code, raw)
+          body = call(:http_body_json, raw)
+          out  = body.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
           unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
+            out['debug'] = call(:debug_pack, input['debug'], url, req_body, body) if call(:normalize_boolean, input['debug'])
           end
           out
         rescue => e
@@ -1330,9 +1339,10 @@ require 'securerandom'
           path = call(:build_rag_corpus_path, connection, input['rag_corpus'])
           loc  = connection['location'].to_s.downcase
           url  = call(:aipl_v1_url, connection, loc, path)
-          resp = delete(url).headers(call(:request_headers, corr))
-          code = call(:telemetry_success_code, resp)
-          resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          raw  = call(:http_call!, 'DELETE', url).headers(call(:request_headers, corr))
+          code = call(:telemetry_success_code, raw)
+          body = call(:http_body_json, raw)
+          body.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
         rescue => e
           {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
         end
@@ -1413,7 +1423,7 @@ require 'securerandom'
           unless call(:normalize_boolean, connection['prod_mode'])
             qstr = (qs && qs.any?) ? ('?' + qs.map { |k,v| "#{k}=#{v}" }.join('&')) : ''
             # Keep full wrapper in debug for inspecting status/headers/body
-            out['debug'] = call(:debug_pack, input['debug'], "#{url}#{qstr}", nil, resp) if call(:normalize_boolean, input['debug'])
+            out['debug'] = call(:debug_pack, input['debug'], "#{url}#{qstr}", nil, body) if call(:normalize_boolean, input['debug'])
           end
           out
         rescue => e
@@ -1457,9 +1467,9 @@ require 'securerandom'
           name = call(:build_rag_file_path, connection, input['rag_file'])
           loc  = connection['location'].to_s.downcase
           url  = call(:aipl_v1_url, connection, loc, name)
-          resp = get(url).headers(call(:request_headers, corr))
-          code = call(:telemetry_success_code, resp)
-          body = call(:http_body_json, resp)
+          raw  = call(:http_call!, 'GET', url).headers(call(:request_headers, corr))
+          code = call(:telemetry_success_code, raw)
+          body = call(:http_body_json, raw)
           lbl = (body['labels'] || {}).to_h
           md  = (body['metadata'] || {}).to_h
           out = body.merge(
@@ -1502,9 +1512,10 @@ require 'securerandom'
           name = call(:build_rag_file_path, connection, input['rag_file'])
           loc  = connection['location'].to_s.downcase
           url  = call(:aipl_v1_url, connection, loc, name)
-          resp = delete(url).headers(call(:request_headers, corr))
-          code = call(:telemetry_success_code, resp)
-          resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          raw  = call(:http_call!, 'DELETE', url).headers(call(:request_headers, corr))
+          code = call(:telemetry_success_code, raw)
+          body = call(:http_body_json, raw)
+          body.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
         rescue => e
           {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
         end
