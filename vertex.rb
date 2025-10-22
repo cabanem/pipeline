@@ -1285,7 +1285,7 @@ require 'securerandom'
           end
           resp = call(:http_call!, 'GET', url).params(qs).headers(call(:request_headers, corr))
           code = call(:telemetry_success_code, resp)
-          body = call(:safe_json, resp) || {}
+          body = call(:http_body_json, resp)
           out = {
             'items' => call(:safe_array, body['ragCorpora']),
             'next_page_token' => body['nextPageToken'],
@@ -1293,6 +1293,7 @@ require 'securerandom'
           }.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
           unless call(:normalize_boolean, connection['prod_mode'])
             qstr = (qs && qs.any?) ? ('?' + qs.map { |k,v| "#{k}=#{v}" }.join('&')) : ''
+            # Keep full wrapper in debug for inspecting status/headers/body
             out['debug'] = call(:debug_pack, input['debug'], "#{url}#{qstr}", nil, resp) if call(:normalize_boolean, input['debug'])
           end
           out
@@ -1392,7 +1393,7 @@ require 'securerandom'
           end
           resp = call(:http_call!, 'GET', url).params(qs).headers(call(:request_headers, corr))
           code = call(:telemetry_success_code, resp)
-          body = call(:safe_json, resp) || {}
+          body = call(:http_body_json, resp)
           items = call(:safe_array, body['ragFiles']).map do |it|
             h  = (it || {}).to_h
             lbl = (h['labels'] || {}).to_h
@@ -1411,6 +1412,7 @@ require 'securerandom'
           }.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
           unless call(:normalize_boolean, connection['prod_mode'])
             qstr = (qs && qs.any?) ? ('?' + qs.map { |k,v| "#{k}=#{v}" }.join('&')) : ''
+            # Keep full wrapper in debug for inspecting status/headers/body
             out['debug'] = call(:debug_pack, input['debug'], "#{url}#{qstr}", nil, resp) if call(:normalize_boolean, input['debug'])
           end
           out
@@ -1457,7 +1459,7 @@ require 'securerandom'
           url  = call(:aipl_v1_url, connection, loc, name)
           resp = get(url).headers(call(:request_headers, corr))
           code = call(:telemetry_success_code, resp)
-          body = call(:safe_json, resp) || {}
+          body = call(:http_body_json, resp)
           lbl = (body['labels'] || {}).to_h
           md  = (body['metadata'] || {}).to_h
           out = body.merge(
@@ -2459,7 +2461,7 @@ require 'securerandom'
           resp = get(url).headers(call(:request_headers, corr))
 
           code = call(:telemetry_success_code, resp)
-          body = call(:safe_json, resp) || {}
+          body = call(:http_body_json, resp)
 
           # --- Parse helpful probe fields out of metadata ---
           md = (body['metadata'] || {}).to_h
@@ -2643,7 +2645,7 @@ require 'securerandom'
           resp = call(:http_call!, 'GET', url).params(qs).headers(call(:request_headers, corr))
 
           code = call(:telemetry_success_code, resp)
-          body = call(:safe_json, resp) || {}
+          body = call(:http_body_json, resp)
           list = call(:safe_array, body['indexes'])
 
           items = list.map do |it|
@@ -3977,47 +3979,58 @@ require 'securerandom'
   # --------- METHODS ------------------------------------------------------
   methods: {
 
-     # --- HTTP -------------------------------------------------------------
-     http_call!: lambda do |verb, url|
-       v = verb.to_s.upcase
-       case v
-       when 'GET'    then get(url)
-       when 'POST'   then post(url)
-       when 'PUT'    then put(url)
-       when 'PATCH'  then patch(url)
-       when 'DELETE' then delete(url)
-       else error("Unsupported HTTP verb: #{verb}")
-       end
-     end,
-     request_preview_pack: lambda do |url, verb, headers, payload|
-       {
-         'request_preview' => {
-           'method'  => verb.to_s.upcase,
-           'url'     => url.to_s,
-           'headers' => headers || {},
-           'payload' => call(:redact_json, payload)
-         }
-       }
-     end,
-      # Stabilized output shaper for neighbors
-      shape_neighbors: lambda do |resp|
-        body = call(:safe_json, resp) || {}
-        list = Array(body['nearestNeighbors']).map do |nn|
-          neighbors = Array(nn['neighbors']).map do |n|
-            {
-              'datapoint' => n['datapoint'],
-              'distance'  => n['distance'].to_f.round(6),
-              'crowdingTagCount' => n['crowdingTagCount'].to_i
-            }
-          end
-          # Deterministic order: by distance ASC, then datapointId
-          { 'neighbors' => neighbors.sort_by { |x|
-              [x['distance'], x.dig('datapoint','datapointId').to_s]
-            }
+    # --- HTTP -------------------------------------------------------------
+    http_call!: lambda do |verb, url|
+      v = verb.to_s.upcase
+      case v
+      when 'GET'    then get(url)
+      when 'POST'   then post(url)
+      when 'PUT'    then put(url)
+      when 'PATCH'  then patch(url)
+      when 'DELETE' then delete(url)
+      else error("Unsupported HTTP verb: #{verb}")
+      end
+    end,
+    http_body_json: lambda do |resp|
+      # Accepts:
+      #  - Hash wrapper with 'body' (Workato HTTP response)
+      #  - Already-parsed Hash/Array
+      #  - Raw JSON string
+      if resp.is_a?(Hash) && resp.key?('body')
+        call(:safe_json, resp['body']) || {}
+      else
+        call(:safe_json, resp) || {}
+      end
+    end,
+    request_preview_pack: lambda do |url, verb, headers, payload|
+      {
+        'request_preview' => {
+          'method'  => verb.to_s.upcase,
+          'url'     => url.to_s,
+          'headers' => headers || {},
+          'payload' => call(:redact_json, payload)
+        }
+      }
+    end,
+    # Stabilized output shaper for neighbors
+    shape_neighbors: lambda do |resp|
+      body = call(:http_body_json, resp)
+      list = Array(body['nearestNeighbors']).map do |nn|
+        neighbors = Array(nn['neighbors']).map do |n|
+          {
+            'datapoint' => n['datapoint'],
+            'distance'  => n['distance'].to_f.round(6),
+            'crowdingTagCount' => n['crowdingTagCount'].to_i
           }
         end
-        { 'nearestNeighbors' => list }
-      end,
+        # Deterministic order: by distance ASC, then datapointId
+        { 'neighbors' => neighbors.sort_by { |x|
+            [x['distance'], x.dig('datapoint','datapointId').to_s]
+          }
+        }
+      end
+      { 'nearestNeighbors' => list }
+    end,
 
     # --- Telemetry and resilience -----------------------------------------
     telemetry_envelope: lambda do |started_at, correlation_id, ok, code, message|
