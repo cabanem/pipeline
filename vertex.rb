@@ -320,6 +320,26 @@ require 'securerandom'
       end
     },
 
+    # Stabilized output shaper for neighbors
+    shape_neighbors: lambda do |resp|
+      body = call(:safe_json, resp&.body) || {}
+      list = Array(body['nearestNeighbors']).map do |nn|
+        neighbors = Array(nn['neighbors']).map do |n|
+          {
+            'datapoint' => n['datapoint'],
+            'distance'  => n['distance'].to_f.round(6),
+            'crowdingTagCount' => n['crowdingTagCount'].to_i
+          }
+        end
+        # Deterministic order: by distance ASC, then datapointId
+        { 'neighbors' => neighbors.sort_by { |x|
+            [x['distance'], x.dig('datapoint','datapointId').to_s]
+          }
+        }
+      end
+      { 'nearestNeighbors' => list }
+    end
+
   },
 
   # --------- ACTIONS ------------------------------------------------------
@@ -975,7 +995,6 @@ require 'securerandom'
           { name: 'temperature', type: 'number', optional: true, hint: 'Default 0' }
         ]
       end,
-
       output_fields: lambda do |_|
         [
           { name: 'answer' },
@@ -990,6 +1009,7 @@ require 'securerandom'
               { name: 'totalTokenCount', type: 'integer' }
             ]
           },
+          { name: 'request_preview', type: 'object' },
           { name: 'ok', type: 'boolean' },
           { name: 'telemetry', type: 'object', properties: [
             { name: 'http_status', type: 'integer' },
@@ -998,7 +1018,6 @@ require 'securerandom'
           ]}
         ]
       end,
-
       execute: lambda do |connection, input|
         # Build correlation id and now (logging)
         t0 = Time.now
@@ -1018,9 +1037,23 @@ require 'securerandom'
           retrieve_payload = call(:build_rag_retrieve_payload, input['question'], corpus, input['restrict_to_file_ids'])
 
           retr_url  = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
-          retr_resp = post(retr_url)
+          retr_req_body = call(:json_compact, retrieve_payload)
+
+          # Dry-run mode returns both planned requests (retrieve + generate)
+          # Build the generation payload now to include in preview if needed.
+          # (The actual gen payload is rebuilt below once chunks are known.)
+
+          if call(:normalize_boolean, input['validate_only'])
+            preview1 = call(:request_preview_pack, retr_url, 'POST', call(:request_headers, corr), retr_req_body)
+            # minimal stand-in for gen request (model path unresolved until runtime)
+            preview = { 'request_preview' => { 'retrieve' => preview1['request_preview'] } }
+            return preview.merge(call(:telemetry_envelope_ex, t0, corr, true, 200, 'DRY_RUN', { 'action' => 'rag_answer' }))
+          end
+
+          retr_resp = call(:http_call!, 'POST', retr_url)
                         .headers(call(:request_headers, corr))
                         .payload(call(:json_compact, retrieve_payload))
+                        .payload(retr_req_body)
           raw_ctxs = call(:normalize_retrieve_contexts!, retr_resp)
 
           maxn  = call(:clamp_int, (input['max_contexts'] || 12), 1, 100)
@@ -1074,10 +1107,10 @@ require 'securerandom'
             'generationConfig'  => gen_cfg
           }
 
-          gen_url   = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
-          gen_resp  = post(gen_url)
+          gen_req_body = call(:json_compact, gen_payload)
+          gen_resp  = call(:http_call!, 'POST', gen_url)
                        .headers(call(:request_headers, corr))
-                       .payload(call(:json_compact, gen_payload))
+                       .payload(gen_req_body)
 
           text = gen_resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
           parsed = call(:safe_parse_json, text)
@@ -1224,6 +1257,7 @@ require 'securerandom'
         [
           { name: 'page_size', type: 'integer', optional: true },
           { name: 'page_token', optional: true },
+          { name: 'validate_only', label: 'Validate only (no call)', type: 'boolean', control_type: 'checkbox', optional: true },
           { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
         ]
       end,
@@ -1240,6 +1274,7 @@ require 'securerandom'
             { name: 'http_status', type: 'integer' }, { name: 'message' },
             { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
           ]},
+          { name: 'request_preview', type: 'object' },
           { name: 'debug', type: 'object' }
         ]
       end,
@@ -1254,7 +1289,11 @@ require 'securerandom'
           qs = {}
           qs['pageSize']  = input['page_size'].to_i if input['page_size'].to_i > 0
           qs['pageToken'] = input['page_token'] if input['page_token'].present?
-          resp = get(url).params(qs).headers(call(:request_headers, corr))
+          if call(:normalize_boolean, input['validate_only'])
+            preview = call(:request_preview_pack, [url, qs].compact.join('?'), 'GET', call(:request_headers, corr), nil)
+            return { 'ok' => true }.merge(preview).merge(call(:telemetry_envelope_ex, t0, corr, true, 200, 'DRY_RUN', { 'action' => 'rag_corpora_list' }))
+          end
+          resp = call(:http_call!, 'GET', url).params(qs).headers(call(:request_headers, corr))
           code = call(:telemetry_success_code, resp)
           body = call(:safe_json, resp&.body) || {}
           out = {
@@ -1318,6 +1357,7 @@ require 'securerandom'
           { name: 'rag_corpus', optional: false, hint: 'Short id or full resource' },
           { name: 'page_size', type: 'integer', optional: true },
           { name: 'page_token', optional: true },
+          { name: 'validate_only', label: 'Validate only (no call)', type: 'boolean', control_type: 'checkbox', optional: true },
           { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
         ]
       end,
@@ -1354,7 +1394,11 @@ require 'securerandom'
           qs = {}
           qs['pageSize']  = input['page_size'].to_i if input['page_size'].to_i > 0
           qs['pageToken'] = input['page_token'] if input['page_token'].present?
-          resp = get(url).params(qs).headers(call(:request_headers, corr))
+          if call(:normalize_boolean, input['validate_only'])
+            preview = call(:request_preview_pack, [url, qs].compact.join('?'), 'GET', call(:request_headers, corr), nil)
+            return { 'ok' => true }.merge(preview).merge(call(:telemetry_envelope_ex, t0, corr, true, 200, 'DRY_RUN', { 'action' => 'rag_files_list' }))
+          end
+          resp = call(:http_call!, 'GET', url).params(qs).headers(call(:request_headers, corr))
           code = call(:telemetry_success_code, resp)
           body = call(:safe_json, resp&.body) || {}
           items = call(:safe_array, body['ragFiles']).map do |it|
@@ -1511,17 +1555,18 @@ require 'securerandom'
           },
           { name: 'max_per_call', type: 'integer', hint: 'Safety cap; default 1000', optional: true },
           { name: 'expected_dimension', type: 'integer', hint: 'Optional sanity check for featureVector length', optional: true },
+          { name: 'validate_only', label: 'Validate only (no call)', type: 'boolean', control_type: 'checkbox', optional: true },
           # Debug
           { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true,
             hint: 'Echo request URL/body and Google error body for troubleshooting' }
         ]
       end,
-
       output_fields: lambda do |_|
         [
           { name: 'ok', type: 'boolean' },
           { name: 'operation_name' },
           { name: 'acknowledged_count', type: 'integer' },
+          { name: 'request_preview', type: 'object' },
           { name: 'telemetry', type: 'object', properties: [
             { name: 'http_status', type: 'integer' },
             { name: 'message' }, { name: 'duration_ms', type: 'integer' },
@@ -1530,7 +1575,6 @@ require 'securerandom'
           { name: 'debug', type: 'object' }
         ]
       end,
-
       execute: lambda do |connection, input|
         t0 = Time.now
         corr = call(:build_correlation_id)
@@ -1578,9 +1622,17 @@ require 'securerandom'
           acknowledged_total = 0
           last_op_name = nil
 
+          if call(:normalize_boolean, input['validate_only'])
+            # preview just the first slice (shape representative payload)
+            preview_body = call(:json_compact, { 'datapoints' => (chunks.first || []) })
+            preview = call(:request_preview_pack, url, 'POST', call(:request_headers, corr), preview_body)
+            return { 'ok' => true }.merge(preview)
+                                  .merge(call(:telemetry_envelope_ex, t0, corr, true, 200, 'DRY_RUN', { 'action' => 'indexes_upsert_datapoints' }))
+          end
+
           chunks.each do |dps|
             req_body = call(:json_compact, { 'datapoints' => dps })
-            resp = post(url)
+            resp = call(:http_call!, 'POST', url)
                    .headers(call(:request_headers, corr))
                    .payload(req_body)
             code = call(:telemetry_success_code, resp)
@@ -1610,7 +1662,6 @@ require 'securerandom'
           out
         end
       end,
-
       sample_output: lambda do
         {
           'ok' => true,
@@ -1663,11 +1714,11 @@ require 'securerandom'
             ],
             hint: 'Each query can specify either featureVector or datapoint.'
           },
+          { name: 'validate_only', label: 'Validate only (no call)', type: 'boolean', control_type: 'checkbox', optional: true },
           # Debug
           { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
         ]
       end,
-
       output_fields: lambda do |_|
         [
           { name: 'nearestNeighbors', type: 'array', of: 'object', properties: [
@@ -1679,6 +1730,7 @@ require 'securerandom'
               }
             ]
           },
+          { name: 'request_preview', type: 'object' },
           { name: 'ok', type: 'boolean' },
           { name: 'telemetry', type: 'object', properties: [
             { name: 'http_status', type: 'integer' },
@@ -1688,7 +1740,6 @@ require 'securerandom'
           { name: 'debug', type: 'object' }
         ]
       end,
-
       execute: lambda do |connection, input|
         t0 = Time.now
         corr = call(:build_correlation_id)
@@ -1733,11 +1784,18 @@ require 'securerandom'
           }
           req_body = call(:json_compact, req)
 
-          resp = post(url)
-                   .headers(call(:request_headers, corr))
-                   .payload(req_body)
+          # Dry-run path for unattended safety
+          if call(:normalize_boolean, input['validate_only'])
+            preview = call(:request_preview_pack, url, 'POST', call(:request_headers, corr), req_body)
+            return preview.merge(call(:telemetry_envelope_ex, t0, corr, true, 200, 'DRY_RUN', { 'action' => 'index_endpoints_find_neighbors' }))
+          end
+
+          resp = call(:http_call!, 'POST', url)
+                  .headers(call(:request_headers, corr))
+                  .payload(req_body)
           code = call(:telemetry_success_code, resp)
-          resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK')).merge(
+          shaped = call(:shape_neighbors, resp) # stable rounding/sorting
+          shaped.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK')).merge(
             call(:normalize_boolean, input['debug']) ? { 'debug' => call(:debug_pack, true, url, req_body, nil) } : {}
           )
         rescue => e
@@ -1752,7 +1810,6 @@ require 'securerandom'
           out
         end
       end,
-
       sample_output: lambda do
         {
           'nearestNeighbors' => [
@@ -1885,7 +1942,6 @@ require 'securerandom'
           { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
         ]
       end,
-
       output_fields: lambda do |_|
         [
           { name: 'name' }, { name: 'done', type: 'boolean' },
@@ -1898,7 +1954,6 @@ require 'securerandom'
           { name: 'debug', type: 'object' }
         ]
       end,
-
       execute: lambda do |connection, input|
         t0 = Time.now
         corr = call(:build_correlation_id)
@@ -1932,7 +1987,6 @@ require 'securerandom'
           out
         end
       end,
-
       sample_output: lambda do
         { 'name' => 'projects/p/locations/us-central1/operations/456', 'done' => false,
           'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 9, 'correlation_id' => 'sample' } }
@@ -2530,11 +2584,11 @@ require 'securerandom'
         [
           { name: 'page_size', type: 'integer', optional: true, hint: 'Max items per page (default 50, max 1000)' },
           { name: 'page_token', optional: true, hint: 'Set this to fetch the next page' },
+          { name: 'validate_only', label: 'Validate only (no call)', type: 'boolean', control_type: 'checkbox', optional: true },
           { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true,
             hint: 'Echo request URL/response for troubleshooting (disabled when connection.prod_mode = true)' }
         ]
       end,
-
       output_fields: lambda do |_|
         [
           { name: 'ok', type: 'boolean' },
@@ -2573,7 +2627,6 @@ require 'securerandom'
           { name: 'debug', type: 'object' }
         ]
       end,
-
       execute: lambda do |connection, input|
         t0 = Time.now
         corr = call(:build_correlation_id)
@@ -2592,8 +2645,12 @@ require 'securerandom'
           qs = {}
           qs['pageSize']  = input['page_size'].to_i if input['page_size'].to_i > 0
           qs['pageToken'] = input['page_token'] if input['page_token'].present?
+          if call(:normalize_boolean, input['validate_only'])
+            preview = call(:request_preview_pack, [url, qs].compact.join('?'), 'GET', call(:request_headers, corr), nil)
+            return { 'ok' => true }.merge(preview).merge(call(:telemetry_envelope_ex, t0, corr, true, 200, 'DRY_RUN', { 'action' => 'index_list' }))
+          end
 
-          resp = get(url)
+          resp = call(:http_call!, 'GET', url)
                   .params(qs)
                   .headers(call(:request_headers, corr))
 
@@ -2662,7 +2719,6 @@ require 'securerandom'
           out
         end
       end,
-
       sample_output: lambda do
         {
           'ok' => true,
@@ -3937,6 +3993,29 @@ require 'securerandom'
   # --------- METHODS ------------------------------------------------------
   methods: {
 
+     # --- HTTP -------------------------------------------------------------
+     http_call!: lambda do |verb, url|
+       v = verb.to_s.upcase
+       case v
+       when 'GET'    then get(url)
+       when 'POST'   then post(url)
+       when 'PUT'    then put(url)
+       when 'PATCH'  then patch(url)
+       when 'DELETE' then delete(url)
+       else error("Unsupported HTTP verb: #{verb}")
+       end
+     end,
+     request_preview_pack: lambda do |url, verb, headers, payload|
+       {
+         'request_preview' => {
+           'method'  => verb.to_s.upcase,
+           'url'     => url.to_s,
+           'headers' => headers || {},
+           'payload' => call(:redact_json, payload)
+         }
+       }
+     end,
+
     # --- Telemetry and resilience -----------------------------------------
     telemetry_envelope: lambda do |started_at, correlation_id, ok, code, message|
       dur = ((Time.now - started_at) * 1000.0).to_i
@@ -3949,6 +4028,14 @@ require 'securerandom'
           'correlation_id' => correlation_id
         }
       }
+    end,
+    telemetry_envelope_ex: lambda do |started_at, correlation_id, ok, code, message, extras={}|
+      # Envelope with optional extras folded into telemetry (non-breaking)
+      env = call(:telemetry_envelope, started_at, correlation_id, ok, code, message)
+      if extras.is_a?(Hash) && !extras.empty?
+        env['telemetry'] = (env['telemetry'] || {}).merge(extras)
+      end
+      env
     end,
     telemetry_success_code: lambda do |resp|
       (resp['status'] || resp['status_code'] || 200).to_i
@@ -4754,13 +4841,37 @@ require 'securerandom'
     end,
     sanitize_tools!: lambda do |raw|
       a = call(:safe_array_of_hashes, raw)
-      a = a.map do |t|
-        # allow simple shorthands like {"googleSearch":{}} or {"retrieval":{"vertexAiSearch":{"datastore":"..."}}}
-        keep = t.slice('googleSearch', 'retrieval', 'codeExecution', 'functionDeclarations')
+      return nil if a.empty?
+
+      allowed_keys = %w[googleSearch retrieval codeExecution functionDeclarations]
+      cleaned = a.map do |t|
+        keep = {}
+        allowed_keys.each do |k|
+          v = t[k]
+          keep[k] = v if v.is_a?(Hash) || v.is_a?(Array) || v == {}
+        end
         keep.empty? ? nil : keep
       end.compact
-      a.empty? ? nil : a
+
+      cleaned.empty? ? nil : cleaned
     end,
+    extract_candidate_text: lambda do |resp|
+      # Returns [text, meta] where meta carries finishReason/safety/promptFeedback
+      cands = call(:safe_array, resp['candidates'])
+      pf    = resp['promptFeedback']
+      return [nil, { 'promptFeedback' => pf }] if cands.empty?
+
+      c0 = cands.first || {}
+      parts = call(:safe_array, c0.dig('content','parts'))
+      text  = parts.first && parts.first['text']
+      meta  = {
+        'finishReason'  => c0['finishReason'],
+        'safetyRatings' => c0['safetyRatings'],
+        'promptFeedback'=> pf
+      }.compact
+      [text, meta]
+    end,
+
     sanitize_safety!: lambda do |raw|
       a = call(:safe_array_of_hashes, raw).map do |h|
         c = h['category'] || h[:category]
