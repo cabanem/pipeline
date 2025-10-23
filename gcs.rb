@@ -750,9 +750,9 @@ require 'uri'
         sup    = input['supports_all_drives'] ? 'true' : 'false'
 
         # Read full file bytes upfront (used by media/multipart; resumable reads in chunks)
-        file_bytes = call(:stream_slice_io, fobj, 0, size)
+        file_bytes = call(:stream_slice_io, fobj, 0, size).to_s
+        file_bytes = file_bytes.force_encoding('BINARY') if file_bytes.respond_to?(:force_encoding)
         error('Failed to read uploaded file bytes') if file_bytes.nil? || file_bytes.bytesize != size
-
 
         if strat == 'auto'
           strat = (size <= 5 * 1024 * 1024) ? 'multipart' : 'resumable' # ≤5MB → multipart
@@ -965,7 +965,6 @@ require 'uri'
     gcs_get_object: {
       title: 'GCS: Get object from GCS bucket',
       subtitle: 'Fetch an object from Google Cloud Storage bucket',
-      description:
       display_priority: 10,
       help: lambda do |_|
         {
@@ -984,11 +983,9 @@ require 'uri'
         # Reuse standard GET UI for consistency with the rest of the connector
         call(:ui_gcs_get_inputs, config_fields)
       end,
-
       output_fields: lambda do |object_definitions|
         object_definitions['gcs_object_with_content']
       end,
-
       execute: lambda do |connection, input|
         begin
           # Correlation id and duration for logs / analytics
