@@ -560,11 +560,9 @@ require 'uri'
       input_fields: lambda do |_obj, _conn, config_fields|
         call(:ui_drive_get_inputs, config_fields)
       end,
-
       output_fields: lambda do |object_definitions|
         object_definitions['drive_file_full']
       end,
-
       execute: lambda do |_connection, input|
         # Correlation id and duration for logs / analytics
         t0 = Time.now
@@ -670,7 +668,6 @@ require 'uri'
                details['message'] || e.to_s, details)
         )
       end,
-
       sample_output: lambda do
         {
           'id'            => '1AbCdEfGhIjK',
@@ -690,6 +687,162 @@ require 'uri'
           'ok'            => true,
           'telemetry'     => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 1, 'correlation_id' => 'sample' }
         }
+      end
+    },
+    drive_files_upload: {
+      title: 'Drive: Upload file',
+      subtitle: 'files.create via media/multipart/resumable',
+      display_priority: 10,
+      help: 'Uploads a file into Google Drive. For large files, use resumable.',
+      retry_on_request: ['GET','HEAD'],
+      retry_on_response: [408,429,500,502,503,504],
+      max_retries: 3,
+
+      input_fields: lambda do |_|
+        [
+          { name: 'file',       label: 'File', type: 'file', optional: false },
+          { name: 'file_name',  label: 'File name (override)', optional: true,
+            hint: 'Defaults to the uploaded file’s name.' },
+          { name: 'mime_type',  label: 'MIME type (override)', optional: true,
+            hint: 'Defaults from the uploaded file’s content type.' },
+          { name: 'parent_folder_id_or_url', label: 'Parent folder (ID or URL)', optional: true,
+            hint: 'Leave blank to upload to My Drive root.' },
+          { name: 'upload_strategy', label: 'Upload strategy', control_type: 'select', optional: true, default: 'auto',
+            pick_list: [['Auto','auto'], ['Multipart','multipart'], ['Resumable','resumable'], ['Simple media','media']],
+            hint: 'Auto uses multipart ≤5MB, else resumable.' },
+          { name: 'strict_on_upload_errors', type: 'boolean', control_type: 'checkbox', default: false,
+            label: 'Fail step on upload error',
+            hint: 'When enabled, errors raise instead of returning a structured error payload.' },
+          { name: 'supports_all_drives', type: 'boolean', control_type: 'checkbox', default: true,
+            label: 'Supports all drives (shared drives/shortcuts)' }
+        ]
+      end,
+      output_fields: lambda do |object_definitions|
+        # Return mapped Drive meta + envelope for stable data pills
+        Array(object_definitions['drive_file_base_fields']) + Array(object_definitions['envelope_fields'])
+      end,
+      sample_output: lambda do |_|
+        {
+          'id' => '1AbCDEFghiJKLmnOP',
+          'name' => 'example.pdf',
+          'mime_type' => 'application/pdf',
+          'size' => 1048576,
+          'modified_time' => Time.now.utc.iso8601,
+          'checksum' => 'd41d8cd98f00b204e9800998ecf8427e',
+          'web_view_url' => 'https://drive.google.com/file/d/1AbCDEFghiJKLmnOP/view',
+          'owners' => [{ 'display_name' => 'A. User', 'email' => 'user@example.com' }],
+          'drive_uri' => 'drive://1AbCDEFghiJKLmnOP',
+          'ok' => true,
+          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 120, 'correlation_id' => 'abc-123' }
+        }
+      end,
+      execute: lambda do |connection, input|
+        t0   = Time.now
+        corr = SecureRandom.uuid
+
+        # ---- Prepare inputs
+        fobj   = input['file']
+        fname  = (input['file_name'].presence || (fobj.is_a?(Hash) && fobj[:original_filename]).presence || 'upload.bin')
+        mime   = (input['mime_type'].presence || (fobj.is_a?(Hash) && fobj[:content_type]).presence || 'application/octet-stream')
+        p_id   = call(:util_extract_drive_id, input['parent_folder_id_or_url'])
+        strat  = (input['upload_strategy'].presence || 'auto').to_s
+        size   = call(:util_file_size, fobj)
+        sup    = input['supports_all_drives'] ? 'true' : 'false'
+
+        if strat == 'auto'
+          strat = (size <= 5 * 1024 * 1024) ? 'multipart' : 'resumable' # ≤5MB → multipart
+        end
+
+        meta = call(:drive_build_file_metadata, fname, p_id, mime)
+
+        base_upload_url = 'https://www.googleapis.com/upload/drive/v3/files'
+        fields = 'id,name,mimeType,size,modifiedTime,md5Checksum,owners(displayName,emailAddress)'
+
+        begin
+          # If metadata is required (parent/name), prefer multipart/resumable over media
+          if strat == 'media' && (p_id.present? || fname.present?)
+            strat = (size <= 5 * 1024 * 1024) ? 'multipart' : 'resumable'
+          end
+          case strat
+          when 'media'
+            # Simple upload: bytes only, minimal metadata (name/parents cannot be set here)
+            # NOTE: If you need parents, prefer multipart or follow-up files.update.
+            resp = post(base_upload_url)
+                    .params(uploadType: 'media', supportsAllDrives: sup, fields: fields)
+                    .headers('Content-Type': mime)
+                    .request_body(fobj)
+
+          when 'multipart'
+            boundary = "wrk-#{SecureRandom.hex(8)}"
+            meta_json = meta.to_json
+            body = []
+            body << "--#{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n#{meta_json}\r\n"
+            body << "--#{boundary}\r\nContent-Type: #{mime}\r\nContent-Transfer-Encoding: binary\r\n\r\n"
+            body << fobj
+            body << "\r\n--#{boundary}--\r\n"
+
+            resp = post(base_upload_url)
+                    .params(uploadType: 'multipart', supportsAllDrives: sup, fields: fields)
+                    .headers('Content-Type': "multipart/related; boundary=#{boundary}")
+                    .request_body(body)
+
+          when 'resumable'
+            # 1) Initiate session
+            init = post(base_upload_url)
+                    .params(uploadType: 'resumable', supportsAllDrives: sup, fields: fields)
+                    .headers(
+                      'Content-Type': 'application/json; charset=UTF-8',
+                      'X-Upload-Content-Type': mime,
+                      'X-Upload-Content-Length': size.to_s
+                    )
+                    .request_body(meta.to_json)
+
+            session = init&.headers&.[]('Location') || init&.headers&.[]('location')
+            error('Missing resumable session Location header') if session.blank?
+
+            # 2) Upload in chunks (1 MiB, multiple of 256 KiB)
+            chunk = 1 * 1024 * 1024
+            offset = 0
+            put_result = nil
+
+            while offset < size
+              len   = [chunk, size - offset].min
+              range = "bytes #{offset}-#{offset + len - 1}/#{size}"
+
+              piece = call(:stream_slice_io, fobj, offset, len)
+              error('Failed to read chunk for upload') if piece.nil? || piece.bytesize != len
+
+              put_result = put(session)
+                            .headers(
+                              'Content-Length': len.to_s,
+                              'Content-Type': mime,
+                              'Content-Range': range
+                            )
+                            .request_body(piece)
+
+              offset += len
+            end
+
+            # Final PUT returns the File resource
+            resp = put_result
+
+          else
+            error("Unsupported upload strategy: #{strat}")
+          end
+
+          # Map to your stable schema pills
+          mapped = call(:map_drive_meta, resp)
+          ok_env = call(:telemetry_envelope, t0, corr, true, 200, 'OK')
+          mapped.merge(ok_env)
+        rescue => e
+          details = call(:google_error_extract, e).merge('service' => 'drive', 'operation' => 'files.create')
+          env = call(:telemetry_envelope, t0, corr, false, (details['code'] || 500), (details['message'] || 'ERROR'), details)
+          payload = { 'ok' => false, 'error' => call(:normalize_error_for_pills, details, 'drive', 'files.create') }.merge(env)
+          if input['strict_on_upload_errors']
+            error("#{(details['code'] || 500)} #{(details['status'] || 'DriveError')} - #{(details['message'] || e.to_s)}")
+          end
+          payload
+        end
       end
     },
 
@@ -800,8 +953,9 @@ require 'uri'
       end
     },
     gcs_get_object: {
-      title: 'GCS: Get object',
+      title: 'GCS: Get object from GCS bucket',
       subtitle: 'Fetch an object from Google Cloud Storage bucket',
+      description:
       display_priority: 10,
       help: lambda do |_|
         {
@@ -1330,9 +1484,9 @@ require 'uri'
 
     # CHECK PERMISSIONS
     permission_probe: {
-      title: 'Permission probe (Drive & GCS)',
+      title: 'Admin: Permission probe',
       subtitle: 'Verify token identity, Drive visibility, GCS access, and requester-pays',
-      display_priority: 120,
+      display_priority: 12,
       # PURPOSE
       #   One-shot diagnostic to verify:
       #     1) Token identity (email)
@@ -1467,18 +1621,15 @@ require 'uri'
           s.match(/[?&]id=([a-zA-Z0-9_-]+)/)
       m ? m[1] : s
     end,
-
     util_to_iso8601_utc: lambda do |t|
       Time.parse(t.to_s).utc.iso8601
     rescue
       t
     end,
-
     util_to_int_or_nil: lambda do |val|
       v = val.to_s
       v.empty? ? nil : v.to_i
     end,
-
     util_is_textual_mime?: lambda do |mime|
       return false if mime.nil? || mime.strip.empty?
 
@@ -1511,11 +1662,9 @@ require 'uri'
       # Be conservative: do NOT treat as text by default
       false
     end,
-
     util_is_google_editors_mime?: lambda do |mime|
       (mime || '').start_with?('application/vnd.google-apps.')
     end,
-
     util_editors_export_mime: lambda do |source_mime, preferred_export_mime|
       # Choose export MIME for Google Editors when caller wants *text*.
       # If caller supplies an allowed textual MIME for the type, use it;
@@ -1549,17 +1698,14 @@ require 'uri'
         pref.presence || 'application/octet-stream'
       end
     end,
-
     util_strip_urls: lambda do |text|
       text.to_s.gsub(%r{https?://\S+|www\.\S+}, '')
     end,
-
     util_force_utf8: lambda do |bytes|
       s = bytes.to_s
       s.force_encoding('UTF-8')
       s.valid_encoding? ? s : s.encode('UTF-8', invalid: :replace, undef: :replace, replace: '')
     end,
-
     util_compute_checksums: lambda do |raw|
       # Compute MD5 and SHA-256 from raw bytes
       s = raw.to_s
@@ -1567,13 +1713,11 @@ require 'uri'
       sha = OpenSSL::Digest::SHA256.hexdigest(s)
       { 'md5' => md5, 'sha256' => sha }
     end,
-
     util_normalize_prefix: lambda do |prefix|
       p = (prefix || '').to_s
       return '' if p.empty?
       p.end_with?('/') ? p : "#{p}/"
     end,
-
     util_to_utf8: lambda do |bytes|
       str = bytes.is_a?(String) ? bytes.dup : bytes.to_s
       str.force_encoding('UTF-8')
@@ -1582,21 +1726,17 @@ require 'uri'
       str.sub!(/\A\xEF\xBB\xBF/, '')
       str
     end,
-
     util_md5_hex: lambda { |bytes| Digest::MD5.hexdigest(bytes) },
     util_sha256_hex: lambda { |bytes| Digest::SHA256.hexdigest(bytes) },
-
     util_b64md5_to_hex: lambda do |b64|
       return nil unless b64
       Digest::MD5.new.update(Base64.decode64(b64)).hexdigest
     end,
-
     util_b64crc32c_to_hex: lambda do |b64|
       return nil unless b64
       # GCS CRC32C is big-endian; decode and hexlify
       Base64.decode64(b64).unpack1('H*')
     end,
-
     util_csv_to_array_of_strings: lambda do |val|
       # Accepts Array, CSV string, nil, or scalar; returns Array<String>
       case val
@@ -1610,7 +1750,6 @@ require 'uri'
         [val.to_s].reject(&:empty?)
       end
     end,
-
     util_guess_extension_from_mime: lambda do |mime|
       map = {
         'text/plain' => '.txt',
@@ -1622,6 +1761,36 @@ require 'uri'
         'image/png' => '.png'
       }
       map[mime.to_s]
+    end,
+    util_file_size: lambda do |fobj|
+      # Workato file inputs often include :size; fallbacks cover common shapes.
+      return fobj[:size].to_i if fobj.is_a?(Hash) && fobj[:size]
+      s = fobj.to_s
+      s.respond_to?(:bytesize) ? s.bytesize : s.length
+    end,
+    stream_slice_io: lambda do |fobj, offset, length|
+      # Returns a binary string of exactly `length` bytes starting at `offset`.
+      # Supports common Workato shapes: { tempfile: File/Tempfile }, { content: String }, raw String.
+      if fobj.is_a?(Hash) && fobj[:tempfile].respond_to?(:seek) && fobj[:tempfile].respond_to?(:read)
+        io = fobj[:tempfile]
+        io.seek(offset)
+        return io.read(length) || ''.b
+      end
+      raw =
+        if fobj.is_a?(Hash) && fobj[:content]
+          fobj[:content]
+        elsif fobj.is_a?(Hash) && fobj[:original_filename] && fobj[:io].respond_to?(:read)
+          # Rare shape: UploadIO-like
+          io = fobj[:io]
+          io.seek(offset)
+          io.read(length) || ''.b
+        else
+          fobj.to_s
+        end
+      # Ensure binary and slice safely
+      str = raw.dup
+      str = str.force_encoding('BINARY') if str.respond_to?(:force_encoding)
+      str.byteslice(offset, length) || ''.b
     end,
 
     # --- 3. TELEMETRY --------------------
@@ -2123,6 +2292,12 @@ require 'uri'
       end
 
       results
+    end,
+    drive_build_file_metadata: lambda do |name, parent_id, mime|
+      h = { name: name.to_s.strip }
+      h[:parents]  = [parent_id] if parent_id.present?
+      h[:mimeType] = mime if mime.present?
+      h
     end,
 
     # --- 9. UI BUILDERS ------------------
