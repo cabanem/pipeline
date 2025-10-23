@@ -1138,6 +1138,7 @@ require 'securerandom'
             out['metrics_kv'] = call(:metrics_to_kv, m)
           end
           out
+        end
       end,
       sample_output: lambda do
         {
@@ -1541,7 +1542,7 @@ require 'securerandom'
       title: 'RAG Files: Import files to corpus',
       subtitle: 'projects.locations.ragCorpora.ragFiles:import',
       display_priority: 90,
-      retry_on_request: ['GET','HEAD'], # removed "POST" to preserve idempotency, prevent duplication of jobs
+      retry_on_request: ['GET','HEAD'], # not "POST" to preserve idempotency, prevent duplication of jobs
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
 
@@ -1594,66 +1595,77 @@ require 'securerandom'
           { name: 'metrics_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] } ]
       end,
       execute: lambda do |connection, input|
-        # Build correlation ID, now (for traceability)
-        t0 = Time.now
+        t0   = Time.now
         corr = call(:build_correlation_id)
-        begin
-          url = nil
-          req_body = nil
+        url  = nil
+        req_body = nil
 
-          # Validate inputs
+        begin
+          # Validate inputs & context
           call(:ensure_project_id!, connection)
           call(:ensure_regional_location!, connection)
 
           corpus = call(:normalize_rag_corpus, connection, input['rag_corpus_resource_name'])
           error('rag_corpus_resource_name is required') if corpus.blank?
 
-          # Build payload
+          # Build request
           payload  = call(:build_rag_import_payload!, input)
-
-          loc = (connection['location'] || '').downcase
-          url = call(:aipl_v1_url, connection, loc, "#{corpus}/ragFiles:import")
+          loc      = (connection['location'] || '').downcase
+          url      = call(:aipl_v1_url, connection, loc, "#{corpus}/ragFiles:import")
           req_body = call(:json_compact, payload)
-          raw  = call(:http_call!, 'POST', url)
-                   .headers(call(:request_headers, corr))
-                   .payload(req_body)
-          code = call(:telemetry_success_code, raw)
-          body = call(:http_body_json, raw)
+
+          # POST import (returns LRO)
+          http = call(:http_call!, 'POST', url)
+                  .headers(call(:request_headers, corr))
+                  .payload(req_body)
+
+          code = call(:telemetry_success_code, http)
+          body = call(:http_body_json, http)
+
           out  = body.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
           ok = true
           http_status = code
+
+          # Metrics
           flags = call(:metrics_effective_flags, connection, input)
           if flags['emit']
             m = call(:metrics_base, connection, 'rag_files_import', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
-              .merge(call(:metrics_from_import_lro, body))
-              .merge('rag_corpus' => call(:normalize_rag_corpus, connection, input['rag_corpus_resource_name']))
+                  .merge(call(:metrics_from_import_lro, body))
+                  .merge('rag_corpus' => call(:normalize_rag_corpus, connection, input['rag_corpus_resource_name']))
             out['metrics']    = m
             out['metrics_kv'] = call(:metrics_to_kv, m)
           end
+
+          # Debug
           if call(:normalize_boolean, input['debug'])
             ops_root = "https://#{call(:aipl_service_host, connection, loc)}/v1/projects/#{connection['project_id']}/locations/#{loc}/operations"
             dbg = call(:debug_pack, true, url, req_body, body) || {}
             dbg['ops_list_url'] = ops_root
             out['debug'] = dbg
           end
+
           out
 
         rescue => e
-          g = call(:extract_google_error, e)
-          vio = (g['violations'] || []).map { |x| "#{x['field']}: #{x['reason']}" }.join(' ; ')
-          msg = [e.to_s, (g['message'] || nil), (vio.presence)].compact.join(' | ')
-          http_status = call(:telemetry_parse_error_code, e), msg))
+          g    = call(:extract_google_error, e)
+          vio  = (g['violations'] || []).map { |x| "#{x['field']}: #{x['reason']}" }.join(' ; ')
+          msg  = [e.to_s, (g['message'] || nil), (vio.presence)].compact.join(' | ')
+          http_status = call(:telemetry_parse_error_code, e)
           ok = false
+
           out = {}.merge(call(:telemetry_envelope, t0, corr, false, http_status, msg))
+
           flags = call(:metrics_effective_flags, connection, input)
           if flags['emit']
             m = call(:metrics_base, connection, 'rag_files_import', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
             out['metrics']    = m
             out['metrics_kv'] = call(:metrics_to_kv, m)
           end
+
           unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
+            out['debug'] = call(:debug_pack, input['debug'], url, req_body, g) if call(:normalize_boolean, input['debug'])
           end
+
           out
         end
       end,
