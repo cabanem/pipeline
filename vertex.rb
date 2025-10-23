@@ -865,9 +865,12 @@ require 'securerandom'
           body  = call(:http_body_json, http)
           raw   = call(:normalize_retrieve_contexts!, body)
 
-          maxn  = call(:clamp_int, (input['max_contexts'] || 20), 1, 200)
-          mapped = call(:map_context_chunks, raw, maxn)
+          maxn    = call(:clamp_int, (input['max_contexts'] || 20), 1, 200)
+          mapped  = call(:map_context_chunks, raw, maxn)
+          # Optional: fail fast on empty retrievals (comment out if you prefer OK/200)
           if mapped.empty?
+            error('No contexts retrieved; check corpus, region, permissions, or the query text.')
+          end
 
           # Build output
           base_out = {
@@ -886,6 +889,7 @@ require 'securerandom'
             base_out['metrics_kv'] = call(:metrics_to_kv, m)
           end
           base_out
+        end
         rescue => e
           # Extract error details
           g           = call(:extract_google_error, e)
@@ -904,7 +908,6 @@ require 'securerandom'
           out
         end
       end,
-
       sample_output: lambda do
         {
           'question' => 'What is the PTO carryover policy?',
@@ -3290,7 +3293,7 @@ require 'securerandom'
     end,
     build_rag_retrieve_payload: lambda do |question, rag_corpus, restrict_ids = []|
       rag_res = { 'ragCorpus' => rag_corpus }
-      ids     = call(:sanitize_drive_ids, restrict_ids, allow_empty: true, label: 'restrict_to_file_ids')
+      ids     = call(:sanitize_rag_file_ids, restrict_ids, allow_empty: true, label: 'restrict_to_file_ids')
       rag_res['ragFileIds'] = ids if ids.present?
       {
         'query'      => { 'text' => question.to_s },
@@ -3456,6 +3459,14 @@ require 'securerandom'
     end,
     sanitize_feature_vector: lambda do |arr|
       call(:safe_array, arr).map { |x| call(:safe_float, x) }.reject { |x| x.nil? }
+    end,
+    sanitize_rag_file_ids: lambda do |raw_list, allow_empty: false, label: 'rag_file_ids'|
+      list = call(:safe_array, raw_list).map { |x| x.to_s.strip }.reject(&:empty?).uniq
+      return [] if list.empty? && allow_empty
+      # Accept broad safe charset for Vertex RAG file IDs (don’t “normalize links” like Drive).
+      bad = list.find { |id| !(id =~ /\A[A-Za-z0-9_\-:\/]{8,200}\z/) }
+      error("Invalid RAG file id in #{label}: #{bad}") if bad
+      list
     end,
 
     # --- Embeddings -------------------------------------------------------
@@ -4050,6 +4061,6 @@ require 'securerandom'
   # --------- CUSTOM ACTION SUPPORT ----------------------------------------
   custom_action: true,
   custom_action_help: {
-    body: 'For actions calling host 'aiplatform.googleapis.com/v1', use relative paths. For actions calling other endpoints (e.g. discovery engine), provide the absolute URL.'
+    body: 'For actions calling host "aiplatform.googleapis.com/v1", use relative paths. For actions calling other endpoints (e.g. discovery engine), provide the absolute URL.'
   }
 }
