@@ -12,8 +12,7 @@ require 'time'
   connection: {
     fields: [
       { name: 'prod_mode', label: 'Production mode', optional: true, type: 'boolean',
-        control_type: 'checkbox', default: true,
-        hint: 'When enabled, reduces debug echoes.' }
+        control_type: 'checkbox', default: true, hint: 'When enabled, reduces debug echoes.' }
     ]
   },
 
@@ -46,7 +45,7 @@ require 'time'
           { name: 'server_url',               label: 'Override server URL',                                   optional: true,
             hint: 'If provided, this replaces the derived rootUrl+servicePath.' },
           { name: 'include_internal_schemas', label: 'Include all schemas',       control_type: 'checkbox',   optional: true,
-            type: 'boolean', default: false },
+            type: 'boolean', default: false, convert_input: 'boolean_conversion' },
           { name: 'return_mode',              label: 'Return mode',               control_type: 'select',     optional: true,
             default: 'inline_pretty', pick_list: 'return_modes', hint: 'Choose how the OpenAPI is returned (inline, minified, chunked, or as a file object).' },
           { name: 'chunk_size_kb',            label: 'Chunk size (KB)',                                       optional: true,
@@ -167,7 +166,7 @@ require 'time'
       title: 'Validate OpenAPI 3.x',
       subtitle: 'Run structural checks on an OpenAPI 3.x document',
       help: lambda do
-        body: 'Validate an OpenAPI 3.x object or JSON string; returns pass/fail with errors and warnings.',
+        {body: 'Validate an OpenAPI 3.x object or JSON string; returns pass/fail with errors and warnings.'}
       end,
 
       input_fields: lambda do
@@ -229,7 +228,7 @@ require 'time'
     validation: {
       fields: lambda do
         [
-          { name: 'passed', type: 'boolean' },
+          { name: 'passed', type: 'boolean', control_type: 'checkbox', convert_output: 'boolean_conversion'},
           { name: 'error_count', type: 'integer' },
           { name: 'warning_count', type: 'integer' },
           { name: 'errors', type: 'array', of: 'string' },
@@ -279,8 +278,14 @@ require 'time'
   # --------- METHODS ------------------------------------------------------
   methods: {
 
+    now_iso8601: lambda do
+      # RFC3339/ISO8601 timestamp without requiring 'time'
+      Time.now.utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+    end,
+
     b64: lambda do |str|
-      Base64.strict_encode64(str.to_s)
+      # Base64 encode without requiring 'base64'
+      [str.to_s].pack('m0')
     end,
 
     chunk_string: lambda do |str, size|
