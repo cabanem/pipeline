@@ -125,39 +125,20 @@ require 'securerandom'
 
   # --------- OBJECT DEFINITIONS -------------------------------------------
   object_definitions: {
+    # Object definition calls receive 2 arguments, connection and config_fields
 
     content_part: {
-      fields: lambda do
-        [
-          { name: 'text' },
-          { name: 'inlineData', type: 'object', properties: [
-              { name: 'mimeType' }, { name: 'data', hint: 'Base64' }
-          ]},
-          { name: 'fileData', type: 'object', properties: [
-              { name: 'mimeType' }, { name: 'fileUri' }
-          ]},
-          { name: 'functionCall', type: 'object', properties: [
-              { name: 'name' }, { name: 'args', type: 'object' }
-          ]},
-          { name: 'functionResponse', type: 'object', properties: [
-              { name: 'name' }, { name: 'response', type: 'object' }
-          ]},
-          { name: 'executableCode', type: 'object', properties: [
-              { name: 'language' }, { name: 'code' }
-          ]},
-          { name: 'codeExecutionResult', type: 'object', properties: [
-              { name: 'outcome' }, { name: 'stdout' }, { name: 'stderr' }
-          ]}
-        ]
+      fields: lambda do |connection, config_fields|
+        call(:schema_content_part)
       end
     },
     content: {
       # Per contract: role ∈ {user, model}
-      fields: lambda do |_connection, _config_fields, object_definitions|
+      fields: lambda do |connection, config_fields|
         [
           { name: 'role', control_type: 'select', pick_list: 'roles', optional: false },
           { name: 'parts', type: 'array', of: 'object',
-            properties: object_definitions['content_part'], optional: false }
+            properties: call(:schema_content_part), optional: false }
         ]
       end
     },
@@ -199,7 +180,7 @@ require 'securerandom'
       end
     },
     generation_config: {
-      fields: lambda do
+      fields: lambda do |connection, config_fields|
         [
           { name: 'temperature',       type: 'number'  },
           { name: 'topP',              type: 'number'  },
@@ -213,7 +194,7 @@ require 'securerandom'
       end
     },
     generate_content_output: {
-      fields: lambda do
+      fields: lambda do |connection, config_fields|
         [
           { name: 'responseId' },
           { name: 'modelVersion' },
@@ -246,7 +227,7 @@ require 'securerandom'
 
     embed_output: {
       # Align to contract: embeddings object, not array
-      fields: lambda do
+      fields: lambda do |connection, config_fields|
         [
           { name: 'predictions', type: 'array', of: 'object', properties: [
               { name: 'embeddings', type: 'object', properties: [
@@ -269,7 +250,7 @@ require 'securerandom'
       end
     },
     predict_output: {
-      fields: lambda do
+      fields: lambda do |connection, config_fields|
         [
           { name: 'predictions', type: 'array', of: 'object' },
           { name: 'deployedModelId' }
@@ -278,7 +259,7 @@ require 'securerandom'
     },
 
     batch_job: {
-      fields: lambda do |_|
+      fields: lambda do |connection, config_fields|
         [
           { name: 'name' },
           { name: 'displayName' },
@@ -295,7 +276,7 @@ require 'securerandom'
     },
 
     envelope_fields: {
-      fields: lambda do |_|
+      fields: lambda do |connection, config_fields|
         [
           { name: 'ok', type: 'boolean' },
           { name: 'telemetry', type: 'object', properties: [
@@ -308,7 +289,7 @@ require 'securerandom'
       end
     },
     metrics_fields: {
-      fields: lambda do |_|
+      fields: lambda do |connection, config_fields|
         [
           # Identity & routing
           { name: 'namespace' },                    # optional logical bucket, e.g. 'email_rag_prod'
@@ -353,7 +334,7 @@ require 'securerandom'
     },
 
     safety_setting: {
-      fields: lambda do
+      fields: lambda do |connection, config_fields|
         [
           { name: 'category'  },   # e.g., HARM_CATEGORY_*
           { name: 'threshold' }    # e.g., BLOCK_LOW_AND_ABOVE
@@ -362,7 +343,7 @@ require 'securerandom'
     },
 
     kv_pair: {
-      fields: lambda do
+      fields: lambda do |connection, config_fields|
         [
           { name: 'key' },
           { name: 'value' }
@@ -387,7 +368,7 @@ require 'securerandom'
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
 
-      input_fields: lambda do |_|
+      input_fields: lambda do |object_definitions, connection, config_fields|
         [
           { name: 'mode', control_type: 'select', pick_list: 'modes_classification', optional: false, default: 'embedding',
             hint: 'embedding (deterministic), generative (LLM-only), or hybrid (embeddings + LLM referee).' },
@@ -422,7 +403,7 @@ require 'securerandom'
             hint: 'How much to blend salience importance into the final confidence (0–0.5 typical).' },
         ]
       end,
-      output_fields: lambda do |object_definitions|
+      output_fields: lambda do |object_definitions, connection|
         [
           { name: 'mode' },
           { name: 'chosen' },
@@ -806,7 +787,7 @@ require 'securerandom'
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
 
-      input_fields: lambda do
+      input_fields: lambda do |object_definitions, connection, config_fields|
         [
           { name: 'rag_corpus', optional: false,
             hint: 'Accepts either full resource name (e.g., "projects/{project}/locations/{region}/ragCorpora/{corpus}") or the "corpus"' },
@@ -934,7 +915,7 @@ require 'securerandom'
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
 
-      input_fields: lambda do |_|
+      input_fields: lambda do |object_definitions, connection, config_fields|
         [
           { name: 'model', label: 'Model', optional: false, control_type: 'text' },
           { name: 'rag_corpus', optional: false,
@@ -952,7 +933,7 @@ require 'securerandom'
           { name: 'metrics_namespace', optional: true, hint: 'Optional tag for partitioning dashboards (e.g., "email_rag_prod").' },
         ]
       end,
-      output_fields: lambda do |_|
+      output_fields: lambda do |object_definitions, connection|
         [
           { name: 'answer' },
           { name: 'citations', type: 'array', of: 'object', properties: [
@@ -1125,9 +1106,11 @@ require 'securerandom'
             base_out['metrics_kv'] = call(:metrics_to_kv, m)
           end
           base_out
+
         rescue => e
           g = call(:extract_google_error, e)
           http_status = call(:telemetry_parse_error_code, e)
+          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
           out = {}.merge(call(:telemetry_envelope, t0, corr, false, http_status, msg))
           ok = false
           flags = call(:metrics_effective_flags, connection, input)
@@ -1160,7 +1143,7 @@ require 'securerandom'
       display_priority: 90,
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
-      input_fields: lambda do |_|
+      input_fields: lambda do |object_definitions, connection, config_fields|
         [
           { name: 'corpusId', optional: false, hint: 'Short ID for the new corpus' },
           { name: 'displayName', optional: true },
@@ -1169,7 +1152,7 @@ require 'securerandom'
           { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
         ]
       end,
-      output_fields: lambda do |_|
+      output_fields: lambda do |object_definitions, connection|
         [
           { name: 'name' }, { name: 'displayName' }, { name: 'description' },
           { name: 'labels', type: 'object' }, { name: 'createTime' }, { name: 'updateTime' }
@@ -1230,10 +1213,10 @@ require 'securerandom'
       display_priority: 90,
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
-      input_fields: lambda do |_|
+      input_fields: lambda do |object_definitions, connection, config_fields|
         [ { name: 'rag_corpus', optional: false, hint: 'Short id or full resource' } ]
       end,
-      output_fields: lambda do |_|
+      output_fields: lambda do |object_definitions, connection|
         [
           { name: 'name' }, { name: 'displayName' }, { name: 'description' },
           { name: 'labels', type: 'object' }, { name: 'createTime' }, { name: 'updateTime' }
@@ -1268,7 +1251,7 @@ require 'securerandom'
       display_priority: 90,
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
-      input_fields: lambda do |_|
+      input_fields: lambda do |object_definitions, connection, config_fields|
         [
           { name: 'page_size', type: 'integer', optional: true },
           { name: 'page_token', optional: true },
@@ -1276,7 +1259,7 @@ require 'securerandom'
           { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
         ]
       end,
-      output_fields: lambda do |_|
+      output_fields: lambda do |object_definitions, connection|
         [
           { name: 'items', type: 'array', of: 'object', properties: [
             { name: 'name' }, { name: 'displayName' }, { name: 'description' },
@@ -1333,10 +1316,10 @@ require 'securerandom'
       display_priority: 90,
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
-      input_fields: lambda do |_|
+      input_fields: lambda do |object_definitions, connection, config_fields|
         [ { name: 'rag_corpus', optional: false } ]
       end,
-      output_fields: lambda do |_|
+      output_fields: lambda do |object_definitions, connection|
         [
           { name: 'name' }, { name: 'done', type: 'boolean' }, { name: 'error', type: 'object' }
         ] + [
@@ -1371,7 +1354,7 @@ require 'securerandom'
       display_priority: 90,
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
-      input_fields: lambda do |_|
+      input_fields: lambda do |object_definitions, connection, config_fields|
         [
           { name: 'rag_corpus', optional: false, hint: 'Short id or full resource' },
           { name: 'page_size', type: 'integer', optional: true },
@@ -1454,7 +1437,7 @@ require 'securerandom'
       display_priority: 90,
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
-      input_fields: lambda do |_|
+      input_fields: lambda do |object_definitions, connection, config_fields|
         [ { name: 'rag_file', optional: false, hint: 'Full name: projects/.../ragCorpora/{id}/ragFiles/{fileId}' } ]
       end,
       output_fields: lambda do |object_definitions, connection|
@@ -1507,10 +1490,10 @@ require 'securerandom'
       display_priority: 90,
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
-      input_fields: lambda do |_|
+      input_fields: lambda do |object_definitions, connection, config_fields|
         [ { name: 'rag_file', optional: false, hint: 'Full name: projects/.../ragCorpora/{id}/ragFiles/{fileId}' } ]
       end,
-      output_fields: lambda do |_|
+      output_fields: lambda do |object_definitions, connection|
         [
           { name: 'name' }, { name: 'done', type: 'boolean' }, { name: 'error', type: 'object' }
         ] + [
@@ -1546,7 +1529,7 @@ require 'securerandom'
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
 
-      input_fields: lambda do
+      input_fields: lambda do |object_definitions, connection, config_fields|
         [
           { name: 'rag_corpus_resource_name', optional: false, hint: 'Accepts either full resource name (e.g., "projects/{project}/locations/{region}/ragCorpora/{corpus}") or the "corpus"' },
 
@@ -1578,7 +1561,7 @@ require 'securerandom'
           { name: 'metrics_namespace', optional: true, hint: 'Optional tag for partitioning dashboards (e.g., "email_rag_prod").' },
         ]
       end,
-      output_fields: lambda do |_|
+      output_fields: lambda do |object_definitions, connection|
         [
           { name: 'name' },           # LRO: projects/.../operations/...
           { name: 'done', type: 'boolean' },
@@ -1775,7 +1758,7 @@ require 'securerandom'
             out['metrics_kv'] = call(:metrics_to_kv, m)
           end
           out
-
+        end
       end,
       sample_output: lambda do
         {
@@ -1900,6 +1883,7 @@ require 'securerandom'
             out['metrics_kv'] = call(:metrics_to_kv, m)
           end
           out
+        end
       end,
       sample_output: lambda do
         {
@@ -1925,7 +1909,7 @@ require 'securerandom'
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
 
-      input_fields: lambda do |_|
+      input_fields: lambda do |object_definitions, connection, config_fields|
         [
           { name: 'model', label: 'Model', optional: false, control_type: 'text' },
           { name: 'question', optional: false },
@@ -1966,7 +1950,7 @@ require 'securerandom'
           { name: 'metrics_namespace', optional: true, hint: 'Optional tag for partitioning dashboards (e.g., "email_rag_prod").' },
         ]
       end,
-      output_fields: lambda do |object_definitions|
+      output_fields: lambda do |object_definitions, connection|
         [
           { name: 'answer' },
           { name: 'citations', type: 'array', of: 'object', properties: [
@@ -2145,6 +2129,7 @@ require 'securerandom'
             out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
           end
           out
+        end
       end,
       sample_output: lambda do
         {
@@ -2172,7 +2157,7 @@ require 'securerandom'
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
 
-      input_fields: lambda do |_|
+      input_fields: lambda do |object_definitions, connection, config_fields|
         [
           { name: 'model', label: 'Embedding model', optional: false, control_type: 'text', default: 'text-embedding-005' },
           { name: 'texts', type: 'array', of: 'string', optional: false },
@@ -2185,7 +2170,7 @@ require 'securerandom'
           { name: 'metrics_namespace', optional: true, hint: 'Optional tag for partitioning dashboards (e.g., "email_rag_prod").' },
         ]
       end,
-      output_fields: lambda do |object_definitions|
+      output_fields: lambda do |object_definitions, connection|
         Array(object_definitions['embed_output']) + 
         Array(object_definitions['envelope_fields']) + [
           { name: 'metrics', type: 'object', properties: object_definitions['metrics_fields'] },
@@ -2251,6 +2236,7 @@ require 'securerandom'
             out['metrics_kv'] = call(:metrics_to_kv, m)
           end
           out
+        end
       end,
       sample_output: lambda do
         {
@@ -2334,7 +2320,7 @@ require 'securerandom'
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
 
-      input_fields: lambda do
+      input_fields: lambda do |object_definitions, connection, config_fields|
         [
           { name: 'operation', optional: false,
             hint: 'Operation name or full path, e.g., projects/{p}/locations/{l}/operations/{id}' },
@@ -2343,7 +2329,7 @@ require 'securerandom'
           { name: 'metrics_namespace', optional: true, hint: 'Optional tag for partitioning dashboards (e.g., "email_rag_prod").' },
         ]
       end,
-      output_fields: lambda do |_|
+      output_fields: lambda do |object_definitions, connection|
         [
           { name: 'name' }, { name: 'done', type: 'boolean' },
           { name: 'metadata', type: 'object' }, { name: 'error', type: 'object' }
@@ -2403,7 +2389,7 @@ require 'securerandom'
         { body: 'Runs lightweight calls (locations.list, models.countTokens, indexes.list, ragCorpora.list, optional Discovery Engine engines.list & search) to validate auth, billing, and region. Returns per-check status and suggestions.' }
       end,
 
-      input_fields: lambda do |_|
+      input_fields: lambda do |object_definitions, connection, config_fields|
         [
           # Which checks to run
           { name: 'check_locations', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
@@ -2445,8 +2431,7 @@ require 'securerandom'
             hint: 'Tiny query for the smoke test' }
         ]
       end,
-
-      output_fields: lambda do |_|
+      output_fields: lambda do |object_definitions, connection|
         [
           { name: 'project_id' },
           { name: 'location' },
@@ -2473,7 +2458,6 @@ require 'securerandom'
           ]}
         ]
       end,
-
       execute: lambda do |connection, input|
         t0   = Time.now
         corr = call(:build_correlation_id)
@@ -2701,7 +2685,6 @@ require 'securerandom'
           'results'    => results
         }.merge(call(:telemetry_envelope, t0, corr, overall_ok, (overall_ok ? 200 : 207), (overall_ok ? 'OK' : 'PARTIAL')))
       end,
-
       sample_output: lambda do
         {
           'project_id' => 'acme-prod',
@@ -2722,7 +2705,7 @@ require 'securerandom'
     test_iam_permissions: {
       title: 'Admin: Test IAM permissions',
       display_priority: 1,
-      input_fields: lambda do |_|
+      input_fields: lambda do |object_definitions, connection, config_fields|
         [
           { name: 'service', control_type: 'select', pick_list: 'iam_services', optional: false,
             hint: 'vertex or discovery' },
@@ -2730,7 +2713,7 @@ require 'securerandom'
           { name: 'permissions', type: 'array', of: 'string', optional: false }
         ]
       end,
-      output_fields: lambda do |_|
+      output_fields: lambda do |object_definitions, connection|
         [
           { name: 'permissions', type: 'array', of: 'string' },
           { name: 'ok', type: 'boolean' },
@@ -4023,6 +4006,29 @@ require 'securerandom'
             connection['metrics_namespace_default'].presence)
       { 'emit' => emit, 'ns' => ns }
     end,
+    schema_content_part: lambda do
+      [
+        { name: 'text' },
+        { name: 'inlineData', type: 'object', properties: [
+            { name: 'mimeType' }, { name: 'data', hint: 'Base64' }
+        ]},
+        { name: 'fileData', type: 'object', properties: [
+            { name: 'mimeType' }, { name: 'fileUri' }
+        ]},
+        { name: 'functionCall', type: 'object', properties: [
+            { name: 'name' }, { name: 'args', type: 'object' }
+        ]},
+        { name: 'functionResponse', type: 'object', properties: [
+            { name: 'name' }, { name: 'response', type: 'object' }
+        ]},
+        { name: 'executableCode', type: 'object', properties: [
+            { name: 'language' }, { name: 'code' }
+        ]},
+        { name: 'codeExecutionResult', type: 'object', properties: [
+            { name: 'outcome' }, { name: 'stdout' }, { name: 'stderr' }
+        ]}
+      ]
+    end
   },
 
   # --------- TRIGGERS -----------------------------------------------------
@@ -4031,16 +4037,6 @@ require 'securerandom'
   # --------- CUSTOM ACTION SUPPORT ----------------------------------------
   custom_action: true,
   custom_action_help: {
-    body: <<~HELP
-      Use relative Vertex v1 paths; we prefix the correct regional base automatically.
-
-      • Base: https://{location-}aiplatform.googleapis.com/v1/
-      • Enter paths WITHOUT leading "v1/". Examples:
-        - projects/{project}/locations/{location}/indexes
-        - projects/{project}/locations/{location}/publishers/google/models/gemini-2.0-flash:generateContent
-      • Absolute URLs (incl. Discovery Engine) bypass the base.
-
-      Auth and x-goog-user-project are applied from the connection.
-    HELP
+    body: 'For actions calling host 'aiplatform.googleapis.com/v1', use relative paths. For actions calling other endpoints (e.g. discovery engine), provide the absolute URL.'
   }
 }
