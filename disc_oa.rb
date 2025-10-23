@@ -6,6 +6,43 @@ require 'time'
   title: 'Discovery→OpenAPI Converter',
   version: '0.1.0',
   description: 'Convert a Google API Discovery document into an OpenAPI 3.x spec',
+  help: {
+    body: <<~MD
+      ## What this connector does
+      Converts a **Google API Discovery** document into an **OpenAPI 3.x** spec you can store, validate, or hand to downstream tools.
+
+      **Inputs it accepts**
+      - A pasted Discovery JSON blob, or
+      - A Discovery URL (e.g., `https://www.googleapis.com/discovery/v1/apis/gmail/v1/rest`)
+
+      **Outputs you can use**
+      - Full OpenAPI object (`spec`)
+      - JSON string (`openapi_json`) or **chunks** (`openapi_chunks[]`)
+      - A ready-to-upload **file object** (`file`)
+      - A structured **validation** report
+
+      ### Return modes (choose in the action)
+      - **inline_pretty**: Human-readable JSON + `spec` (use for small specs)
+      - **inline_minified**: Compact JSON only
+      - **inline_chunked**: `openapi_chunks[]` (loop and upload/append per chunk)
+      - **file_object**: Base64 file you can upload in one step
+
+      ### Typical patterns
+      - **URL → file**: Convert a Discovery URL and upload the OpenAPI JSON to Drive/GCS/S3.
+      - **URL → chunked append**: Use `inline_chunked` for very large specs; loop over `openapi_chunks` and append to a file.
+      - **Inline validation**: Pipe the produced spec to **Validate OpenAPI 3.x** and fail early on structural errors.
+
+      ### Limits & notes
+      - Workato actions don't stream; large payloads require **minified** JSON or **chunked** mode.
+      - If both JSON and URL are provided, the action will error. Provide only **one**.
+      - Server URL is derived from Discovery `rootUrl + servicePath`; you can override via **Server URL**.
+
+      ### Troubleshooting
+      - **HTTP 4xx/5xx on fetch**: Check the Discovery URL and network egress allowlists.
+      - **Validation fails**: Inspect `validation.errors[]` for the exact field and path.
+      - **Huge outputs**: Switch to **inline_minified** or **inline_chunked**; avoid returning both `spec` and pretty JSON.
+      MD
+  },
 
   # --------- CONNECTION ---------------------------------------------------
   connection: {
@@ -27,7 +64,43 @@ require 'time'
     discovery_to_openapi: {
       title: 'Convert Discovery → OpenAPI',
       subtitle: 'Generate OpenAPI 3.x spec from a Google Discovery doc',
-      help: 'Provide either a raw Discovery JSON or a URL to the discovery document.',
+      help: lambda do |_|
+        {
+          body: <<~MD
+          Generate an **OpenAPI 3.x** spec from a Google Discovery doc.
+
+          #### Provide exactly one input
+          - **Discovery document (JSON)**: paste the full JSON
+          - **Discovery document URL**: e.g., Gmail REST `.../discovery/v1/apis/gmail/v1/rest`
+
+          #### Options
+          - **OpenAPI version**: `3.0.3` or `3.1.0`
+          - **Override title/version**: force `info.title` / `info.version`
+          - **Server URL**: replace derived `rootUrl + servicePath`
+          - **Include all schemas**: keep internal/unused schemas instead of pruning
+          - **Return mode**:
+            - `inline_pretty` → returns `spec` + pretty JSON (best for inspection)
+            - `inline_minified` → returns only minified JSON
+            - `inline_chunked` → returns `openapi_chunks[]` (for big specs)
+            - `file_object` → returns `{filename, content_type, content(base64)}`
+          - **Chunk size (KB)**: used only with `inline_chunked`
+
+          #### Output fields you’ll typically use
+          - `openapi_json` or `openapi_chunks[]` or `file`
+          - `validation.passed` (boolean), plus counts and lists of errors/warnings
+
+          #### Example recipe flow
+          1) **Convert Discovery → OpenAPI** (mode: `file_object`)
+          2) **Upload file** to GDrive/GCS using the returned file object
+          3) **(Optional) Validate OpenAPI 3.x** on the stored object
+
+          #### Gotchas
+          - Don’t supply both JSON and URL.
+          - Large specs → prefer `inline_minified` or `inline_chunked`.
+          - If you override **Server URL**, ensure it matches the API host you intend to call.
+          MD
+        }
+      end, 
       input_fields: lambda do
         [
           { name: 'discovery_doc_json',       label: 'Discovery document (JSON)', control_type: 'text-area',  optional: true,
@@ -162,7 +235,28 @@ require 'time'
     validate_openapi: {
       title: 'Validate OpenAPI 3.x',
       subtitle: 'Run structural checks on an OpenAPI 3.x document',
-      help: 'Provide either the OpenAPI JSON string or an object.',
+      help: lambda do |_|
+        {
+          body: <<~MD
+          Validate a candidate **OpenAPI 3.x** document for basic structural correctness.
+
+          #### Inputs
+          - **OpenAPI (object)**: pass the object produced by the converter, or
+          - **OpenAPI (JSON string)**: paste JSON directly
+          - **Expected version prefix**: default `3.` (accepts `3.0` or `3.1`)
+
+          #### Output
+          - `validation.passed` — quick yes/no
+          - `validation.errors[]` — actionable messages with the exact path and reason
+          - `validation.warnings[]` — non-fatal issues (e.g., missing servers)
+
+          #### Tips
+          - Feed this action right after conversion to fail early on broken specs.
+          - Keep the `Expected version prefix` aligned with your downstream tooling.
+          MD
+        }
+      end,
+      
       input_fields: lambda do
         [
           { name: 'openapi_json', label: 'OpenAPI (JSON string)', control_type: 'text-area', optional: true },
