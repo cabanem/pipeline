@@ -1283,14 +1283,15 @@ require 'securerandom'
             ], hint: 'id + content required.' },
           { name: 'rank_model', optional: true, hint: 'e.g., semantic-ranker-default@latest' },
           { name: 'top_n', type: 'integer', optional: true },
-          { name: 'ranking_config_name', optional: true,
-            hint: 'Full name or leave blank for .../rankingConfigs/default_ranking_config' },
+          { name: 'ignore_record_details_in_response', type: 'boolean', control_type: 'checkbox', optional: true,
+            hint: 'If true, response returns only {id, score}. Useful when you only need scores.' },
+          { name: 'ranking_config_name', optional: true, hint: 'Full name or leave blank for .../rankingConfigs/default_ranking_config' },
           { name: 'emit_metrics', type: 'boolean', control_type: 'checkbox', optional: true, default: true },
           { name: 'metrics_namespace', optional: true }
         ]
       end,
 
-      output_fields: lambda do |_od, _connection|
+      output_fields: lambda do |object_definitions, _connection, _cfg|
         [
           { name: 'records', type: 'array', of: 'object', properties: [
               { name: 'id' }, { name: 'score', type: 'number' }
@@ -1309,7 +1310,8 @@ require 'securerandom'
           loc = connection['location'].to_s.downcase
 
           ranking_config = call(:build_ranking_config_name, connection, loc, input['ranking_config_name'])
-          url = "https://discoveryengine.googleapis.com/v1/#{ranking_config}:rank"
+          # Honor connection's Discovery version/host settings
+          url = call(:discovery_url, connection, loc, "#{ranking_config}:rank")
 
           body = {
             'query'   => input['query_text'].to_s,
@@ -1317,10 +1319,12 @@ require 'securerandom'
               { 'id' => r['id'].to_s, 'content' => r['content'].to_s,
                 'metadata' => (r['metadata'].is_a?(Hash) ? r['metadata'] : nil) }.delete_if { |_k,v| v.nil? } },
             'model'   => (input['rank_model'].to_s.strip.empty? ? nil : input['rank_model'].to_s.strip),
-            'topN'    => (input['top_n'].to_i > 0 ? input['top_n'].to_i : nil)
+            'topN'    => (input['top_n'].to_i > 0 ? input['top_n'].to_i : nil),
+            'ignoreRecordDetailsInResponse' => (input['ignore_record_details_in_response'] == true ? true : nil)
           }.delete_if { |_k,v| v.nil? }
 
-          resp = post(url).headers(call(:request_headers, corr)).payload(call(:json_compact, body))
+          req_body = call(:json_compact, body)
+          resp = post(url).headers(call(:request_headers, corr)).payload(req_body)
           code = call(:telemetry_success_code, resp)
           out = { 'records' => (resp['records'] || []) }.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
 
@@ -1334,7 +1338,14 @@ require 'securerandom'
           out
         rescue => e
           http_status = call(:telemetry_parse_error_code, e)
+          # Include debug echo when not in prod_mode
+          dbg = call(:debug_pack,
+                     !(call(:normalize_boolean, connection['prod_mode'])),
+                     url,
+                     req_body,
+                     call(:extract_google_error, e))
           out = {}.merge(call(:telemetry_envelope, t0, corr, false, http_status, e.to_s))
+          out.merge!(dbg) if dbg
           flags = call(:metrics_effective_flags, connection, input)
           if flags['emit']
             m = call(:metrics_base, connection, 'rank_texts_with_ranking_api', t0, false, http_status, corr, { 'namespace' => flags['ns'] })
@@ -1393,7 +1404,7 @@ require 'securerandom'
               { name: 'uri' },
               { name: 'metadata', type: 'object' },
               { name: 'metadata_kv', label: 'metadata (KV)', type: 'array', of: 'object', properties: object_definitions['kv_pair'] },
-              { name: 'metadata_json', label: 'metadata (JSON)', }
+              { name: 'metadata_json', label: 'metadata (JSON)', type: 'string' }
             ]
           }
         ] + [
@@ -1495,8 +1506,15 @@ require 'securerandom'
           msg         = [e.to_s, (g['message'] || nil)].compact.join(' | ')
           http_status = call(:telemetry_parse_error_code, e)
 
-          # Prepare output
+          # Prepare output; include debug echo when not in prod_mode to avoid "silent" failures
+          dbg = call(:debug_pack,
+                     !(call(:normalize_boolean, connection['prod_mode'])),
+                     url,
+                     req_body,
+                     g)
+
           out   = {}.merge(call(:telemetry_envelope, t0, corr, false, http_status, msg))
+          out.merge!(dbg) if dbg
           flags = call(:metrics_effective_flags, connection, input)
           if flags['emit']
             m = call(:metrics_base, connection, 'rag_retrieve_contexts', t0, false, http_status, corr, { 'namespace' => flags['ns'] })
@@ -2997,25 +3015,6 @@ require 'securerandom'
         }
       }
     end,
-    # Stabilized output shaper for neighbors
-    shape_neighbors: lambda do |resp|
-      body = call(:http_body_json, resp)
-      list = Array(body['nearestNeighbors']).map do |nn|
-        neighbors = Array(nn['neighbors']).map do |n|
-          {
-            'datapoint' => n['datapoint'],
-            'distance'  => n['distance'].to_f.round(6),
-            'crowdingTagCount' => n['crowdingTagCount'].to_i
-          }
-        end
-        # Deterministic order: by distance ASC, then datapointId
-        { 'neighbors' => neighbors.sort_by { |x|
-            [x['distance'], x.dig('datapoint','datapointId').to_s]
-          }
-        }
-      end
-      { 'nearestNeighbors' => list }
-    end,
 
     # --- Telemetry and resilience -----------------------------------------
     telemetry_envelope: lambda do |started_at, correlation_id, ok, code, message|
@@ -3419,18 +3418,23 @@ require 'securerandom'
       return '' if raw.nil? || raw == false
       raw.to_s.strip
     end,
-    build_rag_retrieve_payload: lambda do |question, rag_corpus, restrict_ids = []|
-      rag_res = { 'ragCorpus' => rag_corpus }
+    build_rag_retrieve_payload: lambda do |question, rag_corpus, restrict_ids = [], ranking_opts = nil|
+      # Build RagResource (corpus + optional ragFileIds)
+      rag_res = { 'ragCorpus' => rag_corpus.to_s }
       ids     = call(:sanitize_rag_file_ids, restrict_ids, allow_empty: true, label: 'restrict_to_file_ids')
       rag_res['ragFileIds'] = ids if ids.present?
 
-      ranking_block = call(:build_ranking_block, ranking_opts['ranker'], ranking_opts['rank_model'])
-      query_obj = call(:build_rag_query_with_ranking,
-                      question.to_s,
-                      (ranking_opts['similarity_top_k'] || nil),
-                      ranking_block)
+      # Optional ranking/topK
+      ropts         = (ranking_opts || {}).to_h
+      ranking_block = call(:build_ranking_block, ropts['ranker'], ropts['rank_model'])
+      query_obj     = call(:build_rag_query_with_ranking,
+                           question.to_s,
+                           (ropts['similarity_top_k'] || nil),
+                           ranking_block)
+
+      # Align to REST reference: query = RagQuery, dataSource.vertexRagStore.ragResources[...]
       {
-        'query'      => { 'text' => question.to_s },
+        'query'      => query_obj,
         'dataSource' => {
           'vertexRagStore' => { 'ragResources' => [rag_res] }
         }
@@ -3527,7 +3531,7 @@ require 'securerandom'
     # Builds RagRetrievalConfig and merges into retrieveContexts payload
     build_rag_query_with_ranking: lambda do |question, top_k, ranking_block|
       cfg = {}
-      cfg['topK']   = (top_k.to_i > 0 ? top_k.to_i : nil)
+      cfg['topK']    = (top_k.to_i > 0 ? top_k.to_i : nil)
       cfg['ranking'] = ranking_block if ranking_block
       cfg.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
 
@@ -4252,6 +4256,6 @@ require 'securerandom'
   # --------- CUSTOM ACTION SUPPORT ----------------------------------------
   custom_action: true,
   custom_action_help: {
-    body: 'For actions calling host "aiplatform.googleapis.com/v1", use relative paths. For actions calling other endpoints (e.g. discovery engine), provide the absolute URL.'
+    body: "For actions calling host 'aiplatform.googleapis.com/v1", use relative paths. For actions calling other endpoints (e.g. discovery engine), provide the absolute URL.''
   }
 }
