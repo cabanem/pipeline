@@ -749,6 +749,11 @@ require 'uri'
         size   = call(:util_file_size, fobj)
         sup    = input['supports_all_drives'] ? 'true' : 'false'
 
+        # Read full file bytes upfront (used by media/multipart; resumable reads in chunks)
+        file_bytes = call(:stream_slice_io, fobj, 0, size)
+        error('Failed to read uploaded file bytes') if file_bytes.nil? || file_bytes.bytesize != size
+
+
         if strat == 'auto'
           strat = (size <= 5 * 1024 * 1024) ? 'multipart' : 'resumable' # ≤5MB → multipart
         end
@@ -771,15 +776,20 @@ require 'uri'
                     .params(uploadType: 'media', supportsAllDrives: sup, fields: fields)
                     .headers('Content-Type': mime)
                     .request_body(fobj)
+                    .request_body(file_bytes)
 
           when 'multipart'
             boundary = "wrk-#{SecureRandom.hex(8)}"
             meta_json = meta.to_json
-            body = []
-            body << "--#{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n#{meta_json}\r\n"
-            body << "--#{boundary}\r\nContent-Type: #{mime}\r\nContent-Transfer-Encoding: binary\r\n\r\n"
-            body << fobj
+            # Build a single String payload: JSON part + binary part
+            body = +"--#{boundary}\r\n" \
+                   "Content-Type: application/json; charset=UTF-8\r\n\r\n#{meta_json}\r\n" \
+                   "--#{boundary}\r\n" \
+                   "Content-Type: #{mime}\r\n" \
+                   "Content-Transfer-Encoding: binary\r\n\r\n"
+            body << file_bytes
             body << "\r\n--#{boundary}--\r\n"
+
 
             resp = post(base_upload_url)
                     .params(uploadType: 'multipart', supportsAllDrives: sup, fields: fields)
