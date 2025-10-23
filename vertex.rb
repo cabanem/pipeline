@@ -5,14 +5,18 @@ require 'json'
 require 'time'
 require 'securerandom'
 
+# Documentation:      cloud.google.com/vertex-ai/generative-ai/docs/rag-engine/rag-overview
+# Reranking for RAG:  docs.cloud.google.com/vertex-ai/generative-ai/docs/rag-engine/retrieval-and-ranking
 
 {
-  title: 'Vertex AI',
-  subtitle: 'Vertex AI',
-  version: '0.9.1',
-  description: 'Vertex AI via service account (JWT)',
+  title: 'Vertex RAG Engine',
+  subtitle: 'RAG Engine',
+  version: '0.9.5',
+  description: 'RAG engine via service account (JWT)',
   help: {
-    body: 'cloud.google.com/vertex-ai/docs/vector-search/quick-start'
+    body: 'The Vertex AI RAG Engine is a component of the Vertex AI platform, which facilitates Retrieval-Augmented-Generation (RAG).' \
+          'RAG Engine enables Large Language Models (LLMs) to access and incorporate data from external knowledge sources, such as '  \
+          'documents and databases. By using RAG, LLMs can generate more accurate and informative LLM responses.'
   },
 
   # --------- CONNECTION ---------------------------------------------------
@@ -32,6 +36,9 @@ require 'securerandom'
         extends_schema: true, hint: 'Sets x-goog-user-project for billing/quota. Service account must have roles/serviceusage.serviceUsageConsumer on this project.' },
       { name: 'discovery_api_version', label: 'Discovery API version', control_type: 'select', optional: true, default: 'v1alpha',
         pick_list: 'discovery_versions', hint: 'v1alpha for AI Applications; switch to v1beta/v1 if/when you migrate.' },
+      { name: 'emit_metrics_default', type: 'boolean', control_type: 'checkbox', label: 'Emit metrics by default', 
+        optional: true, default: true, hint: 'Actions can override with their own emit_metrics input.' },
+      { name: 'metrics_namespace_default', optional: true, hint: 'e.g., email_rag_prod, applied when action input is empty.' },
 
       # Defaults for test probe
       { name: 'set_defaults_for_probe',     optional: false,  control_type: 'checkbox', 
@@ -300,6 +307,50 @@ require 'securerandom'
         ]
       end
     },
+    metrics_fields: {
+      fields: lambda do |_|
+        [
+          # Identity & routing
+          { name: 'namespace' },                    # optional logical bucket, e.g. 'email_rag_prod'
+          { name: 'action' },                       # e.g. 'rag_retrieve_contexts'
+          { name: 'correlation_id' },
+          { name: 'project_id' },
+          { name: 'location' },
+
+          # Request traits
+          { name: 'model' },
+          { name: 'rag_corpus' },
+          { name: 'operation' },                    # LRO name for imports, etc.
+
+          # Outcome
+          { name: 'ok', type: 'boolean' },
+          { name: 'http_status', type: 'integer' },
+          { name: 'duration_ms', type: 'integer' },
+
+          # Retrieval metrics
+          { name: 'retrieved_contexts', type: 'integer' },
+          { name: 'max_contexts_requested', type: 'integer' },
+          { name: 'retrieval_top_score', type: 'number' },
+          { name: 'retrieval_avg_score', type: 'number' },
+
+          # Generation metrics
+          { name: 'prompt_tokens', type: 'integer' },
+          { name: 'output_tokens', type: 'integer' },
+          { name: 'total_tokens',  type: 'integer' },
+          { name: 'temperature',   type: 'number' },
+
+          # Embedding metrics
+          { name: 'emb_instances', type: 'integer' },
+          { name: 'emb_billable_chars', type: 'integer' },
+
+          # Import/LRO metrics
+          { name: 'lro_done', type: 'boolean' },
+
+          # Free form extras (safe to store)
+          { name: 'extras', type: 'object' }
+        ]
+      end
+    },
 
     safety_setting: {
       fields: lambda do
@@ -324,7 +375,7 @@ require 'securerandom'
   # --------- ACTIONS ------------------------------------------------------
   actions: {
 
-    # 1)  Email categorization
+    # 1) Email categorization
     gen_categorize_email: {
       title: 'Email: Categorize email',
       subtitle: 'Classify an email into a category',
@@ -744,119 +795,11 @@ require 'securerandom'
       end
     },
 
-    # 2)  RAG store engine (Vertex AI)
-    rag_files_import: {
-      title: 'RAG: Import files to corpus',
-      subtitle: 'projects.locations.ragCorpora.ragFiles:import',
-      display_priority: 90,
-      retry_on_request: ['GET','HEAD'], # removed "POST" to preserve idempotency, prevent duplication of jobs
-      retry_on_response: [408,429,500,502,503,504],
-      max_retries: 3,
+    # 2) RAG store engine (Vertex AI)
 
-      input_fields: lambda do
-        [
-          { name: 'rag_corpus_resource_name', optional: false, hint: 'Accepts either full resource name (e.g., "projects/{project}/locations/{region}/ragCorpora/{corpus}") or the "corpus"' },
-
-          # Exactly one source family:
-          { name: 'source_family', label: 'Source family', optional: false, control_type: 'select', extends_schema: true,
-            pick_list: 'rag_source_families', hint: 'Choose which source you are importing from (purely a UI gate; validation still enforced at runtime).' },
-          { name: 'gcs_uris',         optional: true, ngIf: 'input.source_family == "gcs"',   type: 'array', of: 'string', 
-            hint: 'Pass files or directory prefixes (e.g., gs://bucket/dir). Wildcards (*, **) are NOT supported.' },
-          { name: 'folder_or_files', label: 'Drive input type', optional: true, ngIf: 'input.source_family == "drive"', control_type: 'select', extends_schema: true,
-            pick_list: 'drive_input_type' },
-          { name: 'drive_folder_id',  optional: true, ngIf: 'input.folder_or_files == "folder"', 
-            hint: 'Google Drive folder ID (share with Vertex RAG service agent)' },
-          { name: 'drive_file_ids',   optional: true, ngIf: 'input.folder_or_files == "files"', type: 'array', of: 'string', 
-            hint: 'Optional explicit file IDs if not using folder' },
-
-          # Tuning / ops
-          { name: 'maxEmbeddingRequestsPerMin', type: 'integer', optional: true },
-          { name: 'rebuildAnnIndex', type: 'boolean', optional: true, default: false, hint: 'Set true after first large import to build ANN index' },
-          { name: 'importResultGcsSink', type: 'object', optional: true, properties: [
-              { name: 'outputUriPrefix', optional: false, hint: 'gs://bucket/prefix/' }
-            ]},
-          # Debug
-          { name: 'show_debug', label: 'Show debug options', type: 'boolean', control_type: 'checkbox', optional: true, 
-            extends_schema: true, default: false },
-          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true, ngIf: 'input.show_debug == "true"',
-            hint: 'Echo request URL/body and Google error body for troubleshooting' }
-        ]
-      end,
-      output_fields: lambda do |_|
-        [
-          { name: 'name' },           # LRO: projects/.../operations/...
-          { name: 'done', type: 'boolean' },
-          { name: 'metadata', type: 'object' },
-          { name: 'error', type: 'object' }
-        ] + [
-          { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object', properties: [
-            { name: 'http_status', type: 'integer' },
-            { name: 'message' }, { name: 'duration_ms', type: 'integer' },
-            { name: 'correlation_id' }
-          ]}
-        ]
-      end,
-      execute: lambda do |connection, input|
-        # Build correlation ID, now (for traceability)
-        t0 = Time.now
-        corr = call(:build_correlation_id)
-        begin
-          url = nil
-          req_body = nil
-
-          # Validate inputs
-          call(:ensure_project_id!, connection)
-          call(:ensure_regional_location!, connection)
-
-          corpus = call(:normalize_rag_corpus, connection, input['rag_corpus_resource_name'])
-          error('rag_corpus_resource_name is required') if corpus.blank?
-
-          # Build payload
-          payload  = call(:build_rag_import_payload!, input)
-
-          loc = (connection['location'] || '').downcase
-          url = call(:aipl_v1_url, connection, loc, "#{corpus}/ragFiles:import")
-          req_body = call(:json_compact, payload)
-          raw  = call(:http_call!, 'POST', url)
-                   .headers(call(:request_headers, corr))
-                   .payload(req_body)
-          code = call(:telemetry_success_code, raw)
-          body = call(:http_body_json, raw)
-          out  = body.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-          if call(:normalize_boolean, input['debug'])
-            ops_root = "https://#{call(:aipl_service_host, connection, loc)}/v1/projects/#{connection['project_id']}/locations/#{loc}/operations"
-            dbg = call(:debug_pack, true, url, req_body, body) || {}
-            dbg['ops_list_url'] = ops_root
-            out['debug'] = dbg
-          end
-          out
-
-        rescue => e
-          g = call(:extract_google_error, e)
-          vio = (g['violations'] || []).map { |x| "#{x['field']}: #{x['reason']}" }.join(' ; ')
-          msg = [e.to_s, (g['message'] || nil), (vio.presence)].compact.join(' | ')
-          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
-          # Assess environment (dev/prod)
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
-          end
-          # Return
-          out
-        end
-      end,
-
-      sample_output: lambda do
-        {
-          'name' => 'projects/p/locations/us-central1/operations/1234567890',
-          'done' => false,
-          'ok' => true,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 18, 'correlation_id' => 'sample' }
-        }
-      end
-    },
+    # Serving
     rag_retrieve_contexts: {
-      title: 'RAG: Retrieve contexts',
+      title: 'RAG Serving: Retrieve contexts',
       subtitle: 'projects.locations:retrieveContexts (Vertex RAG Store)',
       display_priority: 90,
       retry_on_request: ['GET','HEAD'],
@@ -869,7 +812,10 @@ require 'securerandom'
             hint: 'Accepts either full resource name (e.g., "projects/{project}/locations/{region}/ragCorpora/{corpus}") or the "corpus"' },
           { name: 'question', optional: false },
           { name: 'restrict_to_file_ids', type: 'array', of: 'string', optional: true },
-          { name: 'max_contexts', type: 'integer', optional: true, default: 20 }
+          { name: 'max_contexts', type: 'integer', optional: true, default: 20 },
+          { name: 'emit_metrics', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+            hint: 'Attach a metrics object in the output for downstream persistence.' },
+          { name: 'metrics_namespace', optional: true, hint: 'Optional tag for partitioning dashboards (e.g., "email_rag_prod").' },
         ]
       end,
       output_fields: lambda do |object_definitions, connection|
@@ -893,42 +839,76 @@ require 'securerandom'
             { name: 'message' }, { name: 'duration_ms', type: 'integer' },
             { name: 'correlation_id' }
           ]}
-        ]
+        ] + [
+          { name: 'metrics', type: 'object', properties: object_definitions['metrics_fields'] },
+          { name: 'metrics_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] } ]
       end,
       execute: lambda do |connection, input|
         # Build correlation ID, now (for traceability)
         t0 = Time.now
         corr = call(:build_correlation_id)
         begin
+          # Validate project ID, regional location
           call(:ensure_project_id!, connection)
           call(:ensure_regional_location!, connection)
 
+          # Validate and normalize corpus, location
           corpus = call(:normalize_rag_corpus, connection, input['rag_corpus'])
           error('rag_corpus is required') if corpus.blank?
 
           loc = (connection['location'] || '').downcase
           parent = "projects/#{connection['project_id']}/locations/#{loc}"
 
+          # Build payload from input
           payload = call(:build_rag_retrieve_payload, input['question'], corpus, input['restrict_to_file_ids'])
-
           url  = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
-          raw  = call(:http_call!, 'POST', url)
+
+          # POST
+          http  = call(:http_call!, 'POST', url)
                     .headers(call(:request_headers, corr))
                     .payload(call(:json_compact, payload))
-          body  = call(:http_body_json, raw)
+
+          # Handle result
+          code  = call(:telemetry_success_code, http)
+          body  = call(:http_body_json, http)
           raw   = call(:normalize_retrieve_contexts!, body)
 
           maxn  = call(:clamp_int, (input['max_contexts'] || 20), 1, 200)
           mapped = call(:map_context_chunks, raw, maxn)
 
-          {
+          # Build output
+          base_out = {
             'question' => input['question'],
             'contexts' => mapped
-          }.merge(call(:telemetry_envelope, t0, corr, true, call(:telemetry_success_code, raw), 'OK'))
+          }.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          ok = true
+          http_status = code
+
+          flags = call(:metrics_effective_flags, connection, input)
+          if flags['emit']
+            m = call(:metrics_base, connection, 'rag_retrieve_contexts', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
+                .merge('rag_corpus' => call(:normalize_rag_corpus, connection, input['rag_corpus']))
+                .merge(call(:metrics_from_retrieve, mapped, input['max_contexts']))
+            base_out['metrics']    = m
+            base_out['metrics_kv'] = call(:metrics_to_kv, m)
+          end
+          base_out
         rescue => e
-          g = call(:extract_google_error, e)
-          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
+          # Extract error details
+          g           = call(:extract_google_error, e)
+          msg         = [e.to_s, (g['message'] || nil)].compact.join(' | ')
+          http_status = call(:telemetry_parse_error_code, e)
+
+          # Prepare output
+          out         = {}.merge(call(:telemetry_envelope, t0, corr, false, http_status, msg))
+          ok          = false
+          flags       = call(:metrics_effective_flags, connection, input)
+          if flags['emit']
+            m = call(:metrics_base, connection, 'rag_retrieve_contexts', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
+            out['metrics']    = m
+            out['metrics_kv'] = call(:metrics_to_kv, m)
+          end
+          out
         end
       end,
 
@@ -947,7 +927,7 @@ require 'securerandom'
       end
     },
     rag_answer: {
-      title: 'RAG: Retrieve + answer (one-shot)',
+      title: 'RAG Serving: Retrieve + answer (one-shot)',
       subtitle: 'Retrieve contexts from a corpus and generate a cited answer',
       display_priority: 90,
       retry_on_request: ['GET','HEAD'],
@@ -966,7 +946,10 @@ require 'securerandom'
 
           { name: 'system_preamble', optional: true,
             hint: 'e.g., Only answer from retrieved contexts; say “I don’t know” otherwise.' },
-          { name: 'temperature', type: 'number', optional: true, hint: 'Default 0' }
+          { name: 'temperature', type: 'number', optional: true, hint: 'Default 0' },
+          { name: 'emit_metrics', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+            hint: 'Attach a metrics object in the output for downstream persistence.' },
+          { name: 'metrics_namespace', optional: true, hint: 'Optional tag for partitioning dashboards (e.g., "email_rag_prod").' },
         ]
       end,
       output_fields: lambda do |_|
@@ -989,7 +972,9 @@ require 'securerandom'
             { name: 'http_status', type: 'integer' },
             { name: 'message' }, { name: 'duration_ms', type: 'integer' },
             { name: 'correlation_id' }
-          ]}
+          ]},
+          { name: 'metrics', type: 'object', properties: object_definitions['metrics_fields'] },
+          { name: 'metrics_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] }
         ]
       end,
       execute: lambda do |connection, input|
@@ -1020,9 +1005,14 @@ require 'securerandom'
             'maxOutputTokens'   => 1024,
             'responseMimeType'  => 'application/json',
             'responseSchema'    => {
-              'type'=>'object','additionalProperties'=>false,
-              'properties'=>{'answer'=>{'type'=>'string'},'citations'=>{'type'=>'array','items'=>{'type'=>'object','additionalProperties'=>false,'properties'=>{'chunk_id'=>{'type'=>'string'},'source'=>{'type'=>'string'},'uri'=>{'type'=>'string'},'score'=>{'type'=>'number'}}}}},
-              'required'=>['answer']
+              'type'      =>'object','additionalProperties'=>false,
+              'properties'=>{
+                'answer'    =>{'type'=>'string'},
+                'citations' =>{
+                  'type'=>'array',
+                  'items'=>{'type'=>'object','additionalProperties'=>false,'properties'=>{'chunk_id'=>{'type'=>'string'},'source'=>{'type'=>'string'},'uri'=>{'type'=>'string'},'score'=>{'type'=>'number'}}}
+                  }},
+              'required'  =>['answer']
             }
           }
           sys_text = (input['system_preamble'].presence ||
@@ -1043,10 +1033,12 @@ require 'securerandom'
                    .merge(call(:telemetry_envelope_ex, t0, corr, true, 200, 'DRY_RUN', { 'action' => 'rag_answer' }))
           end
 
-          retr_resp = call(:http_call!, 'POST', retr_url)
+          retr_http = call(:http_call!, 'POST', retr_url)
                         .headers(call(:request_headers, corr))
                         .payload(retr_req_body)
-          raw_ctxs = call(:normalize_retrieve_contexts!, retr_resp)
+          retr_code = call(:telemetry_success_code, retr_http)
+          retr_body = call(:http_body_json, retr_http)
+          raw_ctxs  = call(:normalize_retrieve_contexts!, retr_body)
 
           maxn  = call(:clamp_int, (input['max_contexts'] || 12), 1, 100)
           chunks = call(:map_context_chunks, raw_ctxs, maxn)
@@ -1112,19 +1104,41 @@ require 'securerandom'
           text      = gen_body.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
           parsed = call(:safe_parse_json, text)
 
-          {
+          code = call(:telemetry_success_code, gen_raw)
+          base_out = {
             'answer'     => (parsed['answer'] || text),
             'citations'  => (parsed['citations'] || []),
             'responseId' => gen_body['responseId'],
             'usage'      => gen_body['usageMetadata']
-          }.merge(call(:telemetry_envelope, t0, corr, true, call(:telemetry_success_code, gen_raw), 'OK'))
+          }.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          ok = true
+          http_status = code
+
+          flags = call(:metrics_effective_flags, connection, input)
+          if flags['emit']
+            m = call(:metrics_base, connection, 'rag_answer', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
+              .merge('rag_corpus' => call(:normalize_rag_corpus, connection, input['rag_corpus']))
+              .merge(call(:metrics_from_retrieve, chunks, input['max_contexts']))
+              .merge(call(:metrics_from_generation, gen_body, input['temperature']))
+              .merge('model' => input['model'])
+            base_out['metrics']    = m
+            base_out['metrics_kv'] = call(:metrics_to_kv, m)
+          end
+          base_out
         rescue => e
           g = call(:extract_google_error, e)
-          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
-        end
+          http_status = call(:telemetry_parse_error_code, e)
+          out = {}.merge(call(:telemetry_envelope, t0, corr, false, http_status, msg))
+          ok = false
+          flags = call(:metrics_effective_flags, connection, input)
+          if flags['emit']
+            m = call(:metrics_base, connection, 'rag_answer', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
+              .merge('model' => input['model'])
+            out['metrics']    = m
+            out['metrics_kv'] = call(:metrics_to_kv, m)
+          end
+          out
       end,
-
       sample_output: lambda do
         {
           'answer' => 'Employees may carry over up to 40 hours of PTO.',
@@ -1138,8 +1152,9 @@ require 'securerandom'
         }
       end
     },
+    # Corpora management
     rag_corpora_create: {
-      title: 'RAG: Create corpus',
+      title: 'RAG Corpora: Create corpus',
       subtitle: 'projects.locations.ragCorpora.create',
       display_priority: 90,
       retry_on_response: [408,429,500,502,503,504],
@@ -1209,7 +1224,7 @@ require 'securerandom'
       end
     },
     rag_corpora_get: {
-      title: 'RAG: Get corpus',
+      title: 'RAG Corpora: Get corpus',
       subtitle: 'projects.locations.ragCorpora.get',
       display_priority: 90,
       retry_on_response: [408,429,500,502,503,504],
@@ -1247,7 +1262,7 @@ require 'securerandom'
       end
     },
     rag_corpora_list: {
-      title: 'RAG: List corpora',
+      title: 'RAG Corpora: List corpora',
       subtitle: 'projects.locations.ragCorpora.list',
       display_priority: 90,
       retry_on_response: [408,429,500,502,503,504],
@@ -1312,7 +1327,7 @@ require 'securerandom'
       end
     },
     rag_corpora_delete: {
-      title: 'RAG: Delete corpus',
+      title: 'RAG Corpora: Delete corpus',
       subtitle: 'projects.locations.ragCorpora.delete',
       display_priority: 90,
       retry_on_response: [408,429,500,502,503,504],
@@ -1348,8 +1363,9 @@ require 'securerandom'
         end
       end
     },
+    # File management
     rag_files_list: {
-      title: 'RAG: List files in corpus',
+      title: 'RAG Files: List files in corpus',
       subtitle: 'projects.locations.ragCorpora.ragFiles.list',
       display_priority: 90,
       retry_on_response: [408,429,500,502,503,504],
@@ -1432,7 +1448,7 @@ require 'securerandom'
       end
     },
     rag_files_get: {
-      title: 'RAG: Get file',
+      title: 'RAG Files: Get file',
       subtitle: 'projects.locations.ragCorpora.ragFiles.get',
       display_priority: 90,
       retry_on_response: [408,429,500,502,503,504],
@@ -1485,7 +1501,7 @@ require 'securerandom'
       end
     },
     rag_files_delete: {
-      title: 'RAG: Delete file',
+      title: 'RAG Files: Delete file',
       subtitle: 'projects.locations.ragCorpora.ragFiles.delete',
       display_priority: 90,
       retry_on_response: [408,429,500,502,503,504],
@@ -1521,1241 +1537,137 @@ require 'securerandom'
         end
       end
     },
-
-    # 3)  Vector search
-    indexes_upsert_datapoints: {
-      title: 'Vector Search: Upsert datapoints',
-      subtitle: 'Upsert datapoints in a vector index',
-      display_priority: 85,
-      description: 'indexes.upsertDatapoints — Vertex AI Matching Engine',
-      help: lambda do |_|
-        { body: "Insert or update datapoints in a vector index (idempotent by datapointId). Accepts friendly labels/metadata and "\
-                "converts them to attributes[], validates vector dimensions (optional), batches requests with max_per_call, and " \
-                "returns the LRO name plus acknowledged_count."}
-      end,
-      retry_on_request: ['GET','HEAD'],
+    rag_files_import: {
+      title: 'RAG Files: Import files to corpus',
+      subtitle: 'projects.locations.ragCorpora.ragFiles:import',
+      display_priority: 90,
+      retry_on_request: ['GET','HEAD'], # removed "POST" to preserve idempotency, prevent duplication of jobs
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
 
-      input_fields: lambda do |_|
+      input_fields: lambda do
         [
-          { name: 'index', optional: false,
-            hint: 'Index resource (projects/.../locations/.../indexes/ID) or short ID (e.g., "my-index")' },
-          { name: 'datapoints', type: 'array', of: 'object', optional: false, properties: [
-              { name: 'datapointId', optional: false },
-              { name: 'featureVector', type: 'array', of: 'number', optional: false,
-                hint: 'Embedding vector (float array). Length must match index config.' },
-              { name: 'restricts', type: 'array', of: 'object', properties: [
-                  { name: 'namespace' },
-                  { name: 'allowTokens', type: 'array', of: 'string' },
-                  { name: 'denyTokens',  type: 'array', of: 'string' }
-                ]
-              },
-              { name: 'crowdingTag' },
-              # Accept user-friendly objects; we’ll convert them to attributes[]
-              { name: 'labels',   type: 'object', hint: 'Key/value labels → attributes[]' },
-              { name: 'metadata', type: 'object', hint: 'Key/value metadata → attributes[]' }
+          { name: 'rag_corpus_resource_name', optional: false, hint: 'Accepts either full resource name (e.g., "projects/{project}/locations/{region}/ragCorpora/{corpus}") or the "corpus"' },
 
-            ],
-            hint: 'Upsert is idempotent by datapointId.'
-          },
-          { name: 'max_per_call', type: 'integer', hint: 'Safety cap; default 1000', optional: true },
-          { name: 'expected_dimension', type: 'integer', hint: 'Optional sanity check for featureVector length', optional: true },
-          { name: 'validate_only', label: 'Validate only (no call)', type: 'boolean', control_type: 'checkbox', optional: true },
+          # Exactly one source family:
+          { name: 'source_family', label: 'Source family', optional: false, control_type: 'select', extends_schema: true,
+            pick_list: 'rag_source_families', hint: 'Choose which source you are importing from (purely a UI gate; validation still enforced at runtime).' },
+          { name: 'gcs_uris',         optional: true, ngIf: 'input.source_family == "gcs"',   type: 'array', of: 'string', 
+            hint: 'Pass files or directory prefixes (e.g., gs://bucket/dir). Wildcards (*, **) are NOT supported.' },
+          { name: 'folder_or_files', label: 'Drive input type', optional: true, ngIf: 'input.source_family == "drive"', control_type: 'select', extends_schema: true,
+            pick_list: 'drive_input_type' },
+          { name: 'drive_folder_id',  optional: true, ngIf: 'input.folder_or_files == "folder"', 
+            hint: 'Google Drive folder ID (share with Vertex RAG service agent)' },
+          { name: 'drive_file_ids',   optional: true, ngIf: 'input.folder_or_files == "files"', type: 'array', of: 'string', 
+            hint: 'Optional explicit file IDs if not using folder' },
+
+          # Tuning / ops
+          { name: 'maxEmbeddingRequestsPerMin', type: 'integer', optional: true },
+          { name: 'rebuildAnnIndex', type: 'boolean', optional: true, default: false, hint: 'Set true after first large import to build ANN index' },
+          { name: 'importResultGcsSink', type: 'object', optional: true, properties: [
+              { name: 'outputUriPrefix', optional: false, hint: 'gs://bucket/prefix/' }
+            ]},
           # Debug
-          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true,
-            hint: 'Echo request URL/body and Google error body for troubleshooting' }
+          { name: 'show_debug', label: 'Show debug options', type: 'boolean', control_type: 'checkbox', optional: true, 
+            extends_schema: true, default: false },
+          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true, ngIf: 'input.show_debug == "true"',
+            hint: 'Echo request URL/body and Google error body for troubleshooting' },
+          { name: 'emit_metrics', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+            hint: 'Attach a metrics object in the output for downstream persistence.' },
+          { name: 'metrics_namespace', optional: true, hint: 'Optional tag for partitioning dashboards (e.g., "email_rag_prod").' },
         ]
       end,
       output_fields: lambda do |_|
         [
+          { name: 'name' },           # LRO: projects/.../operations/...
+          { name: 'done', type: 'boolean' },
+          { name: 'metadata', type: 'object' },
+          { name: 'error', type: 'object' }
+        ] + [
           { name: 'ok', type: 'boolean' },
-          { name: 'operation_name' },
-          { name: 'acknowledged_count', type: 'integer' },
-          { name: 'request_preview', type: 'object' },
           { name: 'telemetry', type: 'object', properties: [
             { name: 'http_status', type: 'integer' },
             { name: 'message' }, { name: 'duration_ms', type: 'integer' },
-            { name: 'correlation_id' }
-          ]},
-          { name: 'debug', type: 'object' }
-        ]
+            { name: 'correlation_id' } ]}
+        ]+ [
+          { name: 'metrics', type: 'object', properties: object_definitions['metrics_fields'] },
+          { name: 'metrics_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] } ]
       end,
       execute: lambda do |connection, input|
+        # Build correlation ID, now (for traceability)
         t0 = Time.now
         corr = call(:build_correlation_id)
-        url = nil; req_body = nil
         begin
+          url = nil
+          req_body = nil
+
+          # Validate inputs
           call(:ensure_project_id!, connection)
           call(:ensure_regional_location!, connection)
 
-          index_path = call(:build_index_path, connection, input['index'])
-          loc = connection['location'].to_s.downcase
-          url = call(:aipl_v1_url, connection, loc, "#{index_path}:upsertDatapoints")
+          corpus = call(:normalize_rag_corpus, connection, input['rag_corpus_resource_name'])
+          error('rag_corpus_resource_name is required') if corpus.blank?
 
-          max_per_call = (input['max_per_call'].presence || 1000).to_i
-          # sanitize vectors → float[], build attributes[], validate dimension if provided
-          raw = call(:safe_array, input['datapoints'])
-          dps_all = raw.map do |dp|
-            h = (dp || {}).to_h
-            id = h['datapointId'].to_s.strip
-            error('datapointId is required for each datapoint') if id.empty?
+          # Build payload
+          payload  = call(:build_rag_import_payload!, input)
 
-            vec = call(:sanitize_feature_vector, h['featureVector'])
-            error('featureVector must be a non-empty numeric array') if vec.empty?
-            if (dim = input['expected_dimension']).present?
-              error("featureVector length #{vec.length} != expected_dimension #{dim}") unless vec.length == dim.to_i
-            end
-
-            # Convert labels/metadata objects into attributes[]
-            attrs = []
-            [h['labels'], h['metadata']].compact.each do |obj|
-              obj.to_h.each { |k, v| attrs << { 'key' => k.to_s, 'value' => v } }
-            end
-
-            # Keep only supported keys
-            {
-              'datapointId'   => id,
-              'featureVector' => vec,
-              'restricts'     => call(:safe_array, h['restricts']),
-              'crowdingTag'   => h['crowdingTag'],
-              'attributes'    => attrs.presence
-            }.compact
-          end
-
-          # Batch if needed
-          chunks = dps_all.each_slice(max_per_call).to_a
-          acknowledged_total = 0
-          last_op_name = nil
-
-          if call(:normalize_boolean, input['validate_only'])
-            # preview just the first slice (shape representative payload)
-            preview_body = call(:json_compact, { 'datapoints' => (chunks.first || []) })
-            preview = call(:request_preview_pack, url, 'POST', call(:request_headers, corr), preview_body)
-            return { 'ok' => true }.merge(preview)
-                                  .merge(call(:telemetry_envelope_ex, t0, corr, true, 200, 'DRY_RUN', { 'action' => 'indexes_upsert_datapoints' }))
-          end
-
-          chunks.each do |dps|
-            req_body = call(:json_compact, { 'datapoints' => dps })
-            resp = call(:http_call!, 'POST', url)
+          loc = (connection['location'] || '').downcase
+          url = call(:aipl_v1_url, connection, loc, "#{corpus}/ragFiles:import")
+          req_body = call(:json_compact, payload)
+          raw  = call(:http_call!, 'POST', url)
                    .headers(call(:request_headers, corr))
                    .payload(req_body)
-            code = call(:telemetry_success_code, resp)
-            body = call(:safe_json, resp&.body) || {}
-            # Vertex often returns an LRO; sometimes a direct response. Handle both.
-            last_op_name = body['name'] || body.dig('response', 'name') || last_op_name
-            acknowledged_total += (body.dig('response', 'upsertedDatapointCount') || 0).to_i
-          end
-
-          out  = { 'ok' => true, 'operation_name' => last_op_name, 'acknowledged_count' => acknowledged_total }
-                  .merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
-          # Assess environment (dev/prod)
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
-          end
-          # Return
-          out
-        rescue => e
-          g = call(:extract_google_error, e)
-          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
-          # Assess environment (dev/prod)
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
-          end
-          # Return
-          out
-        end
-      end,
-      sample_output: lambda do
-        {
-          'ok' => true,
-          'operation_name' => 'projects/p/locations/us-central1/operations/1234567890',
-          'acknowledged_count' => 128,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 11, 'correlation_id' => 'sample' }
-        }
-      end
-    },
-    index_endpoints_find_neighbors: {
-      title: 'Vector Search: Query neighbors',
-      subtitle: 'Query neighbors using vector search',
-      description: 'indexEndpoints.findNeighbors — Vertex AI Matching Engine',
-      display_priority: 85,
-      help: lambda do |_|
-        { body: "Query nearest neighbors on a deployed index. Provide either a query featureVector or a reference "  \
-                "datapoint, with optional string filters, per-crowding limits, and distanceMeasure override. Returns "\
-                "neighbors with distances per query."
-        }
-      end,
-      retry_on_request: ['GET','HEAD'],
-      retry_on_response: [408,429,500,502,503,504],
-      max_retries: 3,
-
-      input_fields: lambda do |_|
-        [
-          { name: 'indexEndpoint', optional: false,
-            hint: 'IndexEndpoint resource (projects/.../locations/.../indexEndpoints/ID) or short ID' },
-          { name: 'deployedIndexId', optional: false,
-            hint: 'The deployed index ID on the endpoint' },
-          { name: 'queries', type: 'array', of: 'object', optional: false, properties: [
-              # Either featureVector OR datapoint
-              { name: 'featureVector', type: 'array', of: 'number',
-                hint: 'Query vector; alternative to providing datapoint' },
-              { name: 'datapoint', type: 'object', properties: [
-                  { name: 'datapointId' },
-                  { name: 'featureVector', type: 'array', of: 'number' }
-                ]
-              },
-              { name: 'neighborCount', type: 'integer', optional: true, hint: 'Default 10' },
-              { name: 'perCrowdingAttributeNeighborCount', type: 'integer', optional: true },
-              { name: 'stringFilters', type: 'array', of: 'object', properties: [
-                  { name: 'namespace' },
-                  { name: 'allowTokens', type: 'array', of: 'string' },
-                  { name: 'denyTokens',  type: 'array', of: 'string' }
-                ]
-              },
-              { name: 'distanceMeasure', control_type: 'select', pick_list: 'distance_measures', optional: true,
-                hint: 'If omitted, uses index default' }
-            ],
-            hint: 'Each query can specify either featureVector or datapoint.'
-          },
-          { name: 'validate_only', label: 'Validate only (no call)', type: 'boolean', control_type: 'checkbox', optional: true },
-          # Debug
-          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
-        ]
-      end,
-      output_fields: lambda do |_|
-        [
-          { name: 'nearestNeighbors', type: 'array', of: 'object', properties: [
-              { name: 'neighbors', type: 'array', of: 'object', properties: [
-                  { name: 'datapoint', type: 'object' },
-                  { name: 'distance',  type: 'number' },
-                  { name: 'crowdingTagCount', type: 'integer' }
-                ]
-              }
-            ]
-          },
-          { name: 'request_preview', type: 'object' },
-          { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object', properties: [
-            { name: 'http_status', type: 'integer' },
-            { name: 'message' }, { name: 'duration_ms', type: 'integer' },
-            { name: 'correlation_id' }
-          ]},
-          { name: 'debug', type: 'object' }
-        ]
-      end,
-      execute: lambda do |connection, input|
-        t0 = Time.now
-        corr = call(:build_correlation_id)
-        url = nil; req_body = nil
-        begin
-          call(:ensure_project_id!, connection)
-          call(:ensure_regional_location!, connection)
-          loc = connection['location'].to_s.downcase
-
-          ep_path = call(:build_index_endpoint_path, connection, input['indexEndpoint'])
-          url = call(:aipl_v1_url, connection, loc, "#{ep_path}:findNeighbors")
-
-          queries = call(:safe_array, input['queries']).map do |q|
-            h = (q || {}).to_h
-            if h['featureVector'].present?
-              h['featureVector'] = call(:sanitize_feature_vector, h['featureVector'])
-            elsif h['datapoint'].present?
-              dp = (h['datapoint'] || {}).to_h
-              fv = call(:sanitize_feature_vector, dp['featureVector'])
-              dp['featureVector'] = fv unless fv.empty?
-              # require either a datapointId or a non-empty featureVector
-              if (dp['datapointId'].to_s.strip.empty?) && fv.empty?
-                error('datapoint query must include datapointId or a non-empty featureVector')
-              end
-              h['datapoint'] = call(:json_compact, dp)
-            else
-              error('Each query must include featureVector or datapoint')
-            end
-            if h['neighborCount']
-              h['neighborCount'] = call(:clamp_int, h['neighborCount'], 1, 1000)
-            end
-            # forward distanceMeasure if provided
-            if h['distanceMeasure'].present?
-              h['distanceMeasure'] = h['distanceMeasure'].to_s
-            end
-            h
-          end
-
-          req = {
-            'deployedIndexId' => input['deployedIndexId'].to_s,
-            'queries'         => queries
-          }
-          req_body = call(:json_compact, req)
-
-          # Dry-run path for unattended safety
-          if call(:normalize_boolean, input['validate_only'])
-            preview = call(:request_preview_pack, url, 'POST', call(:request_headers, corr), req_body)
-            return preview.merge(call(:telemetry_envelope_ex, t0, corr, true, 200, 'DRY_RUN', { 'action' => 'index_endpoints_find_neighbors' }))
-          end
-
-          resp = call(:http_call!, 'POST', url)
-                  .headers(call(:request_headers, corr))
-                  .payload(req_body)
-          code = call(:telemetry_success_code, resp)
-          shaped = call(:shape_neighbors, resp) # stable rounding/sorting
-          shaped.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK')).merge(
-            call(:normalize_boolean, input['debug']) ? { 'debug' => call(:debug_pack, true, url, req_body, nil) } : {}
-          )
-        rescue => e
-          g = call(:extract_google_error, e)
-          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
-          # Assess environment (dev/prod)
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
-          end
-          # Return
-          out
-        end
-      end,
-      sample_output: lambda do
-        {
-          'nearestNeighbors' => [
-            { 'neighbors' => [
-                { 'datapoint' => { 'datapointId' => 'doc-123' }, 'distance' => 0.12 },
-                { 'datapoint' => { 'datapointId' => 'doc-987' }, 'distance' => 0.19 }
-              ]
-            }
-          ],
-          'ok' => true,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 15, 'correlation_id' => 'sample' }
-        }
-      end
-    },
-    indexes_create: {
-      title: 'Vector Search: Create index',
-      subtitle: 'Create an vector index in Vertex AI Matching Engine',
-      description: 'projects.locations.indexes.create — Vertex AI Matching Engine',
-      display_priority: 85,
-      help: lambda do |_|
-        { body: "Create a vector index resource with displayName/description/metadata. Optionally "\
-                "pass indexId and requestId (for idempotency). Returns the long-running operation "\
-                "(LRO) for provisioning."  }
-      end,
-      retry_on_request: ['GET','HEAD'],
-      retry_on_response: [408,429,500,502,503,504],
-      max_retries: 3,
-      input_fields: lambda do |_|
-        [
-          { name: 'displayName', optional: false },
-          { name: 'description', optional: true },
-          { name: 'metadata', label: 'Index metadata (object)', type: 'object', optional: true },
-          # Optional: supply explicit indexId (kept as query in some APIs; here we fold into body id if present)
-          { name: 'indexId', optional: true },
-          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true },
-          { name: 'requestId', optional: true, hint: 'Optional idempotency token (RFC4122). If omitted we won’t send it.' }
-        ]
-      end,
-      output_fields: lambda do |_|
-        [
-          { name: 'name' }, { name: 'done', type: 'boolean' },
-          { name: 'metadata', type: 'object' }, { name: 'error', type: 'object' },
-          { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object', properties: [
-            { name: 'http_status', type: 'integer' }, { name: 'message' },
-            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
-          ]},
-          { name: 'debug', type: 'object' }
-        ]
-      end,
-      execute: lambda do |connection, input|
-        t0   = Time.now
-        corr = call(:build_correlation_id)
-        url = nil; req_body = nil
-        begin
-          call(:ensure_project_id!, connection)
-          call(:ensure_regional_location!, connection)
-          loc = connection['location'].to_s.downcase
-
-          path = "projects/#{connection['project_id']}/locations/#{loc}/indexes"
-          url  = call(:aipl_v1_url, connection, loc, path)
-
-          # Validation
-          display = input['displayName'].to_s.strip
-          error('displayName is required') if display.empty?
-          meta = input['metadata']
-          error('metadata must be an object') if !meta.nil? && !meta.is_a?(Hash)
-          idx_id = input['indexId'].to_s.strip
-          error('indexId cannot be empty') if input.key?('indexId') && idx_id.empty?
-
-          body = {
-            'displayName' => display,
-            'description' => input['description'],
-            'metadata'    => meta
-          }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
-
-          # Provide explicit indexId via query, not body
-          params = {}
-          req_id = input['requestId'].to_s.strip
-          params[:requestId] = req_id unless req_id.empty?
-          params[:indexId]   = idx_id unless idx_id.empty?
-
-          req_body = call(:json_compact, body)
-
-          raw  = call(:http_call!, 'POST', url).params(params).headers(call(:request_headers, corr)).payload(req_body)
           code = call(:telemetry_success_code, raw)
           body = call(:http_body_json, raw)
           out  = body.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-          # Assess environment (dev/prod)
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, body) if call(:normalize_boolean, input['debug'])
+          ok = true
+          http_status = code
+          flags = call(:metrics_effective_flags, connection, input)
+          if flags['emit']
+            m = call(:metrics_base, connection, 'rag_files_import', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
+              .merge(call(:metrics_from_import_lro, body))
+              .merge('rag_corpus' => call(:normalize_rag_corpus, connection, input['rag_corpus_resource_name']))
+            out['metrics']    = m
+            out['metrics_kv'] = call(:metrics_to_kv, m)
           end
-          # Return
-          out
-        rescue => e
-          g   = call(:extract_google_error, e)
-          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
-          # Assess environment (dev/prod)
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
+          if call(:normalize_boolean, input['debug'])
+            ops_root = "https://#{call(:aipl_service_host, connection, loc)}/v1/projects/#{connection['project_id']}/locations/#{loc}/operations"
+            dbg = call(:debug_pack, true, url, req_body, body) || {}
+            dbg['ops_list_url'] = ops_root
+            out['debug'] = dbg
           end
-          # Return
           out
-        end
-      end,
 
-      sample_output: lambda do
-        { 'name' => 'projects/p/locations/us-central1/operations/123', 'done' => false,
-          'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 14, 'correlation_id' => 'sample' } }
-      end
-    },
-    indexes_delete: {
-      title: 'Vector Search: Delete index',
-      subtitle: 'Delete an index (Vertex AI Matching Engine)',
-      description: 'projects.locations.indexes.delete — Vertex AI Matching Engine',
-      display_priority: 85,
-      help: lambda do |_|
-        { body: 'Delete a vector index by resource name or short ID. Returns the LRO that tracks deletion.' }
-      end,
-      retry_on_request: ['GET','HEAD'],
-      retry_on_response: [408,429,500,502,503,504],
-      max_retries: 3,
-
-      input_fields: lambda do |_|
-        [
-          { name: 'index', optional: false, hint: 'indexes/{id} or full resource path' },
-          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
-        ]
-      end,
-      output_fields: lambda do |_|
-        [
-          { name: 'name' }, { name: 'done', type: 'boolean' },
-          { name: 'metadata', type: 'object' }, { name: 'error', type: 'object' },
-          { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object', properties: [
-            { name: 'http_status', type: 'integer' }, { name: 'message' },
-            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
-          ]},
-          { name: 'debug', type: 'object' }
-        ]
-      end,
-      execute: lambda do |connection, input|
-        t0 = Time.now
-        corr = call(:build_correlation_id)
-        url = nil
-        req_body = nil
-        begin
-          call(:ensure_project_id!, connection)
-          call(:ensure_regional_location!, connection)
-          idx_path = call(:build_index_path, connection, input['index'])
-          loc = connection['location'].to_s.downcase
-          url = call(:aipl_v1_url, connection, loc, idx_path)
-
-          resp = delete(url).headers(call(:request_headers, corr))
-          code = call(:telemetry_success_code, resp)
-          out  = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-          # Assess environment (dev/prod)
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
-          end
-          # Return
-          out
-        rescue => e
-          g   = call(:extract_google_error, e)
-          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
-          # Assess environment (dev/prod)
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
-          end
-          # Return
-          out
-        end
-      end,
-      sample_output: lambda do
-        { 'name' => 'projects/p/locations/us-central1/operations/456', 'done' => false,
-          'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 9, 'correlation_id' => 'sample' } }
-      end
-    },
-
-    # 4)  Vector index
-    index_endpoints_create: {
-      title: 'Vector Index: Create index endpoint',
-      subtitle: 'Create an index endpoint',
-      description: 'projects.locations.indexEndpoints.create — Vertex AI Matching Engine',
-      display_priority: 80,
-      help: lambda do |_| 
-        { body: 'Create an IndexEndpoint to host deployed indexes. Supports displayName, description, and labels. Returns the LRO for endpoint creation.' }
-      end,
-      retry_on_request: ['GET','HEAD'],
-      retry_on_response: [408,429,500,502,503,504],
-      max_retries: 3,
-      input_fields: lambda do |_|
-        [
-          { name: 'displayName', optional: false },
-          { name: 'description', optional: true },
-          { name: 'labels', type: 'object', optional: true },
-          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true },
-          { name: 'requestId', optional: true, hint: 'Optional idempotency token (RFC4122). If omitted we won’t send it.' }
-
-        ]
-      end,
-      output_fields: lambda do |_|
-        [
-          { name: 'name' }, { name: 'done', type: 'boolean' },
-          { name: 'metadata', type: 'object' }, { name: 'error', type: 'object' },
-          { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object', properties: [
-            { name: 'http_status', type: 'integer' }, { name: 'message' },
-            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
-          ]},
-          { name: 'debug', type: 'object' }
-        ]
-      end,
-      execute: lambda do |connection, input|
-        t0 = Time.now
-        corr = call(:build_correlation_id)
-        url = nil; req_body = nil
-        begin
-          call(:ensure_project_id!, connection)
-          call(:ensure_regional_location!, connection)
-          loc  = connection['location'].to_s.downcase
-          path = "projects/#{connection['project_id']}/locations/#{loc}/indexEndpoints"
-          url  = call(:aipl_v1_url, connection, loc, path)
-
-          # Validate
-          display = input['displayName'].to_s.strip
-          error('displayName is required') if display.empty?
-          labels = input['labels']
-          error('labels must be an object') if !labels.nil? && !labels.is_a?(Hash)
-
-          body = {
-            'displayName' => display,
-            'description' => input['description'],
-            'labels'      => labels
-          }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
-          req_body = call(:json_compact, body)
-
-          params = {}
-          req_id = input['requestId'].to_s.strip
-          params[:requestId] = req_id unless req_id.empty?
-
-          raw  = call(:http_call!, 'POST', url).params(params).headers(call(:request_headers, corr)).payload(req_body)
-          code = call(:telemetry_success_code, raw)
-          body = call(:http_body_json, raw)
-          out  = body.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-          # Assess environment (dev/prod)
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, body) if call(:normalize_boolean, input['debug'])
-          end
-          # Return
-          out
-        rescue => e
-          g   = call(:extract_google_error, e)
-          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
-          # Assess environment (dev/prod)
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
-          end
-          # Return
-          out
-        end
-      end,
-
-      sample_output: lambda do
-        { 'name' => 'projects/p/locations/us-central1/operations/789', 'done' => false,
-          'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 11, 'correlation_id' => 'sample' } }
-      end
-    },
-    index_endpoints_delete: {
-      title: 'Vector Index: Delete index endpoint',
-      subtitle: 'Delete an index endpoint',
-      description: 'projects.locations.indexEndpoints.delete — Vertex AI Matching Engine',
-      display_priority: 80,
-      help: lambda do |_|
-        {body: 'Delete an IndexEndpoint by resource name or short ID. Returns the LRO for teardown.'}
-      end,
-      retry_on_request: ['GET','HEAD'],
-      retry_on_response: [408,429,500,502,503,504],
-      max_retries: 3,
-
-      input_fields: lambda do |_|
-        [
-          { name: 'indexEndpoint', optional: false, hint: 'indexEndpoints/{id} or full resource path' },
-          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
-        ]
-      end,
-
-      output_fields: lambda do |_|
-        [
-          { name: 'name' }, { name: 'done', type: 'boolean' },
-          { name: 'metadata', type: 'object' }, { name: 'error', type: 'object' },
-          { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object', properties: [
-            { name: 'http_status', type: 'integer' }, { name: 'message' },
-            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
-          ]},
-          { name: 'debug', type: 'object' }
-        ]
-      end,
-
-      execute: lambda do |connection, input|
-        t0 = Time.now
-        corr = call(:build_correlation_id)
-        url = nil
-        req_body = nil
-        begin
-          call(:ensure_project_id!, connection)
-          call(:ensure_regional_location!, connection)
-          ep_path = call(:build_index_endpoint_path, connection, input['indexEndpoint'])
-          loc = connection['location'].to_s.downcase
-          url = call(:aipl_v1_url, connection, loc, ep_path)
-
-          resp = delete(url).headers(call(:request_headers, corr))
-          code = call(:telemetry_success_code, resp)
-          out  = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-          # Assess environment (dev/prod)
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
-          end
-          # Return
-          out
-        rescue => e
-          g   = call(:extract_google_error, e)
-          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
-          # Assess environment (dev/prod)
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
-          end
-          # Return
-          out
-        end
-      end,
-
-      sample_output: lambda do
-        { 'name' => 'projects/p/locations/us-central1/operations/987', 'done' => false,
-          'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 9, 'correlation_id' => 'sample' } }
-      end
-    },
-    index_endpoints_deploy: {
-      title: 'Vector Index: Deploy index to endpoint',
-      subtitle: 'Deploy an index to a vector endpoint',
-      description: 'projects.locations.indexEndpoints.deployIndex — Vertex AI Matching Engine',
-      display_priority: 80,
-      help: lambda do |_|
-        {body: 'Deploy an index to an IndexEndpoint under a chosen deployedIndexId. Supports optional displayName, labels, and privateEndpoints. Returns the LRO for deployment.' }
-      end,
-      retry_on_request: ['GET','HEAD'],
-      retry_on_response: [408,429,500,502,503,504],
-      max_retries: 3,
-
-      input_fields: lambda do |_|
-        [
-          { name: 'indexEndpoint', optional: false, hint: 'indexEndpoints/{id} or full resource path' },
-          { name: 'deployedIndexId', optional: false, hint: 'Name for the deployed index within the endpoint' },
-          { name: 'index', optional: false, hint: 'Index id or resource; short ids are expanded automatically' },
-          { name: 'displayName', optional: true },
-          { name: 'privateEndpoints', type: 'object', optional: true, hint: 'Optional network settings (object as-is)' },
-          { name: 'labels', type: 'object', optional: true },
-          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true },
-          { name: 'requestId', optional: true, hint: 'Optional idempotency token (RFC4122). If omitted we won’t send it.' }
-        ]
-      end,
-
-      output_fields: lambda do |_|
-        [
-          { name: 'name' }, { name: 'done', type: 'boolean' },
-          { name: 'metadata', type: 'object' }, { name: 'error', type: 'object' },
-          { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object', properties: [
-            { name: 'http_status', type: 'integer' }, { name: 'message' },
-            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
-          ]},
-          { name: 'debug', type: 'object' }
-        ]
-      end,
-
-      execute: lambda do |connection, input|
-        t0 = Time.now
-        corr = call(:build_correlation_id)
-        url = nil; req_body = nil
-        begin
-          call(:ensure_project_id!, connection)
-          call(:ensure_regional_location!, connection)
-          ep_path = call(:build_index_endpoint_path, connection, input['indexEndpoint'])
-          loc = connection['location'].to_s.downcase
-          url = call(:aipl_v1_url, connection, loc, "#{ep_path}:deployIndex")
-
-          # Validate and normalize
-          dep_id = input['deployedIndexId'].to_s.strip
-          error('deployedIndexId is required') if dep_id.empty?
-          idx_path = call(:build_index_path, connection, input['index'])
-          lbls = input['labels']
-          error('labels must be an object') if !lbls.nil? && !lbls.is_a?(Hash)
-          pe = input['privateEndpoints']
-          error('privateEndpoints must be an object') if !pe.nil? && !pe.is_a?(Hash)
-
-          deployed = {
-            'id'              => dep_id,
-            'index'           => idx_path,
-            'displayName'     => input['displayName'],
-            'privateEndpoints'=> pe,
-            'labels'          => lbls
-          }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
-
-          req_body = call(:json_compact, { 'deployedIndex' => deployed })
-
-          params = {}
-          req_id = input['requestId'].to_s.strip
-          params[:requestId] = req_id unless req_id.empty?
-
-          resp = post(url).params(params).headers(call(:request_headers, corr)).payload(req_body)
-          code = call(:telemetry_success_code, resp)
-          out  = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-          # Assess environment (dev/prod)
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
-          end
-          # Return
-          out
-        rescue => e
-          g   = call(:extract_google_error, e)
-          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
-          # Assess environment (dev/prod)
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
-          end
-          # Return
-          out
-        end
-      end,
-
-      sample_output: lambda do
-        { 'name' => 'projects/p/locations/us-central1/operations/dep-1', 'done' => false,
-          'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 13, 'correlation_id' => 'sample' } }
-      end
-    },
-    index_endpoints_undeploy: {
-      title: 'Vector Index: Undeploy index from endpoint',
-      subtitle: 'Undeploy an index from an endpoint',
-      description: 'projects.locations.indexEndpoints.undeployIndex — Vertex AI Matching Engine',
-      display_priority: 90,
-      help: lambda do |_|
-        { body: 'Remove a deployed index from an IndexEndpoint by deployedIndexId. Returns the LRO for undeploy.' }
-      end,
-      retry_on_request: ['GET','HEAD'],
-      retry_on_response: [408,429,500,502,503,504],
-      max_retries: 3,
-
-      input_fields: lambda do |_|
-        [
-          { name: 'indexEndpoint', optional: false, hint: 'indexEndpoints/{id} or full resource path' },
-          { name: 'deployedIndexId', optional: false, hint: 'Deployed index id to remove' },
-          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true },
-          { name: 'requestId', optional: true, hint: 'Optional idempotency token (RFC4122). If omitted we won’t send it.' }
-        ]
-      end,
-
-      output_fields: lambda do |_|
-        [
-          { name: 'name' }, { name: 'done', type: 'boolean' },
-          { name: 'metadata', type: 'object' }, { name: 'error', type: 'object' },
-          { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object', properties: [
-            { name: 'http_status', type: 'integer' }, { name: 'message' },
-            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
-          ]},
-          { name: 'debug', type: 'object' }
-        ]
-      end,
-
-      execute: lambda do |connection, input|
-        t0 = Time.now
-        corr = call(:build_correlation_id)
-        url = nil; req_body = nil
-        begin
-          call(:ensure_project_id!, connection)
-          call(:ensure_regional_location!, connection)
-          ep_path = call(:build_index_endpoint_path, connection, input['indexEndpoint'])
-          loc = connection['location'].to_s.downcase
-          url = call(:aipl_v1_url, connection, loc, "#{ep_path}:undeployIndex")
-
-          dep_id = input['deployedIndexId'].to_s.strip
-          error('deployedIndexId is required') if dep_id.empty?
-          req_body = call(:json_compact, { 'deployedIndexId' => dep_id })
-
-          params = {}
-          req_id = input['requestId'].to_s.strip
-          params[:requestId] = req_id unless req_id.empty?
-
-          resp = post(url).params(params).headers(call(:request_headers, corr)).payload(req_body)
-          code = call(:telemetry_success_code, resp)
-          out  = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-          # Assess environment (dev/prod)
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
-          end
-          # Return
-          out
-        rescue => e
-          g   = call(:extract_google_error, e)
-          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
-          # Assess environment (dev/prod)
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
-          end
-          # Return
-          out
-        end
-      end,
-
-      sample_output: lambda do
-        { 'name' => 'projects/p/locations/us-central1/operations/dep-1', 'done' => false,
-          'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 10, 'correlation_id' => 'sample' } }
-      end
-    },
-    indexes_remove_datapoints: {
-      title: 'Vector Index: Remove datapoints',
-      subtitle: 'Remove datapoints from a deployed vector index',
-      description: 'indexes.removeDatapoints — Vertex AI Matching Engine',
-      display_priority: 80,
-      help: lambda do |_| 
-        { body: 'Bulk-remove datapoints from an index by datapointIds[]. Validates input and returns a success envelope once the request is accepted.' }
-      end,
-      retry_on_request: ['GET','HEAD'],
-      retry_on_response: [408,429,500,502,503,504],
-      max_retries: 3,
-
-      input_fields: lambda do |_|
-        [
-          { name: 'index', optional: false,
-            hint: 'Index resource (projects/.../locations/.../indexes/{id}) or short ID' },
-          { name: 'datapointIds', type: 'array', of: 'string', optional: false }
-        ]
-      end,
-
-      output_fields: lambda do |_|
-        [
-          { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object', properties: [
-            { name: 'http_status', type: 'integer' }, { name: 'message' },
-            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
-          ]}
-        ]
-      end,
-
-      execute: lambda do |connection, input|
-        t0 = Time.now
-        corr = call(:build_correlation_id)
-        url = nil; req_body = nil
-        begin
-          call(:ensure_project_id!, connection)
-          call(:ensure_regional_location!, connection)
-          idx_path = call(:build_index_path, connection, input['index'])
-          loc = connection['location'].to_s.downcase
-          url = call(:aipl_v1_url, connection, loc, "#{idx_path}:removeDatapoints")
-
-          ids = call(:safe_array, input['datapointIds']).map(&:to_s).reject(&:empty?)
-          error('datapointIds must be a non-empty array of strings') if ids.empty?
-          req_body = call(:json_compact, { 'datapointIds' => ids })
-
-          resp = post(url).headers(call(:request_headers, corr)).payload(req_body)
-          code = call(:telemetry_success_code, resp)
-          { 'ok' => true }.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-        rescue => e
-          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
-        end
-      end,
-
-      sample_output: lambda do
-        { 'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 9, 'correlation_id' => 'sample' } }
-      end
-    },
-    index_get: {
-      title: 'Vector Index: Get',
-      subtitle: 'projects.locations.indexes.get',
-      description: 'Fetch a vector index and extract key fields',
-      display_priority: 80,
-      help: lambda do |_|
-        {body: 'Fetch a vector index and extract key probe fields (dimensions, distance metric, algorithm, shard/neighbor settings, and state). Useful for connection tests and recipe conditionals.' }
-      end,
-      retry_on_response: [408, 429, 500, 502, 503, 504],
-      max_retries: 3,
-      input_fields: lambda do |_|
-        [
-          { name: 'index', optional: false,
-            hint: 'Index resource (projects/.../locations/.../indexes/ID) or short ID (e.g., "my-index")' },
-          # Debug
-          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true,
-            hint: 'Echo request URL/response for troubleshooting (disabled when connection.prod_mode = true)' }
-        ]
-      end,
-      output_fields: lambda do |_|
-        [
-          { name: 'ok', type: 'boolean' },
-          { name: 'index', type: 'object', properties: [
-            { name: 'name' },
-            { name: 'displayName' },
-            { name: 'description' },
-            { name: 'labels', type: 'object' },
-            { name: 'createTime' },
-            { name: 'updateTime' },
-            { name: 'etag' },
-            { name: 'indexUpdateMethod' },
-            { name: 'encryptionSpec', type: 'object', properties: [
-              { name: 'kmsKeyName' }
-            ]},
-            { name: 'deployedIndexes', type: 'array', of: 'object', properties: [
-              { name: 'indexEndpoint' }, { name: 'deployedIndexId' }, { name: 'displayName' }
-            ]},
-            { name: 'metadataSchemaUri' },
-            { name: 'metadata', type: 'object' }, # raw Google metadata blob
-            # Parsed convenience fields for Recipe Builder
-            { name: 'parsed', type: 'object', properties: [
-              { name: 'dimensions', type: 'integer' },
-              { name: 'distance_metric' },
-              { name: 'algorithm' },
-              { name: 'shard_count', type: 'integer' },
-              { name: 'approx_neighbors', type: 'integer' },
-              { name: 'index_state' }
-            ]}
-          ]},
-          { name: 'telemetry', type: 'object', properties: [
-            { name: 'http_status', type: 'integer' },
-            { name: 'message' }, { name: 'duration_ms', type: 'integer' },
-            { name: 'correlation_id' }
-          ]},
-          { name: 'debug', type: 'object' }
-        ]
-      end,
-      execute: lambda do |connection, input|
-        t0 = Time.now
-        corr = call(:build_correlation_id)
-        url = nil
-
-        begin
-          call(:ensure_project_id!, connection)
-          call(:ensure_regional_location!, connection)
-
-          # Accept short index id or full resource name
-          index_path = call(:build_index_path, connection, input['index'])
-          loc = connection['location'].to_s.downcase
-          url = call(:aipl_v1_url, connection, loc, index_path)
-
-          raw  = call(:http_call!, 'GET', url).headers(call(:request_headers, corr))
-          code = call(:telemetry_success_code, raw)
-          body = call(:http_body_json, raw)
-
-          # --- Parse helpful probe fields out of metadata ---
-          md = (body['metadata'] || {}).to_h
-          # Common Vertex Vector Search shapes seen in practice:
-          # 1) {"config":{"dimensions":768, "distanceMeasureType":"DOT_PRODUCT", "algorithm_config":{"treeAhConfig":{...}},"shardSize":...,"approximateNeighborsCount":...}}
-          # 2) {"config":{"dimensions":..., "distanceMeasureType":"COSINE"}}
-          config = md['config'].is_a?(Hash) ? md['config'] : {}
-          alg_cfg = config['algorithm_config'] || {}
-          alg =
-            if alg_cfg.key?('treeAhConfig') then 'TREE_AH'
-            elsif alg_cfg.key?('bruteForceConfig') then 'BRUTE_FORCE'
-            elsif alg_cfg.key?('flatConfig') then 'FLAT'
-            else alg_cfg.keys.first
-            end
-
-          parsed = {
-            'dimensions'        => (config['dimensions'] || md['dimensions']),
-            'distance_metric'   => (config['distanceMeasureType'] || md['distanceMeasureType']),
-            'algorithm'         => alg,
-            'shard_count'       => (config['shardCount'] || md['shardCount']),
-            'approx_neighbors'  => (config['approximateNeighborsCount'] || md['approximateNeighborsCount']),
-            # Some environments expose a status/state in metadata; keep best-effort extraction
-            'index_state'       => (md['state'] || md['indexState'] || body['state'])
-          }.compact
-
-          index_obj = {
-            'name'               => body['name'],
-            'displayName'        => body['displayName'],
-            'description'        => body['description'],
-            'labels'             => body['labels'],
-            'createTime'         => body['createTime'],
-            'updateTime'         => body['updateTime'],
-            'etag'               => body['etag'],
-            'indexUpdateMethod'  => body['indexUpdateMethod'],
-            'encryptionSpec'     => body['encryptionSpec'],
-            'deployedIndexes'    => body['deployedIndexes'],
-            'metadataSchemaUri'  => body['metadataSchemaUri'],
-            'metadata'           => md,
-            'parsed'             => parsed
-          }.compact
-
-          out = {
-            'ok' => true,
-            'index' => index_obj
-          }.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, nil, resp) if call(:normalize_boolean, input['debug'])
-          end
-
-          out
         rescue => e
           g = call(:extract_google_error, e)
-          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
+          vio = (g['violations'] || []).map { |x| "#{x['field']}: #{x['reason']}" }.join(' ; ')
+          msg = [e.to_s, (g['message'] || nil), (vio.presence)].compact.join(' | ')
+          http_status = call(:telemetry_parse_error_code, e), msg))
+          ok = false
+          out = {}.merge(call(:telemetry_envelope, t0, corr, false, http_status, msg))
+          flags = call(:metrics_effective_flags, connection, input)
+          if flags['emit']
+            m = call(:metrics_base, connection, 'rag_files_import', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
+            out['metrics']    = m
+            out['metrics_kv'] = call(:metrics_to_kv, m)
+          end
           unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, nil, nil) if call(:normalize_boolean, input['debug'])
-          end
-          out
-        end
-      end,
-
-      sample_output: lambda do
-        {
-          'ok' => true,
-          'index' => {
-            'name' => 'projects/p/locations/us-central1/indexes/abc123',
-            'displayName' => 'email-rag-index',
-            'description' => 'Primary vector index for RAG email responder',
-            'labels' => { 'env' => 'prod', 'owner' => 'rag-team' },
-            'createTime' => '2025-09-10T15:04:05Z',
-            'updateTime' => '2025-10-10T12:00:00Z',
-            'etag' => 'BwXyZ123',
-            'indexUpdateMethod' => 'STREAM_UPDATE',
-            'metadataSchemaUri' => 'gs://google-cloud-aiplatform/schema/index/matching-engine.yaml',
-            'metadata' => {
-              'config' => {
-                'dimensions' => 768,
-                'distanceMeasureType' => 'COSINE',
-                'approximateNeighborsCount' => 50,
-                'shardCount' => 2,
-                'algorithm_config' => { 'treeAhConfig' => { 'leafNodeEmbeddingCount' => 1000 } }
-              }
-            },
-            'parsed' => {
-              'dimensions' => 768,
-              'distance_metric' => 'COSINE',
-              'algorithm' => 'TREE_AH',
-              'shard_count' => 2,
-              'approx_neighbors' => 50,
-              'index_state' => 'READY'
-            }
-          },
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample' }
-        }
-      end
-    },
-    index_list: {
-      title: 'Vector Index: List',
-      subtitle: 'projects.locations.indexes.list',
-      display_priority: 80,
-      help: lambda do |_| 
-        { body: 'List vector indexes in the current project/location with pagination. '\
-                'Also returns parsed convenience fields (dimensions, distance metric, '\
-                'algorithm, shard/neighbor settings, and state) for easy mapping.' }
-      end,
-      retry_on_response: [408, 429, 500, 502, 503, 504],
-      max_retries: 3,
-
-      input_fields: lambda do |_|
-        [
-          { name: 'page_size', type: 'integer', optional: true, hint: 'Max items per page (default 50, max 1000)' },
-          { name: 'page_token', optional: true, hint: 'Set this to fetch the next page' },
-          { name: 'validate_only', label: 'Validate only (no call)', type: 'boolean', control_type: 'checkbox', optional: true },
-          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true,
-            hint: 'Echo request URL/response for troubleshooting (disabled when connection.prod_mode = true)' }
-        ]
-      end,
-      output_fields: lambda do |_|
-        [
-          { name: 'ok', type: 'boolean' },
-          { name: 'items', type: 'array', of: 'object', properties: [
-            { name: 'name' },
-            { name: 'displayName' },
-            { name: 'description' },
-            { name: 'labels', type: 'object' },
-            { name: 'createTime' },
-            { name: 'updateTime' },
-            { name: 'etag' },
-            { name: 'indexUpdateMethod' },
-            { name: 'encryptionSpec', type: 'object', properties: [
-              { name: 'kmsKeyName' }
-            ]},
-            { name: 'deployedIndexes', type: 'array', of: 'object', properties: [
-              { name: 'indexEndpoint' }, { name: 'deployedIndexId' }, { name: 'displayName' }
-            ]},
-            { name: 'metadataSchemaUri' },
-            { name: 'metadata', type: 'object' },
-            { name: 'parsed', type: 'object', properties: [
-              { name: 'dimensions', type: 'integer' },
-              { name: 'distance_metric' },
-              { name: 'algorithm' },
-              { name: 'shard_count', type: 'integer' },
-              { name: 'approx_neighbors', type: 'integer' },
-              { name: 'index_state' }
-            ]}
-          ]},
-          { name: 'next_page_token' },
-          { name: 'telemetry', type: 'object', properties: [
-            { name: 'http_status', type: 'integer' },
-            { name: 'message' }, { name: 'duration_ms', type: 'integer' },
-            { name: 'correlation_id' }
-          ]},
-          { name: 'debug', type: 'object' }
-        ]
-      end,
-      execute: lambda do |connection, input|
-        t0 = Time.now
-        corr = call(:build_correlation_id)
-        url = nil
-
-        begin
-          call(:ensure_project_id!, connection)
-          call(:ensure_regional_location!, connection)
-
-          project = connection['project_id']
-          loc     = connection['location'].to_s.downcase
-          parent  = "projects/#{project}/locations/#{loc}"
-          path    = "#{parent}/indexes"
-          url     = call(:aipl_v1_url, connection, loc, path)
-
-          qs = {}
-          qs['pageSize']  = input['page_size'].to_i if input['page_size'].to_i > 0
-          qs['pageToken'] = input['page_token'] if input['page_token'].present?
-          if call(:normalize_boolean, input['validate_only'])
-            qstr   = (qs && qs.any?) ? ('?' + qs.map { |k,v| "#{k}=#{v}" }.join('&')) : ''
-            preview = call(:request_preview_pack, "#{url}#{qstr}", 'GET', call(:request_headers, corr), nil)
-            return { 'ok' => true }.merge(preview).merge(call(:telemetry_envelope_ex, t0, corr, true, 200, 'DRY_RUN', { 'action' => 'index_list' }))
-          end
-
-          resp = call(:http_call!, 'GET', url).params(qs).headers(call(:request_headers, corr))
-
-          code = call(:telemetry_success_code, resp)
-          body = call(:http_body_json, resp)
-          list = call(:safe_array, body['indexes'])
-
-          items = list.map do |it|
-            h  = (it || {}).to_h
-            md = (h['metadata'] || {}).to_h
-
-            # Extract common config shapes into parsed fields
-            cfg    = md['config'].is_a?(Hash) ? md['config'] : {}
-            algcfg = cfg['algorithm_config'] || {}
-            algorithm =
-              if algcfg.key?('treeAhConfig') then 'TREE_AH'
-              elsif algcfg.key?('bruteForceConfig') then 'BRUTE_FORCE'
-              elsif algcfg.key?('flatConfig') then 'FLAT'
-              else algcfg.keys.first
-              end
-
-            parsed = {
-              'dimensions'       => (cfg['dimensions'] || md['dimensions']),
-              'distance_metric'  => (cfg['distanceMeasureType'] || md['distanceMeasureType']),
-              'algorithm'        => algorithm,
-              'shard_count'      => (cfg['shardCount'] || md['shardCount']),
-              'approx_neighbors' => (cfg['approximateNeighborsCount'] || md['approximateNeighborsCount']),
-              'index_state'      => (md['state'] || md['indexState'] || h['state'])
-            }.compact
-
-            {
-              'name'              => h['name'],
-              'displayName'       => h['displayName'],
-              'description'       => h['description'],
-              'labels'            => h['labels'],
-              'createTime'        => h['createTime'],
-              'updateTime'        => h['updateTime'],
-              'etag'              => h['etag'],
-              'indexUpdateMethod' => h['indexUpdateMethod'],
-              'encryptionSpec'    => h['encryptionSpec'],
-              'deployedIndexes'   => h['deployedIndexes'],
-              'metadataSchemaUri' => h['metadataSchemaUri'],
-              'metadata'          => md,
-              'parsed'            => parsed
-            }.compact
-          end
-
-          out = {
-            'ok' => true,
-            'items' => items,
-            'next_page_token' => body['nextPageToken']
-          }.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-
-          unless call(:normalize_boolean, connection['prod_mode'])
-            qstr = (qs && qs.any?) ? ('?' + qs.map { |k,v| "#{k}=#{v}" }.join('&')) : ''
-            out['debug'] = call(:debug_pack, input['debug'], "#{url}#{qstr}", nil, resp) if call(:normalize_boolean, input['debug'])
-          end
-
-          out
-        rescue => e
-          g = call(:extract_google_error, e)
-          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, nil, nil) if call(:normalize_boolean, input['debug'])
+            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
           end
           out
         end
       end,
       sample_output: lambda do
         {
+          'name' => 'projects/p/locations/us-central1/operations/1234567890',
+          'done' => false,
           'ok' => true,
-          'items' => [
-            {
-              'name' => 'projects/p/locations/us-central1/indexes/abc123',
-              'displayName' => 'email-rag-index',
-              'description' => 'Primary vector index for RAG email responder',
-              'labels' => { 'env' => 'prod', 'owner' => 'rag-team' },
-              'createTime' => '2025-09-10T15:04:05Z',
-              'updateTime' => '2025-10-10T12:00:00Z',
-              'etag' => 'BwXyZ123',
-              'indexUpdateMethod' => 'STREAM_UPDATE',
-              'metadataSchemaUri' => 'gs://google-cloud-aiplatform/schema/index/matching-engine.yaml',
-              'metadata' => {
-                'config' => {
-                  'dimensions' => 768,
-                  'distanceMeasureType' => 'COSINE',
-                  'approximateNeighborsCount' => 50,
-                  'shardCount' => 2,
-                  'algorithm_config' => { 'treeAhConfig' => { 'leafNodeEmbeddingCount' => 1000 } }
-                }
-              },
-              'parsed' => {
-                'dimensions' => 768,
-                'distance_metric' => 'COSINE',
-                'algorithm' => 'TREE_AH',
-                'shard_count' => 2,
-                'approx_neighbors' => 50,
-                'index_state' => 'READY'
-              }
-            }
-          ],
-          'next_page_token' => 'Cg0IARABGg4iC3BhZ2VfdHdv',
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 14, 'correlation_id' => 'sample' }
+          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 18, 'correlation_id' => 'sample' }
         }
       end
     },
 
-    # 5)  Generate content (Gemini)
+    # 3) Generate content (Gemini)
     gen_generate_content: {
       title: 'Generative: Generate content (Gemini)',
       subtitle: 'Generate content from a prompt',
@@ -2768,13 +1680,18 @@ require 'securerandom'
       max_retries: 3,
 
       input_fields: lambda do |object_definitions, connection, config_fields|
-        object_definitions['gen_generate_content_input']
+        Array(object_definitions['gen_generate_content_input']) + [
+          { name: 'emit_metrics', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+            hint: 'Attach a metrics object in the output for downstream persistence.' },
+          { name: 'metrics_namespace', optional: true, hint: 'Optional tag for partitioning dashboards (e.g., "email_rag_prod").' }
+        ]
       end,
-
       output_fields: lambda do |object_definitions, connection|
-         Array(object_definitions['generate_content_output']) + Array(object_definitions['envelope_fields'])
+         Array(object_definitions['generate_content_output']) +
+         Array(object_definitions['envelope_fields']) + [
+          { name: 'metrics', type: 'object', properties: object_definitions['metrics_fields'] },
+          { name: 'metrics_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] } ]
       end,
-
       execute: lambda do |connection, input|
         t0   = Time.now
         corr = call(:build_correlation_id)
@@ -2819,15 +1736,35 @@ require 'securerandom'
           end
 
           code = call(:telemetry_success_code, resp)
-          resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          out  = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          ok = true
+          http_status = code
+          flags = call(:metrics_effective_flags, connection, input)
+          if flags['emit']
+            m = call(:metrics_base, connection, 'gen_generate_content', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
+              .merge(call(:metrics_from_generation, resp, (input['generation_config'] || {})['temperature']))
+              .merge('model' => input['model'])
+            out['metrics']    = m
+            out['metrics_kv'] = call(:metrics_to_kv, m)
+          end
+          out
 
         rescue => e
           g = call(:extract_google_error, e)
           msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
-        end
-      end,
+          http_status = call(:telemetry_parse_error_code, e)
+          out = {}.merge(call(:telemetry_envelope, t0, corr, false, http_status, msg))
+          ok = false
+          flags = call(:metrics_effective_flags, connection, input)
+          if flags['emit']
+            m = call(:metrics_base, connection, 'gen_generate_content', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
+              .merge('model' => input['model'])
+            out['metrics']    = m
+            out['metrics_kv'] = call(:metrics_to_kv, m)
+          end
+          out
 
+      end,
       sample_output: lambda do
         {
           'responseId' => 'resp-123',
@@ -2860,11 +1797,20 @@ require 'securerandom'
           { name: 'vertex_ai_search_datastore', optional: true,
             hint: 'projects/.../locations/.../collections/default_collection/dataStores/...' },
           { name: 'vertex_ai_search_serving_config', optional: true,
-            hint: 'projects/.../locations/.../collections/.../engines/.../servingConfigs/default_config' }
+            hint: 'projects/.../locations/.../collections/.../engines/.../servingConfigs/default_config' },
+          { name: 'generation_config', type: 'object', optional: true, properties: object_definitions['generation_config'] },
+          { name: 'toolConfig', type: 'object', optional: true },
+          { name: 'safetySettings', type: 'array', of: 'object', optional: true, properties: object_definitions['safety_setting'] },
+          { name: 'emit_metrics', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+            hint: 'Attach a metrics object in the output for downstream persistence.' },
+          { name: 'metrics_namespace', optional: true, hint: 'Optional tag for partitioning dashboards (e.g., "email_rag_prod").' },
         ]
       end,
       output_fields: lambda do |object_definitions, connection|
-        Array(object_definitions['generate_content_output']) + Array(object_definitions['envelope_fields'])
+        Array(object_definitions['generate_content_output']) + 
+        Array(object_definitions['envelope_fields']) + [
+          { name: 'metrics', type: 'object', properties: object_definitions['metrics_fields'] },
+          { name: 'metrics_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] } ]
       end,
       execute: lambda do |connection, input|
         # Correlation id and duration for logs / analytics
@@ -2918,12 +1864,31 @@ require 'securerandom'
                   .headers(call(:request_headers, corr))
                   .payload(call(:json_compact, payload))
           code = call(:telemetry_success_code, resp)
-          resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          out  = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          ok = true
+          http_status = code
+          flags = call(:metrics_effective_flags, connection, input)
+          if flags['emit']
+            m = call(:metrics_base, connection, 'gen_generate_grounded', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
+              .merge(call(:metrics_from_generation, resp, (input['generation_config'] || {})['temperature']))
+              .merge('model' => input['model'])
+            out['metrics']    = m
+            out['metrics_kv'] = call(:metrics_to_kv, m)
+          end
+          out
         rescue => e
-          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
-        end
+          http_status = call(:telemetry_parse_error_code, e)
+          out = {}.merge(call(:telemetry_envelope, t0, corr, false, http_status, e.to_s))
+          ok = false
+          flags = call(:metrics_effective_flags, connection, input)
+          if flags['emit']
+            m = call(:metrics_base, connection, 'gen_generate_grounded', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
+              .merge('model' => input['model'])
+            out['metrics']    = m
+            out['metrics_kv'] = call(:metrics_to_kv, m)
+          end
+          out
       end,
-
       sample_output: lambda do
         {
           'responseId' => 'resp-456',
@@ -2961,11 +1926,9 @@ require 'securerandom'
               { name: 'score', type: 'number' },
               { name: 'metadata', type: 'object' }
             ],
-            hint: 'Pass the top-N chunks from your retriever / process.'
-          },
+            hint: 'Pass the top-N chunks from your retriever / process.' },
 
-          { name: 'max_chunks', type: 'integer', optional: true, default: 20,
-            hint: 'Hard cap to avoid overlong prompts.' },
+          { name: 'max_chunks', type: 'integer', optional: true, default: 20, hint: 'Hard cap to avoid overlong prompts.' },
 
           { name: 'system_preamble', optional: true,
             hint: 'Optional guardrails (e.g., “only answer from context; say I don’t know otherwise”).' },
@@ -2985,28 +1948,28 @@ require 'securerandom'
           { name: 'count_tokens_model', optional: true,
             hint: 'If set, use this model for countTokens (defaults to `model`).' },
           { name: 'trim_strategy', control_type: 'select', optional: true, default: 'drop_low_score',
-            pick_list: 'trim_strategies',
-            hint: 'How to shrink when over budget: drop_low_score, diverse_mmr, or truncate_chars' }
+            pick_list: 'trim_strategies', hint: 'How to shrink when over budget: drop_low_score, diverse_mmr, or truncate_chars' },
+          { name: 'emit_metrics', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+            hint: 'Attach a metrics object in the output for downstream persistence.' },
+          { name: 'metrics_namespace', optional: true, hint: 'Optional tag for partitioning dashboards (e.g., "email_rag_prod").' },
         ]
       end,
-
       output_fields: lambda do |object_definitions|
         [
           { name: 'answer' },
           { name: 'citations', type: 'array', of: 'object', properties: [
               { name: 'chunk_id' }, { name: 'source' }, { name: 'uri' }, { name: 'score', type: 'number' }
-            ]
-          },
+            ]},
           { name: 'responseId' },
           { name: 'usage', type: 'object', properties: [
               { name: 'promptTokenCount', type: 'integer' },
               { name: 'candidatesTokenCount', type: 'integer' },
               { name: 'totalTokenCount', type: 'integer' }
-            ]
-          }
-        ] + Array(object_definitions['envelope_fields'])
+            ]}
+        ] + Array(object_definitions['envelope_fields']) + [
+          { name: 'metrics', type: 'object', properties: object_definitions['metrics_fields'] },
+          { name: 'metrics_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] } ]
       end,
-
       execute: lambda do |connection, input|
         # Correlation id and duration for logs/analytics
         t0 = Time.now
@@ -3134,22 +2097,43 @@ require 'securerandom'
 
           parsed = call(:safe_parse_json, text)
 
-          {
+          base_out = {
             'answer'     => parsed['answer'] || text,
             'citations'  => parsed['citations'] || [],
             'responseId' => resp['responseId'],
             'usage'      => resp['usageMetadata']
           }.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+          ok = true
+          http_status = 200
+
+          flags = call(:metrics_effective_flags, connection, input)
+          if flags['emit']
+            m = call(:metrics_base, connection, 'gen_answer_with_context', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
+              .merge(call(:metrics_from_generation, resp, input['temperature']))
+              .merge('model' => input['model'])
+              # This action doesn't accept max_contexts; report the cap applied:
+              .merge(call(:metrics_from_retrieve, items, input['max_chunks']))
+            base_out['metrics']    = m
+            base_out['metrics_kv'] = call(:metrics_to_kv, m)
+          end
+          base_out
 
         rescue => e
-          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
+          http_status = call(:telemetry_parse_error_code, e)
+          out = {}.merge(call(:telemetry_envelope, t0, corr, false, http_status, e.to_s))
+          ok = false
+          flags = call(:metrics_effective_flags, connection, input)
+          if flags['emit']
+            m = call(:metrics_base, connection, 'gen_answer_with_context', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
+              .merge('model' => input['model'])
+            out['metrics']    = m
+            out['metrics_kv'] = call(:metrics_to_kv, m)
+          end
           unless call(:normalize_boolean, connection['prod_mode'])
             out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
           end
           out
-        end
       end,
-
       sample_output: lambda do
         {
           'answer' => 'The outage began at 09:12 UTC due to a misconfigured firewall rule.',
@@ -3164,9 +2148,9 @@ require 'securerandom'
       end
     },
 
-    # 6)  Embeddings
+    # 4) Utilities, operations, administration
     embed_text: {
-      title: 'Embeddings: Embed text',
+      title: 'Utility: Embed text',
       subtitle: 'Get embeddings from a publisher embedding model',
       help: lambda do |_|
         { body: 'POST :predict on a publisher embedding model' }
@@ -3183,14 +2167,18 @@ require 'securerandom'
           { name: 'task', hint: 'Optional: RETRIEVAL_QUERY or RETRIEVAL_DOCUMENT' },
           { name: 'autoTruncate', type: 'boolean', hint: 'Truncate long inputs automatically' },
           { name: 'outputDimensionality', type: 'integer', optional: true, convert_input: 'integer_conversion',
-            hint: 'Optional dimensionality reduction (see model docs).' }
+            hint: 'Optional dimensionality reduction (see model docs).' },
+          { name: 'emit_metrics', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+            hint: 'Attach a metrics object in the output for downstream persistence.' },
+          { name: 'metrics_namespace', optional: true, hint: 'Optional tag for partitioning dashboards (e.g., "email_rag_prod").' },
         ]
       end,
-
       output_fields: lambda do |object_definitions|
-        Array(object_definitions['embed_output']) + Array(object_definitions['envelope_fields'])
+        Array(object_definitions['embed_output']) + 
+        Array(object_definitions['envelope_fields']) + [
+          { name: 'metrics', type: 'object', properties: object_definitions['metrics_fields'] },
+          { name: 'metrics_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] }]
       end,
-
       execute: lambda do |connection, input|
         # Correlation id and duration for logs / analytics
         t0 = Time.now
@@ -3226,13 +2214,32 @@ require 'securerandom'
             'outputDimensionality' => input['outputDimensionality']
           })
 
-          call(:predict_embeddings, connection, model_path, instances, params)
-            .merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+          emb = call(:predict_embeddings, connection, model_path, instances, params)
+          out = emb.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+          ok = true
+          http_status = 200
+          flags = call(:metrics_effective_flags, connection, input)
+          if flags['emit']
+            m = call(:metrics_base, connection, 'embed_text', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
+              .merge(call(:metrics_from_embeddings, emb, instances))
+              .merge('model' => input['model'])
+            out['metrics']    = m
+            out['metrics_kv'] = call(:metrics_to_kv, m)
+          end
+          out
         rescue => e
-          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
-        end
+          http_status = call(:telemetry_parse_error_code, e)
+          out = {}.merge(call(:telemetry_envelope, t0, corr, false, http_status, e.to_s))
+          ok = false
+          flags = call(:metrics_effective_flags, connection, input)
+          if flags['emit']
+            m = call(:metrics_base, connection, 'embed_text', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
+              .merge('model' => input['model'])
+            out['metrics']    = m
+            out['metrics_kv'] = call(:metrics_to_kv, m)
+          end
+          out
       end,
-
       sample_output: lambda do
         {
           'predictions' => [
@@ -3247,194 +2254,6 @@ require 'securerandom'
         }
       end
     },
-
-    # 7)  Predict
-    endpoint_predict: {
-      title: 'Prediction: Endpoint predict (custom model)',
-      subtitle: 'POST :predict to a Vertex AI Endpoint',
-      display_priority: 6,
-      retry_on_request: ['GET', 'HEAD'],
-      retry_on_response: [408, 429, 500, 502, 503, 504],
-      max_retries: 3,
-
-      input_fields: lambda do
-        [
-          { name: 'endpoint',   optional: false, hint: 'Endpoint ID or full resource path' },
-          { name: 'instances',  type: 'array', of: 'object', optional: false },
-          { name: 'parameters', type: 'object' }
-        ]
-      end,
-
-      output_fields: lambda do |object_definitions|
-        Array(object_definitions['predict_output']) + Array(object_definitions['envelope_fields'])
-      end,
-
-      execute: lambda do |connection, input|
-        # Correlation id and duration for logs / analytics
-        t0 = Time.now
-        corr = call(:build_correlation_id)
-
-        # Evaluate connection fields
-        call(:ensure_project_id!, connection)
-        call(:ensure_regional_location!, connection) # require non-global
-
-        # Build URL, payload
-        url     = call(:endpoint_predict_url, connection, input['endpoint'])
-        inst = call(:safe_array, input['instances'])
-        error('instances must be a non-empty array') if inst.empty?
-        payload = { 'instances' => inst, 'parameters' => input['parameters'] }
-
-        # Call EP
-        begin
-          resp = post(url)
-                   .headers(call(:request_headers, corr))
-                   .payload(call(:json_compact, payload))
-          code = call(:telemetry_success_code, resp)
-          resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-        rescue => e
-          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
-        end
-      end,
-
-      sample_output: lambda do
-        { 'predictions' => [ { 'score' => 0.92, 'label' => 'positive' } ],
-          'deployedModelId' => '1234567890',
-          'ok' => true,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr' } }
-      end
-    },
-    batch_prediction_create: {
-      title: 'Prediction: Create prediction job',
-      subtitle: 'Create projects.locations.batchPredictionJobs',
-      batch: true,
-      display_priority: 6,
-
-      input_fields: lambda do
-        [
-          { name: 'displayName', optional: false },
-          { name: 'model',       optional: false, hint: 'Full model resource or publisher model' },
-          { name: 'gcsInputUris', type: 'array', of: 'string', optional: false },
-          { name: 'instancesFormat',   optional: false, hint: 'jsonl,csv,bigquery,tf-record,file-list' },
-          { name: 'predictionsFormat', optional: false, hint: 'jsonl,csv,bigquery' },
-          { name: 'gcsOutputUriPrefix', optional: false, hint: 'gs://bucket/path/' },
-          { name: 'modelParameters', type: 'object' },
-          { name: 'labels', type: 'object', optional: true, hint: 'Key/Value labels for traceability' }
-
-        ]
-      end,
-
-      output_fields: lambda do |object_definitions|
-        Array(object_definitions['batch_job']) + Array(object_definitions['envelope_fields'])
-      end,
-
-      execute: lambda do |connection, input|
-        # Correlation id and duration for logs / analytics
-        t0 = Time.now
-        corr = call(:build_correlation_id)
-
-        # Evaluate connection fields
-        call(:ensure_project_id!, connection)
-        call(:ensure_regional_location!, connection)
-
-        # Build the payload
-        payload = {
-          'displayName'  => input['displayName'],
-          'model'        => input['model'],
-          'inputConfig'  => {
-            'instancesFormat' => input['instancesFormat'],
-            'gcsSource'       => { 'uris' => input['gcsInputUris'] }
-          },
-          'outputConfig' => {
-            'predictionsFormat' => input['predictionsFormat'],
-            'gcsDestination'    => { 'outputUriPrefix' => input['gcsOutputUriPrefix'] }
-          },
-          'modelParameters' => input['modelParameters'],
-          'labels'          => input['labels']
-        }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
-
-        # Build the endpoint URL
-        loc         = connection['location']
-        path        = "projects/#{connection['project_id']}/locations/#{loc}/batchPredictionJobs"
-        url         = call(:aipl_v1_url, connection, loc, path)
-
-        # Call ep
-        begin
-          resp = post(url)
-                   .headers(call(:request_headers, corr))
-                   .payload(call(:json_compact, payload))
-          code = call(:telemetry_success_code, resp)
-          resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-        rescue => e
-          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
-        end
-      end,
-
-      sample_output: lambda do
-        { 'name'        => 'projects/p/locations/us-central1/batchPredictionJobs/123',
-          'displayName' => 'batch-2025-10-06',
-          'state'       => 'JOB_STATE_PENDING',
-          'model'       => 'projects/p/locations/us-central1/models/456',
-          'ok'          => true,
-          'telemetry'   => { 
-            'http_status'     => 200,
-            'message'         => 'OK',
-            'duration_ms'     => 12,
-            'correlation_id'  => 'sample-corr'
-          }
-        }
-      end
-    },
-    batch_prediction_get: {
-      title: 'Prediction: Fetch prediction job (get)',
-      subtitle: 'Get a batch prediction job by ID',
-      batch: true,
-      display_priority: 6,
-
-      input_fields: lambda do
-        [ { name: 'job_id', optional: false } ]
-      end,
-
-      output_fields: lambda do |object_definitions|
-        Array(object_definitions['batch_job']) + Array(object_definitions['envelope_fields'])
-      end,
-
-      execute: lambda do |connection, input|
-        # Correlation id and duration for logs / analytics
-        t0 = Time.now
-        corr = call(:build_correlation_id)
-
-        # Evaluate connection fields
-        call(:ensure_project_id!, connection)
-        call(:ensure_regional_location!, connection)
-
-        # Build endpoint URL
-        name = input['job_id'].to_s.start_with?('projects/') ?
-          input['job_id'] :
-          "projects/#{connection['project_id']}/locations/#{connection['location']}/batchPredictionJobs/#{input['job_id']}"
-        loc = connection['location']
-        url  = call(:aipl_v1_url, connection, loc, name.sub(%r{^/v1/}, ''))
-
-        # Call EP
-        begin
-          resp = get(url).headers(call(:request_headers, corr))
-          code = call(:telemetry_success_code, resp)
-          resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-        rescue => e
-          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
-        end
-      end,
-
-      sample_output: lambda do
-        { 'name' => 'projects/p/locations/us-central1/batchPredictionJobs/123',
-          'displayName' => 'batch-2025-10-06',
-          'state' => 'JOB_STATE_SUCCEEDED',
-          'outputInfo' => { 'gcsOutputDirectory' => 'gs://my-bucket/prediction-...' },
-          'ok' => true,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr' } }
-      end
-    },
-
-    # 8)  Utility
     count_tokens: {
       title: 'Utility: Count tokens',
       description: 'POST :countTokens on a publisher model',
@@ -3496,7 +2315,7 @@ require 'securerandom'
       end
     },
     operations_get: {
-      title: 'Operations: Get (poll LRO)',
+      title: 'OPs: Get (poll LRO)',
       subtitle: 'google.longrunning.operations.get',
       display_priority: 5,
       retry_on_request: ['GET','HEAD'],
@@ -3506,10 +2325,12 @@ require 'securerandom'
       input_fields: lambda do
         [
           { name: 'operation', optional: false,
-            hint: 'Operation name or full path, e.g., projects/{p}/locations/{l}/operations/{id}' }
+            hint: 'Operation name or full path, e.g., projects/{p}/locations/{l}/operations/{id}' },
+          { name: 'emit_metrics', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+            hint: 'Attach a metrics object in the output for downstream persistence.' },
+          { name: 'metrics_namespace', optional: true, hint: 'Optional tag for partitioning dashboards (e.g., "email_rag_prod").' },
         ]
       end,
-
       output_fields: lambda do |_|
         [
           { name: 'name' }, { name: 'done', type: 'boolean' },
@@ -3518,11 +2339,11 @@ require 'securerandom'
           { name: 'ok', type: 'boolean' },
           { name: 'telemetry', type: 'object', properties: [
             { name: 'http_status', type: 'integer' }, { name: 'message' },
-            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
-          ]}
+            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' } ]},
+          { name: 'metrics', type: 'object', properties: object_definitions['metrics_fields'] },
+          { name: 'metrics_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] }
         ]
       end,
-
       execute: lambda do |connection, input|
         t0 = Time.now
         corr = call(:build_correlation_id)
@@ -3534,12 +2355,29 @@ require 'securerandom'
           url = call(:aipl_v1_url, connection, loc, op.start_with?('projects/') ? op : "projects/#{connection['project_id']}/locations/#{loc}/operations/#{op}")
           resp = get(url).headers(call(:request_headers, corr))
           code = call(:telemetry_success_code, resp)
-          resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          out  = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          ok = true
+          http_status = code
+          flags = call(:metrics_effective_flags, connection, input)
+          if flags['emit']
+            m = call(:metrics_base, connection, 'operations_get', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
+            out['metrics']    = m
+            out['metrics_kv'] = call(:metrics_to_kv, m)
+          end
+          out
         rescue => e
-          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
+          http_status = call(:telemetry_parse_error_code, e)
+          out = {}.merge(call(:telemetry_envelope, t0, corr, false, http_status, e.to_s))
+          ok = false
+          flags = call(:metrics_effective_flags, connection, input)
+          if flags['emit']
+            m = call(:metrics_base, connection, 'operations_get', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
+            out['metrics']    = m
+            out['metrics_kv'] = call(:metrics_to_kv, m)
+          end
+          out
         end
       end,
-
       sample_output: lambda do
         { 'name' => 'projects/p/locations/us-central1/operations/123', 'done' => false,
           'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 8, 'correlation_id' => 'sample' } }
@@ -5108,8 +3946,71 @@ require 'securerandom'
         end
       end
       ordered_items.first(lo)
-    end
+    end,
+    
+    metrics_base: lambda do |connection, action_name, started_at, ok, http_status, corr_id, extras = {}|
+      call(:ensure_project_id!, connection)
+      {
+        'namespace'     => (extras['namespace'] || nil),
+        'action'        => action_name.to_s,
+        'correlation_id'=> corr_id.to_s,
+        'project_id'    => connection['project_id'].to_s,
+        'location'      => (connection['location'] || '').to_s.downcase,
+        'ok'            => !!ok,
+        'http_status'   => http_status.to_i,
+        'duration_ms'   => ((Time.now - started_at) * 1000.0).to_i
+      }
+    end,
 
+    metrics_from_retrieve: lambda do |mapped_chunks, max_req|
+      arr = call(:safe_array, mapped_chunks)
+      scores = arr.map { |c| (c['score'] || 0.0).to_f }
+      {
+        'retrieved_contexts'     => arr.length,
+        'max_contexts_requested' => (max_req || nil),
+        'retrieval_top_score'    => (scores.max || nil),
+        'retrieval_avg_score'    => (scores.empty? ? nil : (scores.sum / scores.length.to_f))
+      }
+    end,
+
+    metrics_from_generation: lambda do |resp, temperature=nil|
+      usage = (resp || {})['usageMetadata'] || {}
+      {
+        'prompt_tokens' => usage['promptTokenCount'],
+        'output_tokens' => usage['candidatesTokenCount'],
+        'total_tokens'  => usage['totalTokenCount'],
+        'temperature'   => (temperature.nil? ? nil : call(:safe_float, temperature))
+      }
+    end,
+
+    metrics_from_embeddings: lambda do |embedding_resp, instances|
+      bill = (embedding_resp || {}).dig('metadata','billableCharacterCount').to_i
+      {
+        'emb_instances'      => call(:safe_array, instances).length,
+        'emb_billable_chars' => (bill > 0 ? bill : nil)
+      }
+    end,
+
+    metrics_from_import_lro: lambda do |lro_body|
+      {
+        'operation' => lro_body['name'],
+        'lro_done'  => (lro_body['done'] == true)
+      }
+    end,
+
+    metrics_to_kv: lambda do |h|
+      (h || {}).to_h.map { |k,v| { 'key' => k.to_s, 'value' => v } }
+    end,
+    metrics_effective_flags: lambda do |connection, input|
+      emit = if input.key?('emit_metrics')
+               call(:normalize_boolean, input['emit_metrics'])
+             else
+               call(:normalize_boolean, connection['emit_metrics_default'])
+             end
+      ns = (input['metrics_namespace'].presence ||
+            connection['metrics_namespace_default'].presence)
+      { 'emit' => emit, 'ns' => ns }
+    end,
   },
 
   # --------- TRIGGERS -----------------------------------------------------
