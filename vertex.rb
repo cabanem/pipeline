@@ -782,7 +782,7 @@ require 'securerandom'
     rag_retrieve_contexts: {
       title: 'RAG Serving: Retrieve contexts',
       subtitle: 'projects.locations:retrieveContexts (Vertex RAG Store)',
-      display_priority: 90,
+      display_priority: 89,
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
@@ -794,6 +794,7 @@ require 'securerandom'
           { name: 'question', optional: false },
           { name: 'restrict_to_file_ids', type: 'array', of: 'string', optional: true },
           { name: 'max_contexts', type: 'integer', optional: true, default: 20 },
+          { name: 'validate_only', label: 'Validate only (no call)', type: 'boolean', control_type: 'checkbox', optional: true },
           { name: 'emit_metrics', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
             hint: 'Attach a metrics object in the output for downstream persistence.' },
           { name: 'metrics_namespace', optional: true, hint: 'Optional tag for partitioning dashboards (e.g., "email_rag_prod").' },
@@ -828,6 +829,7 @@ require 'securerandom'
         # Build correlation ID, now (for traceability)
         t0 = Time.now
         corr = call(:build_correlation_id)
+        url = nil; req_body = nil
         begin
           # Validate project ID, regional location
           call(:ensure_project_id!, connection)
@@ -844,10 +846,19 @@ require 'securerandom'
           payload = call(:build_rag_retrieve_payload, input['question'], corpus, input['restrict_to_file_ids'])
           url  = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
 
+          # Validate-only preview (no network call)
+          if call(:normalize_boolean, input['validate_only'])
+            preview = call(:request_preview_pack, url, 'POST', call(:request_headers, corr), call(:json_compact, payload))
+            return { 'ok' => true }
+              .merge(preview)
+              .merge(call(:telemetry_envelope_ex, t0, corr, true, 200, 'DRY_RUN', { 'action' => 'rag_retrieve_contexts' }))
+          end
+
           # POST
+          req_body = call(:json_compact, payload)
           http  = call(:http_call!, 'POST', url)
                     .headers(call(:request_headers, corr))
-                    .payload(call(:json_compact, payload))
+                    .payload(req_body)
 
           # Handle result
           code  = call(:telemetry_success_code, http)
@@ -856,6 +867,7 @@ require 'securerandom'
 
           maxn  = call(:clamp_int, (input['max_contexts'] || 20), 1, 200)
           mapped = call(:map_context_chunks, raw, maxn)
+          if mapped.empty?
 
           # Build output
           base_out = {
@@ -910,7 +922,7 @@ require 'securerandom'
     rag_answer: {
       title: 'RAG Serving: Retrieve + answer (one-shot)',
       subtitle: 'Retrieve contexts from a corpus and generate a cited answer',
-      display_priority: 90,
+      display_priority: 89,
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
@@ -3281,9 +3293,10 @@ require 'securerandom'
       ids     = call(:sanitize_drive_ids, restrict_ids, allow_empty: true, label: 'restrict_to_file_ids')
       rag_res['ragFileIds'] = ids if ids.present?
       {
-        'query'          => { 'text'          => question.to_s },
-        # NOTE: union member is supplied at top-level (not wrapped in "dataSource")
-        'vertexRagStore' => { 'ragResources'  => [rag_res] }
+        'query'      => { 'text' => question.to_s },
+        'dataSource' => {
+          'vertexRagStore' => { 'ragResources' => [rag_res] }
+        }
       }
     end,
     map_context_chunks: lambda do |raw_contexts, maxn = 20|
