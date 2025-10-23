@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 require 'json'
+require 'time'
 
 {
   title: 'Discovery→OpenAPI Converter',
@@ -24,22 +25,21 @@ require 'json'
       title: 'Convert Discovery → OpenAPI',
       subtitle: 'Generate OpenAPI 3.x spec from a Google Discovery doc',
       help: 'Provide either a raw Discovery JSON or a URL to the discovery document.',
-
       input_fields: lambda do
         [
-          { name: 'discovery_doc_json', label: 'Discovery document (JSON)', control_type: 'text-area', optional: true,
+          { name: 'discovery_doc_json',       label: 'Discovery document (JSON)', control_type: 'text-area',  optional: true,
             hint: 'Paste the raw Google Discovery document JSON here.' },
-          { name: 'discovery_doc_url',  label: 'Discovery document URL',    control_type: 'text', optional: true,
+          { name: 'discovery_doc_url',        label: 'Discovery document URL',    control_type: 'text',       optional: true,
             hint: 'Example: https://www.googleapis.com/discovery/v1/apis/gmail/v1/rest' },
-          { name: 'openapi_version',    label: 'OpenAPI version', optional: false, control_type: 'select',
+          { name: 'openapi_version',          label: 'OpenAPI version',           control_type: 'select',     optional: false,
             pick_list: 'openapi_versions', default: '3.0.3' },
 
-          { name: 'override_title',     label: 'Override spec title', optional: true },
-          { name: 'override_version',   label: 'Override spec version', optional: true },
-          { name: 'server_url',         label: 'Override server URL', optional: true,
+          { name: 'override_title',           label: 'Override spec title',                                   optional: true },
+          { name: 'override_version',         label: 'Override spec version',                                 optional: true },
+          { name: 'server_url',               label: 'Override server URL',                                   optional: true,
             hint: 'If provided, this replaces the derived rootUrl+servicePath.' },
-          { name: 'include_internal_schemas', label: 'Include all schemas (even if unused)',
-            type: 'boolean', control_type: 'checkbox', optional: true, default: false }
+          { name: 'include_internal_schemas', label: 'Include all schemas',       control_type: 'checkbox',   optional: true,
+            type: 'boolean', default: false }
         ]
       end,
       output_fields: lambda do |_object_definitions|
@@ -77,10 +77,7 @@ require 'json'
           elsif input['discovery_doc_json'].present?
             JSON.parse(input['discovery_doc_json'])
           elsif input['discovery_doc_url'].present?
-            # Terminate the Workato HTTP builder with a response formatter.
-            # Returns a parsed Ruby Hash when the server sends JSON.
-            doc = get(input['discovery_doc_url']).response_format_json
-            doc
+            get(input['discovery_doc_url'])
           else
             error('You must provide discovery_doc_json or discovery_doc_url.')
           end
@@ -89,7 +86,7 @@ require 'json'
         openapi_version = (input['openapi_version'].presence || '3.0.3')
         title           = input['override_title'].presence  || doc['title'] || doc['name'] || 'API'
         api_version     = input['override_version'].presence || doc['version'] || 'v1'
-        root_url        = (input['server_url'].presence || _call(:derive_server_url, doc))
+        root_url        = (input['server_url'].presence || call(:derive_server_url, doc))
 
         spec = {
           'openapi' => openapi_version.start_with?('3.') ? openapi_version : '3.0.3',
@@ -107,19 +104,19 @@ require 'json'
         }
 
         # ---- Security (OAuth2 scopes → securitySchemes)
-        _call(:inject_security_schemes!, spec, doc)
+        call(:inject_security_schemes!, spec, doc)
 
         # ---- Schemas (Discovery → components.schemas)
-        _call(:inject_schemas!, spec, doc, include_all: !!input['include_internal_schemas'])
+        call(:inject_schemas!, spec, doc, include_all: !!input['include_internal_schemas'])
 
         # ---- Paths (resources + top-level methods)
-        _call(:inject_paths!, spec, doc)
+        call(:inject_paths!, spec, doc)
 
         # Cleanup
-        spec = _call(:deep_compact, spec)
+        spec = call(:deep_compact, spec)
 
         # Validate
-        validation = _call(:validate_openapi!, spec, openapi_version)
+        validation = call(:validate_openapi!, spec, openapi_version)
 
         {
           started_at: t0.iso8601,
@@ -212,7 +209,7 @@ require 'json'
             error('Provide openapi_json or openapi_obj.')
           end
 
-        validation = _call(:validate_openapi!, spec, (input['expect_version'].presence || '3.'))
+        validation = call(:validate_openapi!, spec, (input['expect_version'].presence || '3.'))
         {
           openapi_version: spec['openapi'],
           title: spec.dig('info', 'title'),
@@ -276,14 +273,14 @@ require 'json'
             else
               nil
             end
-      _call(:normalize_url_like, raw)
+      call(:normalize_url_like, raw)
     end,
 
     inject_security_schemes!: lambda do |spec, doc|
       auth = doc.dig('auth', 'oauth2')
       return unless auth
 
-      scopes = (auth.dig('scopes') || auth.dig('scopes', 'scopes') || {}) # discovery variants exist
+      scopes = auth['scopes']
       scopes = scopes.is_a?(Hash) ? scopes : {}
 
       flows = {
@@ -307,7 +304,7 @@ require 'json'
       # Google Discovery schemas resemble JSON Schema draft 03/04; we keep it simple.
       components = {}
       schemas.each do |name, schema|
-        components[name] = _call(:translate_schema, schema)
+        components[name] = call(:translate_schema, schema)
       end
 
       spec['components']['schemas'] = components
@@ -332,13 +329,13 @@ require 'json'
         t['type'] = 'object' unless t['type']
         t['properties'] = {}
         schema['properties'].each do |pname, pschema|
-          t['properties'][pname] = _call(:translate_schema, pschema)
+          t['properties'][pname] = call(:translate_schema, pschema)
         end
       end
 
       if schema['items']
         t['type'] = 'array'
-        t['items'] = _call(:translate_schema, schema['items'])
+        t['items'] = call(:translate_schema, schema['items'])
       end
 
       if schema['required'].is_a?(Array)
@@ -355,9 +352,9 @@ require 'json'
 
     inject_paths!: lambda do |spec, doc|
       paths = spec['paths']
-      meths = _call(:collect_methods, doc) +
-              _call(:collect_resource_methods, (doc['resources'] || {}))
-      meths.each { |m| _call(:add_method_to_paths!, paths, m, doc) }
+      meths = call(:collect_methods, doc) +
+              call(:collect_resource_methods, (doc['resources'] || {}))
+      meths.each { |m| call(:add_method_to_paths!, paths, m, doc) }
     end,
 
     collect_methods: lambda do |doc|
@@ -373,7 +370,7 @@ require 'json'
         (robj['methods'] || {}).each do |mid, mobj|
           out << ({ 'methodId' => mid }.merge(mobj || {}))
         end
-        out.concat(_call(:collect_resource_methods, robj['resources'])) if robj['resources'].is_a?(Hash)
+        out.concat(call(:collect_resource_methods, robj['resources'])) if robj['resources'].is_a?(Hash)
       end
       out
     end,
@@ -381,7 +378,7 @@ require 'json'
     add_method_to_paths!: lambda do |paths, m, doc|
       http_method = (m['httpMethod'] || 'GET').downcase
       raw_path    = m['path'] || m['id'] || ''
-      path        = _call(:normalize_path, raw_path)
+      path        = call(:normalize_path, raw_path)
       path        = "/#{path}" unless path.start_with?('/')
 
       paths[path] ||= {}
@@ -393,7 +390,7 @@ require 'json'
               end
 
       # Parameters
-      params = _call(:translate_parameters, m['parameters'])
+      params = call(:translate_parameters, m['parameters'])
 
       # Ensure all templated {vars} in path are present as path params (required)
       template_vars = path.scan(/\{([^}]+)\}/).flatten
@@ -404,15 +401,15 @@ require 'json'
       end
 
       # Request body
-      request_body = _call(:translate_request_body, m['request'])
+      request_body = call(:translate_request_body, m['request'])
 
       # Responses (basic 200 mapping)
-      responses = _call(:translate_responses, m['response'])
+      responses = call(:translate_responses, m['response'])
 
-      operation = _call(:hcompact, {
+      operation = call(:hcompact, {
         'operationId' => op_id,
         'description' => m['description'],
-        'parameters'  => params.empty? ? nil : _call(:dedupe_parameters, params),
+        'parameters'  => params.empty? ? nil : call(:dedupe_parameters, params),
         'requestBody' => request_body,
         'responses'   => responses
       })
@@ -430,12 +427,12 @@ require 'json'
         location = p['location'].to_s
         location = 'query' unless %w[path query header].include?(location) # default to query
 
-        out << _call(:hcompact, {
+        out << call(:hcompact, {
           'name'        => name,
           'in'          => location,
           'required'    => !!p['required'],
           'description' => p['description'],
-          'schema'      => _call(:param_schema_from_discovery, p)
+          'schema'      => call(:param_schema_from_discovery, p)
         })
       end
       out
@@ -455,7 +452,7 @@ require 'json'
 
     translate_request_body: lambda do |req|
       return nil unless req.is_a?(Hash)
-      schema = _call(:schema_ref_or_inline, req)
+      schema = call(:schema_ref_or_inline, req)
       return nil unless schema
 
       {
@@ -470,10 +467,10 @@ require 'json'
 
     translate_responses: lambda do |resp|
       # Simple 200 response with schema if present
-      schema = _call(:schema_ref_or_inline, resp)
+      schema = call(:schema_ref_or_inline, resp)
       content = schema ? { 'application/json' => { 'schema' => schema } } : nil
-      _call(:hcompact, {
-        '200' => _call(:hcompact, {
+      call(:hcompact, {
+        '200' => call(:hcompact, {
           'description' => 'OK',
           'content'     => content
         })
@@ -485,7 +482,7 @@ require 'json'
       if obj['$ref']
         { '$ref' => "#/components/schemas/#{obj['$ref']}" }
       elsif obj['schema'].is_a?(Hash)
-        _call(:translate_schema, obj['schema'])
+        call(:translate_schema, obj['schema'])
       else
         nil
       end
@@ -505,11 +502,11 @@ require 'json'
       case obj
       when Hash
         obj.each_with_object({}) do |(k, v), h|
-          nv = _call(:deep_compact, v)
+          nv = call(:deep_compact, v)
           h[k] = nv unless nv.nil? || (nv.respond_to?(:empty?) && nv.empty?)
         end
       when Array
-        obj.map { |v| _call(:deep_compact, v) }.reject { |v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
+        obj.map { |v| call(:deep_compact, v) }.reject { |v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
       else
         obj
       end
@@ -517,7 +514,7 @@ require 'json'
 
     validate_openapi!: lambda do |spec, expect_version=nil|
       ev = expect_version || '3.'
-      errors, warnings = _call(:collect_validation_errors, spec, ev)
+      errors, warnings = call(:collect_validation_errors, spec, ev)
       {
         'passed' => errors.empty?,
         'error_count' => errors.size,
