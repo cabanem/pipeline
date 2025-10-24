@@ -1388,7 +1388,7 @@ require 'securerandom'
 
     # 4) RAG store engine (Vertex AI)
     # ---- Serving (80)
-    rag_retrieve_contexts: {
+    rag_retrieve_contexts_8: {
       title: 'RAG Serving: Retrieve contexts',
       subtitle: 'projects.locations:retrieveContexts (Vertex RAG Store)',
       help: lambda do |input, picklist_label|
@@ -1562,6 +1562,154 @@ require 'securerandom'
               'metadata_kv' => [ { 'key' => 'page', 'value' => 7 } ],
               'metadata_json' => '{"page":7}' 
             }],
+          'ok' => true,
+          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 22, 'correlation_id' => 'sample' }
+        }
+      end
+    },
+    rag_retrieve_contexts: {
+      title: 'RAG Serving: Retrieve contexts',
+      subtitle: 'projects.locations:retrieveContexts (Vertex RAG Store)',
+      help: lambda do |input, picklist_label|
+        {
+          learn_more_url: 'https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/rag-api-v1#retrieval-and-prediction-params-api',
+          learn_more_text: 'Retrieval and predication params'
+        }
+      end,
+      display_priority: 80,
+      retry_on_request: ['GET','HEAD'],
+      retry_on_response: [408,429,500,502,503,504],
+      max_retries: 3,
+
+      input_fields: lambda do |object_definitions, connection, config_fields|
+        [
+          { name: 'rag_corpus', optional: false,
+            hint: 'Accepts either full resource name (e.g., "projects/{project}/locations/{region}/ragCorpora/{corpus}") or the "corpus"' },
+          { name: 'question', optional: false },
+          { name: 'restrict_to_file_ids', type: 'array', of: 'string', optional: true },
+          { name: 'max_contexts', type: 'integer', optional: true, default: 20 },
+          { name: 'validate_only', label: 'Validate only (no call)', type: 'boolean', control_type: 'checkbox', optional: true },
+          { name: 'emit_metrics', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+            hint: 'Attach a metrics object in the output for downstream persistence.' },
+          { name: 'metrics_namespace', optional: true, hint: 'Optional tag for partitioning dashboards (e.g., "email_rag_prod").' }
+        ]
+      end,
+
+      output_fields: lambda do |object_definitions, connection|
+        [
+          { name: 'question' },
+          { name: 'contexts', type: 'array', of: 'object', properties: [
+              { name: 'id' },
+              { name: 'text' },
+              { name: 'score', type: 'number' },
+              { name: 'source' },
+              { name: 'uri' },
+              { name: 'metadata', type: 'object' },
+              { name: 'metadata_kv', label: 'metadata (KV)', type: 'array', of: 'object', properties: object_definitions['kv_pair'] },
+              { name: 'metadata_json', label: 'metadata (JSON)', type: 'string' }
+            ]
+          }
+        ] + [
+          { name: 'ok', type: 'boolean' },
+          { name: 'telemetry', type: 'object', properties: [
+            { name: 'http_status', type: 'integer' },
+            { name: 'message' }, { name: 'duration_ms', type: 'integer' },
+            { name: 'correlation_id' }
+          ]}
+        ] + [
+          { name: 'metrics', type: 'object', properties: object_definitions['metrics_fields'] },
+          { name: 'metrics_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] } ]
+      end,
+
+      execute: lambda do |connection, input|
+        # Correlation + monotonic time for deterministic duration
+        t0   = call(:telemetry_t0)
+        corr = call(:build_correlation_id)
+        url  = nil; req_body = nil
+
+        begin
+          # Resolve parent & corpus without enforcing connection.location when corpus is fully‑qualified
+          proj, loc, corpus = call(:resolve_rag_parent_and_corpus!, connection, input['rag_corpus'])
+          parent = "projects/#{proj}/locations/#{loc}"
+
+          # Build simple retrieve payload (no ranking)
+          ids = call(:sanitize_rag_file_ids, input['restrict_to_file_ids'], allow_empty: true, label: 'restrict_to_file_ids')
+          payload = {
+            'query' => { 'text' => input['question'].to_s },
+            'dataSource' => {
+              'vertexRagStore' => {
+                'ragResources' => [
+                  ({ 'ragCorpus' => corpus }.tap { |h| h['ragFileIds'] = ids if ids.present? })
+                ]
+              }
+            }
+          }
+
+          url = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
+
+          # Dry‑run preview
+          if call(:normalize_boolean, input['validate_only'])
+            return { 'ok' => true }
+              .merge(call(:request_preview_pack, url, 'POST', call(:request_headers, corr), call(:json_compact, payload)))
+              .merge(call(:telemetry_envelope_ex, t0, corr, true, 200, 'DRY_RUN', { 'action' => 'rag_retrieve_contexts' }))
+          end
+
+          # POST
+          req_body = call(:json_compact, payload)
+          http  = post(url).headers(call(:request_headers, corr)).payload(req_body)
+          code  = call(:telemetry_success_code, http)
+          body  = call(:http_body_json, http)
+          raw   = call(:normalize_retrieve_contexts!, body)
+
+          maxn   = call(:clamp_int, (input['max_contexts'] || 20), 1, 200)
+          mapped = call(:map_context_chunks, raw, maxn)
+          error('No contexts retrieved; check corpus, region, permissions, or the query text.') if mapped.empty?
+
+          out = { 'question' => input['question'], 'contexts' => mapped }
+                  .merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+
+          # Metrics (no re‑ranking fields)
+          flags = call(:metrics_effective_flags, connection, input)
+          if flags['emit']
+            m = call(:metrics_base, connection, 'rag_retrieve_contexts', t0, true, code, corr, { 'namespace' => flags['ns'] })
+                  .merge('rag_corpus' => corpus)
+                  .merge(call(:metrics_from_retrieve, mapped, input['max_contexts']))
+            out['metrics']    = m
+            out['metrics_kv'] = call(:metrics_to_kv, m)
+          end
+          out
+
+        rescue => e
+          g           = call(:extract_google_error, e)
+          msg         = [e.to_s, (g['message'] || nil)].compact.join(' | ')
+          http_status = call(:telemetry_parse_error_code, e)
+
+          dbg = call(:debug_pack, !(call(:normalize_boolean, connection['prod_mode'])), url, req_body, g)
+
+          out = {}.merge(call(:telemetry_envelope, t0, corr, false, http_status, msg))
+          out.merge!(dbg) if dbg
+
+          flags = call(:metrics_effective_flags, connection, input)
+          if flags['emit']
+            m = call(:metrics_base, connection, 'rag_retrieve_contexts', t0, false, http_status, corr, { 'namespace' => flags['ns'] })
+            out['metrics']    = m
+            out['metrics_kv'] = call(:metrics_to_kv, m)
+          end
+          out
+        end
+      end,
+
+      sample_output: lambda do
+        {
+          'question' => 'What is the PTO carryover policy?',
+          'contexts' => [
+            {
+              'id' => 'doc-42#c3', 'text' => 'Employees may carry over up to 40 hours...', 'score' => 0.91,
+              'source' => 'handbook', 'uri' => 'https://drive.google.com/file/d/abc...', 'metadata' => { 'page' => 7 },
+              'metadata_kv' => [ { 'key' => 'page', 'value' => 7 } ],
+              'metadata_json' => '{"page":7}'
+            }
+          ],
           'ok' => true,
           'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 22, 'correlation_id' => 'sample' }
         }
@@ -2998,12 +3146,10 @@ require 'securerandom'
 
   # --------- METHODS ------------------------------------------------------
   methods: {
-    # Resolve effective {project, location, corpus_full_path} for RAG calls.
-    # - If rag_corpus is fully-qualified, we trust its project/location and DO NOT enforce connection.location.
-    # - If rag_corpus is a short id, we require connection.location to be regional.
     resolve_rag_parent_and_corpus!: lambda do |connection, raw_corpus|
       v = raw_corpus.to_s.strip
       error('rag_corpus is required') if v.empty?
+
       if v.start_with?('projects/')
         s = v.sub(%r{^/v1/}, '')
         m = s.match(%r{\Aprojects/([^/]+)/locations/([^/]+)/ragCorpora/[^/]+})
