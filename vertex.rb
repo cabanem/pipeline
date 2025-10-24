@@ -3079,7 +3079,7 @@ require 'securerandom'
       else
         {}
       end
-    end,a
+    end,
     request_preview_pack: lambda do |url, verb, headers, payload|
       {
         'request_preview' => {
@@ -3527,7 +3527,7 @@ require 'securerandom'
         {
           'id'       => (c['chunkId'] || "ctx-#{i+1}"),
           'text'     => c['text'].to_s,
-          'score'    => (c['score'] || c['relevanceScore'] || 0.0).to_f,
+          'score'    => call(:safe_float, (c['score'] || c['relevanceScore'] || 0.0)),
           'source'   => (c['sourceDisplayName'] || c.dig('metadata','source')),
           'uri'      => (c['sourceUri']        || c.dig('metadata','uri')),
           'metadata' => md,
@@ -3643,14 +3643,14 @@ require 'securerandom'
     apply_ranking_order: lambda do |chunks, ranking_resp|
       order = {}
       call(:safe_array, ranking_resp['records']).each_with_index do |rec, idx|
-        order[rec['id']] = { 'score' => rec['score'].to_f, 'rank' => idx + 1 }
+        order[rec['id'].to_s] = { 'score' => call(:safe_float, rec['score']), 'rank' => idx + 1 }
       end
       out = call(:safe_array, chunks).map do |c|
         id = (c['id'] || c[:id]).to_s
         meta = order[id] || {}
-        c.merge('score' => (meta['score'] || c['score']), '_rerank' => meta)
+        c.merge('score' => (meta['score'].nil? ? (call(:safe_float, c['score']) || 0.0) : meta['score']), '_rerank' => meta)
       end
-      out.sort_by { |h| [-(h.dig('_rerank','score') || -1.0), h['id'].to_s] }
+      out.sort_by { |h| [-(call(:safe_float, h.dig('_rerank','score')) || -1.0), h['id'].to_s] }
     end,
 
     # --- Sanitizers and conversion ----------------------------------------
@@ -4247,36 +4247,42 @@ require 'securerandom'
     end,
     
     metrics_base: lambda do |connection, action_name, started_at, ok, http_status, corr_id, extras = {}|
+      # Use the same monotonic clock used across telemetry to avoid Time/Float arithmetic traps.
       call(:ensure_project_id!, connection)
+      now_f  = call(:telemetry_now_f)
+      base_f = (started_at.respond_to?(:to_f) ? started_at.to_f : 0.0)
+      dur_ms = ((now_f - base_f) * 1000.0).to_i
       {
-        'namespace'     => (extras['namespace'] || nil),
-        'action'        => action_name.to_s,
-        'correlation_id'=> corr_id.to_s,
-        'project_id'    => connection['project_id'].to_s,
-        'location'      => (connection['location'] || '').to_s.downcase,
-        'ok'            => !!ok,
-        'http_status'   => http_status.to_i,
-        'duration_ms'   => ((Time.now - started_at) * 1000.0).to_i
+        'namespace'      => (extras['namespace'] || nil),
+        'action'         => action_name.to_s,
+        'correlation_id' => corr_id.to_s,
+        'project_id'     => connection['project_id'].to_s,
+        'location'       => (connection['location'] || '').to_s.downcase,
+        'ok'             => !!ok,
+        'http_status'    => http_status.to_i,
+        'duration_ms'    => dur_ms
       }
     end,
 
     metrics_from_retrieve: lambda do |mapped_chunks, max_req|
-      arr = call(:safe_array, mapped_chunks)
-      scores = arr.map { |c| (c['score'] || 0.0).to_f }
+      arr    = call(:safe_array, mapped_chunks)
+      scores = arr.map { |c| call(:safe_float, (c['score'] || c['relevanceScore'] || 0.0)) }
+      top    = scores.max
+      avg    = scores.empty? ? nil : (scores.inject(0.0) { |s, x| s + x.to_f } / scores.length.to_f)
       {
         'retrieved_contexts'     => arr.length,
         'max_contexts_requested' => (max_req || nil),
-        'retrieval_top_score'    => (scores.max || nil),
-        'retrieval_avg_score'    => (scores.empty? ? nil : (scores.sum / scores.length.to_f))
+        'retrieval_top_score'    => (top.nil? ? nil : top.to_f),
+        'retrieval_avg_score'    => (avg.nil? ? nil : avg.to_f)
       }
     end,
 
     metrics_from_generation: lambda do |resp, temperature=nil|
       usage = (resp || {})['usageMetadata'] || {}
       {
-        'prompt_tokens' => usage['promptTokenCount'],
-        'output_tokens' => usage['candidatesTokenCount'],
-        'total_tokens'  => usage['totalTokenCount'],
+        'prompt_tokens' => call(:safe_integer, usage['promptTokenCount']),
+        'output_tokens' => call(:safe_integer, usage['candidatesTokenCount']),
+        'total_tokens'  => call(:safe_integer, usage['totalTokenCount']),
         'temperature'   => (temperature.nil? ? nil : call(:safe_float, temperature))
       }
     end,
@@ -4331,7 +4337,7 @@ require 'securerandom'
             { name: 'outcome' }, { name: 'stdout' }, { name: 'stderr' }
         ]}
       ]
-    end,
+    end
 
   },
 
