@@ -1455,16 +1455,10 @@ require 'securerandom'
         corr = call(:build_correlation_id)
         url  = nil; req_body = nil
         begin
-          # Validate project ID, regional location
-          call(:ensure_project_id!, connection)
-          call(:ensure_regional_location!, connection)
-
-          # Validate and normalize corpus, location
-          corpus = call(:normalize_rag_corpus, connection, input['rag_corpus'])
-          error('rag_corpus is required') if corpus.blank?
-
-          loc    = (connection['location'] || '').downcase
-          parent = "projects/#{connection['project_id']}/locations/#{loc}"
+          # Resolve effective parent (project/location) from the rag_corpus if fully-qualified,
+          # otherwise fall back to connection.project/location (and enforce regional).
+          proj, loc, corpus = call(:resolve_rag_parent_and_corpus!, connection, input['rag_corpus'])
+          parent = "projects/#{proj}/locations/#{loc}"
 
           # Assemble ranking inputs (supported by build_rag_retrieve_payload)
           ranking_opts = {
@@ -1632,16 +1626,9 @@ require 'securerandom'
         t0   = call(:telemetry_t0)
         corr = call(:build_correlation_id)
         begin
-          # Validate inputs
-          call(:ensure_project_id!, connection)
-          call(:ensure_regional_location!, connection)
-
-          # 1) Retrieve contexts (inline call to same API used by rag_retrieve_contexts)
-          corpus = call(:normalize_rag_corpus, connection, input['rag_corpus'])
-          error('rag_corpus is required') if corpus.blank?
-
-          loc    = (connection['location'] || '').downcase
-          parent = "projects/#{connection['project_id']}/locations/#{loc}"
+          # 1) Resolve parent & corpus
+          proj, loc, corpus = call(:resolve_rag_parent_and_corpus!, connection, input['rag_corpus'])
+          parent = "projects/#{proj}/locations/#{loc}"
 
           retrieve_payload = call(:build_rag_retrieve_payload, input['question'], corpus, input['restrict_to_file_ids'])
 
@@ -1736,7 +1723,7 @@ require 'securerandom'
           flags = call(:metrics_effective_flags, connection, input)
           if flags['emit']
             m = call(:metrics_base, connection, 'rag_answer', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
-              .merge('rag_corpus' => call(:normalize_rag_corpus, connection, input['rag_corpus']))
+              .merge('rag_corpus' => corpus)
               .merge(call(:metrics_from_retrieve, chunks, input['max_contexts']))
               .merge(call(:metrics_from_generation, gen_body, input['temperature']))
               .merge('model' => input['model'])
@@ -2560,10 +2547,13 @@ require 'securerandom'
           'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 8, 'correlation_id' => 'sample' } }
       end
     },
+
+    # Deprecated (testing and configuration required 10/24/25)
     permission_probe: {
       title: 'Admin: Permission probe',
       subtitle: 'Quick IAM/billing/region checks for Vertex, RAG Store & Discovery Engine',
-      display_priority: 1,
+      display_priority: 1,# 1 = lowest display priority
+      deprecated: true, # maintenance and testing needed before release
       help: lambda do |_|
         { body: 'Runs lightweight calls (locations.list, models.countTokens, indexes.list, ragCorpora.list, optional Discovery Engine engines.list & search) to validate auth, billing, and region. Returns per-check status and suggestions.' }
       end,
@@ -2884,7 +2874,8 @@ require 'securerandom'
     },
     test_iam_permissions: {
       title: 'Admin: Test IAM permissions',
-      display_priority: 1,
+      display_priority: 1, # 1 = lowest display priority
+      deprecated: true, # maintenance and testing needed before release
       input_fields: lambda do |object_definitions, connection, config_fields|
         [
           { name: 'service', control_type: 'select', pick_list: 'iam_services', optional: false,
@@ -3007,6 +2998,27 @@ require 'securerandom'
 
   # --------- METHODS ------------------------------------------------------
   methods: {
+    # Resolve effective {project, location, corpus_full_path} for RAG calls.
+    # - If rag_corpus is fully-qualified, we trust its project/location and DO NOT enforce connection.location.
+    # - If rag_corpus is a short id, we require connection.location to be regional.
+    resolve_rag_parent_and_corpus!: lambda do |connection, raw_corpus|
+      v = raw_corpus.to_s.strip
+      error('rag_corpus is required') if v.empty?
+      if v.start_with?('projects/')
+        s = v.sub(%r{^/v1/}, '')
+        m = s.match(%r{\Aprojects/([^/]+)/locations/([^/]+)/ragCorpora/[^/]+})
+        error('rag_corpus must be projects/{project}/locations/{location}/ragCorpora/{id}') unless m
+        proj = m[1].to_s
+        loc  = m[2].to_s.downcase
+        [proj, loc, s]
+      else
+        call(:ensure_project_id!, connection)
+        loc = (connection['location'] || '').to_s.downcase
+        error("RAG corpus requires regional location; got '#{loc}'") if loc.blank? || loc == 'global'
+        corpus_full = "projects/#{connection['project_id']}/locations/#{loc}/ragCorpora/#{v}"
+        [connection['project_id'].to_s, loc, corpus_full]
+      end
+    end,
     telemetry_t0: lambda do
       # Monotonic start time as Float seconds
       (Process.clock_gettime(Process::CLOCK_MONOTONIC) rescue Time.now.to_f)
