@@ -234,7 +234,7 @@ require 'securerandom'
                   { name: 'values', type: 'array', of: 'number' },
                   { name: 'statistics', type: 'object', properties: [
                       { name: 'truncated',   type: 'boolean' },
-                      { name: 'token_count', type: 'number' } # sometimes returned as decimal place, e.g., 7.0
+                      { name: 'token_count', type: 'integer' } # sometimes returned as decimal place, cast to int
                     ]
                   }
                 ]
@@ -808,51 +808,56 @@ require 'securerandom'
           { name: 'metrics', type: 'object', properties: object_definitions['metrics_fields'] },
           { name: 'metrics_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] } ]
       end,
-      execute: lambda do |connection, input|
+      execute: lambda do |connection, raw_input|
+        input = call(:normalize_input_keys, raw_input)
         t0   = Time.now
         corr = call(:build_correlation_id)
 
         begin
-          # Model path and region must agree
-          model_path = call(:build_model_path_with_global_preview, connection, input['model'])
-          loc_from_model = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
-
-          # Build payload (hardened)
+          # 1) Build payload
           contents = call(:sanitize_contents!, input['contents'])
           error('At least one non-system message with non-empty parts is required in contents') if contents.blank?
 
-          sys_inst = call(:system_instruction_from_text, input['system_preamble'])
+          req = call(:build_generate_content_request,
+                     connection,
+                     input['model'],
+                     contents:          contents,
+                     system_text:       input['system_preamble'],
+                     generation_config: call(:sanitize_generation_config, input['generation_config']),
+                     tools:             call(:sanitize_tools!, input['tools']),
+                     tool_config:       call(:safe_obj, input['toolConfig']),
+                     safety:            call(:sanitize_safety!, input['safetySettings']))
 
-          gen_cfg  = call(:sanitize_generation_config, input['generation_config'])
+          url      = req['url']
+          req_body = call(:json_compact, req['body'])
 
-          tools    = call(:sanitize_tools!, input['tools'])
-          tool_cfg = call(:safe_obj, input['toolConfig'])
-          safety   = call(:sanitize_safety!, input['safetySettings'])
+          # 2) HTTP with standard telemetry path
+          raw   = call(:http_call!, 'POST', url)
+                    .headers(call(:request_headers, corr))
+                    .payload(req_body)
+          code  = call(:telemetry_success_code, raw)
+          resp  = call(:http_body_json, raw)
 
-          payload = {
-            'contents'          => contents,
-            'systemInstruction' => sys_inst,
-            'tools'             => tools,
-            'toolConfig'        => tool_cfg,
-            'safetySettings'    => safety,
-            'generationConfig'  => gen_cfg
-          }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
-
-          url  = call(:aipl_v1_url, connection, loc_from_model, "#{model_path}:generateContent")
-          resp = post(url)
-                  .headers(call(:request_headers, corr))
-                  .payload(call(:json_compact, payload))
-
-          # Guard: empty candidates (safety block or other)
-          cands = call(:safe_array, resp['candidates'])
-          if cands.empty?
-            # Surface a friendlier error but keep telemetry envelope
+          # 3) Guard: empty candidates (blocked or filtered)
+          if call(:safe_array, resp['candidates']).empty?
             err_msg = (resp.dig('promptFeedback','blockReason') || 'No candidates returned').to_s
-            return {}.merge(call(:telemetry_envelope, t0, corr, false, 200, err_msg))
+            return({}.merge(call(:telemetry_envelope, t0, corr, false, code, err_msg)))
           end
 
-          code = call(:telemetry_success_code, resp)
-          out  = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          # 4) Normalize candidate text/meta
+          text, meta = call(:extract_candidate_text, resp)
+          out = {
+            'responseId'    => resp['responseId'],
+            'modelVersion'  => resp['modelVersion'],
+            'usageMetadata' => resp['usageMetadata'],
+            'candidates'    => resp['candidates'],
+            'raw'           => resp,
+            'text'          => text,
+            'meta'          => meta
+          }
+          out.merge!(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+
+          # 5) Metrics
           ok = true
           http_status = code
           flags = call(:metrics_effective_flags, connection, input)
@@ -928,66 +933,71 @@ require 'securerandom'
           { name: 'metrics', type: 'object', properties: object_definitions['metrics_fields'] },
           { name: 'metrics_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] } ]
       end,
-      execute: lambda do |connection, input|
-        # Correlation id and duration for logs / analytics
-        t0 = Time.now
-        corr = call(:build_correlation_id)
-
-        # Compute model path
-        model_path = call(:build_model_path_with_global_preview, connection, input['model'])
-
-        # Build payload
-        contents   = call(:sanitize_contents_roles, input['contents'])
-        error('At least one non-system message is required in contents') if contents.blank?
-        sys_inst   = call(:system_instruction_from_text, input['system_preamble'])
-
-        tools =
-          if input['grounding'] == 'google_search'
-            [ { 'googleSearch' => {} } ]
-          else
-            ds   = input['vertex_ai_search_datastore'].to_s
-            scfg = input['vertex_ai_search_serving_config'].to_s
-            # Back-compat: allow legacy 'engine' by mapping -> servingConfig
-            legacy_engine = input['vertex_ai_search_engine'].to_s
-            scfg = legacy_engine if scfg.blank? && legacy_engine.present?
-
-            # Enforce XOR
-            error('Provide exactly one of vertex_ai_search_datastore OR vertex_ai_search_serving_config') \
-              if (ds.blank? && scfg.blank?) || (ds.present? && scfg.present?)
-
-            vas = {}
-            vas['datastore']     = ds unless ds.blank?
-            vas['servingConfig'] = scfg unless scfg.blank?
-            [ { 'retrieval' => { 'vertexAiSearch' => vas } } ]
-          end
-
-        gen_cfg = call(:sanitize_generation_config, input['generation_config'])
-
-        payload = {
-          'contents'          => contents,
-          'systemInstruction' => sys_inst,
-          'tools'             => tools,
-          'toolConfig'        => input['toolConfig'],
-          'safetySettings'    => input['safetySettings'],
-          'generationConfig'  => gen_cfg
-        }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
-
-        # Call endpoint
-        loc_from_model = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
-        url = call(:aipl_v1_url, connection, loc_from_model, "#{model_path}:generateContent")
+      execute: lambda do |connection, raw_input|
+        input = call(:normalize_input_keys, raw_input)
+        t0    = Time.now
+        corr  = call(:build_correlation_id)
         begin
-          resp = post(url)
-                  .headers(call(:request_headers, corr))
-                  .payload(call(:json_compact, payload))
-          code = call(:telemetry_success_code, resp)
-          out  = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-          ok = true
-          http_status = code
+          # 1) Contents & grounding tools
+          contents = call(:sanitize_contents_roles, input['contents'])
+          error('At least one non-system message is required in contents') if contents.blank?
+
+          tools =
+            if input['grounding'] == 'google_search'
+              [ { 'googleSearch' => {} } ]
+            else
+              ds   = input['vertex_ai_search_datastore'].to_s
+              scfg = input['vertex_ai_search_serving_config'].to_s
+              legacy_engine = input['vertex_ai_search_engine'].to_s # back-compat
+              scfg = legacy_engine if scfg.blank? && legacy_engine.present?
+              error('Provide exactly one of vertex_ai_search_datastore OR vertex_ai_search_serving_config') \
+                if (ds.blank? && scfg.blank?) || (ds.present? && scfg.present?)
+              vas = {}
+              vas['datastore']     = ds unless ds.blank?
+              vas['servingConfig'] = scfg unless scfg.blank?
+              [ { 'retrieval' => { 'vertexAiSearch' => vas } } ]
+            end
+
+          # 2) Base request via helper
+          base_req = call(
+            :build_generate_content_request,
+            connection,
+            input['model'],
+            contents:          contents,
+            system_text:       input['system_preamble'],
+            generation_config: call(:sanitize_generation_config, input['generation_config']),
+            tools:             tools,
+            tool_config:       call(:safe_obj, input['toolConfig']),
+            safety:            call(:sanitize_safety!, input['safetySettings'])
+          )
+
+          # 3) Merge groundingConfig (citations / web grounding knobs)
+          body = base_req['body'].merge(
+            'groundingConfig' => call(:sanitize_grounding!, input)
+          ).delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
+
+          # 4) HTTP with standard telemetry
+          raw   = call(:http_call!, 'POST', base_req['url'])
+                    .headers(call(:request_headers, corr))
+                    .payload(call(:json_compact, body))
+          code  = call(:telemetry_success_code, raw)
+          resp  = call(:http_body_json, raw)
+
+          # 5) Normalize output (text + meta), plus telemetry
+          if call(:safe_array, resp['candidates']).empty?
+            err_msg = (resp.dig('promptFeedback','blockReason') || 'No candidates returned').to_s
+            return({}.merge(call(:telemetry_envelope, t0, corr, false, code, err_msg)))
+          end
+          text, meta = call(:extract_candidate_text, resp)
+          out = { 'raw' => resp, 'answer' => text, 'meta' => meta }
+          out.merge!(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+
+          # 6) Metrics
           flags = call(:metrics_effective_flags, connection, input)
           if flags['emit']
-            m = call(:metrics_base, connection, 'gen_generate_grounded', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
-              .merge(call(:metrics_from_generation, resp, (input['generation_config'] || {})['temperature']))
-              .merge('model' => input['model'])
+            m = call(:metrics_base, connection, 'gen_generate_grounded', t0, true, code, corr, { 'namespace' => flags['ns'] })
+                .merge(call(:metrics_from_generation, resp, (input['generation_config'] || {})['temperature']))
+                .merge('model' => input['model'])
             out['metrics']    = m
             out['metrics_kv'] = call(:metrics_to_kv, m)
           end
@@ -995,11 +1005,10 @@ require 'securerandom'
         rescue => e
           http_status = call(:telemetry_parse_error_code, e)
           out = {}.merge(call(:telemetry_envelope, t0, corr, false, http_status, e.to_s))
-          ok = false
           flags = call(:metrics_effective_flags, connection, input)
           if flags['emit']
-            m = call(:metrics_base, connection, 'gen_generate_grounded', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
-              .merge('model' => input['model'])
+            m = call(:metrics_base, connection, 'gen_generate_grounded', t0, false, http_status, corr, { 'namespace' => flags['ns'] })
+                .merge('model' => input['model'])
             out['metrics']    = m
             out['metrics_kv'] = call(:metrics_to_kv, m)
           end
@@ -1087,9 +1096,10 @@ require 'securerandom'
           { name: 'metrics', type: 'object', properties: object_definitions['metrics_fields'] },
           { name: 'metrics_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] } ]
       end,
-      execute: lambda do |connection, input|
+      execute: lambda do |connection, raw_input|
+        input = call(:normalize_input_keys, raw_input)
         # Correlation id and duration for logs/analytics
-        t0 = Time.now
+        t0   = Time.now
         corr = call(:build_correlation_id)
         url = nil; req_body = nil
 
@@ -1188,26 +1198,40 @@ require 'securerandom'
           contents = [
             { 'role' => 'user', 'parts' => [ { 'text' => "Question:\n#{input['question']}\n\nContext:\n#{ctx_blob}" } ] }
           ]
-          payload = { 'contents' => contents, 'systemInstruction' => sys_inst, 'generationConfig' => gen_cfg }
+          # Build via helper (single source of truth)
+          req = call(:build_generate_content_request,
+                     connection,
+                     input['model'],
+                     contents:          contents,
+                     system_text:       sys_text,
+                     generation_config: gen_cfg)
+          url      = req['url']
+          req_body = call(:json_compact, req['body'])
 
-          # Derive location from model_path to avoid region/global mismatch
-          loc_from_model = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
-          url  = call(:aipl_v1_url, connection, loc_from_model, "#{model_path}:generateContent")
-          req_body = call(:json_compact, payload)
-
-          resp = post(url).headers(call(:request_headers, corr)).payload(req_body)
+          # POST with standard telemetry path
+          raw   = call(:http_call!, 'POST', url)
+                    .headers(call(:request_headers, corr))
+                    .payload(req_body)
+          code  = call(:telemetry_success_code, raw)
+          resp  = call(:http_body_json, raw)
 
           text = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
 
           # One controlled retry if nothing came back (e.g., safety or schema hiccup)
           if text.to_s.strip.empty?
-            retry_payload = payload.dup
-            retry_payload['generationConfig'] = {
+            retry_req = req.dup
+            retry_body = retry_req['body'].dup
+            retry_body['generationConfig'] = {
               'temperature' => 0,
               'maxOutputTokens' => reserve_out,
               'responseMimeType' => 'text/plain'
             }
-            resp2 = post(url).headers(call(:request_headers, corr)).payload(call(:json_compact, retry_payload))
+            req_body = call(:json_compact, retry_body)
+            raw2 = call(:http_call!, 'POST', url)
+                     .headers(call(:request_headers, corr))
+                     .payload(req_body)
+            code = call(:telemetry_success_code, raw2)
+            resp2 = call(:http_body_json, raw2)
             text = resp2.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
             resp = resp2 if text.present?
           end
@@ -1219,9 +1243,9 @@ require 'securerandom'
             'citations'  => parsed['citations'] || [],
             'responseId' => resp['responseId'],
             'usage'      => resp['usageMetadata']
-          }.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+          }.merge(call(:telemetry_envelope, t0, corr, true, code || 200, 'OK'))
           ok = true
-          http_status = 200
+          http_status = (code || 200)
 
           flags = call(:metrics_effective_flags, connection, input)
           if flags['emit']
@@ -1290,7 +1314,6 @@ require 'securerandom'
           { name: 'metrics_namespace', optional: true }
         ]
       end,
-
       output_fields: lambda do |object_definitions, _connection, _cfg|
         [
           { name: 'records', type: 'array', of: 'object', properties: [
@@ -1301,7 +1324,6 @@ require 'securerandom'
           { name: 'metrics_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] }
         ]
       end,
-
       execute: lambda do |connection, input|
         t0 = Time.now; corr = call(:build_correlation_id)
         begin
@@ -1311,7 +1333,7 @@ require 'securerandom'
 
           ranking_config = call(:build_ranking_config_name, connection, loc, input['ranking_config_name'])
           # Honor connection's Discovery version/host settings
-          url = call(:discovery_url, connection, loc, "#{ranking_config}:rank")
+          url = call(:aipl_v1_url, connection, loc, "#{ranking_config}:rank")
 
           body = {
             'query'   => input['query_text'].to_s,
@@ -1454,11 +1476,11 @@ require 'securerandom'
                      .merge(call(:telemetry_envelope_ex, t0, corr, true, 200, 'DRY_RUN', { 'action' => 'rag_retrieve_contexts' }))
           end
 
-          # POST
+          # POST (inline to enable Workato's standard HTTP inspector)
           req_body = call(:json_compact, payload)
-          http     = call(:http_call!, 'POST', url)
-                       .headers(call(:request_headers, corr))
-                       .payload(req_body)
+          http = post(url)
+                  .headers(call(:request_headers, corr))
+                  .payload(req_body)
 
           # Handle result
           code = call(:telemetry_success_code, http)
@@ -1556,6 +1578,8 @@ require 'securerandom'
           { name: 'rag_corpus', optional: false,
             hint: 'projects/{project}/locations/{region}/ragCorpora/{corpus}' },
           { name: 'question', optional: false },
+          { name: 'validate_only', label: 'Validate only (no call)', type: 'boolean', control_type: 'checkbox', optional: true },
+
 
           { name: 'restrict_to_file_ids', type: 'array', of: 'string', optional: true },
           { name: 'max_contexts', type: 'integer', optional: true, default: 12 },
@@ -1593,9 +1617,10 @@ require 'securerandom'
           { name: 'metrics_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] }
         ]
       end,
-      execute: lambda do |connection, input|
+      execute: lambda do |connection, raw_input|
+        input = call(:normalize_input_keys, raw_input)
         # Build correlation id and now (logging)
-        t0 = Time.now
+        t0   = Time.now
         corr = call(:build_correlation_id)
         begin
           # Validate inputs
@@ -1611,7 +1636,7 @@ require 'securerandom'
 
           retrieve_payload = call(:build_rag_retrieve_payload, input['question'], corpus, input['restrict_to_file_ids'])
 
-          retr_url  = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
+          retr_url      = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
           retr_req_body = call(:json_compact, retrieve_payload)
 
           # Precompute model path & generation scaffold used by both real and validate-only flows
@@ -1638,22 +1663,29 @@ require 'securerandom'
           # Dry-run: return previews of both calls
           if call(:normalize_boolean, input['validate_only'])
             preview_retr = call(:request_preview_pack, retr_url, 'POST', call(:request_headers, corr), retr_req_body)
-            loc_from_model = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
-            gen_url        = call(:aipl_v1_url, connection, loc_from_model, "#{model_path}:generateContent")
-            preview_gen    = call(:request_preview_pack, gen_url, 'POST', call(:request_headers, corr), call(:json_compact, {
-              'contents' => [{ 'role'=>'user','parts'=>[{ 'text' => "Question:\n#{input['question']}\n\nContext:\n<trimmed in runtime>" }]}],
-              'systemInstruction' => sys_inst,
-              'generationConfig'  => gen_cfg
-            }))
+            # Use helper for gen preview; override contents with placeholder
+            gen_req = call(:build_generate_content_request,
+                           connection,
+                           input['model'],
+                           contents: [
+                             { 'role'=>'user','parts'=>[{ 'text' => "Question:\n#{input['question']}\n\nContext:\n<trimmed in runtime>" }]}
+                           ],
+                           system_text:       sys_text,
+                           generation_config: gen_cfg)
+            preview_gen = call(:request_preview_pack,
+                               gen_req['url'],
+                               'POST',
+                               call(:request_headers, corr),
+                               call(:json_compact, gen_req['body']))
             return { 'ok'=>true, 'request_preview'=> { 'retrieve'=>preview_retr['request_preview'], 'generate'=>preview_gen['request_preview'] } }
                    .merge(call(:telemetry_envelope_ex, t0, corr, true, 200, 'DRY_RUN', { 'action' => 'rag_answer' }))
           end
 
-          retr_http = call(:http_call!, 'POST', retr_url)
+          retr_raw  = call(:http_call!, 'POST', retr_url)
                         .headers(call(:request_headers, corr))
                         .payload(retr_req_body)
-          retr_code = call(:telemetry_success_code, retr_http)
-          retr_body = call(:http_body_json, retr_http)
+          retr_code = call(:telemetry_success_code, retr_raw)
+          retr_body = call(:http_body_json, retr_raw)
           raw_ctxs  = call(:normalize_retrieve_contexts!, retr_body)
 
           maxn  = call(:clamp_int, (input['max_contexts'] || 12), 1, 100)
@@ -1661,38 +1693,6 @@ require 'securerandom'
           error('No contexts retrieved; check corpus/permissions/region') if chunks.empty?
 
           # 2) Generate structured answer with parsed context
-          model_path = call(:build_model_path_with_global_preview, connection, input['model'])
-
-          gen_cfg = {
-            'temperature'       => (input['temperature'].present? ? call(:safe_float, input['temperature']) : 0),
-            'maxOutputTokens'   => 1024,
-            'responseMimeType'  => 'application/json',
-            'responseSchema'    => {
-              'type'        => 'object', 'additionalProperties' => false,
-              'properties'  => {
-                'answer'    => { 'type' => 'string' },
-                'citations' => {
-                  'type'    => 'array',
-                  'items'   => {
-                    'type'  => 'object', 'additionalProperties' => false,
-                    'properties' => {
-                      'chunk_id' => { 'type' => 'string' },
-                      'source'   => { 'type' => 'string' },
-                      'uri'      => { 'type' => 'string' },
-                      'score'    => { 'type' => 'number' }
-                    }
-                  }
-                }
-              },
-              'required' => ['answer']
-            }
-          }
-
-          sys_text = (input['system_preamble'].presence ||
-            'Answer using ONLY the retrieved context chunks. If the context is insufficient, reply with “I don’t know.” '\
-            'Keep answers concise and include citations with chunk_id, source, uri, and score.')
-          sys_inst = { 'role' => 'system', 'parts' => [ { 'text' => sys_text } ] }
-
           ctx_blob = call(:format_context_chunks, chunks)
           contents = [
             { 'role' => 'user', 'parts' => [
@@ -1700,23 +1700,17 @@ require 'securerandom'
               ]
             }
           ]
-
-          gen_payload = {
-            'contents'          => contents,
-            'systemInstruction' => sys_inst,
-            'generationConfig'  => gen_cfg
-          }
-
-          # Derive location from model path to avoid region/global mismatch
-          loc_from_model = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
-          gen_url  = call(:aipl_v1_url, connection, loc_from_model, "#{model_path}:generateContent")
-          gen_req_body = call(:json_compact, gen_payload)
-          gen_raw   = call(:http_call!, 'POST', gen_url)
+          # Build via helper; single source of truth for URL/body
+          gen_req = call(:build_generate_content_request,
+                         connection,
+                         input['model'],
+                         contents:          contents,
+                         system_text:       sys_text,
+                         generation_config: gen_cfg)
+          gen_raw  = call(:http_call!, 'POST', gen_req['url'])
                         .headers(call(:request_headers, corr))
-                        .payload(gen_req_body)
-
-
-          gen_body  = call(:http_body_json, gen_raw)
+                        .payload(call(:json_compact, gen_req['body']))
+          gen_body = call(:http_body_json, gen_raw)
           text      = gen_body.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
           parsed = call(:safe_parse_json, text)
 
@@ -1815,7 +1809,10 @@ require 'securerandom'
             'labels'      => input['labels']
           }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
           req_body = call(:json_compact, body)
-          raw  = call(:http_call!, 'POST', url).params(corpusId: input['corpusId'].to_s).headers(call(:request_headers, corr)).payload(req_body)
+          raw  = post(url)
+                  .params(corpusId: input['corpusId'].to_s)
+                  .headers(call(:request_headers, corr))
+                  .payload(req_body)
           code = call(:telemetry_success_code, raw)
           body = call(:http_body_json, raw)
           out  = body.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
@@ -1872,7 +1869,8 @@ require 'securerandom'
           path = call(:build_rag_corpus_path, connection, input['rag_corpus'])
           loc  = connection['location'].to_s.downcase
           url  = call(:aipl_v1_url, connection, loc, path)
-          raw  = call(:http_call!, 'GET', url).headers(call(:request_headers, corr))
+          raw  = get(url)
+                  .headers(call(:request_headers, corr))
           code = call(:telemetry_success_code, raw)
           body = call(:http_body_json, raw)
           body.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
@@ -1928,7 +1926,9 @@ require 'securerandom'
             preview = call(:request_preview_pack, "#{url}#{qstr}", 'GET', call(:request_headers, corr), nil)
             return { 'ok' => true }.merge(preview).merge(call(:telemetry_envelope_ex, t0, corr, true, 200, 'DRY_RUN', { 'action' => 'rag_corpora_list' }))
           end
-          raw  = call(:http_call!, 'GET', url).params(qs).headers(call(:request_headers, corr))
+
+          raw  = get(url)
+                  .params(qs).headers(call(:request_headers, corr))
           code = call(:telemetry_success_code, raw)
           body = call(:http_body_json, raw)
           out = {
@@ -1974,7 +1974,8 @@ require 'securerandom'
           path = call(:build_rag_corpus_path, connection, input['rag_corpus'])
           loc  = connection['location'].to_s.downcase
           url  = call(:aipl_v1_url, connection, loc, path)
-          raw  = call(:http_call!, 'DELETE', url).headers(call(:request_headers, corr))
+          raw  = delete(url)
+                  .headers(call(:request_headers, corr))
           code = call(:telemetry_success_code, raw)
           body = call(:http_body_json, raw)
           body.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
@@ -2037,7 +2038,11 @@ require 'securerandom'
             preview = call(:request_preview_pack, "#{url}#{qstr}", 'GET', call(:request_headers, corr), nil)
             return { 'ok' => true }.merge(preview).merge(call(:telemetry_envelope_ex, t0, corr, true, 200, 'DRY_RUN', { 'action' => 'rag_files_list' }))
           end
-          raw  = call(:http_call!, 'GET', url).params(qs).headers(call(:request_headers, corr))
+
+          # HTTP - GET
+          raw  = get(url)
+                  .params(qs)
+                  .headers(call(:request_headers, corr))
           code = call(:telemetry_success_code, raw)
           body = call(:http_body_json, raw)
           items = call(:safe_array, body['ragFiles']).map do |it|
@@ -2103,7 +2108,10 @@ require 'securerandom'
           name = call(:build_rag_file_path, connection, input['rag_file'])
           loc  = connection['location'].to_s.downcase
           url  = call(:aipl_v1_url, connection, loc, name)
-          raw  = call(:http_call!, 'GET', url).headers(call(:request_headers, corr))
+
+          # HTTP - GET
+          raw  = get(url)
+                  .headers(call(:request_headers, corr))
           code = call(:telemetry_success_code, raw)
           body = call(:http_body_json, raw)
           lbl = (body['labels'] || {}).to_h
@@ -2148,7 +2156,10 @@ require 'securerandom'
           name = call(:build_rag_file_path, connection, input['rag_file'])
           loc  = connection['location'].to_s.downcase
           url  = call(:aipl_v1_url, connection, loc, name)
-          raw  = call(:http_call!, 'DELETE', url).headers(call(:request_headers, corr))
+
+          # HTTP - DELETE
+          raw  = delete(url)
+                  .headers(call(:request_headers, corr))
           code = call(:telemetry_success_code, raw)
           body = call(:http_body_json, raw)
           body.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
@@ -2233,8 +2244,8 @@ require 'securerandom'
           url      = call(:aipl_v1_url, connection, loc, "#{corpus}/ragFiles:import")
           req_body = call(:json_compact, payload)
 
-          # POST import (returns LRO)
-          http = call(:http_call!, 'POST', url)
+          # HTTP - POST import (returns LRO)
+          http = post(url)
                   .headers(call(:request_headers, corr))
                   .payload(req_body)
 
@@ -2329,7 +2340,8 @@ require 'securerandom'
           { name: 'metrics', type: 'object', properties: object_definitions['metrics_fields'] },
           { name: 'metrics_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] }]
       end,
-      execute: lambda do |connection, input|
+      execute: lambda do |connection, raw_input|
+        input = call(:normalize_input_keys, raw_input)
         # Correlation id and duration for logs / analytics
         t0 = Time.now
         corr = call(:build_correlation_id)
@@ -2444,6 +2456,7 @@ require 'securerandom'
         url = call(:aipl_v1_url, connection, loc_from_model, "#{model_path}:countTokens")
 
         begin
+          # HTTP - POST
           resp = post(url)
                     .headers(call(:request_headers, corr))
                     .payload(call(:json_compact, {
@@ -2504,7 +2517,10 @@ require 'securerandom'
           op = input['operation'].to_s.sub(%r{^/v1/}, '')
           loc = (connection['location'].presence || 'us-central1').to_s.downcase
           url = call(:aipl_v1_url, connection, loc, op.start_with?('projects/') ? op : "projects/#{connection['project_id']}/locations/#{loc}/operations/#{op}")
-          resp = get(url).headers(call(:request_headers, corr))
+
+          # HTTP - GET
+          resp = get(url)
+                  .headers(call(:request_headers, corr))
           code = call(:telemetry_success_code, resp)
           out  = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
           ok = true
@@ -2979,6 +2995,45 @@ require 'securerandom'
   # --------- METHODS ------------------------------------------------------
   methods: {
 
+    # --- Request builders (pure; no HTTP) --------------------------------
+    build_embeddings_predict_request: lambda do |connection, model_path, instances, params={}|
+      loc = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
+      url = call(:aipl_v1_url, connection, loc, "#{model_path}:predict")
+      body = {
+        'instances'  => Array(instances),
+        'parameters' => (params.presence || {})
+      }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
+      { 'url' => url, 'body' => body }
+    end,
+    build_generate_content_request: lambda do |connection, model, contents:, system_text:nil, generation_config:nil, tools:nil, tool_config:nil, safety:nil|
+      model_path = call(:build_model_path_with_global_preview, connection, model)
+      loc = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
+      url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
+      sys_inst = call(:system_instruction_from_text, system_text)
+      body = {
+        'contents'          => contents,
+        'systemInstruction' => sys_inst,
+        'generationConfig'  => generation_config,
+        'tools'             => tools,
+        'toolConfig'        => tool_config,
+        'safetySettings'    => safety
+      }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
+      { 'url' => url, 'body' => body }
+    end,
+    parse_referee_json!: lambda do |text, allowed_categories, fallback=nil|
+      parsed = JSON.parse(text) rescue { 'category' => nil, 'confidence' => nil, 'reasoning' => nil, 'distribution' => [] }
+      cat = parsed['category']
+      cat = nil unless allowed_categories.include?(cat)
+      cat = (fallback if cat.to_s.empty? && fallback.present?)
+      error('Referee returned no valid category and no fallback is configured') if cat.to_s.empty?
+      {
+        'category'     => cat,
+        'confidence'   => parsed['confidence'],
+        'reasoning'    => parsed['reasoning'],
+        'distribution' => Array(parsed['distribution'])
+      }
+    end,
+
     # --- HTTP -------------------------------------------------------------
     http_call!: lambda do |verb, url|
       v = verb.to_s.upcase
@@ -3102,7 +3157,7 @@ require 'securerandom'
         return obj
       end
       if j.is_a?(Hash)
-        %w[access_token authorization api_key apiKey bearer token id_token refresh_token client_secret private_key].each do |k|
+        %w[access_token authorization api_key apiKey bearer token id_token refresh_token client_secret private_key assertion].each do |k|
           j[k] = '[REDACTED]' if j.key?(k)
         end
       end
@@ -3434,8 +3489,8 @@ require 'securerandom'
 
       # Align to REST v1: top-level vertexRagStore + query
       {
-        'query'           => query_obj,
-        'vertexRagStore'  => { 'ragResources' => [rag_res] }
+        'query'      => query_obj,
+        'dataSource' => { 'vertexRagStore' => { 'ragResources' => [rag_res] } }
       }
     end,
     map_context_chunks: lambda do |raw_contexts, maxn = 20|
@@ -4245,7 +4300,8 @@ require 'securerandom'
             { name: 'outcome' }, { name: 'stdout' }, { name: 'stderr' }
         ]}
       ]
-    end
+    end,
+
   },
 
   # --------- TRIGGERS -----------------------------------------------------
