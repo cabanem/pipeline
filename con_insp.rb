@@ -361,8 +361,11 @@ end
 class ConnectorWalker
   include Util
 
-  def initialize(filename:, ast:, comments: {}, max_warnings: 10_000)
+  def initialize(filename:, ast:, comments: {}, max_warnings: 10_000, source: nil, file_sha1: nil, file_size: nil)
     @filename, @ast, @comments = filename, ast, (comments || {})
+    @source = source
+    @file_sha1 = file_sha1
+    @file_size = file_size
     @graph = IR::Graph.new(directed: true)
     @issues = []
     @stats = Hash.new(0)
@@ -389,6 +392,42 @@ class ConnectorWalker
   end
 
   private
+
+  def source_for(node)
+    return nil unless @source && node
+    Util.slice_source(@source, Util.node_loc(node))
+  end
+
+  # Given a :send node in a call chain, walk to the base HTTP verb and collect chained args.
+  def extract_http_chain(send_node)
+    chain = []
+    cur = send_node
+    while cur&.type == :send
+      recv, mname, *args = cur.children
+      chain << { node: cur, name: mname, args: args }
+      cur = recv
+    end
+    chain.reverse! # base → tail
+    base = chain.first
+    return nil unless base && Workato::HTTP_VERBS.include?(base[:name])
+    # Aggregate derived fields
+    url_arg = base[:args]&.first
+    url_expr = url_arg ? source_for(url_arg) : nil
+    headers = chain.find { |h| h[:name] == :headers }&.dig(:args, 0)
+    params  = chain.find { |h| h[:name] == :params  }&.dig(:args, 0)
+    payload = chain.find { |h| h[:name] == :payload }&.dig(:args, 0)
+    {
+      verb: base[:name].to_s.upcase,
+      url_expr: url_expr,
+      headers_expr: headers ? source_for(headers) : nil,
+      params_expr:  params  ? source_for(params)  : nil,
+      payload_expr: payload ? source_for(payload) : nil,
+      start: Util.node_loc(base[:node])[:line],
+      stop:  Util.node_loc(chain.last[:node])[:line],
+      pagination: !!(params && source_for(params)&.match(/\bpage(Size|Token)\b/)),
+      lro: !!(url_expr&.match(/:import\b/) || url_expr&.match(%r{/operations\b}))
+    }
+  end
 
   def issue(sev, code, msg, loc = {}, ctx = {})
     sev_sym = sev.to_s.to_sym
@@ -454,6 +493,8 @@ class ConnectorWalker
       loc: Util.node_loc(hash_node),
       meta: {
         filename: @filename,
+        sha1: @file_sha1,
+        size: @file_size,
         root_keys: keys.sort,
         doc: extract_docstring(hash_node)
       }
@@ -564,7 +605,7 @@ class ConnectorWalker
     defs = hash_pairs(od).map do |pair|
       name = Util.sym_or_str(pair.children[0]) || '(dynamic)'
       body = pair.children[1]
-      IR::Node.new(kind: 'object_definition', name: name, loc: Util.node_loc(body), meta: {})
+      IR::Node.new(kind: 'object_definition', name: name, loc: Util.node_loc(body), meta: { unresolved: true })
     end
     IR::Node.new(kind: 'object_definitions', name: 'object_definitions', loc: Util.node_loc(od), meta: {}, children: defs)
   end
@@ -572,7 +613,7 @@ class ConnectorWalker
   def extract_pick_lists(root_hash)
     pl = key_value(root_hash, 'pick_lists') || key_value(root_hash, 'picklists')
     return unless pl
-    IR::Node.new(kind: 'pick_lists', name: 'pick_lists', loc: Util.node_loc(pl), meta: {})
+    IR::Node.new(kind: 'pick_lists', name: 'pick_lists', loc: Util.node_loc(pl), meta: { unresolved: true })
   end
 
   def extract_actions(root_hash)
@@ -759,28 +800,46 @@ class ConnectorWalker
     @lambda_records << { owner: owner_label, role: role, loc: loc }
 
     # Traverse for sends
+    @http_seen ||= Set.new
     traverse(block_node) do |n|
       next unless n.type == :send
       recv, mname, *args = n.children
 
-      if Workato::HTTP_VERBS.include?(mname)
-        first_arg = args[0]
-        lit = if first_arg&.type == :str
-                first_arg.children[0]
-              else
-                nil
-              end
-        http_node_id = "#{owner_label}::http##{mname}(#{lit ? lit[0..50] : '...'})"
-        @graph.add_node(http_node_id, label: "#{mname.upcase} #{lit || '(dynamic)'}", kind: 'http')
-        @graph.add_edge(owner_label, http_node_id, label: 'calls')
-        @stats["http_#{mname}"] += 1
+      # Capture any chain anchored at an HTTP verb, even if we're at tail node
+      chain = extract_http_chain(n)
+      if chain
+        sig = [chain[:verb], chain[:url_expr], chain[:start], chain[:stop]].join("\0")
+        next if @http_seen.include?(sig)
+        @http_seen << sig
+        label_url = (chain[:url_expr] && chain[:url_expr][0,120]) || '(dynamic)'
+        http_node_id = "#{owner_label}::http##{chain[:verb]}(#{label_url})"
+        @graph.add_node(http_node_id, label: "#{chain[:verb]} #{label_url}", kind: 'http')
+        meta = {
+          owner: owner_label,
+          verb: chain[:verb],
+          url_expr: chain[:url_expr],
+          headers_expr: chain[:headers_expr],
+          params_expr: chain[:params_expr],
+          payload_expr: chain[:payload_expr],
+          start_line: chain[:start],
+          end_line: chain[:stop],
+          has_headers: !!chain[:headers_expr],
+          has_params:  !!chain[:params_expr],
+          has_payload: !!chain[:payload_expr],
+          pagination: chain[:pagination],
+          lro: chain[:lro]
+        }
+        @graph.add_edge(owner_label, http_node_id, meta)
+        @stats["http_#{chain[:verb].downcase}"] += 1
+        @stats["http_pagination"] += 1 if chain[:pagination]
+        @stats["http_lro"] += 1 if chain[:lro]
       elsif mname == :call && recv.nil?
         if args[0] && (args[0].type == :sym || args[0].type == :str)
           meth = args[0].children[0].to_s
           # Only treat as a Workato method when it looks like a valid identifier,
           # not a model id like "gemini-1.5-pro" or "text-embedding-004".
           if meth.match?(/\A[A-Za-z_][A-Za-z0-9_]*\z/)
-            call_loc = Util.node_loc(n) # <-- use the actual send-node location
+            call_loc = Util.node_loc(n)
             @methods_called << { from: owner_label, to: "method:#{meth}", name: meth, loc: call_loc }
             @graph.add_node("method:#{meth}", label: "method:#{meth}", kind: 'method')
             @graph.add_edge(owner_label, "method:#{meth}", label: 'calls')
@@ -982,6 +1041,31 @@ class Emit
         bundle.issues.each { |iss| f.puts({ type: 'issue', **iss.to_h }.to_json) }
         bundle.graph.edges.each do |from, to, meta|
           f.puts({ type: 'http_call', from: from, to: to, meta: meta }.to_json) if to.to_s.include?('::http#')
+        end
+      end
+    end
+
+    # HTTP calls JSONL (compact, stable fields)
+    if emit.include?('httpcalls')
+      paths[:httpcalls] = write_ndjson(File.join(outdir, Util.safe_filename("#{base}.http_calls", '.jsonl'))) do |f|
+        bundle.graph.edges.each do |from, to, meta|
+          next unless to.to_s.include?('::http#')
+          rec = {
+            owner: meta[:owner] || from,
+            verb:  meta[:verb],
+            url_expr: meta[:url_expr],
+            headers_expr: meta[:headers_expr],
+            params_expr:  meta[:params_expr],
+            payload_expr: meta[:payload_expr],
+            start_line:   meta[:start_line],
+            end_line:     meta[:end_line],
+            pagination:   !!meta[:pagination],
+            lro:          !!meta[:lro],
+            has_headers:  !!meta[:has_headers],
+            has_params:   !!meta[:has_params],
+            has_payload:  !!meta[:has_payload]
+          }
+          f.puts(JSON.dump(rec))
         end
       end
     end
@@ -1294,14 +1378,17 @@ class CLI
       max_warnings: 10_000
     }
 
-    options[:emit] = %w[json md dot ndjson graphjson sourcemap embed tokens sarif schema index]
+    # default emitters; can be overridden by --emit
+    options[:emit] = %w[json md dot ndjson graphjson sourcemap embed tokens sarif schema index httpcalls]
 
     optparser = OptionParser.new do |opts|
       opts.banner = "Usage: #{File.basename($PROGRAM_NAME)} PATH/TO/connector.rb [options]"
 
       opts.on('--outdir DIR', 'Output directory (default: ./out)') { |v| options[:outdir] = v }
       opts.on('--base NAME', 'Base filename for outputs (default: connector)') { |v| options[:base] = v }
-      opts.on('--emit LIST', 'Comma-separated: json,md,dot,ndjson (default: all)') { |v| options[:emit] = v.split(',').map(&:strip) }
+      opts.on('--emit LIST', 'Comma-separated: json,md,dot,ndjson,graphjson,sourcemap,embed,tokens,sarif,schema,index,httpcalls') do |v|
+        options[:emit] = v.split(',').map(&:strip)
+      end
       opts.on('--pretty', 'Pretty-print JSON (default: on)') { options[:pretty] = true }
       opts.on('--no-pretty', 'Compact JSON') { options[:pretty] = false }
       opts.on('--graph-name NAME', 'Graph name for DOT') { |v| options[:graph_name] = v }
@@ -1317,6 +1404,8 @@ class CLI
     end
 
     source, _ = Util.read_source(path)
+    file_sha1 = Digest::SHA1.hexdigest(source)
+    file_size = source.bytesize
 
     # 1) Parse
     ast_res = AstParser.new(filename: path, source: source).parse
@@ -1328,7 +1417,10 @@ class CLI
           filename: path,
           ast: ast_res[:ast],
           comments: ast_res[:comments],
-          max_warnings: options[:max_warnings]
+          max_warnings: options[:max_warnings],
+          source: source,
+          file_sha1: file_sha1,
+          file_size: file_size
         )
         walker.walk
       else
