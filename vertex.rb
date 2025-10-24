@@ -432,7 +432,8 @@ require 'securerandom'
         ] + Array(object_definitions['envelope_fields'])
       end,
       execute: lambda do |connection, input|
-        t0   = Time.now
+        # Build correlation ID & monotonic start (for traceability)
+        t0   = call(:telemetry_t0)
         corr = call(:build_correlation_id)
         begin
           subj = (input['subject'] || '').to_s.strip
@@ -641,7 +642,8 @@ require 'securerandom'
       end,
 
       execute: lambda do |connection, input|
-        t0   = Time.now
+        # Build correlation ID & monotonic start (for traceability)
+        t0   = call(:telemetry_t0)
         corr = call(:build_correlation_id)
         url = nil; req_body = nil
         begin
@@ -810,7 +812,8 @@ require 'securerandom'
       end,
       execute: lambda do |connection, raw_input|
         input = call(:normalize_input_keys, raw_input)
-        t0   = Time.now
+        # Build correlation ID & monotonic start (for traceability)
+        t0   = call(:telemetry_t0)
         corr = call(:build_correlation_id)
 
         begin
@@ -1098,8 +1101,8 @@ require 'securerandom'
       end,
       execute: lambda do |connection, raw_input|
         input = call(:normalize_input_keys, raw_input)
-        # Correlation id and duration for logs/analytics
-        t0   = Time.now
+        # Build correlation ID & monotonic start (for traceability)
+        t0   = call(:telemetry_t0)
         corr = call(:build_correlation_id)
         url = nil; req_body = nil
 
@@ -1388,6 +1391,12 @@ require 'securerandom'
     rag_retrieve_contexts: {
       title: 'RAG Serving: Retrieve contexts',
       subtitle: 'projects.locations:retrieveContexts (Vertex RAG Store)',
+      help: lambda do |input, picklist_label|
+        {
+        learn_more_url: 'https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/rag-api-v1#retrieval-and-prediction-params-api',
+        learn_more_text: 'Retrieval and predication params'
+        }
+      end,
       display_priority: 80,
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
@@ -1441,8 +1450,8 @@ require 'securerandom'
           { name: 'metrics_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] } ]
       end,
       execute: lambda do |connection, input|
-        # Build correlation ID, now (for traceability)
-        t0   = Time.now
+        # Build correlation ID & monotonic start (for traceability)
+        t0   = call(:telemetry_t0)
         corr = call(:build_correlation_id)
         url  = nil; req_body = nil
         begin
@@ -1619,8 +1628,8 @@ require 'securerandom'
       end,
       execute: lambda do |connection, raw_input|
         input = call(:normalize_input_keys, raw_input)
-        # Build correlation id and now (logging)
-        t0   = Time.now
+        # Build correlation ID & monotonic start (for traceability)
+        t0   = call(:telemetry_t0)
         corr = call(:build_correlation_id)
         begin
           # Validate inputs
@@ -2225,7 +2234,8 @@ require 'securerandom'
           { name: 'metrics_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] } ]
       end,
       execute: lambda do |connection, input|
-        t0   = Time.now
+        # Build correlation ID & monotonic start (for traceability)
+        t0   = call(:telemetry_t0)
         corr = call(:build_correlation_id)
         url  = nil
         req_body = nil
@@ -2628,7 +2638,8 @@ require 'securerandom'
         ]
       end,
       execute: lambda do |connection, input|
-        t0   = Time.now
+        # Build correlation ID & monotonic start (for traceability)
+        t0   = call(:telemetry_t0)
         corr = call(:build_correlation_id)
 
         # Normalize connection context
@@ -2994,7 +3005,14 @@ require 'securerandom'
 
   # --------- METHODS ------------------------------------------------------
   methods: {
-
+    telemetry_t0: lambda do
+      # Prefer a monotonic clock for duration math; fall back to Time
+      begin
+        Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      rescue
+        Time.now.to_f
+      end
+    end,
     # --- Request builders (pure; no HTTP) --------------------------------
     build_embeddings_predict_request: lambda do |connection, model_path, instances, params={}|
       loc = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
@@ -3073,7 +3091,9 @@ require 'securerandom'
 
     # --- Telemetry and resilience -----------------------------------------
     telemetry_envelope: lambda do |started_at, correlation_id, ok, code, message|
-      dur = ((Time.now - started_at) * 1000.0).to_i
+      now = (begin Process.clock_gettime(Process::CLOCK_MONOTONIC) rescue Time.now.to_f end)
+      base = started_at.is_a?(Numeric) ? started_at : started_at.to_f
+      dur = ((now - base) * 1000.0).to_i
       {
         'ok' => !!ok,
         'telemetry' => {
@@ -3490,9 +3510,7 @@ require 'securerandom'
       # Align to REST v1: dataSource.vertexRagStore + query
       {
         'query'      => query_obj,
-        'dataSource' => {
-          'vertexRagStore' => { 'ragResources' => [rag_res] }
-        }
+        'dataSource' => { 'vertexRagStore' => { 'ragResources' => [rag_res] } }
       }
     end,
     map_context_chunks: lambda do |raw_contexts, maxn = 20|
