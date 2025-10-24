@@ -3487,10 +3487,12 @@ require 'securerandom'
                            (ropts['similarity_top_k'] || nil),
                            ranking_block)
 
-      # Align to REST v1: top-level vertexRagStore + query
+      # Align to REST v1: dataSource.vertexRagStore + query
       {
         'query'      => query_obj,
-        'dataSource' => { 'vertexRagStore' => { 'ragResources' => [rag_res] } }
+        'dataSource' => {
+          'vertexRagStore' => { 'ragResources' => [rag_res] }
+        }
       }
     end,
     map_context_chunks: lambda do |raw_contexts, maxn = 20|
@@ -3584,8 +3586,11 @@ require 'securerandom'
     # Builds RagRetrievalConfig and merges into retrieveContexts payload
     build_rag_query_with_ranking: lambda do |question, top_k, ranking_block|
       cfg = {}
-      cfg['topK']    = (top_k.to_i > 0 ? top_k.to_i : nil)
-      cfg['ranking'] = ranking_block if ranking_block
+      # Only include the beta block when a ranker is explicitly provided.
+      if ranking_block
+        cfg['topK']    = (top_k.to_i > 0 ? top_k.to_i : nil)
+        cfg['ranking'] = ranking_block
+      end
       cfg.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
 
       q = { 'text' => question.to_s }
