@@ -2904,7 +2904,9 @@ require 'securerandom'
         ]
       end,
       execute: lambda do |connection, input|
-        t0 = Time.now; corr = call(:build_correlation_id)
+        # Build correlation ID & monotonic start (for traceability)
+        t0   = call(:telemetry_t0)
+        corr = call(:build_correlation_id)
         begin
           loc  = (connection['location'].presence || 'global').to_s.downcase
           path = input['resource'].to_s
@@ -3006,12 +3008,12 @@ require 'securerandom'
   # --------- METHODS ------------------------------------------------------
   methods: {
     telemetry_t0: lambda do
-      # Prefer a monotonic clock for duration math; fall back to Time
-      begin
-        Process.clock_gettime(Process::CLOCK_MONOTONIC)
-      rescue
-        Time.now.to_f
-      end
+      # Monotonic start time as Float seconds
+      (Process.clock_gettime(Process::CLOCK_MONOTONIC) rescue Time.now.to_f)
+    end,
+    telemetry_now_f: lambda do
+      # Monotonic "now" as Float seconds
+      (Process.clock_gettime(Process::CLOCK_MONOTONIC) rescue Time.now.to_f)
     end,
     # --- Request builders (pure; no HTTP) --------------------------------
     build_embeddings_predict_request: lambda do |connection, model_path, instances, params={}|
@@ -3077,7 +3079,7 @@ require 'securerandom'
       else
         {}
       end
-    end,
+    end,a
     request_preview_pack: lambda do |url, verb, headers, payload|
       {
         'request_preview' => {
@@ -3091,9 +3093,9 @@ require 'securerandom'
 
     # --- Telemetry and resilience -----------------------------------------
     telemetry_envelope: lambda do |started_at, correlation_id, ok, code, message|
-      now = (begin Process.clock_gettime(Process::CLOCK_MONOTONIC) rescue Time.now.to_f end)
-      base = started_at.is_a?(Numeric) ? started_at : started_at.to_f
-      dur = ((now - base) * 1000.0).to_i
+      now_f  = call(:telemetry_now_f)
+      base_f = (started_at.respond_to?(:to_f) ? started_at.to_f : 0.0)
+      dur    = ((now_f - base_f) * 1000.0).to_i
       {
         'ok' => !!ok,
         'telemetry' => {
@@ -3104,13 +3106,19 @@ require 'securerandom'
         }
       }
     end,
-    telemetry_envelope_ex: lambda do |started_at, correlation_id, ok, code, message, extras={}|
-      # Envelope with optional extras folded into telemetry (non-breaking)
-      env = call(:telemetry_envelope, started_at, correlation_id, ok, code, message)
-      if extras.is_a?(Hash) && !extras.empty?
-        env['telemetry'] = (env['telemetry'] || {}).merge(extras)
-      end
-      env
+    telemetry_envelope_ex: lambda do |started_at, correlation_id, ok, code, message, extra = {}|
+      now_f  = call(:telemetry_now_f)
+      base_f = (started_at.respond_to?(:to_f) ? started_at.to_f : 0.0)
+      dur    = ((now_f - base_f) * 1000.0).to_i
+      {
+        'ok' => !!ok,
+        'telemetry' => {
+          'http_status'    => code.to_i,
+          'message'        => (message || (ok ? 'OK' : 'ERROR')).to_s,
+          'duration_ms'    => dur,
+          'correlation_id' => correlation_id
+        }
+      }.merge(extra || {})
     end,
     telemetry_success_code: lambda do |resp|
       # Works with Workato HTTP response (has status/status_code) or defaults to 200
