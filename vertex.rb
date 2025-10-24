@@ -3432,12 +3432,10 @@ require 'securerandom'
                            (ropts['similarity_top_k'] || nil),
                            ranking_block)
 
-      # Align to REST reference: query = RagQuery, dataSource.vertexRagStore.ragResources[...]
+      # Align to REST v1: top-level vertexRagStore + query
       {
-        'query'      => query_obj,
-        'dataSource' => {
-          'vertexRagStore' => { 'ragResources' => [rag_res] }
-        }
+        'query'           => query_obj,
+        'vertexRagStore'  => { 'ragResources' => [rag_res] }
       }
     end,
     map_context_chunks: lambda do |raw_contexts, maxn = 20|
@@ -4256,6 +4254,6 @@ require 'securerandom'
   # --------- CUSTOM ACTION SUPPORT ----------------------------------------
   custom_action: true,
   custom_action_help: {
-    body: "For actions calling host 'aiplatform.googleapis.com/v1", use relative paths. For actions calling other endpoints (e.g. discovery engine), provide the absolute URL.''
+    body: "For actions calling host 'aiplatform.googleapis.com/v1', use relative paths. For actions calling other endpoints (e.g. discovery engine), provide the absolute URL."
   }
 }
