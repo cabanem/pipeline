@@ -37,8 +37,6 @@ require 'securerandom'
         hint: 'GCP project ID (inferred from key if blank)' },
       { name: 'user_project',               optional: true,   control_type: 'text',      label: 'User project for quota/billing',
         extends_schema: true, hint: 'Sets x-goog-user-project for billing/quota. Service account must have roles/serviceusage.serviceUsageConsumer on this project.' },
-      { name: 'discovery_api_version', label: 'Discovery API version', control_type: 'select', optional: true, default: 'v1alpha',
-        pick_list: 'discovery_versions', hint: 'v1alpha for AI Applications; switch to v1beta/v1 if/when you migrate.' },
       { name: 'emit_metrics_default', type: 'boolean', control_type: 'checkbox', label: 'Emit metrics by default', 
         optional: true, default: true, hint: 'Actions can override with their own emit_metrics input.' },
       { name: 'metrics_namespace_default', optional: true, hint: 'e.g., email_rag_prod, applied when action input is empty.' },
@@ -1640,7 +1638,8 @@ require 'securerandom'
             'dataSource' => {
               'vertexRagStore' => {
                 'ragResources' => [
-                  ({ 'ragCorpus' => corpus }.tap { |h| h['ragFileIds'] = ids if ids.present? })
+                  # Use pure-Ruby emptiness check; Workato sandbox may not have ActiveSupport.
+                  ({ 'ragCorpus' => corpus }.tap { |h| h['ragFileIds'] = ids if ids && !ids.empty? })
                 ]
               }
             }
@@ -1685,7 +1684,10 @@ require 'securerandom'
           msg         = [e.to_s, (g['message'] || nil)].compact.join(' | ')
           http_status = call(:telemetry_parse_error_code, e)
 
-          dbg = call(:debug_pack, !(call(:normalize_boolean, connection['prod_mode'])), url, req_body, g)
+          # If we raised locally (e.g., no contexts), g will be {}.
+          # Fall back to the parsed HTTP response body so debug shows what the service returned.
+          resp_dbg = (g && !g.empty?) ? g : (body || {})
+          dbg = call(:debug_pack, !(call(:normalize_boolean, connection['prod_mode'])), url, req_body, resp_dbg)
 
           out = {}.merge(call(:telemetry_envelope, t0, corr, false, http_status, msg))
           out.merge!(dbg) if dbg
@@ -3154,7 +3156,8 @@ require 'securerandom'
       error('rag_corpus is required') if v.empty?
 
       if v.start_with?('projects/')
-        s = v.sub(%r{^/v1/}, '')
+        # Accept both "/v1/..." and "v1/..." fully-qualified resources.
+        s = v.sub(%r{^/?v1/}, '')
         m = s.match(%r{\Aprojects/([^/]+)/locations/([^/]+)/ragCorpora/[^/]+})
         error('rag_corpus must be projects/{project}/locations/{location}/ragCorpora/{id}') unless m
         proj = m[1].to_s
@@ -3164,7 +3167,7 @@ require 'securerandom'
         # Avoid mutating frozen connection; use the returned project id directly.
         pid = call(:ensure_project_id!, connection)
         loc = (connection['location'] || '').to_s.downcase
-        error("RAG corpus requires regional location; got '#{loc}'") if loc.blank? || loc == 'global'
+        error("RAG corpus requires regional location; got '#{loc}'") if loc.empty? || loc == 'global'
         corpus_full = "projects/#{pid}/locations/#{loc}/ragCorpora/#{v}"
         [pid.to_s, loc, corpus_full]
       end
@@ -3450,7 +3453,8 @@ require 'securerandom'
     # --- URL and resource building ----------------------------------------
     aipl_service_host: lambda do |connection, loc=nil|
       l = (loc || connection['location']).to_s.downcase
-      (l.blank? || l == 'global') ? 'aiplatform.googleapis.com' : "#{l}-aiplatform.googleapis.com"
+      # Use empty? instead of blank? to avoid ActiveSupport dependency.
+      (l.empty? || l == 'global') ? 'aiplatform.googleapis.com' : "#{l}-aiplatform.googleapis.com"
     end,
     aipl_v1_url: lambda do |connection, loc, path|
       "https://#{call(:aipl_service_host, connection, loc)}/v1/#{path}"
@@ -3561,10 +3565,12 @@ require 'securerandom'
 
     # --- Guards, normalization --------------------------------------------
     ensure_project_id!: lambda do |connection|
-      pid = (connection['project_id'].presence ||
-              (JSON.parse(connection['service_account_key_json'].to_s)['project_id'] rescue nil)).to_s
-      error('Project ID is required (not found in connection or key)') if pid.blank?
-      # Do not mutate connection (frozen in Workato). Return pid for callers to thread through
+      # Prefer explicit project_id; otherwise derive from SA key JSON.
+      pid = connection['project_id'].to_s.strip
+      if pid.empty?
+        pid = (JSON.parse(connection['service_account_key_json'].to_s)['project_id'] rescue nil).to_s.strip
+      end
+      error('Project ID is required (not found in connection or key)') if pid.empty?
       pid
     end,
     ensure_regional_location!: lambda do |connection|
@@ -4468,12 +4474,13 @@ require 'securerandom'
     end,
     metrics_effective_flags: lambda do |connection, input|
       emit = if input.key?('emit_metrics')
-               call(:normalize_boolean, input['emit_metrics'])
-             else
-               call(:normalize_boolean, connection['emit_metrics_default'])
-             end
-      ns = (input['metrics_namespace'].presence ||
-            connection['metrics_namespace_default'].presence)
+                call(:normalize_boolean, input['emit_metrics'])
+              else
+                call(:normalize_boolean, connection['emit_metrics_default'])
+              end
+      # Replace presence with a simple first-non-empty string.
+      ns_candidates = [input['metrics_namespace'], connection['metrics_namespace_default']]
+      ns = ns_candidates.map { |s| s.to_s.strip }.find { |s| !s.empty? }
       { 'emit' => emit, 'ns' => ns }
     end,
     schema_content_part: lambda do
