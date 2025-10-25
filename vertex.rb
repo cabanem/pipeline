@@ -3255,7 +3255,9 @@ require 'securerandom'
       Process.clock_gettime(Process::CLOCK_MONOTONIC)
     end,
     telemetry_envelope: lambda do |started_at, correlation_id, ok, code, message|
-      dur = call(:telemetry_finish, started_at)
+      now_f  = call(:telemetry_now_f)
+      base_f = (started_at.respond_to?(:to_f) ? started_at.to_f : 0.0)
+      dur    = ((now_f - base_f) * 1000.0).to_i
       {
         'ok' => !!ok,
         'telemetry' => {
@@ -3267,7 +3269,9 @@ require 'securerandom'
       }
     end,
     telemetry_envelope_ex: lambda do |started_at, correlation_id, ok, code, message, extra = {}|
-      dur = call(:telemetry_finish, started_at)
+      now_f  = call(:telemetry_now_f)
+      base_f = (started_at.respond_to?(:to_f) ? started_at.to_f : 0.0)
+      dur    = ((now_f - base_f) * 1000.0).to_i
       {
         'ok' => !!ok,
         'telemetry' => {
