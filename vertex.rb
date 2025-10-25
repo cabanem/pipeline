@@ -1591,7 +1591,7 @@ require 'securerandom'
           { name: 'question', optional: false },
           { name: 'restrict_to_file_ids', type: 'array', of: 'string', optional: true },
           { name: 'max_contexts', type: 'integer', optional: true, default: 20 },
-          { name: 'validate_only', label: 'Validate only (no call)', type: 'boolean', control_type: 'checkbox', optional: true },
+          { name: 'validate_only', label: 'Validate only (no call)', type: 'boolean', control_type: 'checkbox', optional: true, default: false },
           { name: 'emit_metrics', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
             hint: 'Attach a metrics object in the output for downstream persistence.' },
           { name: 'metrics_namespace', optional: true, hint: 'Optional tag for partitioning dashboards (e.g., "email_rag_prod").' }
@@ -1656,12 +1656,11 @@ require 'securerandom'
           end
 
           # POST
-          req_body  = call(:json_compact, payload)
-          req_hdrs  = call(:request_headers, corr)
-          http      = post(url).headers(req_hdrs).payload(req_body)
-          code      = call(:telemetry_success_code, http)
-          body      = call(:http_body_json, http)
-          raw       = call(:normalize_retrieve_contexts!, body)
+          req_body = call(:json_compact, payload)
+          http  = post(url).headers(call(:request_headers, corr)).payload(req_body)
+          code  = call(:telemetry_success_code, http)
+          body  = call(:http_body_json, http)
+          raw   = call(:normalize_retrieve_contexts!, body)
 
           maxn   = call(:clamp_int, (input['max_contexts'] || 20), 1, 200)
           mapped = call(:map_context_chunks, raw, maxn)
@@ -1682,27 +1681,24 @@ require 'securerandom'
           out
 
         rescue => e
-        #  g           = call(:extract_google_error, e)
-        #  msg         = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-        #  http_status = call(:telemetry_parse_error_code, e)
+          g           = call(:extract_google_error, e)
+          msg         = [e.to_s, (g['message'] || nil)].compact.join(' | ')
+          http_status = call(:telemetry_parse_error_code, e)
 
-        # dbg = call(:debug_pack, !(call(:normalize_boolean, connection['prod_mode'])), url, req_body, g)
+          dbg = call(:debug_pack, !(call(:normalize_boolean, connection['prod_mode'])), url, req_body, g)
 
-        #  out = {}.merge(call(:telemetry_envelope, t0, corr, false, http_status, msg))
-        #  out.merge!(dbg) if dbg
+          out = {}.merge(call(:telemetry_envelope, t0, corr, false, http_status, msg))
+          out.merge!(dbg) if dbg
 
-        #  flags = call(:metrics_effective_flags, connection, input)
-        #  if flags['emit']
-        #    m = call(:metrics_base, connection, 'rag_retrieve_contexts', t0, false, http_status, corr, { 'namespace' => flags['ns'] })
-        #    out['metrics']    = m
-        #    out['metrics_kv'] = call(:metrics_to_kv, m)
-        #  end
-        #  out
-          # get native Workato stack trace
-          error("[#{corr}] #{e}")
+          flags = call(:metrics_effective_flags, connection, input)
+          if flags['emit']
+            m = call(:metrics_base, connection, 'rag_retrieve_contexts', t0, false, http_status, corr, { 'namespace' => flags['ns'] })
+            out['metrics']    = m
+            out['metrics_kv'] = call(:metrics_to_kv, m)
+          end
+          out
         end
       end,
-
       sample_output: lambda do
         {
           'question' => 'What is the PTO carryover policy?',
@@ -3165,11 +3161,12 @@ require 'securerandom'
         loc  = m[2].to_s.downcase
         [proj, loc, s]
       else
-        call(:ensure_project_id!, connection)
+        # Avoid mutating frozen connection; use the returned project id directly.
+        pid = call(:ensure_project_id!, connection)
         loc = (connection['location'] || '').to_s.downcase
         error("RAG corpus requires regional location; got '#{loc}'") if loc.blank? || loc == 'global'
-        corpus_full = "projects/#{connection['project_id']}/locations/#{loc}/ragCorpora/#{v}"
-        [connection['project_id'].to_s, loc, corpus_full]
+        corpus_full = "projects/#{pid}/locations/#{loc}/ragCorpora/#{v}"
+        [pid.to_s, loc, corpus_full]
       end
     end,
     # --- Request builders (pure; no HTTP) --------------------------------
@@ -3563,7 +3560,7 @@ require 'securerandom'
       pid = (connection['project_id'].presence ||
               (JSON.parse(connection['service_account_key_json'].to_s)['project_id'] rescue nil)).to_s
       error('Project ID is required (not found in connection or key)') if pid.blank?
-      connection['project_id'] = pid
+      # Do not mutate connection (frozen in Workato). Return pid for callers to thread through
       pid
     end,
     ensure_regional_location!: lambda do |connection|
@@ -4407,22 +4404,23 @@ require 'securerandom'
       end
       ordered_items.first(lo)
     end,
-    
     metrics_base: lambda do |connection, action_name, started_at, ok, http_status, corr_id, extras = {}|
-      call(:ensure_project_id!, connection)
-      dur_ms = call(:telemetry_finish, started_at)
+      # Use the same monotonic clock used across telemetry to avoid Time/Float arithmetic traps.
+      pid   = call(:ensure_project_id!, connection)  # returns pid; do not mutate connection
+      now_f  = call(:telemetry_now_f)
+      base_f = (started_at.respond_to?(:to_f) ? started_at.to_f : 0.0)
+      dur_ms = ((now_f - base_f) * 1000.0).to_i
       {
         'namespace'      => (extras['namespace'] || nil),
         'action'         => action_name.to_s,
         'correlation_id' => corr_id.to_s,
-        'project_id'     => connection['project_id'].to_s,
+        'project_id'     => pid.to_s,
         'location'       => (connection['location'] || '').to_s.downcase,
         'ok'             => !!ok,
         'http_status'    => http_status.to_i,
         'duration_ms'    => dur_ms
       }
     end,
-
     metrics_from_retrieve: lambda do |mapped_chunks, max_req|
       arr    = call(:safe_array, mapped_chunks)
       scores = arr.map { |c| call(:safe_float, (c['score'] || c['relevanceScore'] || 0.0)) }
