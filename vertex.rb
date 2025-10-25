@@ -5,8 +5,11 @@ require 'json'
 require 'time'
 require 'securerandom'
 
-# Documentation:      cloud.google.com/vertex-ai/generative-ai/docs/rag-engine/rag-overview
-# Reranking for RAG:  docs.cloud.google.com/vertex-ai/generative-ai/docs/rag-engine/retrieval-and-ranking
+# Documentation:        cloud.google.com/vertex-ai/generative-ai/docs/rag-engine/rag-overview
+# Reranking for RAG:    docs.cloud.google.com/vertex-ai/generative-ai/docs/rag-engine/retrieval-and-ranking
+# Retrieve contexts 
+# - Example (v1beta1):    https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/rag-api#retrieval-query-api
+# - Parameters (v1):      https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/rag-api-v1#retrieval-and-prediction-params-api_
 
 {
   title: 'Vertex RAG Engine',
@@ -1594,7 +1597,6 @@ require 'securerandom'
           { name: 'metrics_namespace', optional: true, hint: 'Optional tag for partitioning dashboards (e.g., "email_rag_prod").' }
         ]
       end,
-
       output_fields: lambda do |object_definitions, connection|
         [
           { name: 'question' },
@@ -1620,7 +1622,6 @@ require 'securerandom'
           { name: 'metrics', type: 'object', properties: object_definitions['metrics_fields'] },
           { name: 'metrics_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] } ]
       end,
-
       execute: lambda do |connection, input|
         # Correlation + monotonic time for deterministic duration
         t0   = call(:telemetry_t0)
@@ -1655,11 +1656,12 @@ require 'securerandom'
           end
 
           # POST
-          req_body = call(:json_compact, payload)
-          http  = post(url).headers(call(:request_headers, corr)).payload(req_body)
-          code  = call(:telemetry_success_code, http)
-          body  = call(:http_body_json, http)
-          raw   = call(:normalize_retrieve_contexts!, body)
+          req_body  = call(:json_compact, payload)
+          req_hdrs  = call(:request_headers, corr)
+          http      = post(url).headers(req_hdrs).payload(req_body)
+          code      = call(:telemetry_success_code, http)
+          body      = call(:http_body_json, http)
+          raw       = call(:normalize_retrieve_contexts!, body)
 
           maxn   = call(:clamp_int, (input['max_contexts'] || 20), 1, 200)
           mapped = call(:map_context_chunks, raw, maxn)
@@ -1680,22 +1682,24 @@ require 'securerandom'
           out
 
         rescue => e
-          g           = call(:extract_google_error, e)
-          msg         = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          http_status = call(:telemetry_parse_error_code, e)
+        #  g           = call(:extract_google_error, e)
+        #  msg         = [e.to_s, (g['message'] || nil)].compact.join(' | ')
+        #  http_status = call(:telemetry_parse_error_code, e)
 
-          dbg = call(:debug_pack, !(call(:normalize_boolean, connection['prod_mode'])), url, req_body, g)
+        # dbg = call(:debug_pack, !(call(:normalize_boolean, connection['prod_mode'])), url, req_body, g)
 
-          out = {}.merge(call(:telemetry_envelope, t0, corr, false, http_status, msg))
-          out.merge!(dbg) if dbg
+        #  out = {}.merge(call(:telemetry_envelope, t0, corr, false, http_status, msg))
+        #  out.merge!(dbg) if dbg
 
-          flags = call(:metrics_effective_flags, connection, input)
-          if flags['emit']
-            m = call(:metrics_base, connection, 'rag_retrieve_contexts', t0, false, http_status, corr, { 'namespace' => flags['ns'] })
-            out['metrics']    = m
-            out['metrics_kv'] = call(:metrics_to_kv, m)
-          end
-          out
+        #  flags = call(:metrics_effective_flags, connection, input)
+        #  if flags['emit']
+        #    m = call(:metrics_base, connection, 'rag_retrieve_contexts', t0, false, http_status, corr, { 'namespace' => flags['ns'] })
+        #    out['metrics']    = m
+        #    out['metrics_kv'] = call(:metrics_to_kv, m)
+        #  end
+        #  out
+          # get native Workato stack trace
+          error("[#{corr}] #{e}")
         end
       end,
 
@@ -3145,6 +3149,9 @@ require 'securerandom'
   },
 
   # --------- METHODS ------------------------------------------------------
+  # Exercise caution when
+  #   - calling '.dup'
+  #   - implementing method-scope 'rescue'
   methods: {
     resolve_rag_parent_and_corpus!: lambda do |connection, raw_corpus|
       v = raw_corpus.to_s.strip
@@ -3164,14 +3171,6 @@ require 'securerandom'
         corpus_full = "projects/#{connection['project_id']}/locations/#{loc}/ragCorpora/#{v}"
         [connection['project_id'].to_s, loc, corpus_full]
       end
-    end,
-    telemetry_t0: lambda do
-      # Monotonic start time as Float seconds
-      (Process.clock_gettime(Process::CLOCK_MONOTONIC) rescue Time.now.to_f)
-    end,
-    telemetry_now_f: lambda do
-      # Monotonic "now" as Float seconds
-      (Process.clock_gettime(Process::CLOCK_MONOTONIC) rescue Time.now.to_f)
     end,
     # --- Request builders (pure; no HTTP) --------------------------------
     build_embeddings_predict_request: lambda do |connection, model_path, instances, params={}|
@@ -3250,10 +3249,16 @@ require 'securerandom'
     end,
 
     # --- Telemetry and resilience -----------------------------------------
+    telemetry_t0: lambda do
+      # Monotonic start time as Float seconds
+      Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    end,
+    telemetry_now_f: lambda do
+      # Monotonic "now" as Float seconds
+      Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    end,
     telemetry_envelope: lambda do |started_at, correlation_id, ok, code, message|
-      now_f  = call(:telemetry_now_f)
-      base_f = (started_at.respond_to?(:to_f) ? started_at.to_f : 0.0)
-      dur    = ((now_f - base_f) * 1000.0).to_i
+      dur = call(:telemetry_finish, started_at)
       {
         'ok' => !!ok,
         'telemetry' => {
@@ -3265,9 +3270,7 @@ require 'securerandom'
       }
     end,
     telemetry_envelope_ex: lambda do |started_at, correlation_id, ok, code, message, extra = {}|
-      now_f  = call(:telemetry_now_f)
-      base_f = (started_at.respond_to?(:to_f) ? started_at.to_f : 0.0)
-      dur    = ((now_f - base_f) * 1000.0).to_i
+      dur = call(:telemetry_finish, started_at)
       {
         'ok' => !!ok,
         'telemetry' => {
@@ -3354,7 +3357,8 @@ require 'securerandom'
       {
         'request_url'  => url.to_s,
         'request_body' => call(:redact_json, body),
-        'error_body'   => (google_error && google_error['raw']) || google_error
+        'error_body'   => (google_error && google_error['raw']) || google_error,
+        'stack'        => ($!.full_message(highlight: false, order: :top) rescue nil)
       }
     end,
 
@@ -4405,11 +4409,8 @@ require 'securerandom'
     end,
     
     metrics_base: lambda do |connection, action_name, started_at, ok, http_status, corr_id, extras = {}|
-      # Use the same monotonic clock used across telemetry to avoid Time/Float arithmetic traps.
       call(:ensure_project_id!, connection)
-      now_f  = call(:telemetry_now_f)
-      base_f = (started_at.respond_to?(:to_f) ? started_at.to_f : 0.0)
-      dur_ms = ((now_f - base_f) * 1000.0).to_i
+      dur_ms = call(:telemetry_finish, started_at)
       {
         'namespace'      => (extras['namespace'] || nil),
         'action'         => action_name.to_s,
