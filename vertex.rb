@@ -1650,20 +1650,21 @@ require 'securerandom'
           # Dry‑run preview
           if call(:normalize_boolean, input['validate_only'])
             return { 'ok' => true }
-              .merge(call(:request_preview_pack, url, 'POST', call(:request_headers, corr), call(:json_compact, payload)))
+              .merge(call(:request_preview_pack, url, 'POST', call(:request_headers, corr, { 'x-goog-request-params' => "parent=#{parent}", 'x-goog-user-project' => proj }), call(:json_compact, payload)))
               .merge(call(:telemetry_envelope_ex, t0, corr, true, 200, 'DRY_RUN', { 'action' => 'rag_retrieve_contexts' }))
           end
 
           # POST
           req_body = call(:json_compact, payload)
-          http  = post(url).headers(call(:request_headers, corr)).payload(req_body)
+          http  = post(url).headers(call(:request_headers, corr, { 'x-goog-request-params' => "parent=#{parent}", 'x-goog-user-project' => proj })).payload(req_body)
           code  = call(:telemetry_success_code, http)
           body  = call(:http_body_json, http)
           raw   = call(:normalize_retrieve_contexts!, body)
 
           maxn   = call(:clamp_int, (input['max_contexts'] || 20), 1, 200)
           mapped = call(:map_context_chunks, raw, maxn)
-          error('No contexts retrieved; check corpus, region, permissions, or the query text.') if mapped.empty?
+          # Optionally raise on empty corpus
+          #error('No contexts retrieved; check corpus, region, permissions, or the query text.') if mapped.empty?
 
           out = { 'question' => input['question'], 'contexts' => mapped }
                   .merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
@@ -2661,7 +2662,7 @@ require 'securerandom'
         begin
           call(:ensure_project_id!, connection)
           # Accept either full /v1/... or name-only
-          op = input['operation'].to_s.sub(%r{^/v1/}, '')
+          op = input['operation'].to_s.sub(%r{^/?v1/}, '')
           loc = (connection['location'].presence || 'us-central1').to_s.downcase
           url = call(:aipl_v1_url, connection, loc, op.start_with?('projects/') ? op : "projects/#{connection['project_id']}/locations/#{loc}/operations/#{op}")
 
@@ -3467,14 +3468,14 @@ require 'securerandom'
       # Prefer region from the resource name; fallback to connection.
       m   = ep.match(%r{^projects/[^/]+/locations/([^/]+)/endpoints/})
       loc = (m && m[1]) || (connection['location'] || '').to_s.downcase
-      error("This action requires a regional location. Current location is '#{loc}'.") if loc.blank? || loc == 'global'
+      error("This action requires a regional location. Current location is '#{loc}'.") if loc.empty? || loc == 'global'
 
       host = call(:aipl_service_host, connection, loc)
       "https://#{host}/v1/#{call(:build_endpoint_path, connection, ep)}:predict"
     end,
     build_endpoint_path: lambda do |connection, endpoint|
       ep = call(:normalize_endpoint_identifier, endpoint)
-      ep = ep.sub(%r{^/v1/}, '') # defensive
+      ep = ep.sub(%r{^/?v1/}, '') # defensive
       ep.start_with?('projects/') ? ep :
         "projects/#{connection['project_id']}/locations/#{connection['location']}/endpoints/#{ep}"
     end,
@@ -3531,21 +3532,21 @@ require 'securerandom'
     build_rag_corpus_path: lambda do |connection, corpus|
       v = corpus.to_s.strip
       return '' if v.empty?
-      return v.sub(%r{^/v1/}, '') if v.start_with?('projects/')
+      return v.sub(%r{^/?v1/}, '') if v.start_with?('projects/')
       call(:ensure_project_id!, connection)
       loc = (connection['location'] || '').to_s.downcase
-      error("RAG corpus requires regional location; got '#{loc}'") if loc.blank? || loc == 'global'
+      error("RAG corpus requires regional location; got '#{loc}'") if loc.empty? || loc == 'global'
       "projects/#{connection['project_id']}/locations/#{loc}/ragCorpora/#{v}"
     end,
     build_rag_file_path: lambda do |connection, rag_file|
       v = rag_file.to_s.strip
       return '' if v.empty?
-      return v.sub(%r{^/v1/}, '') if v.start_with?('projects/')
+      return v.sub(%r{^/?v1/}, '') if v.start_with?('projects/')
       # allow short form: {corpus_id}/ragFiles/{file_id}
       if v.start_with?('ragCorpora/')
         call(:ensure_project_id!, connection)
         loc = (connection['location'] || '').to_s.downcase
-        error("RAG file requires regional location; got '#{loc}'") if loc.blank? || loc == 'global'
+        error("RAG file requires regional location; got '#{loc}'") if loc.empty? || loc == 'global'
         return "projects/#{connection['project_id']}/locations/#{loc}/#{v}"
       end
       # otherwise expect full name
@@ -3575,7 +3576,7 @@ require 'securerandom'
     end,
     ensure_regional_location!: lambda do |connection|
       loc = (connection['location'] || '').downcase
-      error("This action requires a regional location (e.g., us-central1). Current location is '#{loc}'.") if loc.blank? || loc == 'global'
+      error("This action requires a regional location (e.g., us-central1). Current location is '#{loc}'.") if loc.empty? || loc == 'global'
     end,
     embedding_region: lambda do |connection|
       loc = (connection['location'] || '').to_s.downcase
@@ -3747,18 +3748,18 @@ require 'securerandom'
     end,
     build_index_path: lambda do |connection, index|
       id = call(:normalize_index_identifier, index)
-      return id.sub(%r{^/v1/}, '') if id.start_with?('projects/')
+      return id.sub(%r{^/?v1/}, '') if id.start_with?('projects/')
       call(:ensure_project_id!, connection)
       loc = (connection['location'] || '').to_s.downcase
-      error("Index requires regional location; got '#{loc}'") if loc.blank? || loc == 'global'
+      error("Index requires regional location; got '#{loc}'") if loc.empty? || loc == 'global'
       "projects/#{connection['project_id']}/locations/#{loc}/indexes/#{id}"
     end,
     build_index_endpoint_path: lambda do |connection, ep|
       v = call(:normalize_index_endpoint_identifier, ep)
-      return v.sub(%r{^/v1/}, '') if v.start_with?('projects/')
+      return v.sub(%r{^/?v1/}, '') if v.start_with?('projects/')
       call(:ensure_project_id!, connection)
       loc = (connection['location'] || '').to_s.downcase
-      error("IndexEndpoint requires regional location; got '#{loc}'") if loc.blank? || loc == 'global'
+      error("IndexEndpoint requires regional location; got '#{loc}'") if loc.empty? || loc == 'global'
       "projects/#{connection['project_id']}/locations/#{loc}/indexEndpoints/#{v}"
     end,
 
@@ -4093,7 +4094,7 @@ require 'securerandom'
       # Allow short form: just corpus id -> expand using connection project/region
       call(:ensure_project_id!, connection)
       loc = (connection['location'] || '').to_s.downcase
-      error("RAG corpus requires regional location; got '#{loc}'") if loc.blank? || loc == 'global'
+      error("RAG corpus requires regional location; got '#{loc}'") if loc.empty? || loc == 'global'
       "projects/#{connection['project_id']}/locations/#{loc}/ragCorpora/#{v}"
     end,
 
