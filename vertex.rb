@@ -5,22 +5,22 @@ require 'json'
 require 'time'
 require 'securerandom'
 
-# Documentation:        cloud.google.com/vertex-ai/generative-ai/docs/rag-engine/rag-overview
-# Reranking for RAG:    docs.cloud.google.com/vertex-ai/generative-ai/docs/rag-engine/retrieval-and-ranking
-# Retrieve contexts 
-# - Example (v1beta1):    https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/rag-api#retrieval-query-api
-# - Parameters (v1):      https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/rag-api-v1#retrieval-and-prediction-params-api_
 
 {
   title: 'Vertex RAG Engine',
   subtitle: 'RAG Engine',
   version: '0.9.5',
   description: 'RAG engine via service account (JWT)',
-  help: {
-    body: 'The Vertex AI RAG Engine is a component of the Vertex AI platform, which facilitates Retrieval-Augmented-Generation (RAG).' \
-          'RAG Engine enables Large Language Models (LLMs) to access and incorporate data from external knowledge sources, such as '  \
-          'documents and databases. By using RAG, LLMs can generate more accurate and informative LLM responses.'
-  },
+  help: lambda do |input, picklist_label|
+    {
+      body: 'The Vertex AI RAG Engine is a component of the Vertex AI platform, which facilitates Retrieval-Augmented-Generation (RAG).' \
+            'RAG Engine enables Large Language Models (LLMs) to access and incorporate data from external knowledge sources, such as '  \
+            'documents and databases. By using RAG, LLMs can generate more accurate and informative LLM responses.',
+      learn_more_url: "https://aiplatform.googleapis.com/$discovery/rest?version=v1",
+      learn_more_text: "Check out the Vertex AI Discovery Document"
+      # Documentation:        cloud.google.com/vertex-ai/generative-ai/docs/rag-engine/rag-overview
+    }
+  end,
 
   # --------- CONNECTION ---------------------------------------------------
   connection: {
@@ -93,7 +93,7 @@ require 'securerandom'
       loc  = 'global' if loc.empty?
       host = (loc == 'global') ? 'aiplatform.googleapis.com' : "#{loc}-aiplatform.googleapis.com"
       "https://#{host}/v1/"
-    end,
+    end
 
   },
 
@@ -1298,6 +1298,13 @@ require 'securerandom'
     rank_texts_with_ranking_api: {
       title: 'Ranking API: Rerank texts',
       subtitle: 'projects.locations.rankingConfigs:rank',
+      description: '',
+      help: lambda do |input, picklist_label|
+        {
+          learn_more_url: 'docs.cloud.google.com/vertex-ai/generative-ai/docs/rag-engine/retrieval-and-ranking',
+          learn_more_text: 'Check out Google docs for retrieval and ranking'
+        }
+      end,
       display_priority: 85,
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
@@ -1380,7 +1387,6 @@ require 'securerandom'
           out
         end
       end,
-
       sample_output: lambda do
         { 'records' => [ { 'id' => 'ctx-1', 'score' => 0.92 } ],
           'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 9, 'correlation_id' => 'sample' } }
@@ -1389,185 +1395,6 @@ require 'securerandom'
 
     # 4) RAG store engine (Vertex AI)
     # ---- Serving (80)
-    rag_retrieve_contexts_8: {
-      title: 'RAG Serving: Retrieve contexts',
-      subtitle: 'projects.locations:retrieveContexts (Vertex RAG Store)',
-      help: lambda do |input, picklist_label|
-        {
-        learn_more_url: 'https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/rag-api-v1#retrieval-and-prediction-params-api',
-        learn_more_text: 'Retrieval and predication params'
-        }
-      end,
-      display_priority: 80,
-      retry_on_request: ['GET','HEAD'],
-      retry_on_response: [408,429,500,502,503,504],
-      max_retries: 3,
-
-      input_fields: lambda do |object_definitions, connection, config_fields|
-        [
-          { name: 'rag_corpus', optional: false,
-            hint: 'Accepts either full resource name (e.g., "projects/{project}/locations/{region}/ragCorpora/{corpus}") or the "corpus"' },
-          { name: 'question', optional: false },
-          { name: 'restrict_to_file_ids', type: 'array', of: 'string', optional: true },
-          { name: 'max_contexts', type: 'integer', optional: true, default: 20 },
-          { name: 'validate_only', label: 'Validate only (no call)', type: 'boolean', control_type: 'checkbox', optional: true },
-          { name: 'emit_metrics', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
-            hint: 'Attach a metrics object in the output for downstream persistence.' },
-          { name: 'metrics_namespace', optional: true, hint: 'Optional tag for partitioning dashboards (e.g., "email_rag_prod").' },
-          # Re-ranking
-          { name: 'similarity_top_k', label: 'Retriever topK (pre-rerank)', type: 'integer', optional: true, default: 50,
-            hint: 'How many neighbors to fetch before reranking (RAG Engine top_k).' },
-          { name: 'ranker', control_type: 'select', pick_list: 'rankers', optional: true, default: 'none',
-            hint: 'Use Vertex Rank Service (Discovery Engine) or LLM Reranker (Gemini).' },
-          { name: 'rank_model', optional: true,
-            hint: 'When ranker=rank_service, e.g. semantic-ranker-default@latest; when llm_ranker, a Gemini model.' },
-          { name: 'ranking_config_name', optional: true,
-            hint: 'Optional Discovery Engine rankingConfig full name; defaults to .../rankingConfigs/default_ranking_config' }
-        ]
-      end,
-      output_fields: lambda do |object_definitions, connection|
-        [
-          { name: 'question' },
-          { name: 'contexts', type: 'array', of: 'object', properties: [
-              { name: 'id' },
-              { name: 'text' },
-              { name: 'score', type: 'number' },
-              { name: 'source' },
-              { name: 'uri' },
-              { name: 'metadata', type: 'object' },
-              { name: 'metadata_kv', label: 'metadata (KV)', type: 'array', of: 'object', properties: object_definitions['kv_pair'] },
-              { name: 'metadata_json', label: 'metadata (JSON)', type: 'string' }
-            ]
-          }
-        ] + [
-          { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object', properties: [
-            { name: 'http_status', type: 'integer' },
-            { name: 'message' }, { name: 'duration_ms', type: 'integer' },
-            { name: 'correlation_id' }
-          ]}
-        ] + [
-          { name: 'metrics', type: 'object', properties: object_definitions['metrics_fields'] },
-          { name: 'metrics_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] } ]
-      end,
-      execute: lambda do |connection, input|
-        # Build correlation ID & monotonic start (for traceability)
-        t0   = call(:telemetry_t0)
-        corr = call(:build_correlation_id)
-        url  = nil; req_body = nil
-        begin
-          # Resolve effective parent (project/location) from the rag_corpus if fully-qualified,
-          # otherwise fall back to connection.project/location (and enforce regional).
-          proj, loc, corpus = call(:resolve_rag_parent_and_corpus!, connection, input['rag_corpus'])
-          parent = "projects/#{proj}/locations/#{loc}"
-
-          # Assemble ranking inputs (supported by build_rag_retrieve_payload)
-          ranking_opts = {
-            'ranker'           => input['ranker'],
-            'rank_model'       => input['rank_model'],
-            'similarity_top_k' => input['similarity_top_k']
-          }
-
-          # Build payload from input
-          payload = call(:build_rag_retrieve_payload, input['question'], corpus, input['restrict_to_file_ids'], ranking_opts)
-          url     = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
-
-          # Validate-only preview (no network call)
-          if call(:normalize_boolean, input['validate_only'])
-            preview = call(:request_preview_pack, url, 'POST', call(:request_headers, corr), call(:json_compact, payload))
-            return { 'ok' => true }
-                     .merge(preview)
-                     .merge(call(:telemetry_envelope_ex, t0, corr, true, 200, 'DRY_RUN', { 'action' => 'rag_retrieve_contexts' }))
-          end
-
-          # POST (inline to enable Workato's standard HTTP inspector)
-          req_body = call(:json_compact, payload)
-          http = post(url)
-                  .headers(call(:request_headers, corr))
-                  .payload(req_body)
-
-          # Handle result
-          code = call(:telemetry_success_code, http)
-          body = call(:http_body_json, http)
-          raw  = call(:normalize_retrieve_contexts!, body)
-
-          pre_count = call(:safe_array, raw).length
-          maxn      = call(:clamp_int, (input['max_contexts'] || 20), 1, 200)
-          mapped    = call(:map_context_chunks, raw, maxn)
-
-          # Optional: fail fast on empty retrievals (comment out if you prefer OK/200)
-          if mapped.empty?
-            error('No contexts retrieved; check corpus, region, permissions, or the query text.')
-          end
-
-          # Build output
-          base_out = {
-            'question' => input['question'],
-            'contexts' => mapped
-          }.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-          ok          = true
-          http_status = code
-
-          # Metrics (include re-ranking signals if enabled)
-          flags = call(:metrics_effective_flags, connection, input)
-          if flags['emit']
-            m = call(:metrics_base, connection, 'rag_retrieve_contexts', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
-                  .merge('rag_corpus' => corpus)
-                  .merge(call(:metrics_from_retrieve, mapped, input['max_contexts']))
-            # Re-ranking enrichments
-            m['ranker']                   = (input['ranker'] || 'none')
-            m['rank_model']               = input['rank_model']
-            m['retrieved_before_rerank']  = pre_count
-            scores                        = mapped.map { |c| (c['score'] || 0.0).to_f }
-            m['rerank_top_score']         = (scores.max || nil)
-            m['rerank_avg_score']         = (scores.empty? ? nil : (scores.sum / scores.length.to_f))
-
-            base_out['metrics']    = m
-            base_out['metrics_kv'] = call(:metrics_to_kv, m)
-          end
-          base_out
-        rescue => e
-          # Extract error details
-          g           = call(:extract_google_error, e)
-          msg         = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          http_status = call(:telemetry_parse_error_code, e)
-
-          # Prepare output; include debug echo when not in prod_mode to avoid "silent" failures
-          dbg = call(:debug_pack,
-                     !(call(:normalize_boolean, connection['prod_mode'])),
-                     url,
-                     req_body,
-                     g)
-
-          out   = {}.merge(call(:telemetry_envelope, t0, corr, false, http_status, msg))
-          out.merge!(dbg) if dbg
-          flags = call(:metrics_effective_flags, connection, input)
-          if flags['emit']
-            m = call(:metrics_base, connection, 'rag_retrieve_contexts', t0, false, http_status, corr, { 'namespace' => flags['ns'] })
-            # Preserve ranker intent on failures to aid troubleshooting
-            m['ranker']     = (input['ranker'] || 'none')
-            m['rank_model'] = input['rank_model']
-            out['metrics']    = m
-            out['metrics_kv'] = call(:metrics_to_kv, m)
-          end
-          out
-        end
-      end,
-      sample_output: lambda do
-        {
-          'question' => 'What is the PTO carryover policy?',
-          'contexts' => [
-            { 
-              'id' => 'doc-42#c3', 'text' => 'Employees may carry over up to 40 hours...', 'score' => 0.91,
-              'source' => 'handbook', 'uri' => 'https://drive.google.com/file/d/abc...', 'metadata' => { 'page' => 7 },
-              'metadata_kv' => [ { 'key' => 'page', 'value' => 7 } ],
-              'metadata_json' => '{"page":7}' 
-            }],
-          'ok' => true,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 22, 'correlation_id' => 'sample' }
-        }
-      end
-    },
     rag_retrieve_contexts: {
       title: 'RAG Serving: Retrieve contexts',
       subtitle: 'projects.locations:retrieveContexts (Vertex RAG Store)',
@@ -1577,7 +1404,263 @@ require 'securerandom'
           learn_more_text: 'Retrieval and predication params'
         }
       end,
-      display_priority: 80,
+      display_priority: 0,
+      retry_on_request: ['GET','HEAD'],
+      retry_on_response: [408,429,500,502,503,504],
+      max_retries: 3,
+
+      input_fields: lambda do |object_definitions, connection, config_fields|
+        [
+          # Keep mode, but default to AUTO (no user intervention needed).
+          {
+            name: 'mode',
+            label: 'Endpoint mode',
+            control_type: 'select',
+            pick_list: [
+              ['Auto (recommended)', 'auto'],
+              ['Location (v1)', 'at_location_v1'],
+              ['Corpus (v1beta1)', 'at_corpus_v1beta1']
+            ],
+            optional: true,
+            default: 'auto',
+            hint: 'Auto uses v1 for location calls; switches to v1beta1 for corpus-scoped calls.'
+          },
+          { name: 'text', label: 'Query text', optional: false },
+
+          # Signals for corpus mode
+          { name: 'corpus', label: 'Corpus (ID or full resource name)', optional: true },
+
+          {
+            name: 'rag_resources',
+            label: 'RAG resources',
+            type: 'array', of: 'object', optional: true,
+            hint: 'Each item becomes dataSource.vertexRagStore.ragResources[*]',
+            properties: [
+              { name: 'rag_corpus', label: 'Corpus (ID or full resource name)', optional: false },
+              { name: 'rag_file_ids', label: 'File IDs', type: 'array', of: 'string', optional: true }
+            ]
+          },
+
+          { name: 'debug', type: 'boolean', control_type: 'checkbox', label: 'Return request/response in _debug', optional: true }
+        ]
+      end,
+      output_fields: lambda do |_object_definitions, _connection|
+        [
+          { name: 'contexts', type: 'array', of: 'object', properties: [
+            { name: 'chunkId' }, { name: 'text' }, { name: 'score', type: 'number' },
+            { name: 'sourceUri' }, { name: 'sourceDisplayName' }, { name: 'chunk', type: 'object' },
+            { name: 'metadata', type: 'object' }
+          ]},
+          { name: '_meta', type: 'object', properties: [
+            { name: 'http_status', type: 'integer' },
+            { name: 'request_id' }, { name: 'retry_after' }, { name: 'rate_limit_rem' },
+            { name: 'etag' }, { name: 'last_modified' }, { name: 'model_version' },
+            { name: 'next_page_token' }, { name: 'duration_ms', type: 'integer' },
+            { name: 'correlation_id' }, { name: 'endpoint_mode' }, { name: 'api_version' }, { name: 'url' }
+          ]},
+          { name: '_debug', type: 'object', properties: [
+            { name: 'request', type: 'object' }, { name: 'response', type: 'object' }
+          ]}
+        ]
+      end,
+
+      execute: lambda do |connection, input|
+        t0   = Time.now
+        corr = SecureRandom.uuid
+
+        proj = connection['project_id']
+        loc  = connection['location']
+        raise 'Connection is missing project_id' if proj.blank?
+        raise 'Connection is missing location'   if loc.blank?
+
+        # Server base: favor regional endpoint; version added later.
+        base_host = (connection['base_url'].presence || "https://#{loc}-aiplatform.googleapis.com").gsub(%r{/+$}, '')
+
+        headers = {
+          'Accept'           => 'application/json',
+          'Content-Type'     => 'application/json',
+          'X-Correlation-Id' => corr
+        }
+        headers['x-goog-user-project'] = connection['billing_project'] if connection['billing_project'].present?
+
+        text = input['text'].to_s
+        raise 'text is required' if text.blank?
+
+        # ---------- Normalize corpora ----------
+        norm_corpus_fqn = lambda do |val|
+          v = val.to_s
+          return v if v.start_with?('projects/')
+          raise 'corpus is required' if v.blank?
+          "projects/#{proj}/locations/#{loc}/ragCorpora/#{v}"
+        end
+
+        # Build normalized rag_resources array (FQNs only)
+        in_resources = Array(input['rag_resources']).select { |r| r.is_a?(Hash) && r['rag_corpus'].present? }
+        normalized_resources = in_resources.map do |r|
+          rc = norm_corpus_fqn.call(r['rag_corpus'])
+          obj = { 'ragCorpus' => rc }
+          ids = r['rag_file_ids']
+          obj['ragFileIds'] = ids if ids.present?
+          obj
+        end
+
+        # If top-level corpus is provided, prefer it
+        top_corpus = input['corpus'].present? ? norm_corpus_fqn.call(input['corpus']) : nil
+
+        # Decide endpoint automatically unless overridden
+        mode = (input['mode'].presence || 'auto').to_s
+
+        # Heuristics for auto:
+        # - If a top-level corpus is provided => use corpus-scoped (v1beta1)
+        # - Else if exactly one resource corpus is present => corpus-scoped (v1beta1)
+        # - Else => location-scoped (v1)
+        wants_corpus = case mode
+                      when 'at_corpus_v1beta1' then true
+                      when 'at_location_v1'    then false
+                      else
+                        top_corpus.present? || normalized_resources.map { |r| r['ragCorpus'] }.uniq.size == 1
+                      end
+
+        api_version = wants_corpus ? 'v1beta1' : 'v1'
+        path        = nil
+
+        if wants_corpus
+          parent = top_corpus || normalized_resources.first&.dig('ragCorpus')
+          raise 'A corpus is required to call the corpus-scoped endpoint' if parent.blank?
+
+          path = "/#{api_version}/#{parent}:retrieveContexts"
+          headers['x-goog-request-params'] = "parent=#{parent}"
+
+          # Ensure body has a single ragResource aligned to parent
+          resource = { 'ragCorpus' => parent }
+          # If caller provided file IDs on first item, thread them through
+          first_ids = normalized_resources.first&.dig('ragFileIds')
+          resource['ragFileIds'] = first_ids if first_ids.present?
+          rag_resources = [resource]
+
+        else
+          path = "/#{api_version}/projects/#{proj}/locations/#{loc}:retrieveContexts"
+          headers['x-goog-request-params'] = "parent=projects/#{proj}/locations/#{loc}"
+
+          # If user only provided top_corpus, synthesize one resource from it
+          if normalized_resources.empty? && top_corpus.present?
+            rag_resources = [{ 'ragCorpus' => top_corpus }]
+          else
+            rag_resources = normalized_resources
+          end
+
+          raise 'At least one rag_resource or corpus is required for location-scoped call' if rag_resources.empty?
+        end
+
+        url  = "#{base_host}#{path}"
+        body = {
+          'query'      => { 'text' => text },
+          'dataSource' => { 'vertexRagStore' => { 'ragResources' => rag_resources } }
+        }
+
+        response = post(url).headers(headers).payload(body).request_format_json
+
+        out = response.is_a?(Hash) ? response : { 'raw' => response.to_s }
+        out['_meta'] ||= {}
+        out['_meta']['duration_ms']    = ((Time.now - t0) * 1000).to_i
+        out['_meta']['correlation_id'] = corr
+        out['_meta']['endpoint_mode']  = wants_corpus ? 'corpus' : 'location'
+        out['_meta']['api_version']    = api_version
+        out['_meta']['url']            = url if input['debug']
+
+        if input['debug']
+          out['_debug'] = {
+            'request'  => { 'method' => 'POST', 'url' => url, 'headers' => headers, 'body' => body },
+            'response' => response
+          }
+        end
+
+        out
+      rescue StandardError => e
+        e.is_a?(Hash) ? error(e) : error({ 'message' => e.message })
+      end,
+
+      sample_output: lambda do
+        {
+          'contexts' => [
+            {
+              'chunkId' => 'c-001',
+              'text'    => 'Parental leave is 12 weeks paid for all FTEs.',
+              'score'   => 0.8642,
+              'sourceUri' => 'gs://corp-bucket/policies/benefits.pdf#page=2',
+              'sourceDisplayName' => 'benefits.pdf',
+              'metadata' => { 'page' => 2 }
+            }
+          ],
+          '_meta' => {
+            'http_status'   => 200,
+            'request_id'    => 'req-123',
+            'duration_ms'   => 18,
+            'correlation_id'=> 'uuid-abc',
+            'endpoint_mode' => 'corpus',
+            'api_version'   => 'v1beta1'
+          }
+        }
+      end,
+      after_response: lambda { |code, body, headers, message|
+        parsed = body.is_a?(Hash) ? body : (body.present? ? JSON.parse(body) rescue { 'raw' => body.to_s } : {})
+
+        meta = parsed['_meta'] ||= {}
+        meta['http_status']    = code
+        meta['request_id']     = headers['X-Request-Id'] || headers['x-request-id']
+        meta['retry_after']    = headers['Retry-After']
+        meta['rate_limit_rem'] = headers['X-RateLimit-Remaining']
+        meta['etag']           = headers['ETag']
+        meta['last_modified']  = headers['Last-Modified']
+        meta['model_version']  = headers['x-goog-model-id'] || headers['X-Model-Version']
+        parsed['_meta']['next_page_token'] ||= parsed['nextPageToken'] || parsed['next_page_token']
+
+        if parsed['error'].is_a?(Hash)
+          e = parsed['error']
+          raise error({
+            'code'     => e['code'] || code,
+            'status'   => e['status'],
+            'message'  => e['message'] || message || 'Request failed',
+            'details'  => e['details']
+          })
+        end
+        parsed
+      end,
+      after_error_response: lambda { |code, body, headers, message|
+        normalized = { 'code' => code }
+        begin
+          json = body.is_a?(Hash) ? body : (body.present? ? JSON.parse(body) : {})
+        rescue
+          json = { 'raw' => body.to_s }
+        end
+
+        if json['error'].is_a?(Hash)
+          e = json['error']
+          normalized['status']   = e['status']
+          normalized['message']  = e['message'] || message || 'Request failed'
+          normalized['details']  = e['details']
+        else
+          normalized['message']  = message || json['message'] || 'Request failed'
+          normalized['raw']      = json unless json.empty?
+        end
+
+        normalized['retryable']     = [408, 429, 500, 502, 503, 504].include?(code)
+        normalized['retry_after']   = headers['Retry-After']
+        normalized['request_id']    = headers['X-Request-Id'] || headers['x-request-id']
+        normalized['model_version'] = headers['x-goog-model-id'] || headers['X-Model-Version']
+        error(normalized)
+      end
+    },
+    rag_retrieve_contexts_old: {
+      title: 'RAG Serving: Retrieve contexts',
+      subtitle: 'projects.locations:retrieveContexts (Vertex RAG Store)',
+      help: lambda do |input, picklist_label|
+        {
+          learn_more_url: 'https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/rag-api-v1#retrieval-and-prediction-params-api',
+          learn_more_text: 'Retrieval and predication params'
+        }
+      end,
+      display_priority: 0,
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
@@ -2696,382 +2779,6 @@ require 'securerandom'
       sample_output: lambda do
         { 'name' => 'projects/p/locations/us-central1/operations/123', 'done' => false,
           'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 8, 'correlation_id' => 'sample' } }
-      end
-    },
-
-    # Deprecated (testing and configuration required 10/24/25)
-    permission_probe: {
-      title: 'Admin: Permission probe',
-      subtitle: 'Quick IAM/billing/region checks for Vertex, RAG Store & Discovery Engine',
-      display_priority: 1,# 1 = lowest display priority
-      deprecated: true, # maintenance and testing needed before release
-      help: lambda do |_|
-        { body: 'Runs lightweight calls (locations.list, models.countTokens, indexes.list, ragCorpora.list, optional Discovery Engine engines.list & search) to validate auth, billing, and region. Returns per-check status and suggestions.' }
-      end,
-
-      input_fields: lambda do |object_definitions, connection, config_fields|
-        [
-          # Which checks to run
-          { name: 'check_locations', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
-            hint: 'GET projects/{p}/locations (verifies basic access to Vertex AI API and project)' },
-          { name: 'check_count_tokens', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
-            hint: 'POST models:countTokens on a small prompt (verifies generative access & billing)' },
-          { name: 'check_indexes_list', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
-            hint: 'GET indexes list in the selected region (verifies Matching Engine permissions & region)' },
-          { name: 'check_rag_corpora_list', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
-            hint: 'GET ragCorpora list (verifies Vertex RAG Store permissions & region)' },
-
-          # Minimal config for the token-count smoke test
-          { name: 'gen_model', label: 'Generative model (for countTokens)', optional: true,
-            hint: 'Defaults to connection default or gemini-2.0-flash' },
-          { name: 'count_tokens_text', optional: true, hint: 'Optional custom text; default uses "ping"' },
-
-          # Debug echo
-          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true,
-            hint: 'Echo request details and Google error bodies in debug.results[].' },
-
-          # Discovery Engine (Vertex AI Search)
-          { name: 'check_discovery_engines_list', type: 'boolean', control_type: 'checkbox', optional: true, default: false,
-            hint: 'GET discovery engines in the chosen location (verifies Discovery Engine API + IAM)' },
-          { name: 'check_discovery_search_smoke', type: 'boolean', control_type: 'checkbox', optional: true, default: false,
-            hint: 'POST :search on a servingConfig with a tiny query (validates end-to-end search)' },
-          { name: 'discovery_host', label: 'Discovery Engine host', control_type: 'select', pick_list: 'discovery_hosts',
-            optional: true, hint: 'Default global; choose US multi-region if your engine lives there.' },
-          { name: 'discovery_host_custom', label: 'Custom Discovery host', optional: true,
-            hint: 'Override host manually (e.g., us-discoveryengine.googleapis.com). Takes precedence when set.' },
-          { name: 'discovery_location', label: 'Discovery location', optional: true,
-            hint: 'e.g., global, us, us-central1. Defaults to connection.location or "global" if blank.' },
-          { name: 'discovery_collection', optional: true, default: 'default_collection',
-            hint: 'Usually default_collection' },
-          { name: 'discovery_engine_id', label: 'Engine ID (for list/search)', optional: true,
-            hint: 'Required for search when serving_config is not provided.' },
-          { name: 'discovery_serving_config', label: 'Serving config (full path)', optional: true,
-            hint: 'projects/{p}/locations/{l}/collections/{c}/engines/{e}/servingConfigs/{name} (often "default_config")' },
-          { name: 'discovery_search_query', label: 'Search query (smoke)', optional: true, default: 'ping',
-            hint: 'Tiny query for the smoke test' }
-        ]
-      end,
-      output_fields: lambda do |object_definitions, connection|
-        [
-          { name: 'project_id' },
-          { name: 'location' },
-          { name: 'user_project' },
-          { name: 'principal', type: 'object', properties: [
-              { name: 'client_email' }
-            ]
-          },
-          { name: 'results', type: 'array', of: 'object', properties: [
-              { name: 'check' },
-              { name: 'ok', type: 'boolean' },
-              { name: 'http_status', type: 'integer' },
-              { name: 'url' },
-              { name: 'message' },
-              { name: 'suggestion' },
-              { name: 'debug', type: 'object' }
-            ]
-          },
-          { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object', properties: [
-            { name: 'http_status', type: 'integer' },
-            { name: 'message' }, { name: 'duration_ms', type: 'integer' },
-            { name: 'correlation_id' }
-          ]}
-        ]
-      end,
-      execute: lambda do |connection, input|
-        # Build correlation ID & monotonic start (for traceability)
-        t0   = call(:telemetry_t0)
-        corr = call(:build_correlation_id)
-
-        # Normalize connection context
-        call(:ensure_project_id!, connection)
-        project = connection['project_id'].to_s
-        loc     = (connection['location'].presence || 'global').to_s.downcase
-        up      = (connection['user_project'].to_s.strip.presence)
-        sa_json = JSON.parse(connection['service_account_key_json'].to_s) rescue {}
-        client  = sa_json['client_email'].to_s
-
-        results = []
-        do_debug = call(:normalize_boolean, input['debug'])
-
-        # Helper to run a single probe with uniform capture
-        run_probe = lambda do |name|
-          begin
-            url, http_code, msg, dbg = yield
-            results << {
-              'check'       => name,
-              'ok'          => true,
-              'http_status' => http_code,
-              'url'         => url,
-              'message'     => 'OK',
-              'suggestion'  => nil,
-              'debug'       => (do_debug ? dbg : nil)
-            }
-          rescue => e
-            g   = call(:extract_google_error, e) rescue {}
-            code = call(:telemetry_parse_error_code, e)
-            url  = (g['raw'] && g['raw']['error'] && g['raw']['error']['status']) ? nil : nil
-            # Friendly suggestions by common failure modes
-            hint =
-              case code
-              when 400
-                'Bad request. Double-check path/region and request body shape.'
-              when 401
-                'Unauthenticated. Verify service account key is valid and not revoked.'
-              when 403
-                'Permission denied. Ensure the service account has required IAM roles and that the API is enabled for the project and (if set) user_project.'
-              when 404
-                'Not found. Check region (“location”) and resource IDs. Many Vertex calls require a regional (non-global) location.'
-              when 429
-                'Rate limited or quota exceeded. Consider setting user_project or request fewer ops.'
-              when 412
-                'Precondition failed. Resource may be in an invalid state.'
-              else
-                nil
-              end
-
-            results << {
-              'check'       => name,
-              'ok'          => false,
-              'http_status' => code,
-              'url'         => nil,
-              'message'     => [e.to_s, (g['message'] || nil)].compact.join(' | '),
-              'suggestion'  => hint,
-              'debug'       => (do_debug ? call(:debug_pack, true, nil, nil, g) : nil)
-            }
-          end
-        end
-
-        # 1) Locations list (works even when no models created)
-        if input['check_locations'] != false
-          run_probe.call('locations.list') do
-            url = "https://aiplatform.googleapis.com/v1/projects/#{project}/locations"
-            resp = get(url).params(pageSize: 1).headers(call(:request_headers, corr))
-            [url, call(:telemetry_success_code, resp), 'OK',
-             call(:debug_pack, do_debug, [url, {pageSize:1}].compact.join('?'), nil, resp&.body)]
-          end
-        end
-
-        # 2) Count tokens on a tiny prompt (validates generative path + billing)
-        if input['check_count_tokens'] != false
-          begin
-            model = (input['gen_model'].presence || connection['default_probe_gen_model'].presence || 'gemini-2.0-flash').to_s
-            model_path = call(:build_model_path_with_global_preview, connection, model)
-            url = call(:aipl_v1_url, connection, (loc.presence || 'global'), "#{model_path}:countTokens")
-            payload = {
-              'contents' => [
-                { 'role' => 'user', 'parts' => [ { 'text' => (input['count_tokens_text'].presence || 'ping') } ] }
-              ],
-              'systemInstruction' => call(:system_instruction_from_text, 'permission probe')
-            }
-            resp = post(url).headers(call(:request_headers, corr)).payload(call(:json_compact, payload))
-            results << {
-              'check'       => 'models.countTokens',
-              'ok'          => true,
-              'http_status' => call(:telemetry_success_code, resp),
-              'url'         => url,
-              'message'     => 'OK',
-              'suggestion'  => nil,
-              'debug'       => (do_debug ? call(:debug_pack, true, url, payload, resp&.body) : nil)
-            }
-          rescue => e
-            g = call(:extract_google_error, e) rescue {}
-            code = call(:telemetry_parse_error_code, e)
-            results << {
-              'check'       => 'models.countTokens',
-              'ok'          => false,
-              'http_status' => code,
-              'url'         => nil,
-              'message'     => [e.to_s, (g['message'] || nil)].compact.join(' | '),
-              'suggestion'  => (code == 403 ? 'Grant Vertex AI User (roles/aiplatform.user) and ensure billing/quota via x-goog-user-project if needed.' : nil),
-              'debug'       => (do_debug ? call(:debug_pack, true, nil, nil, g) : nil)
-            }
-          end
-        end
-
-        # 3) Indexes list (Matching Engine)
-        if input['check_indexes_list'] != false
-          run_probe.call('indexes.list') do
-            call(:ensure_regional_location!, connection)
-            parent = "projects/#{project}/locations/#{loc}"
-            url    = call(:aipl_v1_url, connection, loc, "#{parent}/indexes")
-            resp   = get(url).params(pageSize: 1).headers(call(:request_headers, corr))
-            [url, call(:telemetry_success_code, resp), 'OK',
-             call(:debug_pack, do_debug, [url, {pageSize:1}].compact.join('?'), nil, resp&.body)]
-          end
-        end
-
-        # 4) RAG corpora list (Vertex RAG Store)
-        if input['check_rag_corpora_list'] != false
-          run_probe.call('ragCorpora.list') do
-            call(:ensure_regional_location!, connection)
-            parent = "projects/#{project}/locations/#{loc}"
-            url    = call(:aipl_v1_url, connection, loc, "#{parent}/ragCorpora")
-            resp   = get(url).params(pageSize: 1).headers(call(:request_headers, corr))
-            [url, call(:telemetry_success_code, resp), 'OK',
-             call(:debug_pack, do_debug, [url, {pageSize:1}].compact.join('?'), nil, resp&.body)]
-          end
-        end
-  
-        # 5) Discovery engine
-        # Resolve host and location
-        de_host =
-          if input['discovery_host_custom'].to_s.strip.present?
-            input['discovery_host_custom'].to_s.strip
-          elsif input['discovery_host'].to_s.strip.present?
-            input['discovery_host'].to_s.strip
-          else
-            'discoveryengine.googleapis.com'
-          end
-        de_loc  = (input['discovery_location'].presence || loc.presence || 'global').to_s.downcase
-        de_coll = (input['discovery_collection'].presence || 'default_collection').to_s
-
-        # (A) engines.list
-        if input['check_discovery_engines_list'] == true
-          run_probe.call('discovery.engines.list') do
-            parent = "projects/#{project}/locations/#{de_loc}/collections/#{de_coll}"
-            host_override = (input['discovery_host_custom'].presence || input['discovery_host'].presence)
-            url = call(:discovery_url, connection, de_loc, "#{parent}/engines", nil, host_override)
-            resp   = get(url).params(pageSize: 1).headers(call(:request_headers, corr))
-            [url, call(:telemetry_success_code, resp), 'OK',
-             call(:debug_pack, do_debug, [url, {pageSize:1}].compact.join('?'), nil, resp&.body)]
-          end
-        end
-
-        # (B) search smoke test
-        if input['check_discovery_search_smoke'] == true
-          begin
-            serving = input['discovery_serving_config'].to_s.strip
-            engine  = input['discovery_engine_id'].to_s.strip
-
-            serving_path =
-              if serving.start_with?('projects/')
-                serving.sub(%r{^/}, '')
-              else
-                # build from pieces when not provided as full path
-                error('Provide discovery_engine_id or discovery_serving_config for search smoke test') if engine.empty?
-                "projects/#{project}/locations/#{de_loc}/collections/#{de_coll}/engines/#{engine}/servingConfigs/default_config"
-              end
-
-            host_override = (input['discovery_host_custom'].presence || input['discovery_host'].presence)
-            url = call(:discovery_url, connection, de_loc, "#{serving_path}:search", nil, host_override)
-            payload = {
-              'query'    => (input['discovery_search_query'].presence || 'ping').to_s,
-              'pageSize' => 1
-            }
-
-            resp = post(url).headers(call(:request_headers, corr)).payload(call(:json_compact, payload))
-            results << {
-              'check'       => 'discovery.search',
-              'ok'          => true,
-              'http_status' => call(:telemetry_success_code, resp),
-              'url'         => url,
-              'message'     => 'OK',
-              'suggestion'  => nil,
-              'debug'       => (do_debug ? call(:debug_pack, true, url, payload, resp&.body) : nil)
-            }
-          rescue => e
-            g    = call(:extract_google_error, e) rescue {}
-            code = call(:telemetry_parse_error_code, e)
-            hint =
-              case code
-              when 403
-                'Permission denied. Grant Discovery Engine roles (e.g., roles/discoveryengine.admin or roles/discoveryengine.searchEditor) and ensure the API is enabled.'
-              when 404
-                'Not found. Check location/collection/engine/servingConfig. Discovery Engine often uses global/us multi-region; ensure host and location align.'
-              when 400
-                'Bad request. Verify request body shape and that the servingConfig is deployed.'
-              else
-                nil
-              end
-            results << {
-              'check'       => 'discovery.search',
-              'ok'          => false,
-              'http_status' => code,
-              'url'         => nil,
-              'message'     => [e.to_s, (g['message'] || nil)].compact.join(' | '),
-              'suggestion'  => hint,
-              'debug'       => (do_debug ? call(:debug_pack, true, nil, nil, g) : nil)
-            }
-          end
-        end
-
-        # Overall
-        overall_ok = results.all? { |r| r['ok'] }
-        {
-          'project_id' => project,
-          'location'   => loc,
-          'user_project' => up,
-          'principal'  => { 'client_email' => client },
-          'results'    => results
-        }.merge(call(:telemetry_envelope, t0, corr, overall_ok, (overall_ok ? 200 : 207), (overall_ok ? 'OK' : 'PARTIAL')))
-      end,
-      sample_output: lambda do
-        {
-          'project_id' => 'acme-prod',
-          'location'   => 'us-central1',
-          'user_project' => 'acme-billing',
-          'principal'  => { 'client_email' => 'svc-vertex@acme.iam.gserviceaccount.com' },
-          'results' => [
-            { 'check' => 'locations.list',       'ok' => true,  'http_status' => 200, 'url' => 'https://aiplatform.googleapis.com/v1/projects/acme/locations', 'message' => 'OK' },
-            { 'check' => 'models.countTokens',   'ok' => true,  'http_status' => 200, 'url' => 'https://us-central1-aiplatform.googleapis.com/v1/projects/acme/locations/us-central1/publishers/google/models/gemini-2.0-flash:countTokens', 'message' => 'OK' },
-            { 'check' => 'indexes.list',         'ok' => true,  'http_status' => 200, 'url' => 'https://us-central1-aiplatform.googleapis.com/v1/projects/acme/locations/us-central1/indexes', 'message' => 'OK' },
-            { 'check' => 'ragCorpora.list',      'ok' => false, 'http_status' => 403, 'message' => 'PERMISSION_DENIED | caller lacks permission', 'suggestion' => 'Permission denied. Ensure the service account has required IAM roles and that the API is enabled for the project and (if set) user_project.' }
-          ],
-          'ok' => false,
-          'telemetry' => { 'http_status' => 207, 'message' => 'PARTIAL', 'duration_ms' => 27, 'correlation_id' => 'sample-corr' }
-        }
-      end
-    },
-    test_iam_permissions: {
-      title: 'Admin: Test IAM permissions',
-      display_priority: 1, # 1 = lowest display priority
-      deprecated: true, # maintenance and testing needed before release
-      input_fields: lambda do |object_definitions, connection, config_fields|
-        [
-          { name: 'service', control_type: 'select', pick_list: 'iam_services', optional: false,
-            hint: 'vertex or discovery' },
-          { name: 'resource', optional: false, hint: 'Full resource name starting with projects/...'},
-          { name: 'permissions', type: 'array', of: 'string', optional: false }
-        ]
-      end,
-      output_fields: lambda do |object_definitions, connection|
-        [
-          { name: 'permissions', type: 'array', of: 'string' },
-          { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object', properties: [
-            { name: 'http_status', type: 'integer' }, { name: 'message' },
-            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
-          ]}
-        ]
-      end,
-      execute: lambda do |connection, input|
-        # Build correlation ID & monotonic start (for traceability)
-        t0   = call(:telemetry_t0)
-        corr = call(:build_correlation_id)
-        begin
-          loc  = (connection['location'].presence || 'global').to_s.downcase
-          path = input['resource'].to_s
-                  .sub(%r{^/(v1|v1alpha|v1beta)/}i, '')  # strip any accidental version prefix
-                  .sub(%r{^/}, '')                       # strip leading '/'
-
-          if input['service'].to_s == 'discovery'
-            # Honor per-action host selection, go through discovery_url to pick v1alpha
-            host_override = nil # no per-action fields here; rely on connection defaults
-            url  = call(:discovery_url, connection, loc, "#{path}:testIamPermissions", nil, host_override)
-          else
-            # Vertex: keep existing v1 builder
-            url  = "https://#{call(:aipl_service_host, connection, loc)}/v1/#{path}:testIamPermissions"
-          end
-
-          body = { 'permissions' => call(:safe_array, input['permissions']) }
-          resp = post(url).headers(call(:request_headers, corr)).payload(call(:json_compact, body))
-          code = call(:telemetry_success_code, resp)
-          { 'permissions' => (resp['permissions'] || []), 'ok' => true }
-            .merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-        rescue => e
-          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
-        end
       end
     }
 
