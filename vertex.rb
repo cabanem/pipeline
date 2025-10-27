@@ -33,21 +33,12 @@ require 'securerandom'
         hint: 'Paste full JSON key' },
       { name: 'location',                   optional: false,  control_type: 'text',
         hint: 'e.g., global, us-central1, us-east4' },
-      { name: 'project_id',                 optional: true,   control_type: 'text',
+      { name: 'project_id',                 optional: false,   control_type: 'text',
         hint: 'GCP project ID (inferred from key if blank)' },
       { name: 'user_project',               optional: true,   control_type: 'text',      label: 'User project for quota/billing',
         extends_schema: true, hint: 'Sets x-goog-user-project for billing/quota. Service account must have roles/serviceusage.serviceUsageConsumer on this project.' },
-      { name: 'emit_metrics_default', type: 'boolean', control_type: 'checkbox', label: 'Emit metrics by default', 
-        optional: true, default: true, hint: 'Actions can override with their own emit_metrics input.' },
-      { name: 'metrics_namespace_default', optional: true, hint: 'e.g., email_rag_prod, applied when action input is empty.' },
-
-      # Defaults for test probe
-      { name: 'set_defaults_for_probe',     optional: false,  control_type: 'checkbox', 
-        extends_schema: true, type: 'boolean', default: false, hint: 'Optionally set default model(s) for connection test' },
-      { name: 'default_probe_gen_model',    optional: true,
-        ngIf: 'input.set_defaults_for_probe == "true"', hint: 'e.g., gemini-2.0-flash' },
-      { name: 'default_probe_embed_model',  optional: true,
-        ngIf: 'input.set_defaults_for_probe == "true"', hint: 'e.g., text-embedding-005' }
+      { name: 'discovery_api_version', label: 'Discovery API version', control_type: 'select', optional: true, default: 'v1alpha',
+        pick_list: 'discovery_versions', hint: 'v1alpha for AI Applications; switch to v1beta/v1 if/when you migrate.' }
     ],
 
     authorization: {
@@ -93,53 +84,40 @@ require 'securerandom'
       loc  = 'global' if loc.empty?
       host = (loc == 'global') ? 'aiplatform.googleapis.com' : "#{loc}-aiplatform.googleapis.com"
       "https://#{host}/v1/"
-    end
+    end,
 
   },
 
   # --------- CONNECTION TEST ----------------------------------------------
   test: lambda do |connection|
-    # Fast path: if defaults provided, exercise a real, auth’d call to surface IAM/billing issues early.
-    if %w[true 1 yes].include?(connection['set_defaults_for_probe'].to_s.downcase) && connection['default_probe_gen_model'].present?
-      # Evaluate connection fields
-      call(:ensure_project_id!, connection)
-      # Build model path (global preview)
-      model_path = call(:build_model_path_with_global_preview, connection, connection['default_probe_gen_model'])
-      # Set location (derive from model)
-      loc_from_model = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
-      url = call(:aipl_v1_url, connection, loc_from_model, "#{model_path}:countTokens")
-      post(url)
-        .headers(call(:request_headers, call(:build_correlation_id)))
-        .payload({
-          'contents' => [{ 'role' => 'user', 'parts' => [{ 'text' => 'ping' }] }],
-          'systemInstruction' => call(:system_instruction_from_text, 'Connection probe')
-        })
-    else
-      # Fallback: verify access by listing locations for the project (no model catalog dependency).
-      call(:ensure_project_id!, connection)
-      pid = connection['project_id']
-      get("https://aiplatform.googleapis.com/v1/projects/#{pid}/locations")
-        .headers(call(:request_headers, call(:build_correlation_id)))
-        .params pageSize: 1
-    end
+    proj = connection['project_id']
+    loc  = connection['location']
+    base = (connection['base_url'].presence || "https://#{loc}-aiplatform.googleapis.com").gsub(%r{/+$}, '')
+    get("#{base}/v1/projects/#{proj}/locations/#{loc}")
   end,
 
   # --------- OBJECT DEFINITIONS -------------------------------------------
   object_definitions: {
-    # Object definition calls receive 2 arguments, connection and config_fields
 
     content_part: {
       fields: lambda do |connection, config_fields|
-        call(:schema_content_part)
+        [
+          { name: 'text' },
+          { name: 'inlineData', type: 'object', properties: [ { name: 'mimeType' }, { name: 'data', hint: 'Base64' } ]},
+          { name: 'fileData', type: 'object', properties: [  { name: 'mimeType' }, { name: 'fileUri' } ]},
+          { name: 'functionCall', type: 'object', properties: [ { name: 'name' }, { name: 'args', type: 'object' } ]},
+          { name: 'functionResponse', type: 'object', properties: [ { name: 'name' }, { name: 'response', type: 'object' } ]},
+          { name: 'executableCode', type: 'object', properties: [ { name: 'language' }, { name: 'code' }  ]},
+          { name: 'codeExecutionResult', type: 'object', properties: [ { name: 'outcome' }, { name: 'stdout' }, { name: 'stderr' } ]}
+        ]
       end
     },
     content: {
       # Per contract: role ∈ {user, model}
-      fields: lambda do |connection, config_fields|
+      fields: lambda do |_connection, _config_fields, object_definitions|
         [
           { name: 'role', control_type: 'select', pick_list: 'roles', optional: false },
-          { name: 'parts', type: 'array', of: 'object',
-            properties: call(:schema_content_part), optional: false }
+          { name: 'parts', type: 'array', of: 'object', properties: object_definitions['content_part'], optional: false }
         ]
       end
     },
@@ -181,7 +159,7 @@ require 'securerandom'
       end
     },
     generation_config: {
-      fields: lambda do |connection, config_fields|
+      fields: lambda do
         [
           { name: 'temperature',       type: 'number'  },
           { name: 'topP',              type: 'number'  },
@@ -195,7 +173,7 @@ require 'securerandom'
       end
     },
     generate_content_output: {
-      fields: lambda do |connection, config_fields|
+      fields: lambda do
         [
           { name: 'responseId' },
           { name: 'modelVersion' },
@@ -228,14 +206,14 @@ require 'securerandom'
 
     embed_output: {
       # Align to contract: embeddings object, not array
-      fields: lambda do |connection, config_fields|
+      fields: lambda do
         [
           { name: 'predictions', type: 'array', of: 'object', properties: [
               { name: 'embeddings', type: 'object', properties: [
                   { name: 'values', type: 'array', of: 'number' },
                   { name: 'statistics', type: 'object', properties: [
                       { name: 'truncated',   type: 'boolean' },
-                      { name: 'token_count', type: 'integer' } # sometimes returned as decimal place, cast to int
+                      { name: 'token_count', type: 'number' } # sometimes returned as decimal place, e.g., 7.0
                     ]
                   }
                 ]
@@ -251,7 +229,7 @@ require 'securerandom'
       end
     },
     predict_output: {
-      fields: lambda do |connection, config_fields|
+      fields: lambda do
         [
           { name: 'predictions', type: 'array', of: 'object' },
           { name: 'deployedModelId' }
@@ -260,7 +238,7 @@ require 'securerandom'
     },
 
     batch_job: {
-      fields: lambda do |connection, config_fields|
+      fields: lambda do |_|
         [
           { name: 'name' },
           { name: 'displayName' },
@@ -277,7 +255,7 @@ require 'securerandom'
     },
 
     envelope_fields: {
-      fields: lambda do |connection, config_fields|
+      fields: lambda do |_|
         [
           { name: 'ok', type: 'boolean' },
           { name: 'telemetry', type: 'object', properties: [
@@ -289,60 +267,9 @@ require 'securerandom'
         ]
       end
     },
-    metrics_fields: {
-      fields: lambda do |connection, config_fields|
-        [
-          # Identity & routing
-          { name: 'namespace' },                    # optional logical bucket, e.g. 'email_rag_prod'
-          { name: 'action' },                       # e.g. 'rag_retrieve_contexts'
-          { name: 'correlation_id' },
-          { name: 'project_id' },
-          { name: 'location' },
-
-          # Request traits
-          { name: 'model' },
-          { name: 'rag_corpus' },
-          { name: 'operation' },                    # LRO name for imports, etc.
-
-          # Outcome
-          { name: 'ok', type: 'boolean' },
-          { name: 'http_status', type: 'integer' },
-          { name: 'duration_ms', type: 'integer' },
-
-          # Retrieval metrics
-          { name: 'retrieved_contexts', type: 'integer' },
-          { name: 'max_contexts_requested', type: 'integer' },
-          { name: 'retrieval_top_score', type: 'number' },
-          { name: 'retrieval_avg_score', type: 'number' },
-
-          # Generation metrics
-          { name: 'prompt_tokens', type: 'integer' },
-          { name: 'output_tokens', type: 'integer' },
-          { name: 'total_tokens',  type: 'integer' },
-          { name: 'temperature',   type: 'number' },
-
-          # Embedding metrics
-          { name: 'emb_instances', type: 'integer' },
-          { name: 'emb_billable_chars', type: 'integer' },
-
-          # Re-ranking metrics
-          { name: 'ranker' },
-          { name: 'rank_model' },
-          { name: 'retrieved_before_rerank', type: 'integer' },
-          { name: 'rerank_top_score', type: 'number' },
-          { name: 'rerank_avg_score', type: 'number' },
-
-          # Import/LRO metrics
-          { name: 'lro_done', type: 'boolean' },
-
-          # Free form extras (safe to store)
-          { name: 'extras', type: 'object' }
-        ]
-      end
-    },
 
     safety_setting: {
-      fields: lambda do |connection, config_fields|
+      fields: lambda do
         [
           { name: 'category'  },   # e.g., HARM_CATEGORY_*
           { name: 'threshold' }    # e.g., BLOCK_LOW_AND_ABOVE
@@ -351,7 +278,7 @@ require 'securerandom'
     },
 
     kv_pair: {
-      fields: lambda do |connection, config_fields|
+      fields: lambda do
         [
           { name: 'key' },
           { name: 'value' }
@@ -433,10 +360,11 @@ require 'securerandom'
         ] + Array(object_definitions['envelope_fields'])
       end,
       execute: lambda do |connection, input|
-        # Build correlation ID & monotonic start (for traceability)
-        t0   = call(:telemetry_t0)
+        # 1. Invariants
+        t0   = Time.now
         corr = call(:build_correlation_id)
         begin
+          # 2. Build the request
           subj = (input['subject'] || '').to_s.strip
           body = (input['body']    || '').to_s.strip
           error('Provide subject and/or body') if subj.empty? && body.empty?
@@ -643,8 +571,7 @@ require 'securerandom'
       end,
 
       execute: lambda do |connection, input|
-        # Build correlation ID & monotonic start (for traceability)
-        t0   = call(:telemetry_t0)
+        t0   = Time.now
         corr = call(:build_correlation_id)
         url = nil; req_body = nil
         begin
@@ -786,7 +713,7 @@ require 'securerandom'
       end
     },
 
-    # 2) Generate content (90)
+    # 2)  Generate content (90)
     gen_generate_content: {
       title: 'Generative: Generate content (Gemini)',
       subtitle: 'Generate content from a prompt',
@@ -799,97 +726,66 @@ require 'securerandom'
       max_retries: 3,
 
       input_fields: lambda do |object_definitions, connection, config_fields|
-        Array(object_definitions['gen_generate_content_input']) + [
-          { name: 'emit_metrics', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
-            hint: 'Attach a metrics object in the output for downstream persistence.' },
-          { name: 'metrics_namespace', optional: true, hint: 'Optional tag for partitioning dashboards (e.g., "email_rag_prod").' }
-        ]
+        object_definitions['gen_generate_content_input']
       end,
+
       output_fields: lambda do |object_definitions, connection|
-         Array(object_definitions['generate_content_output']) +
-         Array(object_definitions['envelope_fields']) + [
-          { name: 'metrics', type: 'object', properties: object_definitions['metrics_fields'] },
-          { name: 'metrics_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] } ]
+         Array(object_definitions['generate_content_output']) + Array(object_definitions['envelope_fields'])
       end,
-      execute: lambda do |connection, raw_input|
-        input = call(:normalize_input_keys, raw_input)
-        # Build correlation ID & monotonic start (for traceability)
-        t0   = call(:telemetry_t0)
+
+      execute: lambda do |connection, input|
+        t0   = Time.now
         corr = call(:build_correlation_id)
 
         begin
-          # 1) Build payload
+          # Model path and region must agree
+          model_path = call(:build_model_path_with_global_preview, connection, input['model'])
+          loc_from_model = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
+
+          # Build payload (hardened)
           contents = call(:sanitize_contents!, input['contents'])
           error('At least one non-system message with non-empty parts is required in contents') if contents.blank?
 
-          req = call(:build_generate_content_request,
-                     connection,
-                     input['model'],
-                     contents:          contents,
-                     system_text:       input['system_preamble'],
-                     generation_config: call(:sanitize_generation_config, input['generation_config']),
-                     tools:             call(:sanitize_tools!, input['tools']),
-                     tool_config:       call(:safe_obj, input['toolConfig']),
-                     safety:            call(:sanitize_safety!, input['safetySettings']))
+          sys_inst = call(:system_instruction_from_text, input['system_preamble'])
 
-          url      = req['url']
-          req_body = call(:json_compact, req['body'])
+          gen_cfg  = call(:sanitize_generation_config, input['generation_config'])
 
-          # 2) HTTP with standard telemetry path
-          raw   = call(:http_call!, 'POST', url)
-                    .headers(call(:request_headers, corr))
-                    .payload(req_body)
-          code  = call(:telemetry_success_code, raw)
-          resp  = call(:http_body_json, raw)
+          tools    = call(:sanitize_tools!, input['tools'])
+          tool_cfg = call(:safe_obj, input['toolConfig'])
+          safety   = call(:sanitize_safety!, input['safetySettings'])
 
-          # 3) Guard: empty candidates (blocked or filtered)
-          if call(:safe_array, resp['candidates']).empty?
+          payload = {
+            'contents'          => contents,
+            'systemInstruction' => sys_inst,
+            'tools'             => tools,
+            'toolConfig'        => tool_cfg,
+            'safetySettings'    => safety,
+            'generationConfig'  => gen_cfg
+          }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
+
+          url  = call(:aipl_v1_url, connection, loc_from_model, "#{model_path}:generateContent")
+          resp = post(url)
+                  .headers(call(:request_headers, corr))
+                  .payload(call(:json_compact, payload))
+
+          # Guard: empty candidates (safety block or other)
+          cands = call(:safe_array, resp['candidates'])
+          if cands.empty?
+            # Surface a friendlier error but keep telemetry envelope
             err_msg = (resp.dig('promptFeedback','blockReason') || 'No candidates returned').to_s
-            return({}.merge(call(:telemetry_envelope, t0, corr, false, code, err_msg)))
+            return {}.merge(call(:telemetry_envelope, t0, corr, false, 200, err_msg))
           end
 
-          # 4) Normalize candidate text/meta
-          text, meta = call(:extract_candidate_text, resp)
-          out = {
-            'responseId'    => resp['responseId'],
-            'modelVersion'  => resp['modelVersion'],
-            'usageMetadata' => resp['usageMetadata'],
-            'candidates'    => resp['candidates'],
-            'raw'           => resp,
-            'text'          => text,
-            'meta'          => meta
-          }
-          out.merge!(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-
-          # 5) Metrics
-          ok = true
-          http_status = code
-          flags = call(:metrics_effective_flags, connection, input)
-          if flags['emit']
-            m = call(:metrics_base, connection, 'gen_generate_content', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
-              .merge(call(:metrics_from_generation, resp, (input['generation_config'] || {})['temperature']))
-              .merge('model' => input['model'])
-            out['metrics']    = m
-            out['metrics_kv'] = call(:metrics_to_kv, m)
-          end
-          out
+          code = call(:telemetry_success_code, resp)
+          resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
 
         rescue => e
           g = call(:extract_google_error, e)
           msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          http_status = call(:telemetry_parse_error_code, e)
-          out = {}.merge(call(:telemetry_envelope, t0, corr, false, http_status, msg))
-          ok = false
-          flags = call(:metrics_effective_flags, connection, input)
-          if flags['emit']
-            m = call(:metrics_base, connection, 'gen_generate_content', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
-              .merge('model' => input['model'])
-            out['metrics']    = m
-            out['metrics_kv'] = call(:metrics_to_kv, m)
-          end
-          out
+          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
         end
       end,
+
       sample_output: lambda do
         {
           'responseId' => 'resp-123',
@@ -922,103 +818,70 @@ require 'securerandom'
           { name: 'vertex_ai_search_datastore', optional: true,
             hint: 'projects/.../locations/.../collections/default_collection/dataStores/...' },
           { name: 'vertex_ai_search_serving_config', optional: true,
-            hint: 'projects/.../locations/.../collections/.../engines/.../servingConfigs/default_config' },
-          { name: 'generation_config', type: 'object', optional: true, properties: object_definitions['generation_config'] },
-          { name: 'toolConfig', type: 'object', optional: true },
-          { name: 'safetySettings', type: 'array', of: 'object', optional: true, properties: object_definitions['safety_setting'] },
-          { name: 'emit_metrics', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
-            hint: 'Attach a metrics object in the output for downstream persistence.' },
-          { name: 'metrics_namespace', optional: true, hint: 'Optional tag for partitioning dashboards (e.g., "email_rag_prod").' },
+            hint: 'projects/.../locations/.../collections/.../engines/.../servingConfigs/default_config' }
         ]
       end,
       output_fields: lambda do |object_definitions, connection|
-        Array(object_definitions['generate_content_output']) + 
-        Array(object_definitions['envelope_fields']) + [
-          { name: 'metrics', type: 'object', properties: object_definitions['metrics_fields'] },
-          { name: 'metrics_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] } ]
+        Array(object_definitions['generate_content_output']) + Array(object_definitions['envelope_fields'])
       end,
-      execute: lambda do |connection, raw_input|
-        input = call(:normalize_input_keys, raw_input)
-        t0    = Time.now
-        corr  = call(:build_correlation_id)
+      execute: lambda do |connection, input|
+        # Correlation id and duration for logs / analytics
+        t0 = Time.now
+        corr = call(:build_correlation_id)
+
+        # Compute model path
+        model_path = call(:build_model_path_with_global_preview, connection, input['model'])
+
+        # Build payload
+        contents   = call(:sanitize_contents_roles, input['contents'])
+        error('At least one non-system message is required in contents') if contents.blank?
+        sys_inst   = call(:system_instruction_from_text, input['system_preamble'])
+
+        tools =
+          if input['grounding'] == 'google_search'
+            [ { 'googleSearch' => {} } ]
+          else
+            ds   = input['vertex_ai_search_datastore'].to_s
+            scfg = input['vertex_ai_search_serving_config'].to_s
+            # Back-compat: allow legacy 'engine' by mapping -> servingConfig
+            legacy_engine = input['vertex_ai_search_engine'].to_s
+            scfg = legacy_engine if scfg.blank? && legacy_engine.present?
+
+            # Enforce XOR
+            error('Provide exactly one of vertex_ai_search_datastore OR vertex_ai_search_serving_config') \
+              if (ds.blank? && scfg.blank?) || (ds.present? && scfg.present?)
+
+            vas = {}
+            vas['datastore']     = ds unless ds.blank?
+            vas['servingConfig'] = scfg unless scfg.blank?
+            [ { 'retrieval' => { 'vertexAiSearch' => vas } } ]
+          end
+
+        gen_cfg = call(:sanitize_generation_config, input['generation_config'])
+
+        payload = {
+          'contents'          => contents,
+          'systemInstruction' => sys_inst,
+          'tools'             => tools,
+          'toolConfig'        => input['toolConfig'],
+          'safetySettings'    => input['safetySettings'],
+          'generationConfig'  => gen_cfg
+        }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
+
+        # Call endpoint
+        loc_from_model = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
+        url = call(:aipl_v1_url, connection, loc_from_model, "#{model_path}:generateContent")
         begin
-          # 1) Contents & grounding tools
-          contents = call(:sanitize_contents_roles, input['contents'])
-          error('At least one non-system message is required in contents') if contents.blank?
-
-          tools =
-            if input['grounding'] == 'google_search'
-              [ { 'googleSearch' => {} } ]
-            else
-              ds   = input['vertex_ai_search_datastore'].to_s
-              scfg = input['vertex_ai_search_serving_config'].to_s
-              legacy_engine = input['vertex_ai_search_engine'].to_s # back-compat
-              scfg = legacy_engine if scfg.blank? && legacy_engine.present?
-              error('Provide exactly one of vertex_ai_search_datastore OR vertex_ai_search_serving_config') \
-                if (ds.blank? && scfg.blank?) || (ds.present? && scfg.present?)
-              vas = {}
-              vas['datastore']     = ds unless ds.blank?
-              vas['servingConfig'] = scfg unless scfg.blank?
-              [ { 'retrieval' => { 'vertexAiSearch' => vas } } ]
-            end
-
-          # 2) Base request via helper
-          base_req = call(
-            :build_generate_content_request,
-            connection,
-            input['model'],
-            contents:          contents,
-            system_text:       input['system_preamble'],
-            generation_config: call(:sanitize_generation_config, input['generation_config']),
-            tools:             tools,
-            tool_config:       call(:safe_obj, input['toolConfig']),
-            safety:            call(:sanitize_safety!, input['safetySettings'])
-          )
-
-          # 3) Merge groundingConfig (citations / web grounding knobs)
-          body = base_req['body'].merge(
-            'groundingConfig' => call(:sanitize_grounding!, input)
-          ).delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
-
-          # 4) HTTP with standard telemetry
-          raw   = call(:http_call!, 'POST', base_req['url'])
-                    .headers(call(:request_headers, corr))
-                    .payload(call(:json_compact, body))
-          code  = call(:telemetry_success_code, raw)
-          resp  = call(:http_body_json, raw)
-
-          # 5) Normalize output (text + meta), plus telemetry
-          if call(:safe_array, resp['candidates']).empty?
-            err_msg = (resp.dig('promptFeedback','blockReason') || 'No candidates returned').to_s
-            return({}.merge(call(:telemetry_envelope, t0, corr, false, code, err_msg)))
-          end
-          text, meta = call(:extract_candidate_text, resp)
-          out = { 'raw' => resp, 'answer' => text, 'meta' => meta }
-          out.merge!(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-
-          # 6) Metrics
-          flags = call(:metrics_effective_flags, connection, input)
-          if flags['emit']
-            m = call(:metrics_base, connection, 'gen_generate_grounded', t0, true, code, corr, { 'namespace' => flags['ns'] })
-                .merge(call(:metrics_from_generation, resp, (input['generation_config'] || {})['temperature']))
-                .merge('model' => input['model'])
-            out['metrics']    = m
-            out['metrics_kv'] = call(:metrics_to_kv, m)
-          end
-          out
+          resp = post(url)
+                  .headers(call(:request_headers, corr))
+                  .payload(call(:json_compact, payload))
+          code = call(:telemetry_success_code, resp)
+          resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
         rescue => e
-          http_status = call(:telemetry_parse_error_code, e)
-          out = {}.merge(call(:telemetry_envelope, t0, corr, false, http_status, e.to_s))
-          flags = call(:metrics_effective_flags, connection, input)
-          if flags['emit']
-            m = call(:metrics_base, connection, 'gen_generate_grounded', t0, false, http_status, corr, { 'namespace' => flags['ns'] })
-                .merge('model' => input['model'])
-            out['metrics']    = m
-            out['metrics_kv'] = call(:metrics_to_kv, m)
-          end
-          out
+          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
         end
       end,
+
       sample_output: lambda do
         {
           'responseId' => 'resp-456',
@@ -1038,12 +901,12 @@ require 'securerandom'
       help: lambda do |_|
         { body: 'Answer a question using caller-supplied context chunks (RAG-lite). Returns structured JSON with citations.' }
       end,
-      display_priority: 90,
+      display_priority: 90
       retry_on_request: ['GET', 'HEAD'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
 
-      input_fields: lambda do |object_definitions, connection, config_fields|
+      input_fields: lambda do |_|
         [
           { name: 'model', label: 'Model', optional: false, control_type: 'text' },
           { name: 'question', optional: false },
@@ -1056,9 +919,11 @@ require 'securerandom'
               { name: 'score', type: 'number' },
               { name: 'metadata', type: 'object' }
             ],
-            hint: 'Pass the top-N chunks from your retriever / process.' },
+            hint: 'Pass the top-N chunks from your retriever / process.'
+          },
 
-          { name: 'max_chunks', type: 'integer', optional: true, default: 20, hint: 'Hard cap to avoid overlong prompts.' },
+          { name: 'max_chunks', type: 'integer', optional: true, default: 20,
+            hint: 'Hard cap to avoid overlong prompts.' },
 
           { name: 'system_preamble', optional: true,
             hint: 'Optional guardrails (e.g., “only answer from context; say I don’t know otherwise”).' },
@@ -1078,32 +943,31 @@ require 'securerandom'
           { name: 'count_tokens_model', optional: true,
             hint: 'If set, use this model for countTokens (defaults to `model`).' },
           { name: 'trim_strategy', control_type: 'select', optional: true, default: 'drop_low_score',
-            pick_list: 'trim_strategies', hint: 'How to shrink when over budget: drop_low_score, diverse_mmr, or truncate_chars' },
-          { name: 'emit_metrics', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
-            hint: 'Attach a metrics object in the output for downstream persistence.' },
-          { name: 'metrics_namespace', optional: true, hint: 'Optional tag for partitioning dashboards (e.g., "email_rag_prod").' },
+            pick_list: 'trim_strategies',
+            hint: 'How to shrink when over budget: drop_low_score, diverse_mmr, or truncate_chars' }
         ]
       end,
-      output_fields: lambda do |object_definitions, connection|
+
+      output_fields: lambda do |object_definitions|
         [
           { name: 'answer' },
           { name: 'citations', type: 'array', of: 'object', properties: [
               { name: 'chunk_id' }, { name: 'source' }, { name: 'uri' }, { name: 'score', type: 'number' }
-            ]},
+            ]
+          },
           { name: 'responseId' },
           { name: 'usage', type: 'object', properties: [
               { name: 'promptTokenCount', type: 'integer' },
               { name: 'candidatesTokenCount', type: 'integer' },
               { name: 'totalTokenCount', type: 'integer' }
-            ]}
-        ] + Array(object_definitions['envelope_fields']) + [
-          { name: 'metrics', type: 'object', properties: object_definitions['metrics_fields'] },
-          { name: 'metrics_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] } ]
+            ]
+          }
+        ] + Array(object_definitions['envelope_fields'])
       end,
-      execute: lambda do |connection, raw_input|
-        input = call(:normalize_input_keys, raw_input)
-        # Build correlation ID & monotonic start (for traceability)
-        t0   = call(:telemetry_t0)
+
+      execute: lambda do |connection, input|
+        # Correlation id and duration for logs/analytics
+        t0 = Time.now
         corr = call(:build_correlation_id)
         url = nil; req_body = nil
 
@@ -1202,84 +1066,48 @@ require 'securerandom'
           contents = [
             { 'role' => 'user', 'parts' => [ { 'text' => "Question:\n#{input['question']}\n\nContext:\n#{ctx_blob}" } ] }
           ]
-          # Build via helper (single source of truth)
-          req = call(:build_generate_content_request,
-                     connection,
-                     input['model'],
-                     contents:          contents,
-                     system_text:       sys_text,
-                     generation_config: gen_cfg)
-          url      = req['url']
-          req_body = call(:json_compact, req['body'])
+          payload = { 'contents' => contents, 'systemInstruction' => sys_inst, 'generationConfig' => gen_cfg }
 
-          # POST with standard telemetry path
-          raw   = call(:http_call!, 'POST', url)
-                    .headers(call(:request_headers, corr))
-                    .payload(req_body)
-          code  = call(:telemetry_success_code, raw)
-          resp  = call(:http_body_json, raw)
+          # Derive location from model_path to avoid region/global mismatch
+          loc_from_model = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
+          url  = call(:aipl_v1_url, connection, loc_from_model, "#{model_path}:generateContent")
+          req_body = call(:json_compact, payload)
+
+          resp = post(url).headers(call(:request_headers, corr)).payload(req_body)
 
           text = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
 
           # One controlled retry if nothing came back (e.g., safety or schema hiccup)
           if text.to_s.strip.empty?
-            retry_req = req.dup
-            retry_body = retry_req['body'].dup
-            retry_body['generationConfig'] = {
+            retry_payload = payload.dup
+            retry_payload['generationConfig'] = {
               'temperature' => 0,
               'maxOutputTokens' => reserve_out,
               'responseMimeType' => 'text/plain'
             }
-            req_body = call(:json_compact, retry_body)
-            raw2 = call(:http_call!, 'POST', url)
-                     .headers(call(:request_headers, corr))
-                     .payload(req_body)
-            code = call(:telemetry_success_code, raw2)
-            resp2 = call(:http_body_json, raw2)
+            resp2 = post(url).headers(call(:request_headers, corr)).payload(call(:json_compact, retry_payload))
             text = resp2.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
             resp = resp2 if text.present?
           end
 
           parsed = call(:safe_parse_json, text)
 
-          base_out = {
+          {
             'answer'     => parsed['answer'] || text,
             'citations'  => parsed['citations'] || [],
             'responseId' => resp['responseId'],
             'usage'      => resp['usageMetadata']
-          }.merge(call(:telemetry_envelope, t0, corr, true, code || 200, 'OK'))
-          ok = true
-          http_status = (code || 200)
-
-          flags = call(:metrics_effective_flags, connection, input)
-          if flags['emit']
-            m = call(:metrics_base, connection, 'gen_answer_with_context', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
-              .merge(call(:metrics_from_generation, resp, input['temperature']))
-              .merge('model' => input['model'])
-              # This action doesn't accept max_contexts; report the cap applied:
-              .merge(call(:metrics_from_retrieve, items, input['max_chunks']))
-            base_out['metrics']    = m
-            base_out['metrics_kv'] = call(:metrics_to_kv, m)
-          end
-          base_out
+          }.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
 
         rescue => e
-          http_status = call(:telemetry_parse_error_code, e)
-          out = {}.merge(call(:telemetry_envelope, t0, corr, false, http_status, e.to_s))
-          ok = false
-          flags = call(:metrics_effective_flags, connection, input)
-          if flags['emit']
-            m = call(:metrics_base, connection, 'gen_answer_with_context', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
-              .merge('model' => input['model'])
-            out['metrics']    = m
-            out['metrics_kv'] = call(:metrics_to_kv, m)
-          end
+          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
           unless call(:normalize_boolean, connection['prod_mode'])
             out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
           end
           out
         end
       end,
+
       sample_output: lambda do
         {
           'answer' => 'The outage began at 09:12 UTC due to a misconfigured firewall rule.',
@@ -1294,388 +1122,22 @@ require 'securerandom'
       end
     },
 
-    # 3) Rank texts (85)
-    rank_texts_with_ranking_api: {
-      title: 'Ranking API: Rerank texts',
-      subtitle: 'projects.locations.rankingConfigs:rank',
-      description: '',
-      help: lambda do |input, picklist_label|
-        {
-          learn_more_url: 'docs.cloud.google.com/vertex-ai/generative-ai/docs/rag-engine/retrieval-and-ranking',
-          learn_more_text: 'Check out Google docs for retrieval and ranking'
-        }
-      end,
-      display_priority: 85,
-      retry_on_request: ['GET','HEAD'],
-      retry_on_response: [408,429,500,502,503,504],
-      max_retries: 3,
-
-      input_fields: lambda do |_od, connection, _cfg|
-        [
-          { name: 'query_text', optional: false },
-          { name: 'records', type: 'array', of: 'object', optional: false, properties: [
-              { name: 'id', optional: false }, { name: 'content', optional: false }, { name: 'metadata', type: 'object' }
-            ], hint: 'id + content required.' },
-          { name: 'rank_model', optional: true, hint: 'e.g., semantic-ranker-default@latest' },
-          { name: 'top_n', type: 'integer', optional: true },
-          { name: 'ignore_record_details_in_response', type: 'boolean', control_type: 'checkbox', optional: true,
-            hint: 'If true, response returns only {id, score}. Useful when you only need scores.' },
-          { name: 'ranking_config_name', optional: true, hint: 'Full name or leave blank for .../rankingConfigs/default_ranking_config' },
-          { name: 'emit_metrics', type: 'boolean', control_type: 'checkbox', optional: true, default: true },
-          { name: 'metrics_namespace', optional: true }
-        ]
-      end,
-      output_fields: lambda do |object_definitions, _connection, _cfg|
-        [
-          { name: 'records', type: 'array', of: 'object', properties: [
-              { name: 'id' }, { name: 'score', type: 'number' }
-            ] }
-        ] + Array(object_definitions['envelope_fields']) + [
-          { name: 'metrics', type: 'object', properties: object_definitions['metrics_fields'] },
-          { name: 'metrics_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] }
-        ]
-      end,
-      execute: lambda do |connection, input|
-        t0 = Time.now; corr = call(:build_correlation_id)
-        begin
-          call(:ensure_project_id!, connection)
-          call(:ensure_regional_location!, connection)
-          loc = connection['location'].to_s.downcase
-
-          ranking_config = call(:build_ranking_config_name, connection, loc, input['ranking_config_name'])
-          # Honor connection's Discovery version/host settings
-          url = call(:aipl_v1_url, connection, loc, "#{ranking_config}:rank")
-
-          body = {
-            'query'   => input['query_text'].to_s,
-            'records' => call(:safe_array, input['records']).map { |r|
-              { 'id' => r['id'].to_s, 'content' => r['content'].to_s,
-                'metadata' => (r['metadata'].is_a?(Hash) ? r['metadata'] : nil) }.delete_if { |_k,v| v.nil? } },
-            'model'   => (input['rank_model'].to_s.strip.empty? ? nil : input['rank_model'].to_s.strip),
-            'topN'    => (input['top_n'].to_i > 0 ? input['top_n'].to_i : nil),
-            'ignoreRecordDetailsInResponse' => (input['ignore_record_details_in_response'] == true ? true : nil)
-          }.delete_if { |_k,v| v.nil? }
-
-          req_body = call(:json_compact, body)
-          resp = post(url).headers(call(:request_headers, corr)).payload(req_body)
-          code = call(:telemetry_success_code, resp)
-          out = { 'records' => (resp['records'] || []) }.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-
-          flags = call(:metrics_effective_flags, connection, input)
-          if flags['emit']
-            m = call(:metrics_base, connection, 'rank_texts_with_ranking_api', t0, true, code, corr, { 'namespace' => flags['ns'] })
-                  .merge('ranker' => 'rank_service', 'rank_model' => body['model'])
-            out['metrics']    = m
-            out['metrics_kv'] = call(:metrics_to_kv, m)
-          end
-          out
-        rescue => e
-          http_status = call(:telemetry_parse_error_code, e)
-          # Include debug echo when not in prod_mode
-          dbg = call(:debug_pack,
-                     !(call(:normalize_boolean, connection['prod_mode'])),
-                     url,
-                     req_body,
-                     call(:extract_google_error, e))
-          out = {}.merge(call(:telemetry_envelope, t0, corr, false, http_status, e.to_s))
-          out.merge!(dbg) if dbg
-          flags = call(:metrics_effective_flags, connection, input)
-          if flags['emit']
-            m = call(:metrics_base, connection, 'rank_texts_with_ranking_api', t0, false, http_status, corr, { 'namespace' => flags['ns'] })
-            out['metrics']    = m; out['metrics_kv'] = call(:metrics_to_kv, m)
-          end
-          out
-        end
-      end,
-      sample_output: lambda do
-        { 'records' => [ { 'id' => 'ctx-1', 'score' => 0.92 } ],
-          'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 9, 'correlation_id' => 'sample' } }
-      end
-    },
-
-    # 4) RAG store engine (Vertex AI)
-    # ---- Serving (80)
+    # 3)  RAG store engine (80-86)
     rag_retrieve_contexts: {
-      title: 'RAG Serving: Retrieve contexts',
+      title: 'RAG (Serving): Retrieve contexts',
       subtitle: 'projects.locations:retrieveContexts (Vertex RAG Store)',
-      help: lambda do |input, picklist_label|
-        {
-          learn_more_url: 'https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/rag-api-v1#retrieval-and-prediction-params-api',
-          learn_more_text: 'Retrieval and predication params'
-        }
-      end,
-      display_priority: 0,
+      display_priority: 86,
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
 
-      input_fields: lambda do |object_definitions, connection, config_fields|
-        [
-          # Keep mode, but default to AUTO (no user intervention needed).
-          {
-            name: 'mode',
-            label: 'Endpoint mode',
-            control_type: 'select',
-            pick_list: [
-              ['Auto (recommended)', 'auto'],
-              ['Location (v1)', 'at_location_v1'],
-              ['Corpus (v1beta1)', 'at_corpus_v1beta1']
-            ],
-            optional: true,
-            default: 'auto',
-            hint: 'Auto uses v1 for location calls; switches to v1beta1 for corpus-scoped calls.'
-          },
-          { name: 'text', label: 'Query text', optional: false },
-
-          # Signals for corpus mode
-          { name: 'corpus', label: 'Corpus (ID or full resource name)', optional: true },
-
-          {
-            name: 'rag_resources',
-            label: 'RAG resources',
-            type: 'array', of: 'object', optional: true,
-            hint: 'Each item becomes dataSource.vertexRagStore.ragResources[*]',
-            properties: [
-              { name: 'rag_corpus', label: 'Corpus (ID or full resource name)', optional: false },
-              { name: 'rag_file_ids', label: 'File IDs', type: 'array', of: 'string', optional: true }
-            ]
-          },
-
-          { name: 'debug', type: 'boolean', control_type: 'checkbox', label: 'Return request/response in _debug', optional: true }
-        ]
-      end,
-      output_fields: lambda do |_object_definitions, _connection|
-        [
-          { name: 'contexts', type: 'array', of: 'object', properties: [
-            { name: 'chunkId' }, { name: 'text' }, { name: 'score', type: 'number' },
-            { name: 'sourceUri' }, { name: 'sourceDisplayName' }, { name: 'chunk', type: 'object' },
-            { name: 'metadata', type: 'object' }
-          ]},
-          { name: '_meta', type: 'object', properties: [
-            { name: 'http_status', type: 'integer' },
-            { name: 'request_id' }, { name: 'retry_after' }, { name: 'rate_limit_rem' },
-            { name: 'etag' }, { name: 'last_modified' }, { name: 'model_version' },
-            { name: 'next_page_token' }, { name: 'duration_ms', type: 'integer' },
-            { name: 'correlation_id' }, { name: 'endpoint_mode' }, { name: 'api_version' }, { name: 'url' }
-          ]},
-          { name: '_debug', type: 'object', properties: [
-            { name: 'request', type: 'object' }, { name: 'response', type: 'object' }
-          ]}
-        ]
-      end,
-
-      execute: lambda do |connection, input|
-        t0   = Time.now
-        corr = SecureRandom.uuid
-
-        proj = connection['project_id']
-        loc  = connection['location']
-        raise 'Connection is missing project_id' if proj.blank?
-        raise 'Connection is missing location'   if loc.blank?
-
-        # Server base: favor regional endpoint; version added later.
-        base_host = (connection['base_url'].presence || "https://#{loc}-aiplatform.googleapis.com").gsub(%r{/+$}, '')
-
-        headers = {
-          'Accept'           => 'application/json',
-          'Content-Type'     => 'application/json',
-          'X-Correlation-Id' => corr
-        }
-        headers['x-goog-user-project'] = connection['billing_project'] if connection['billing_project'].present?
-
-        text = input['text'].to_s
-        raise 'text is required' if text.blank?
-
-        # ---------- Normalize corpora ----------
-        norm_corpus_fqn = lambda do |val|
-          v = val.to_s
-          return v if v.start_with?('projects/')
-          raise 'corpus is required' if v.blank?
-          "projects/#{proj}/locations/#{loc}/ragCorpora/#{v}"
-        end
-
-        # Build normalized rag_resources array (FQNs only)
-        in_resources = Array(input['rag_resources']).select { |r| r.is_a?(Hash) && r['rag_corpus'].present? }
-        normalized_resources = in_resources.map do |r|
-          rc = norm_corpus_fqn.call(r['rag_corpus'])
-          obj = { 'ragCorpus' => rc }
-          ids = r['rag_file_ids']
-          obj['ragFileIds'] = ids if ids.present?
-          obj
-        end
-
-        # If top-level corpus is provided, prefer it
-        top_corpus = input['corpus'].present? ? norm_corpus_fqn.call(input['corpus']) : nil
-
-        # Decide endpoint automatically unless overridden
-        mode = (input['mode'].presence || 'auto').to_s
-
-        # Heuristics for auto:
-        # - If a top-level corpus is provided => use corpus-scoped (v1beta1)
-        # - Else if exactly one resource corpus is present => corpus-scoped (v1beta1)
-        # - Else => location-scoped (v1)
-        wants_corpus = case mode
-                      when 'at_corpus_v1beta1' then true
-                      when 'at_location_v1'    then false
-                      else
-                        top_corpus.present? || normalized_resources.map { |r| r['ragCorpus'] }.uniq.size == 1
-                      end
-
-        api_version = wants_corpus ? 'v1beta1' : 'v1'
-        path        = nil
-
-        if wants_corpus
-          parent = top_corpus || normalized_resources.first&.dig('ragCorpus')
-          raise 'A corpus is required to call the corpus-scoped endpoint' if parent.blank?
-
-          path = "/#{api_version}/#{parent}:retrieveContexts"
-          headers['x-goog-request-params'] = "parent=#{parent}"
-
-          # Ensure body has a single ragResource aligned to parent
-          resource = { 'ragCorpus' => parent }
-          # If caller provided file IDs on first item, thread them through
-          first_ids = normalized_resources.first&.dig('ragFileIds')
-          resource['ragFileIds'] = first_ids if first_ids.present?
-          rag_resources = [resource]
-
-        else
-          path = "/#{api_version}/projects/#{proj}/locations/#{loc}:retrieveContexts"
-          headers['x-goog-request-params'] = "parent=projects/#{proj}/locations/#{loc}"
-
-          # If user only provided top_corpus, synthesize one resource from it
-          if normalized_resources.empty? && top_corpus.present?
-            rag_resources = [{ 'ragCorpus' => top_corpus }]
-          else
-            rag_resources = normalized_resources
-          end
-
-          raise 'At least one rag_resource or corpus is required for location-scoped call' if rag_resources.empty?
-        end
-
-        url  = "#{base_host}#{path}"
-        body = {
-          'query'      => { 'text' => text },
-          'dataSource' => { 'vertexRagStore' => { 'ragResources' => rag_resources } }
-        }
-
-        response = post(url).headers(headers).payload(body).request_format_json
-
-        out = response.is_a?(Hash) ? response : { 'raw' => response.to_s }
-        out['_meta'] ||= {}
-        out['_meta']['duration_ms']    = ((Time.now - t0) * 1000).to_i
-        out['_meta']['correlation_id'] = corr
-        out['_meta']['endpoint_mode']  = wants_corpus ? 'corpus' : 'location'
-        out['_meta']['api_version']    = api_version
-        out['_meta']['url']            = url if input['debug']
-
-        if input['debug']
-          out['_debug'] = {
-            'request'  => { 'method' => 'POST', 'url' => url, 'headers' => headers, 'body' => body },
-            'response' => response
-          }
-        end
-
-        out
-      rescue StandardError => e
-        e.is_a?(Hash) ? error(e) : error({ 'message' => e.message })
-      end,
-
-      sample_output: lambda do
-        {
-          'contexts' => [
-            {
-              'chunkId' => 'c-001',
-              'text'    => 'Parental leave is 12 weeks paid for all FTEs.',
-              'score'   => 0.8642,
-              'sourceUri' => 'gs://corp-bucket/policies/benefits.pdf#page=2',
-              'sourceDisplayName' => 'benefits.pdf',
-              'metadata' => { 'page' => 2 }
-            }
-          ],
-          '_meta' => {
-            'http_status'   => 200,
-            'request_id'    => 'req-123',
-            'duration_ms'   => 18,
-            'correlation_id'=> 'uuid-abc',
-            'endpoint_mode' => 'corpus',
-            'api_version'   => 'v1beta1'
-          }
-        }
-      end,
-      after_response: lambda { |code, body, headers, message|
-        parsed = body.is_a?(Hash) ? body : (body.present? ? JSON.parse(body) rescue { 'raw' => body.to_s } : {})
-
-        meta = parsed['_meta'] ||= {}
-        meta['http_status']    = code
-        meta['request_id']     = headers['X-Request-Id'] || headers['x-request-id']
-        meta['retry_after']    = headers['Retry-After']
-        meta['rate_limit_rem'] = headers['X-RateLimit-Remaining']
-        meta['etag']           = headers['ETag']
-        meta['last_modified']  = headers['Last-Modified']
-        meta['model_version']  = headers['x-goog-model-id'] || headers['X-Model-Version']
-        parsed['_meta']['next_page_token'] ||= parsed['nextPageToken'] || parsed['next_page_token']
-
-        if parsed['error'].is_a?(Hash)
-          e = parsed['error']
-          raise error({
-            'code'     => e['code'] || code,
-            'status'   => e['status'],
-            'message'  => e['message'] || message || 'Request failed',
-            'details'  => e['details']
-          })
-        end
-        parsed
-      end,
-      after_error_response: lambda { |code, body, headers, message|
-        normalized = { 'code' => code }
-        begin
-          json = body.is_a?(Hash) ? body : (body.present? ? JSON.parse(body) : {})
-        rescue
-          json = { 'raw' => body.to_s }
-        end
-
-        if json['error'].is_a?(Hash)
-          e = json['error']
-          normalized['status']   = e['status']
-          normalized['message']  = e['message'] || message || 'Request failed'
-          normalized['details']  = e['details']
-        else
-          normalized['message']  = message || json['message'] || 'Request failed'
-          normalized['raw']      = json unless json.empty?
-        end
-
-        normalized['retryable']     = [408, 429, 500, 502, 503, 504].include?(code)
-        normalized['retry_after']   = headers['Retry-After']
-        normalized['request_id']    = headers['X-Request-Id'] || headers['x-request-id']
-        normalized['model_version'] = headers['x-goog-model-id'] || headers['X-Model-Version']
-        error(normalized)
-      end
-    },
-    rag_retrieve_contexts_old: {
-      title: 'RAG Serving: Retrieve contexts',
-      subtitle: 'projects.locations:retrieveContexts (Vertex RAG Store)',
-      help: lambda do |input, picklist_label|
-        {
-          learn_more_url: 'https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/rag-api-v1#retrieval-and-prediction-params-api',
-          learn_more_text: 'Retrieval and predication params'
-        }
-      end,
-      display_priority: 0,
-      retry_on_request: ['GET','HEAD'],
-      retry_on_response: [408,429,500,502,503,504],
-      max_retries: 3,
-
-      input_fields: lambda do |object_definitions, connection, config_fields|
+      input_fields: lambda do
         [
           { name: 'rag_corpus', optional: false,
             hint: 'Accepts either full resource name (e.g., "projects/{project}/locations/{region}/ragCorpora/{corpus}") or the "corpus"' },
           { name: 'question', optional: false },
           { name: 'restrict_to_file_ids', type: 'array', of: 'string', optional: true },
-          { name: 'max_contexts', type: 'integer', optional: true, default: 20 },
-          { name: 'validate_only', label: 'Validate only (no call)', type: 'boolean', control_type: 'checkbox', optional: true, default: false },
-          { name: 'emit_metrics', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
-            hint: 'Attach a metrics object in the output for downstream persistence.' },
-          { name: 'metrics_namespace', optional: true, hint: 'Optional tag for partitioning dashboards (e.g., "email_rag_prod").' }
+          { name: 'max_contexts', type: 'integer', optional: true, default: 20 }
         ]
       end,
       output_fields: lambda do |object_definitions, connection|
@@ -1689,7 +1151,7 @@ require 'securerandom'
               { name: 'uri' },
               { name: 'metadata', type: 'object' },
               { name: 'metadata_kv', label: 'metadata (KV)', type: 'array', of: 'object', properties: object_definitions['kv_pair'] },
-              { name: 'metadata_json', label: 'metadata (JSON)', type: 'string' }
+              { name: 'metadata_json', label: 'metadata (JSON)', }
             ]
           }
         ] + [
@@ -1699,102 +1161,52 @@ require 'securerandom'
             { name: 'message' }, { name: 'duration_ms', type: 'integer' },
             { name: 'correlation_id' }
           ]}
-        ] + [
-          { name: 'metrics', type: 'object', properties: object_definitions['metrics_fields'] },
-          { name: 'metrics_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] } ]
+        ]
       end,
       execute: lambda do |connection, input|
-        # Correlation + monotonic time for deterministic duration
-        t0   = call(:telemetry_t0)
+        # Build correlation ID, now (for traceability)
+        t0 = Time.now
         corr = call(:build_correlation_id)
-        url  = nil; req_body = nil
-
         begin
-          # Resolve parent & corpus without enforcing connection.location when corpus is fully‑qualified
-          proj, loc, corpus = call(:resolve_rag_parent_and_corpus!, connection, input['rag_corpus'])
-          parent = "projects/#{proj}/locations/#{loc}"
+          call(:ensure_project_id!, connection)
+          call(:ensure_regional_location!, connection)
 
-          # Build simple retrieve payload (no ranking)
-          ids = call(:sanitize_rag_file_ids, input['restrict_to_file_ids'], allow_empty: true, label: 'restrict_to_file_ids')
-          payload = {
-            'query' => { 'text' => input['question'].to_s },
-            'dataSource' => {
-              'vertexRagStore' => {
-                'ragResources' => [
-                  # Use pure-Ruby emptiness check; Workato sandbox may not have ActiveSupport.
-                  ({ 'ragCorpus' => corpus }.tap { |h| h['ragFileIds'] = ids if ids && !ids.empty? })
-                ]
-              }
-            }
-          }
+          corpus = call(:normalize_rag_corpus, connection, input['rag_corpus'])
+          error('rag_corpus is required') if corpus.blank?
 
-          url = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
+          loc = (connection['location'] || '').downcase
+          parent = "projects/#{connection['project_id']}/locations/#{loc}"
 
-          # Dry‑run preview
-          if call(:normalize_boolean, input['validate_only'])
-            return { 'ok' => true }
-              .merge(call(:request_preview_pack, url, 'POST', call(:request_headers, corr, { 'x-goog-request-params' => "parent=#{parent}", 'x-goog-user-project' => proj }), call(:json_compact, payload)))
-              .merge(call(:telemetry_envelope_ex, t0, corr, true, 200, 'DRY_RUN', { 'action' => 'rag_retrieve_contexts' }))
-          end
+          payload = call(:build_rag_retrieve_payload, input['question'], corpus, input['restrict_to_file_ids'])
 
-          # POST
-          req_body = call(:json_compact, payload)
-          http  = post(url).headers(call(:request_headers, corr, { 'x-goog-request-params' => "parent=#{parent}", 'x-goog-user-project' => proj })).payload(req_body)
-          code  = call(:telemetry_success_code, http)
-          body  = call(:http_body_json, http)
+          url  = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
+          raw  = call(:http_call!, 'POST', url)
+                    .headers(call(:request_headers, corr))
+                    .payload(call(:json_compact, payload))
+          body  = call(:http_body_json, raw)
           raw   = call(:normalize_retrieve_contexts!, body)
 
-          maxn   = call(:clamp_int, (input['max_contexts'] || 20), 1, 200)
+          maxn  = call(:clamp_int, (input['max_contexts'] || 20), 1, 200)
           mapped = call(:map_context_chunks, raw, maxn)
-          # Optionally raise on empty corpus
-          #error('No contexts retrieved; check corpus, region, permissions, or the query text.') if mapped.empty?
 
-          out = { 'question' => input['question'], 'contexts' => mapped }
-                  .merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-
-          # Metrics (no re‑ranking fields)
-          flags = call(:metrics_effective_flags, connection, input)
-          if flags['emit']
-            m = call(:metrics_base, connection, 'rag_retrieve_contexts', t0, true, code, corr, { 'namespace' => flags['ns'] })
-                  .merge('rag_corpus' => corpus)
-                  .merge(call(:metrics_from_retrieve, mapped, input['max_contexts']))
-            out['metrics']    = m
-            out['metrics_kv'] = call(:metrics_to_kv, m)
-          end
-          out
-
+          {
+            'question' => input['question'],
+            'contexts' => mapped
+          }.merge(call(:telemetry_envelope, t0, corr, true, call(:telemetry_success_code, raw), 'OK'))
         rescue => e
-          g           = call(:extract_google_error, e)
-          msg         = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          http_status = call(:telemetry_parse_error_code, e)
-
-          # If we raised locally (e.g., no contexts), g will be {}.
-          # Fall back to the parsed HTTP response body so debug shows what the service returned.
-          resp_dbg = (g && !g.empty?) ? g : (body || {})
-          dbg = call(:debug_pack, !(call(:normalize_boolean, connection['prod_mode'])), url, req_body, resp_dbg)
-
-          out = {}.merge(call(:telemetry_envelope, t0, corr, false, http_status, msg))
-          out.merge!(dbg) if dbg
-
-          flags = call(:metrics_effective_flags, connection, input)
-          if flags['emit']
-            m = call(:metrics_base, connection, 'rag_retrieve_contexts', t0, false, http_status, corr, { 'namespace' => flags['ns'] })
-            out['metrics']    = m
-            out['metrics_kv'] = call(:metrics_to_kv, m)
-          end
-          out
+          g = call(:extract_google_error, e)
+          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
+          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
         end
       end,
       sample_output: lambda do
         {
           'question' => 'What is the PTO carryover policy?',
           'contexts' => [
-            {
-              'id' => 'doc-42#c3', 'text' => 'Employees may carry over up to 40 hours...', 'score' => 0.91,
-              'source' => 'handbook', 'uri' => 'https://drive.google.com/file/d/abc...', 'metadata' => { 'page' => 7 },
-              'metadata_kv' => [ { 'key' => 'page', 'value' => 7 } ],
-              'metadata_json' => '{"page":7}'
-            }
+            { 'id' => 'doc-42#c3', 'text' => 'Employees may carry over up to 40 hours...', 'score' => 0.91,
+            'source' => 'handbook', 'uri' => 'https://drive.google.com/file/d/abc...', 'metadata' => { 'page' => 7 },
+            'metadata_kv' => [ { 'key' => 'page', 'value' => 7 } ],
+            'metadata_json' => '{"page":7}' }
           ],
           'ok' => true,
           'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 22, 'correlation_id' => 'sample' }
@@ -1802,34 +1214,29 @@ require 'securerandom'
       end
     },
     rag_answer: {
-      title: 'RAG Serving: Retrieve + answer (one-shot)',
+      title: 'RAG (Serving): Retrieve + answer (one-shot)',
       subtitle: 'Retrieve contexts from a corpus and generate a cited answer',
-      display_priority: 80,
+      display_priority: 86,
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
 
-      input_fields: lambda do |object_definitions, connection, config_fields|
+      input_fields: lambda do |_|
         [
           { name: 'model', label: 'Model', optional: false, control_type: 'text' },
           { name: 'rag_corpus', optional: false,
             hint: 'projects/{project}/locations/{region}/ragCorpora/{corpus}' },
           { name: 'question', optional: false },
-          { name: 'validate_only', label: 'Validate only (no call)', type: 'boolean', control_type: 'checkbox', optional: true },
-
 
           { name: 'restrict_to_file_ids', type: 'array', of: 'string', optional: true },
           { name: 'max_contexts', type: 'integer', optional: true, default: 12 },
 
           { name: 'system_preamble', optional: true,
             hint: 'e.g., Only answer from retrieved contexts; say “I don’t know” otherwise.' },
-          { name: 'temperature', type: 'number', optional: true, hint: 'Default 0' },
-          { name: 'emit_metrics', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
-            hint: 'Attach a metrics object in the output for downstream persistence.' },
-          { name: 'metrics_namespace', optional: true, hint: 'Optional tag for partitioning dashboards (e.g., "email_rag_prod").' },
+          { name: 'temperature', type: 'number', optional: true, hint: 'Default 0' }
         ]
       end,
-      output_fields: lambda do |object_definitions, connection|
+      output_fields: lambda do |_|
         [
           { name: 'answer' },
           { name: 'citations', type: 'array', of: 'object', properties: [
@@ -1849,24 +1256,28 @@ require 'securerandom'
             { name: 'http_status', type: 'integer' },
             { name: 'message' }, { name: 'duration_ms', type: 'integer' },
             { name: 'correlation_id' }
-          ]},
-          { name: 'metrics', type: 'object', properties: object_definitions['metrics_fields'] },
-          { name: 'metrics_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] }
+          ]}
         ]
       end,
-      execute: lambda do |connection, raw_input|
-        input = call(:normalize_input_keys, raw_input)
-        # Build correlation ID & monotonic start (for traceability)
-        t0   = call(:telemetry_t0)
+      execute: lambda do |connection, input|
+        # Build correlation id and now (logging)
+        t0 = Time.now
         corr = call(:build_correlation_id)
         begin
-          # 1) Resolve parent & corpus
-          proj, loc, corpus = call(:resolve_rag_parent_and_corpus!, connection, input['rag_corpus'])
-          parent = "projects/#{proj}/locations/#{loc}"
+          # Validate inputs
+          call(:ensure_project_id!, connection)
+          call(:ensure_regional_location!, connection)
+
+          # 1) Retrieve contexts (inline call to same API used by rag_retrieve_contexts)
+          corpus = call(:normalize_rag_corpus, connection, input['rag_corpus'])
+          error('rag_corpus is required') if corpus.blank?
+
+          loc    = (connection['location'] || '').downcase
+          parent = "projects/#{connection['project_id']}/locations/#{loc}"
 
           retrieve_payload = call(:build_rag_retrieve_payload, input['question'], corpus, input['restrict_to_file_ids'])
 
-          retr_url      = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
+          retr_url  = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
           retr_req_body = call(:json_compact, retrieve_payload)
 
           # Precompute model path & generation scaffold used by both real and validate-only flows
@@ -1876,14 +1287,9 @@ require 'securerandom'
             'maxOutputTokens'   => 1024,
             'responseMimeType'  => 'application/json',
             'responseSchema'    => {
-              'type'      =>'object','additionalProperties'=>false,
-              'properties'=>{
-                'answer'    =>{'type'=>'string'},
-                'citations' =>{
-                  'type'=>'array',
-                  'items'=>{'type'=>'object','additionalProperties'=>false,'properties'=>{'chunk_id'=>{'type'=>'string'},'source'=>{'type'=>'string'},'uri'=>{'type'=>'string'},'score'=>{'type'=>'number'}}}
-                  }},
-              'required'  =>['answer']
+              'type'=>'object','additionalProperties'=>false,
+              'properties'=>{'answer'=>{'type'=>'string'},'citations'=>{'type'=>'array','items'=>{'type'=>'object','additionalProperties'=>false,'properties'=>{'chunk_id'=>{'type'=>'string'},'source'=>{'type'=>'string'},'uri'=>{'type'=>'string'},'score'=>{'type'=>'number'}}}}},
+              'required'=>['answer']
             }
           }
           sys_text = (input['system_preamble'].presence ||
@@ -1893,36 +1299,59 @@ require 'securerandom'
           # Dry-run: return previews of both calls
           if call(:normalize_boolean, input['validate_only'])
             preview_retr = call(:request_preview_pack, retr_url, 'POST', call(:request_headers, corr), retr_req_body)
-            # Use helper for gen preview; override contents with placeholder
-            gen_req = call(:build_generate_content_request,
-                           connection,
-                           input['model'],
-                           contents: [
-                             { 'role'=>'user','parts'=>[{ 'text' => "Question:\n#{input['question']}\n\nContext:\n<trimmed in runtime>" }]}
-                           ],
-                           system_text:       sys_text,
-                           generation_config: gen_cfg)
-            preview_gen = call(:request_preview_pack,
-                               gen_req['url'],
-                               'POST',
-                               call(:request_headers, corr),
-                               call(:json_compact, gen_req['body']))
+            loc_from_model = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
+            gen_url        = call(:aipl_v1_url, connection, loc_from_model, "#{model_path}:generateContent")
+            preview_gen    = call(:request_preview_pack, gen_url, 'POST', call(:request_headers, corr), call(:json_compact, {
+              'contents' => [{ 'role'=>'user','parts'=>[{ 'text' => "Question:\n#{input['question']}\n\nContext:\n<trimmed in runtime>" }]}],
+              'systemInstruction' => sys_inst,
+              'generationConfig'  => gen_cfg
+            }))
             return { 'ok'=>true, 'request_preview'=> { 'retrieve'=>preview_retr['request_preview'], 'generate'=>preview_gen['request_preview'] } }
                    .merge(call(:telemetry_envelope_ex, t0, corr, true, 200, 'DRY_RUN', { 'action' => 'rag_answer' }))
           end
 
-          retr_raw  = call(:http_call!, 'POST', retr_url)
+          retr_resp = call(:http_call!, 'POST', retr_url)
                         .headers(call(:request_headers, corr))
                         .payload(retr_req_body)
-          retr_code = call(:telemetry_success_code, retr_raw)
-          retr_body = call(:http_body_json, retr_raw)
-          raw_ctxs  = call(:normalize_retrieve_contexts!, retr_body)
+          raw_ctxs = call(:normalize_retrieve_contexts!, retr_resp)
 
           maxn  = call(:clamp_int, (input['max_contexts'] || 12), 1, 100)
           chunks = call(:map_context_chunks, raw_ctxs, maxn)
           error('No contexts retrieved; check corpus/permissions/region') if chunks.empty?
 
           # 2) Generate structured answer with parsed context
+          model_path = call(:build_model_path_with_global_preview, connection, input['model'])
+
+          gen_cfg = {
+            'temperature'       => (input['temperature'].present? ? call(:safe_float, input['temperature']) : 0),
+            'maxOutputTokens'   => 1024,
+            'responseMimeType'  => 'application/json',
+            'responseSchema'    => {
+              'type'        => 'object', 'additionalProperties' => false,
+              'properties'  => {
+                'answer'    => { 'type' => 'string' },
+                'citations' => {
+                  'type'    => 'array',
+                  'items'   => {
+                    'type'  => 'object', 'additionalProperties' => false,
+                    'properties' => {
+                      'chunk_id' => { 'type' => 'string' },
+                      'source'   => { 'type' => 'string' },
+                      'uri'      => { 'type' => 'string' },
+                      'score'    => { 'type' => 'number' }
+                    }
+                  }
+                }
+              },
+              'required' => ['answer']
+            }
+          }
+
+          sys_text = (input['system_preamble'].presence ||
+            'Answer using ONLY the retrieved context chunks. If the context is insufficient, reply with “I don’t know.” '\
+            'Keep answers concise and include citations with chunk_id, source, uri, and score.')
+          sys_inst = { 'role' => 'system', 'parts' => [ { 'text' => sys_text } ] }
+
           ctx_blob = call(:format_context_chunks, chunks)
           contents = [
             { 'role' => 'user', 'parts' => [
@@ -1930,58 +1359,39 @@ require 'securerandom'
               ]
             }
           ]
-          # Build via helper; single source of truth for URL/body
-          gen_req = call(:build_generate_content_request,
-                         connection,
-                         input['model'],
-                         contents:          contents,
-                         system_text:       sys_text,
-                         generation_config: gen_cfg)
-          gen_raw  = call(:http_call!, 'POST', gen_req['url'])
+
+          gen_payload = {
+            'contents'          => contents,
+            'systemInstruction' => sys_inst,
+            'generationConfig'  => gen_cfg
+          }
+
+          # Derive location from model path to avoid region/global mismatch
+          loc_from_model = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
+          gen_url  = call(:aipl_v1_url, connection, loc_from_model, "#{model_path}:generateContent")
+          gen_req_body = call(:json_compact, gen_payload)
+          gen_raw   = call(:http_call!, 'POST', gen_url)
                         .headers(call(:request_headers, corr))
-                        .payload(call(:json_compact, gen_req['body']))
-          gen_body = call(:http_body_json, gen_raw)
+                        .payload(gen_req_body)
+
+
+          gen_body  = call(:http_body_json, gen_raw)
           text      = gen_body.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
           parsed = call(:safe_parse_json, text)
 
-          code = call(:telemetry_success_code, gen_raw)
-          base_out = {
+          {
             'answer'     => (parsed['answer'] || text),
             'citations'  => (parsed['citations'] || []),
             'responseId' => gen_body['responseId'],
             'usage'      => gen_body['usageMetadata']
-          }.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-          ok = true
-          http_status = code
-
-          flags = call(:metrics_effective_flags, connection, input)
-          if flags['emit']
-            m = call(:metrics_base, connection, 'rag_answer', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
-              .merge('rag_corpus' => corpus)
-              .merge(call(:metrics_from_retrieve, chunks, input['max_contexts']))
-              .merge(call(:metrics_from_generation, gen_body, input['temperature']))
-              .merge('model' => input['model'])
-            base_out['metrics']    = m
-            base_out['metrics_kv'] = call(:metrics_to_kv, m)
-          end
-          base_out
-
+          }.merge(call(:telemetry_envelope, t0, corr, true, call(:telemetry_success_code, gen_raw), 'OK'))
         rescue => e
           g = call(:extract_google_error, e)
-          http_status = call(:telemetry_parse_error_code, e)
           msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          out = {}.merge(call(:telemetry_envelope, t0, corr, false, http_status, msg))
-          ok = false
-          flags = call(:metrics_effective_flags, connection, input)
-          if flags['emit']
-            m = call(:metrics_base, connection, 'rag_answer', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
-              .merge('model' => input['model'])
-            out['metrics']    = m
-            out['metrics_kv'] = call(:metrics_to_kv, m)
-          end
-          out
+          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
         end
       end,
+
       sample_output: lambda do
         {
           'answer' => 'Employees may carry over up to 40 hours of PTO.',
@@ -1996,14 +1406,13 @@ require 'securerandom'
       end
     },
 
-    # ---- Corpora management (70)
     rag_corpora_create: {
-      title: 'RAG Corpora: Create corpus',
+      title: 'RAG (Corpus): Create corpus',
       subtitle: 'projects.locations.ragCorpora.create',
-      display_priority: 70,
+      display_priority: 85,
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
-      input_fields: lambda do |object_definitions, connection, config_fields|
+      input_fields: lambda do |_|
         [
           { name: 'corpusId', optional: false, hint: 'Short ID for the new corpus' },
           { name: 'displayName', optional: true },
@@ -2012,7 +1421,7 @@ require 'securerandom'
           { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
         ]
       end,
-      output_fields: lambda do |object_definitions, connection|
+      output_fields: lambda do |_|
         [
           { name: 'name' }, { name: 'displayName' }, { name: 'description' },
           { name: 'labels', type: 'object' }, { name: 'createTime' }, { name: 'updateTime' }
@@ -2039,10 +1448,7 @@ require 'securerandom'
             'labels'      => input['labels']
           }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
           req_body = call(:json_compact, body)
-          raw  = post(url)
-                  .params(corpusId: input['corpusId'].to_s)
-                  .headers(call(:request_headers, corr))
-                  .payload(req_body)
+          raw  = call(:http_call!, 'POST', url).params(corpusId: input['corpusId'].to_s).headers(call(:request_headers, corr)).payload(req_body)
           code = call(:telemetry_success_code, raw)
           body = call(:http_body_json, raw)
           out  = body.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
@@ -2071,15 +1477,15 @@ require 'securerandom'
       end
     },
     rag_corpora_get: {
-      title: 'RAG Corpora: Get corpus',
+      title: 'RAG (Corpus): Get corpus',
       subtitle: 'projects.locations.ragCorpora.get',
-      display_priority: 70,
+      display_priority: 85,
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
-      input_fields: lambda do |object_definitions, connection, config_fields|
+      input_fields: lambda do |_|
         [ { name: 'rag_corpus', optional: false, hint: 'Short id or full resource' } ]
       end,
-      output_fields: lambda do |object_definitions, connection|
+      output_fields: lambda do |_|
         [
           { name: 'name' }, { name: 'displayName' }, { name: 'description' },
           { name: 'labels', type: 'object' }, { name: 'createTime' }, { name: 'updateTime' }
@@ -2099,8 +1505,7 @@ require 'securerandom'
           path = call(:build_rag_corpus_path, connection, input['rag_corpus'])
           loc  = connection['location'].to_s.downcase
           url  = call(:aipl_v1_url, connection, loc, path)
-          raw  = get(url)
-                  .headers(call(:request_headers, corr))
+          raw  = call(:http_call!, 'GET', url).headers(call(:request_headers, corr))
           code = call(:telemetry_success_code, raw)
           body = call(:http_body_json, raw)
           body.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
@@ -2110,12 +1515,12 @@ require 'securerandom'
       end
     },
     rag_corpora_list: {
-      title: 'RAG Corpora: List corpora',
+      title: 'RAG (Corpus): List corpora',
       subtitle: 'projects.locations.ragCorpora.list',
-      display_priority: 70,
+      display_priority: 85,
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
-      input_fields: lambda do |object_definitions, connection, config_fields|
+      input_fields: lambda do |_|
         [
           { name: 'page_size', type: 'integer', optional: true },
           { name: 'page_token', optional: true },
@@ -2123,7 +1528,7 @@ require 'securerandom'
           { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
         ]
       end,
-      output_fields: lambda do |object_definitions, connection|
+      output_fields: lambda do |_|
         [
           { name: 'items', type: 'array', of: 'object', properties: [
             { name: 'name' }, { name: 'displayName' }, { name: 'description' },
@@ -2156,9 +1561,7 @@ require 'securerandom'
             preview = call(:request_preview_pack, "#{url}#{qstr}", 'GET', call(:request_headers, corr), nil)
             return { 'ok' => true }.merge(preview).merge(call(:telemetry_envelope_ex, t0, corr, true, 200, 'DRY_RUN', { 'action' => 'rag_corpora_list' }))
           end
-
-          raw  = get(url)
-                  .params(qs).headers(call(:request_headers, corr))
+          raw  = call(:http_call!, 'GET', url).params(qs).headers(call(:request_headers, corr))
           code = call(:telemetry_success_code, raw)
           body = call(:http_body_json, raw)
           out = {
@@ -2177,15 +1580,15 @@ require 'securerandom'
       end
     },
     rag_corpora_delete: {
-      title: 'RAG Corpora: Delete corpus',
+      title: 'RAG (Corpus): Delete corpus',
       subtitle: 'projects.locations.ragCorpora.delete',
-      display_priority: 70,
+      display_priority: 85,
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
-      input_fields: lambda do |object_definitions, connection, config_fields|
+      input_fields: lambda do |_|
         [ { name: 'rag_corpus', optional: false } ]
       end,
-      output_fields: lambda do |object_definitions, connection|
+      output_fields: lambda do |_|
         [
           { name: 'name' }, { name: 'done', type: 'boolean' }, { name: 'error', type: 'object' }
         ] + [
@@ -2204,8 +1607,7 @@ require 'securerandom'
           path = call(:build_rag_corpus_path, connection, input['rag_corpus'])
           loc  = connection['location'].to_s.downcase
           url  = call(:aipl_v1_url, connection, loc, path)
-          raw  = delete(url)
-                  .headers(call(:request_headers, corr))
+          raw  = call(:http_call!, 'DELETE', url).headers(call(:request_headers, corr))
           code = call(:telemetry_success_code, raw)
           body = call(:http_body_json, raw)
           body.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
@@ -2214,14 +1616,123 @@ require 'securerandom'
         end
       end
     },
-    # ---- File management (60)
-    rag_files_list: {
-      title: 'RAG Files: List files in corpus',
-      subtitle: 'projects.locations.ragCorpora.ragFiles.list',
-      display_priority: 60,
+    rag_files_import: {
+      title: 'RAG (Files): Import files to corpus',
+      subtitle: 'projects.locations.ragCorpora.ragFiles:import',
+      display_priority: 85,
+      retry_on_request: ['GET','HEAD'], # removed "POST" to preserve idempotency, prevent duplication of jobs
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
-      input_fields: lambda do |object_definitions, connection, config_fields|
+
+      input_fields: lambda do
+        [
+          { name: 'rag_corpus_resource_name', optional: false, hint: 'Accepts either full resource name (e.g., "projects/{project}/locations/{region}/ragCorpora/{corpus}") or the "corpus"' },
+
+          # Exactly one source family:
+          { name: 'source_family', label: 'Source family', optional: false, control_type: 'select', extends_schema: true,
+            pick_list: 'rag_source_families', hint: 'Choose which source you are importing from (purely a UI gate; validation still enforced at runtime).' },
+          { name: 'gcs_uris',         optional: true, ngIf: 'input.source_family == "gcs"',   type: 'array', of: 'string', 
+            hint: 'Pass files or directory prefixes (e.g., gs://bucket/dir). Wildcards (*, **) are NOT supported.' },
+          { name: 'folder_or_files', label: 'Drive input type', optional: true, ngIf: 'input.source_family == "drive"', control_type: 'select', extends_schema: true,
+            pick_list: 'drive_input_type' },
+          { name: 'drive_folder_id',  optional: true, ngIf: 'input.folder_or_files == "folder"', 
+            hint: 'Google Drive folder ID (share with Vertex RAG service agent)' },
+          { name: 'drive_file_ids',   optional: true, ngIf: 'input.folder_or_files == "files"', type: 'array', of: 'string', 
+            hint: 'Optional explicit file IDs if not using folder' },
+
+          # Tuning / ops
+          { name: 'maxEmbeddingRequestsPerMin', type: 'integer', optional: true },
+          { name: 'rebuildAnnIndex', type: 'boolean', optional: true, default: false, hint: 'Set true after first large import to build ANN index' },
+          { name: 'importResultGcsSink', type: 'object', optional: true, properties: [
+              { name: 'outputUriPrefix', optional: false, hint: 'gs://bucket/prefix/' }
+            ]},
+          # Debug
+          { name: 'show_debug', label: 'Show debug options', type: 'boolean', control_type: 'checkbox', optional: true, 
+            extends_schema: true, default: false },
+          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true, ngIf: 'input.show_debug == "true"',
+            hint: 'Echo request URL/body and Google error body for troubleshooting' }
+        ]
+      end,
+      output_fields: lambda do |_|
+        [
+          { name: 'name' },           # LRO: projects/.../operations/...
+          { name: 'done', type: 'boolean' },
+          { name: 'metadata', type: 'object' },
+          { name: 'error', type: 'object' }
+        ] + [
+          { name: 'ok', type: 'boolean' },
+          { name: 'telemetry', type: 'object', properties: [
+            { name: 'http_status', type: 'integer' },
+            { name: 'message' }, { name: 'duration_ms', type: 'integer' },
+            { name: 'correlation_id' }
+          ]}
+        ]
+      end,
+      execute: lambda do |connection, input|
+        # Build correlation ID, now (for traceability)
+        t0 = Time.now
+        corr = call(:build_correlation_id)
+        begin
+          url = nil
+          req_body = nil
+
+          # Validate inputs
+          call(:ensure_project_id!, connection)
+          call(:ensure_regional_location!, connection)
+
+          corpus = call(:normalize_rag_corpus, connection, input['rag_corpus_resource_name'])
+          error('rag_corpus_resource_name is required') if corpus.blank?
+
+          # Build payload
+          payload  = call(:build_rag_import_payload!, input)
+
+          loc = (connection['location'] || '').downcase
+          url = call(:aipl_v1_url, connection, loc, "#{corpus}/ragFiles:import")
+          req_body = call(:json_compact, payload)
+          raw  = call(:http_call!, 'POST', url)
+                   .headers(call(:request_headers, corr))
+                   .payload(req_body)
+          code = call(:telemetry_success_code, raw)
+          body = call(:http_body_json, raw)
+          out  = body.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          if call(:normalize_boolean, input['debug'])
+            ops_root = "https://#{call(:aipl_service_host, connection, loc)}/v1/projects/#{connection['project_id']}/locations/#{loc}/operations"
+            dbg = call(:debug_pack, true, url, req_body, body) || {}
+            dbg['ops_list_url'] = ops_root
+            out['debug'] = dbg
+          end
+          out
+
+        rescue => e
+          g = call(:extract_google_error, e)
+          vio = (g['violations'] || []).map { |x| "#{x['field']}: #{x['reason']}" }.join(' ; ')
+          msg = [e.to_s, (g['message'] || nil), (vio.presence)].compact.join(' | ')
+          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
+          # Assess environment (dev/prod)
+          unless call(:normalize_boolean, connection['prod_mode'])
+            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
+          end
+          # Return
+          out
+        end
+      end,
+
+      sample_output: lambda do
+        {
+          'name' => 'projects/p/locations/us-central1/operations/1234567890',
+          'done' => false,
+          'ok' => true,
+          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 18, 'correlation_id' => 'sample' }
+        }
+      end
+    },
+    rag_files_list: {
+      title: 'RAG (Files): List files in corpus',
+      subtitle: 'projects.locations.ragCorpora.ragFiles.list',
+      display_priority: 85,
+      retry_on_response: [408,429,500,502,503,504],
+      max_retries: 3,
+      input_fields: lambda do |_|
         [
           { name: 'rag_corpus', optional: false, hint: 'Short id or full resource' },
           { name: 'page_size', type: 'integer', optional: true },
@@ -2268,11 +1779,7 @@ require 'securerandom'
             preview = call(:request_preview_pack, "#{url}#{qstr}", 'GET', call(:request_headers, corr), nil)
             return { 'ok' => true }.merge(preview).merge(call(:telemetry_envelope_ex, t0, corr, true, 200, 'DRY_RUN', { 'action' => 'rag_files_list' }))
           end
-
-          # HTTP - GET
-          raw  = get(url)
-                  .params(qs)
-                  .headers(call(:request_headers, corr))
+          raw  = call(:http_call!, 'GET', url).params(qs).headers(call(:request_headers, corr))
           code = call(:telemetry_success_code, raw)
           body = call(:http_body_json, raw)
           items = call(:safe_array, body['ragFiles']).map do |it|
@@ -2303,12 +1810,12 @@ require 'securerandom'
       end
     },
     rag_files_get: {
-      title: 'RAG Files: Get file',
+      title: 'RAG (Files): Get file',
       subtitle: 'projects.locations.ragCorpora.ragFiles.get',
-      display_priority: 60,
+      display_priority: 85,
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
-      input_fields: lambda do |object_definitions, connection, config_fields|
+      input_fields: lambda do |_|
         [ { name: 'rag_file', optional: false, hint: 'Full name: projects/.../ragCorpora/{id}/ragFiles/{fileId}' } ]
       end,
       output_fields: lambda do |object_definitions, connection|
@@ -2338,10 +1845,7 @@ require 'securerandom'
           name = call(:build_rag_file_path, connection, input['rag_file'])
           loc  = connection['location'].to_s.downcase
           url  = call(:aipl_v1_url, connection, loc, name)
-
-          # HTTP - GET
-          raw  = get(url)
-                  .headers(call(:request_headers, corr))
+          raw  = call(:http_call!, 'GET', url).headers(call(:request_headers, corr))
           code = call(:telemetry_success_code, raw)
           body = call(:http_body_json, raw)
           lbl = (body['labels'] || {}).to_h
@@ -2359,15 +1863,15 @@ require 'securerandom'
       end
     },
     rag_files_delete: {
-      title: 'RAG Files: Delete file',
+      title: 'RAG (Files): Delete file',
       subtitle: 'projects.locations.ragCorpora.ragFiles.delete',
-      display_priority: 60,
+      display_priority: 85,
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
-      input_fields: lambda do |object_definitions, connection, config_fields|
+      input_fields: lambda do |_|
         [ { name: 'rag_file', optional: false, hint: 'Full name: projects/.../ragCorpora/{id}/ragFiles/{fileId}' } ]
       end,
-      output_fields: lambda do |object_definitions, connection|
+      output_fields: lambda do |_|
         [
           { name: 'name' }, { name: 'done', type: 'boolean' }, { name: 'error', type: 'object' }
         ] + [
@@ -2386,10 +1890,7 @@ require 'securerandom'
           name = call(:build_rag_file_path, connection, input['rag_file'])
           loc  = connection['location'].to_s.downcase
           url  = call(:aipl_v1_url, connection, loc, name)
-
-          # HTTP - DELETE
-          raw  = delete(url)
-                  .headers(call(:request_headers, corr))
+          raw  = call(:http_call!, 'DELETE', url).headers(call(:request_headers, corr))
           code = call(:telemetry_success_code, raw)
           body = call(:http_body_json, raw)
           body.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
@@ -2398,151 +1899,10 @@ require 'securerandom'
         end
       end
     },
-    rag_files_import: {
-      title: 'RAG Files: Import files to corpus',
-      subtitle: 'projects.locations.ragCorpora.ragFiles:import',
-      display_priority: 60,
-      retry_on_request: ['GET','HEAD'], # not "POST" to preserve idempotency, prevent duplication of jobs
-      retry_on_response: [408,429,500,502,503,504],
-      max_retries: 3,
 
-      input_fields: lambda do |object_definitions, connection, config_fields|
-        [
-          { name: 'rag_corpus_resource_name', optional: false, hint: 'Accepts either full resource name (e.g., "projects/{project}/locations/{region}/ragCorpora/{corpus}") or the "corpus"' },
-
-          # Exactly one source family:
-          { name: 'source_family', label: 'Source family', optional: false, control_type: 'select', extends_schema: true,
-            pick_list: 'rag_source_families', hint: 'Choose which source you are importing from (purely a UI gate; validation still enforced at runtime).' },
-          { name: 'gcs_uris',         optional: true, ngIf: 'input.source_family == "gcs"',   type: 'array', of: 'string', 
-            hint: 'Pass files or directory prefixes (e.g., gs://bucket/dir). Wildcards (*, **) are NOT supported.' },
-          { name: 'folder_or_files', label: 'Drive input type', optional: true, ngIf: 'input.source_family == "drive"', control_type: 'select', extends_schema: true,
-            pick_list: 'drive_input_type' },
-          { name: 'drive_folder_id',  optional: true, ngIf: 'input.folder_or_files == "folder"', 
-            hint: 'Google Drive folder ID (share with Vertex RAG service agent)' },
-          { name: 'drive_file_ids',   optional: true, ngIf: 'input.folder_or_files == "files"', type: 'array', of: 'string', 
-            hint: 'Optional explicit file IDs if not using folder' },
-
-          # Tuning / ops
-          { name: 'maxEmbeddingRequestsPerMin', type: 'integer', optional: true },
-          { name: 'rebuildAnnIndex', type: 'boolean', optional: true, default: false, hint: 'Set true after first large import to build ANN index' },
-          { name: 'importResultGcsSink', type: 'object', optional: true, properties: [
-              { name: 'outputUriPrefix', optional: false, hint: 'gs://bucket/prefix/' }
-            ]},
-          # Debug
-          { name: 'show_debug', label: 'Show debug options', type: 'boolean', control_type: 'checkbox', optional: true, 
-            extends_schema: true, default: false },
-          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true, ngIf: 'input.show_debug == "true"',
-            hint: 'Echo request URL/body and Google error body for troubleshooting' },
-          { name: 'emit_metrics', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
-            hint: 'Attach a metrics object in the output for downstream persistence.' },
-          { name: 'metrics_namespace', optional: true, hint: 'Optional tag for partitioning dashboards (e.g., "email_rag_prod").' },
-        ]
-      end,
-      output_fields: lambda do |object_definitions, connection|
-        [
-          { name: 'name' },           # LRO: projects/.../operations/...
-          { name: 'done', type: 'boolean' },
-          { name: 'metadata', type: 'object' },
-          { name: 'error', type: 'object' }
-        ] + [
-          { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object', properties: [
-            { name: 'http_status', type: 'integer' },
-            { name: 'message' }, { name: 'duration_ms', type: 'integer' },
-            { name: 'correlation_id' } ]}
-        ]+ [
-          { name: 'metrics', type: 'object', properties: object_definitions['metrics_fields'] },
-          { name: 'metrics_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] } ]
-      end,
-      execute: lambda do |connection, input|
-        # Build correlation ID & monotonic start (for traceability)
-        t0   = call(:telemetry_t0)
-        corr = call(:build_correlation_id)
-        url  = nil
-        req_body = nil
-
-        begin
-          # Validate inputs & context
-          call(:ensure_project_id!, connection)
-          call(:ensure_regional_location!, connection)
-
-          corpus = call(:normalize_rag_corpus, connection, input['rag_corpus_resource_name'])
-          error('rag_corpus_resource_name is required') if corpus.blank?
-
-          # Build request
-          payload  = call(:build_rag_import_payload!, input)
-          loc      = (connection['location'] || '').downcase
-          url      = call(:aipl_v1_url, connection, loc, "#{corpus}/ragFiles:import")
-          req_body = call(:json_compact, payload)
-
-          # HTTP - POST import (returns LRO)
-          http = post(url)
-                  .headers(call(:request_headers, corr))
-                  .payload(req_body)
-
-          code = call(:telemetry_success_code, http)
-          body = call(:http_body_json, http)
-
-          out  = body.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-          ok = true
-          http_status = code
-
-          # Metrics
-          flags = call(:metrics_effective_flags, connection, input)
-          if flags['emit']
-            m = call(:metrics_base, connection, 'rag_files_import', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
-                  .merge(call(:metrics_from_import_lro, body))
-                  .merge('rag_corpus' => call(:normalize_rag_corpus, connection, input['rag_corpus_resource_name']))
-            out['metrics']    = m
-            out['metrics_kv'] = call(:metrics_to_kv, m)
-          end
-
-          # Debug
-          if call(:normalize_boolean, input['debug'])
-            ops_root = "https://#{call(:aipl_service_host, connection, loc)}/v1/projects/#{connection['project_id']}/locations/#{loc}/operations"
-            dbg = call(:debug_pack, true, url, req_body, body) || {}
-            dbg['ops_list_url'] = ops_root
-            out['debug'] = dbg
-          end
-
-          out
-
-        rescue => e
-          g    = call(:extract_google_error, e)
-          vio  = (g['violations'] || []).map { |x| "#{x['field']}: #{x['reason']}" }.join(' ; ')
-          msg  = [e.to_s, (g['message'] || nil), (vio.presence)].compact.join(' | ')
-          http_status = call(:telemetry_parse_error_code, e)
-          ok = false
-
-          out = {}.merge(call(:telemetry_envelope, t0, corr, false, http_status, msg))
-
-          flags = call(:metrics_effective_flags, connection, input)
-          if flags['emit']
-            m = call(:metrics_base, connection, 'rag_files_import', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
-            out['metrics']    = m
-            out['metrics_kv'] = call(:metrics_to_kv, m)
-          end
-
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, g) if call(:normalize_boolean, input['debug'])
-          end
-
-          out
-        end
-      end,
-      sample_output: lambda do
-        {
-          'name' => 'projects/p/locations/us-central1/operations/1234567890',
-          'done' => false,
-          'ok' => true,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 18, 'correlation_id' => 'sample' }
-        }
-      end
-    },
-
-    # 4) Utilities, operations, administration
+    # 4)  Utility (5-10)
     embed_text: {
-      title: 'Utility: Embed text',
+      title: 'Embeddings: Embed text',
       subtitle: 'Get embeddings from a publisher embedding model',
       help: lambda do |_|
         { body: 'POST :predict on a publisher embedding model' }
@@ -2552,27 +1912,22 @@ require 'securerandom'
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
 
-      input_fields: lambda do |object_definitions, connection, config_fields|
+      input_fields: lambda do |_|
         [
           { name: 'model', label: 'Embedding model', optional: false, control_type: 'text', default: 'text-embedding-005' },
           { name: 'texts', type: 'array', of: 'string', optional: false },
           { name: 'task', hint: 'Optional: RETRIEVAL_QUERY or RETRIEVAL_DOCUMENT' },
           { name: 'autoTruncate', type: 'boolean', hint: 'Truncate long inputs automatically' },
           { name: 'outputDimensionality', type: 'integer', optional: true, convert_input: 'integer_conversion',
-            hint: 'Optional dimensionality reduction (see model docs).' },
-          { name: 'emit_metrics', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
-            hint: 'Attach a metrics object in the output for downstream persistence.' },
-          { name: 'metrics_namespace', optional: true, hint: 'Optional tag for partitioning dashboards (e.g., "email_rag_prod").' },
+            hint: 'Optional dimensionality reduction (see model docs).' }
         ]
       end,
-      output_fields: lambda do |object_definitions, connection|
-        Array(object_definitions['embed_output']) + 
-        Array(object_definitions['envelope_fields']) + [
-          { name: 'metrics', type: 'object', properties: object_definitions['metrics_fields'] },
-          { name: 'metrics_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] }]
+
+      output_fields: lambda do |object_definitions|
+        Array(object_definitions['embed_output']) + Array(object_definitions['envelope_fields'])
       end,
-      execute: lambda do |connection, raw_input|
-        input = call(:normalize_input_keys, raw_input)
+
+      execute: lambda do |connection, input|
         # Correlation id and duration for logs / analytics
         t0 = Time.now
         corr = call(:build_correlation_id)
@@ -2607,33 +1962,13 @@ require 'securerandom'
             'outputDimensionality' => input['outputDimensionality']
           })
 
-          emb = call(:predict_embeddings, connection, model_path, instances, params)
-          out = emb.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
-          ok = true
-          http_status = 200
-          flags = call(:metrics_effective_flags, connection, input)
-          if flags['emit']
-            m = call(:metrics_base, connection, 'embed_text', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
-              .merge(call(:metrics_from_embeddings, emb, instances))
-              .merge('model' => input['model'])
-            out['metrics']    = m
-            out['metrics_kv'] = call(:metrics_to_kv, m)
-          end
-          out
+          call(:predict_embeddings, connection, model_path, instances, params)
+            .merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
         rescue => e
-          http_status = call(:telemetry_parse_error_code, e)
-          out = {}.merge(call(:telemetry_envelope, t0, corr, false, http_status, e.to_s))
-          ok = false
-          flags = call(:metrics_effective_flags, connection, input)
-          if flags['emit']
-            m = call(:metrics_base, connection, 'embed_text', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
-              .merge('model' => input['model'])
-            out['metrics']    = m
-            out['metrics_kv'] = call(:metrics_to_kv, m)
-          end
-          out
+          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
         end
       end,
+
       sample_output: lambda do
         {
           'predictions' => [
@@ -2687,7 +2022,6 @@ require 'securerandom'
         url = call(:aipl_v1_url, connection, loc_from_model, "#{model_path}:countTokens")
 
         begin
-          # HTTP - POST
           resp = post(url)
                     .headers(call(:request_headers, corr))
                     .payload(call(:json_compact, {
@@ -2710,23 +2044,21 @@ require 'securerandom'
       end
     },
     operations_get: {
-      title: 'OPs: Get (poll LRO)',
+      title: 'Operations: Get (poll LRO)',
       subtitle: 'google.longrunning.operations.get',
       display_priority: 5,
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
 
-      input_fields: lambda do |object_definitions, connection, config_fields|
+      input_fields: lambda do
         [
           { name: 'operation', optional: false,
-            hint: 'Operation name or full path, e.g., projects/{p}/locations/{l}/operations/{id}' },
-          { name: 'emit_metrics', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
-            hint: 'Attach a metrics object in the output for downstream persistence.' },
-          { name: 'metrics_namespace', optional: true, hint: 'Optional tag for partitioning dashboards (e.g., "email_rag_prod").' },
+            hint: 'Operation name or full path, e.g., projects/{p}/locations/{l}/operations/{id}' }
         ]
       end,
-      output_fields: lambda do |object_definitions, connection|
+
+      output_fields: lambda do |_|
         [
           { name: 'name' }, { name: 'done', type: 'boolean' },
           { name: 'metadata', type: 'object' }, { name: 'error', type: 'object' }
@@ -2734,48 +2066,28 @@ require 'securerandom'
           { name: 'ok', type: 'boolean' },
           { name: 'telemetry', type: 'object', properties: [
             { name: 'http_status', type: 'integer' }, { name: 'message' },
-            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' } ]},
-          { name: 'metrics', type: 'object', properties: object_definitions['metrics_fields'] },
-          { name: 'metrics_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] }
+            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
+          ]}
         ]
       end,
+
       execute: lambda do |connection, input|
         t0 = Time.now
         corr = call(:build_correlation_id)
         begin
           call(:ensure_project_id!, connection)
           # Accept either full /v1/... or name-only
-          op = input['operation'].to_s.sub(%r{^/?v1/}, '')
+          op = input['operation'].to_s.sub(%r{^/v1/}, '')
           loc = (connection['location'].presence || 'us-central1').to_s.downcase
           url = call(:aipl_v1_url, connection, loc, op.start_with?('projects/') ? op : "projects/#{connection['project_id']}/locations/#{loc}/operations/#{op}")
-
-          # HTTP - GET
-          resp = get(url)
-                  .headers(call(:request_headers, corr))
+          resp = get(url).headers(call(:request_headers, corr))
           code = call(:telemetry_success_code, resp)
-          out  = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-          ok = true
-          http_status = code
-          flags = call(:metrics_effective_flags, connection, input)
-          if flags['emit']
-            m = call(:metrics_base, connection, 'operations_get', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
-            out['metrics']    = m
-            out['metrics_kv'] = call(:metrics_to_kv, m)
-          end
-          out
+          resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
         rescue => e
-          http_status = call(:telemetry_parse_error_code, e)
-          out = {}.merge(call(:telemetry_envelope, t0, corr, false, http_status, e.to_s))
-          ok = false
-          flags = call(:metrics_effective_flags, connection, input)
-          if flags['emit']
-            m = call(:metrics_base, connection, 'operations_get', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
-            out['metrics']    = m
-            out['metrics_kv'] = call(:metrics_to_kv, m)
-          end
-          out
+          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
         end
       end,
+
       sample_output: lambda do
         { 'name' => 'projects/p/locations/us-central1/operations/123', 'done' => false,
           'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 8, 'correlation_id' => 'sample' } }
@@ -2803,14 +2115,6 @@ require 'securerandom'
 
     modes_grounding: lambda do
       [%w[Google\ Search google_search], %w[Vertex\ AI\ Search vertex_ai_search]]
-    end,
-
-    rankers: lambda do
-      [
-        ['None',          'none'],
-        ['Rank Service',  'rank_service'],
-        ['LLM Reranker',  'llm_ranker']
-      ]
     end,
 
     roles: lambda do
@@ -2855,69 +2159,7 @@ require 'securerandom'
   },
 
   # --------- METHODS ------------------------------------------------------
-  # Exercise caution when
-  #   - calling '.dup'
-  #   - implementing method-scope 'rescue'
   methods: {
-    resolve_rag_parent_and_corpus!: lambda do |connection, raw_corpus|
-      v = raw_corpus.to_s.strip
-      error('rag_corpus is required') if v.empty?
-
-      if v.start_with?('projects/')
-        # Accept both "/v1/..." and "v1/..." fully-qualified resources.
-        s = v.sub(%r{^/?v1/}, '')
-        m = s.match(%r{\Aprojects/([^/]+)/locations/([^/]+)/ragCorpora/[^/]+})
-        error('rag_corpus must be projects/{project}/locations/{location}/ragCorpora/{id}') unless m
-        proj = m[1].to_s
-        loc  = m[2].to_s.downcase
-        [proj, loc, s]
-      else
-        # Avoid mutating frozen connection; use the returned project id directly.
-        pid = call(:ensure_project_id!, connection)
-        loc = (connection['location'] || '').to_s.downcase
-        error("RAG corpus requires regional location; got '#{loc}'") if loc.empty? || loc == 'global'
-        corpus_full = "projects/#{pid}/locations/#{loc}/ragCorpora/#{v}"
-        [pid.to_s, loc, corpus_full]
-      end
-    end,
-    # --- Request builders (pure; no HTTP) --------------------------------
-    build_embeddings_predict_request: lambda do |connection, model_path, instances, params={}|
-      loc = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
-      url = call(:aipl_v1_url, connection, loc, "#{model_path}:predict")
-      body = {
-        'instances'  => Array(instances),
-        'parameters' => (params.presence || {})
-      }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
-      { 'url' => url, 'body' => body }
-    end,
-    build_generate_content_request: lambda do |connection, model, contents:, system_text:nil, generation_config:nil, tools:nil, tool_config:nil, safety:nil|
-      model_path = call(:build_model_path_with_global_preview, connection, model)
-      loc = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
-      url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
-      sys_inst = call(:system_instruction_from_text, system_text)
-      body = {
-        'contents'          => contents,
-        'systemInstruction' => sys_inst,
-        'generationConfig'  => generation_config,
-        'tools'             => tools,
-        'toolConfig'        => tool_config,
-        'safetySettings'    => safety
-      }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
-      { 'url' => url, 'body' => body }
-    end,
-    parse_referee_json!: lambda do |text, allowed_categories, fallback=nil|
-      parsed = JSON.parse(text) rescue { 'category' => nil, 'confidence' => nil, 'reasoning' => nil, 'distribution' => [] }
-      cat = parsed['category']
-      cat = nil unless allowed_categories.include?(cat)
-      cat = (fallback if cat.to_s.empty? && fallback.present?)
-      error('Referee returned no valid category and no fallback is configured') if cat.to_s.empty?
-      {
-        'category'     => cat,
-        'confidence'   => parsed['confidence'],
-        'reasoning'    => parsed['reasoning'],
-        'distribution' => Array(parsed['distribution'])
-      }
-    end,
 
     # --- HTTP -------------------------------------------------------------
     http_call!: lambda do |verb, url|
@@ -2955,20 +2197,29 @@ require 'securerandom'
         }
       }
     end,
+    # Stabilized output shaper for neighbors
+    shape_neighbors: lambda do |resp|
+      body = call(:http_body_json, resp)
+      list = Array(body['nearestNeighbors']).map do |nn|
+        neighbors = Array(nn['neighbors']).map do |n|
+          {
+            'datapoint' => n['datapoint'],
+            'distance'  => n['distance'].to_f.round(6),
+            'crowdingTagCount' => n['crowdingTagCount'].to_i
+          }
+        end
+        # Deterministic order: by distance ASC, then datapointId
+        { 'neighbors' => neighbors.sort_by { |x|
+            [x['distance'], x.dig('datapoint','datapointId').to_s]
+          }
+        }
+      end
+      { 'nearestNeighbors' => list }
+    end,
 
     # --- Telemetry and resilience -----------------------------------------
-    telemetry_t0: lambda do
-      # Monotonic start time as Float seconds
-      Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    end,
-    telemetry_now_f: lambda do
-      # Monotonic "now" as Float seconds
-      Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    end,
     telemetry_envelope: lambda do |started_at, correlation_id, ok, code, message|
-      now_f  = call(:telemetry_now_f)
-      base_f = (started_at.respond_to?(:to_f) ? started_at.to_f : 0.0)
-      dur    = ((now_f - base_f) * 1000.0).to_i
+      dur = ((Time.now - started_at) * 1000.0).to_i
       {
         'ok' => !!ok,
         'telemetry' => {
@@ -2979,19 +2230,13 @@ require 'securerandom'
         }
       }
     end,
-    telemetry_envelope_ex: lambda do |started_at, correlation_id, ok, code, message, extra = {}|
-      now_f  = call(:telemetry_now_f)
-      base_f = (started_at.respond_to?(:to_f) ? started_at.to_f : 0.0)
-      dur    = ((now_f - base_f) * 1000.0).to_i
-      {
-        'ok' => !!ok,
-        'telemetry' => {
-          'http_status'    => code.to_i,
-          'message'        => (message || (ok ? 'OK' : 'ERROR')).to_s,
-          'duration_ms'    => dur,
-          'correlation_id' => correlation_id
-        }
-      }.merge(extra || {})
+    telemetry_envelope_ex: lambda do |started_at, correlation_id, ok, code, message, extras={}|
+      # Envelope with optional extras folded into telemetry (non-breaking)
+      env = call(:telemetry_envelope, started_at, correlation_id, ok, code, message)
+      if extras.is_a?(Hash) && !extras.empty?
+        env['telemetry'] = (env['telemetry'] || {}).merge(extras)
+      end
+      env
     end,
     telemetry_success_code: lambda do |resp|
       # Works with Workato HTTP response (has status/status_code) or defaults to 200
@@ -3058,7 +2303,7 @@ require 'securerandom'
         return obj
       end
       if j.is_a?(Hash)
-        %w[access_token authorization api_key apiKey bearer token id_token refresh_token client_secret private_key assertion].each do |k|
+        %w[access_token authorization api_key apiKey bearer token id_token refresh_token client_secret private_key].each do |k|
           j[k] = '[REDACTED]' if j.key?(k)
         end
       end
@@ -3069,8 +2314,7 @@ require 'securerandom'
       {
         'request_url'  => url.to_s,
         'request_body' => call(:redact_json, body),
-        'error_body'   => (google_error && google_error['raw']) || google_error,
-        'stack'        => ($!.full_message(highlight: false, order: :top) rescue nil)
+        'error_body'   => (google_error && google_error['raw']) || google_error
       }
     end,
 
@@ -3161,8 +2405,7 @@ require 'securerandom'
     # --- URL and resource building ----------------------------------------
     aipl_service_host: lambda do |connection, loc=nil|
       l = (loc || connection['location']).to_s.downcase
-      # Use empty? instead of blank? to avoid ActiveSupport dependency.
-      (l.empty? || l == 'global') ? 'aiplatform.googleapis.com' : "#{l}-aiplatform.googleapis.com"
+      (l.blank? || l == 'global') ? 'aiplatform.googleapis.com' : "#{l}-aiplatform.googleapis.com"
     end,
     aipl_v1_url: lambda do |connection, loc, path|
       "https://#{call(:aipl_service_host, connection, loc)}/v1/#{path}"
@@ -3175,14 +2418,14 @@ require 'securerandom'
       # Prefer region from the resource name; fallback to connection.
       m   = ep.match(%r{^projects/[^/]+/locations/([^/]+)/endpoints/})
       loc = (m && m[1]) || (connection['location'] || '').to_s.downcase
-      error("This action requires a regional location. Current location is '#{loc}'.") if loc.empty? || loc == 'global'
+      error("This action requires a regional location. Current location is '#{loc}'.") if loc.blank? || loc == 'global'
 
       host = call(:aipl_service_host, connection, loc)
       "https://#{host}/v1/#{call(:build_endpoint_path, connection, ep)}:predict"
     end,
     build_endpoint_path: lambda do |connection, endpoint|
       ep = call(:normalize_endpoint_identifier, endpoint)
-      ep = ep.sub(%r{^/?v1/}, '') # defensive
+      ep = ep.sub(%r{^/v1/}, '') # defensive
       ep.start_with?('projects/') ? ep :
         "projects/#{connection['project_id']}/locations/#{connection['location']}/endpoints/#{ep}"
     end,
@@ -3239,21 +2482,21 @@ require 'securerandom'
     build_rag_corpus_path: lambda do |connection, corpus|
       v = corpus.to_s.strip
       return '' if v.empty?
-      return v.sub(%r{^/?v1/}, '') if v.start_with?('projects/')
+      return v.sub(%r{^/v1/}, '') if v.start_with?('projects/')
       call(:ensure_project_id!, connection)
       loc = (connection['location'] || '').to_s.downcase
-      error("RAG corpus requires regional location; got '#{loc}'") if loc.empty? || loc == 'global'
+      error("RAG corpus requires regional location; got '#{loc}'") if loc.blank? || loc == 'global'
       "projects/#{connection['project_id']}/locations/#{loc}/ragCorpora/#{v}"
     end,
     build_rag_file_path: lambda do |connection, rag_file|
       v = rag_file.to_s.strip
       return '' if v.empty?
-      return v.sub(%r{^/?v1/}, '') if v.start_with?('projects/')
+      return v.sub(%r{^/v1/}, '') if v.start_with?('projects/')
       # allow short form: {corpus_id}/ragFiles/{file_id}
       if v.start_with?('ragCorpora/')
         call(:ensure_project_id!, connection)
         loc = (connection['location'] || '').to_s.downcase
-        error("RAG file requires regional location; got '#{loc}'") if loc.empty? || loc == 'global'
+        error("RAG file requires regional location; got '#{loc}'") if loc.blank? || loc == 'global'
         return "projects/#{connection['project_id']}/locations/#{loc}/#{v}"
       end
       # otherwise expect full name
@@ -3273,17 +2516,15 @@ require 'securerandom'
 
     # --- Guards, normalization --------------------------------------------
     ensure_project_id!: lambda do |connection|
-      # Prefer explicit project_id; otherwise derive from SA key JSON.
-      pid = connection['project_id'].to_s.strip
-      if pid.empty?
-        pid = (JSON.parse(connection['service_account_key_json'].to_s)['project_id'] rescue nil).to_s.strip
-      end
-      error('Project ID is required (not found in connection or key)') if pid.empty?
+      pid = (connection['project_id'].presence ||
+              (JSON.parse(connection['service_account_key_json'].to_s)['project_id'] rescue nil)).to_s
+      error('Project ID is required (not found in connection or key)') if pid.blank?
+      connection['project_id'] = pid
       pid
     end,
     ensure_regional_location!: lambda do |connection|
       loc = (connection['location'] || '').downcase
-      error("This action requires a regional location (e.g., us-central1). Current location is '#{loc}'.") if loc.empty? || loc == 'global'
+      error("This action requires a regional location (e.g., us-central1). Current location is '#{loc}'.") if loc.blank? || loc == 'global'
     end,
     embedding_region: lambda do |connection|
       loc = (connection['location'] || '').to_s.downcase
@@ -3378,24 +2619,14 @@ require 'securerandom'
       return '' if raw.nil? || raw == false
       raw.to_s.strip
     end,
-    build_rag_retrieve_payload: lambda do |question, rag_corpus, restrict_ids = [], ranking_opts = nil|
-      # Build RagResource (corpus + optional ragFileIds)
-      rag_res = { 'ragCorpus' => rag_corpus.to_s }
-      ids     = call(:sanitize_rag_file_ids, restrict_ids, allow_empty: true, label: 'restrict_to_file_ids')
+    build_rag_retrieve_payload: lambda do |question, rag_corpus, restrict_ids = []|
+      rag_res = { 'ragCorpus' => rag_corpus }
+      ids     = call(:sanitize_drive_ids, restrict_ids, allow_empty: true, label: 'restrict_to_file_ids')
       rag_res['ragFileIds'] = ids if ids.present?
-
-      # Optional ranking/topK
-      ropts         = (ranking_opts || {}).to_h
-      ranking_block = call(:build_ranking_block, ropts['ranker'], ropts['rank_model'])
-      query_obj     = call(:build_rag_query_with_ranking,
-                           question.to_s,
-                           (ropts['similarity_top_k'] || nil),
-                           ranking_block)
-
-      # Align to REST v1: dataSource.vertexRagStore + query
       {
-        'query'      => query_obj,
-        'dataSource' => { 'vertexRagStore' => { 'ragResources' => [rag_res] } }
+        'query'          => { 'text'          => question.to_s },
+        # NOTE: union member is supplied at top-level (not wrapped in "dataSource")
+        'vertexRagStore' => { 'ragResources'  => [rag_res] }
       }
     end,
     map_context_chunks: lambda do |raw_contexts, maxn = 20|
@@ -3404,7 +2635,7 @@ require 'securerandom'
         {
           'id'       => (c['chunkId'] || "ctx-#{i+1}"),
           'text'     => c['text'].to_s,
-          'score'    => call(:safe_float, (c['score'] || c['relevanceScore'] || 0.0)),
+          'score'    => (c['score'] || c['relevanceScore'] || 0.0).to_f,
           'source'   => (c['sourceDisplayName'] || c.dig('metadata','source')),
           'uri'      => (c['sourceUri']        || c.dig('metadata','uri')),
           'metadata' => md,
@@ -3455,79 +2686,19 @@ require 'securerandom'
     end,
     build_index_path: lambda do |connection, index|
       id = call(:normalize_index_identifier, index)
-      return id.sub(%r{^/?v1/}, '') if id.start_with?('projects/')
+      return id.sub(%r{^/v1/}, '') if id.start_with?('projects/')
       call(:ensure_project_id!, connection)
       loc = (connection['location'] || '').to_s.downcase
-      error("Index requires regional location; got '#{loc}'") if loc.empty? || loc == 'global'
+      error("Index requires regional location; got '#{loc}'") if loc.blank? || loc == 'global'
       "projects/#{connection['project_id']}/locations/#{loc}/indexes/#{id}"
     end,
     build_index_endpoint_path: lambda do |connection, ep|
       v = call(:normalize_index_endpoint_identifier, ep)
-      return v.sub(%r{^/?v1/}, '') if v.start_with?('projects/')
+      return v.sub(%r{^/v1/}, '') if v.start_with?('projects/')
       call(:ensure_project_id!, connection)
       loc = (connection['location'] || '').to_s.downcase
-      error("IndexEndpoint requires regional location; got '#{loc}'") if loc.empty? || loc == 'global'
+      error("IndexEndpoint requires regional location; got '#{loc}'") if loc.blank? || loc == 'global'
       "projects/#{connection['project_id']}/locations/#{loc}/indexEndpoints/#{v}"
-    end,
-
-    # Build a ranking block for RagRetrievalConfig based on inputs
-    build_ranking_block: lambda do |ranker, rank_model|
-      r = (ranker || 'none').to_s
-      return nil if r == 'none'
-      m = (rank_model || '').to_s.strip
-      if r == 'rank_service'
-        error('rank_model is required when ranker=rank_service (e.g., semantic-ranker-default@latest)') if m.empty?
-        { 'rankService' => { 'modelName' => m } }
-      elsif r == 'llm_ranker'
-        error('rank_model is required when ranker=llm_ranker (e.g., gemini-2.0-flash)') if m.empty?
-        { 'llmRanker' => { 'modelName' => m } }
-      else
-        nil
-      end
-    end,
-
-    # Builds RagRetrievalConfig and merges into retrieveContexts payload
-    build_rag_query_with_ranking: lambda do |question, top_k, ranking_block|
-      cfg = {}
-      # Only include the beta block when a ranker is explicitly provided.
-      if ranking_block
-        cfg['topK']    = (top_k.to_i > 0 ? top_k.to_i : nil)
-        cfg['ranking'] = ranking_block
-      end
-      cfg.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
-
-      q = { 'text' => question.to_s }
-      q['ragRetrievalConfig'] = cfg unless cfg.empty?
-      q
-    end,
-
-    # Convenience: RankingConfig name with project or project number
-    build_ranking_config_name: lambda do |connection, loc, explicit=nil|
-      return explicit.to_s.strip unless explicit.to_s.strip.empty?
-      # Accept project_id OR a numeric project number if user supplies it in project_id (works in many orgs)
-      pid = call(:ensure_project_id!, connection)
-      "projects/#{pid}/locations/#{loc}/rankingConfigs/default_ranking_config"
-    end,
-
-    # Map Context[] -> RankingRecords[] for Ranking API
-    map_contexts_to_ranking_records: lambda do |chunks|
-      call(:safe_array, chunks).map do |c|
-        { 'id' => (c['id'] || c[:id] || SecureRandom.hex(4)).to_s, 'content' => (c['text'] || c[:text]).to_s }
-      end
-    end,
-
-    # Apply Rank API response order to contexts (stable join on id)
-    apply_ranking_order: lambda do |chunks, ranking_resp|
-      order = {}
-      call(:safe_array, ranking_resp['records']).each_with_index do |rec, idx|
-        order[rec['id'].to_s] = { 'score' => call(:safe_float, rec['score']), 'rank' => idx + 1 }
-      end
-      out = call(:safe_array, chunks).map do |c|
-        id = (c['id'] || c[:id]).to_s
-        meta = order[id] || {}
-        c.merge('score' => (meta['score'].nil? ? (call(:safe_float, c['score']) || 0.0) : meta['score']), '_rerank' => meta)
-      end
-      out.sort_by { |h| [-(call(:safe_float, h.dig('_rerank','score')) || -1.0), h['id'].to_s] }
     end,
 
     # --- Sanitizers and conversion ----------------------------------------
@@ -3615,14 +2786,6 @@ require 'securerandom'
     end,
     sanitize_feature_vector: lambda do |arr|
       call(:safe_array, arr).map { |x| call(:safe_float, x) }.reject { |x| x.nil? }
-    end,
-    sanitize_rag_file_ids: lambda do |raw_list, allow_empty: false, label: 'rag_file_ids'|
-      list = call(:safe_array, raw_list).map { |x| x.to_s.strip }.reject(&:empty?).uniq
-      return [] if list.empty? && allow_empty
-      # Accept broad safe charset for Vertex RAG file IDs (don’t “normalize links” like Drive).
-      bad = list.find { |id| !(id =~ /\A[A-Za-z0-9_\-:\/]{8,200}\z/) }
-      error("Invalid RAG file id in #{label}: #{bad}") if bad
-      list
     end,
 
     # --- Embeddings -------------------------------------------------------
@@ -3801,7 +2964,7 @@ require 'securerandom'
       # Allow short form: just corpus id -> expand using connection project/region
       call(:ensure_project_id!, connection)
       loc = (connection['location'] || '').to_s.downcase
-      error("RAG corpus requires regional location; got '#{loc}'") if loc.empty? || loc == 'global'
+      error("RAG corpus requires regional location; got '#{loc}'") if loc.blank? || loc == 'global'
       "projects/#{connection['project_id']}/locations/#{loc}/ragCorpora/#{v}"
     end,
 
@@ -4121,98 +3284,6 @@ require 'securerandom'
         end
       end
       ordered_items.first(lo)
-    end,
-    metrics_base: lambda do |connection, action_name, started_at, ok, http_status, corr_id, extras = {}|
-      # Use the same monotonic clock used across telemetry to avoid Time/Float arithmetic traps.
-      pid   = call(:ensure_project_id!, connection)  # returns pid; do not mutate connection
-      now_f  = call(:telemetry_now_f)
-      base_f = (started_at.respond_to?(:to_f) ? started_at.to_f : 0.0)
-      dur_ms = ((now_f - base_f) * 1000.0).to_i
-      {
-        'namespace'      => (extras['namespace'] || nil),
-        'action'         => action_name.to_s,
-        'correlation_id' => corr_id.to_s,
-        'project_id'     => pid.to_s,
-        'location'       => (connection['location'] || '').to_s.downcase,
-        'ok'             => !!ok,
-        'http_status'    => http_status.to_i,
-        'duration_ms'    => dur_ms
-      }
-    end,
-    metrics_from_retrieve: lambda do |mapped_chunks, max_req|
-      arr    = call(:safe_array, mapped_chunks)
-      scores = arr.map { |c| call(:safe_float, (c['score'] || c['relevanceScore'] || 0.0)) }
-      top    = scores.max
-      avg    = scores.empty? ? nil : (scores.inject(0.0) { |s, x| s + x.to_f } / scores.length.to_f)
-      {
-        'retrieved_contexts'     => arr.length,
-        'max_contexts_requested' => (max_req || nil),
-        'retrieval_top_score'    => (top.nil? ? nil : top.to_f),
-        'retrieval_avg_score'    => (avg.nil? ? nil : avg.to_f)
-      }
-    end,
-
-    metrics_from_generation: lambda do |resp, temperature=nil|
-      usage = (resp || {})['usageMetadata'] || {}
-      {
-        'prompt_tokens' => call(:safe_integer, usage['promptTokenCount']),
-        'output_tokens' => call(:safe_integer, usage['candidatesTokenCount']),
-        'total_tokens'  => call(:safe_integer, usage['totalTokenCount']),
-        'temperature'   => (temperature.nil? ? nil : call(:safe_float, temperature))
-      }
-    end,
-
-    metrics_from_embeddings: lambda do |embedding_resp, instances|
-      bill = (embedding_resp || {}).dig('metadata','billableCharacterCount').to_i
-      {
-        'emb_instances'      => call(:safe_array, instances).length,
-        'emb_billable_chars' => (bill > 0 ? bill : nil)
-      }
-    end,
-
-    metrics_from_import_lro: lambda do |lro_body|
-      {
-        'operation' => lro_body['name'],
-        'lro_done'  => (lro_body['done'] == true)
-      }
-    end,
-
-    metrics_to_kv: lambda do |h|
-      (h || {}).to_h.map { |k,v| { 'key' => k.to_s, 'value' => v } }
-    end,
-    metrics_effective_flags: lambda do |connection, input|
-      emit = if input.key?('emit_metrics')
-                call(:normalize_boolean, input['emit_metrics'])
-              else
-                call(:normalize_boolean, connection['emit_metrics_default'])
-              end
-      # Replace presence with a simple first-non-empty string.
-      ns_candidates = [input['metrics_namespace'], connection['metrics_namespace_default']]
-      ns = ns_candidates.map { |s| s.to_s.strip }.find { |s| !s.empty? }
-      { 'emit' => emit, 'ns' => ns }
-    end,
-    schema_content_part: lambda do
-      [
-        { name: 'text' },
-        { name: 'inlineData', type: 'object', properties: [
-            { name: 'mimeType' }, { name: 'data', hint: 'Base64' }
-        ]},
-        { name: 'fileData', type: 'object', properties: [
-            { name: 'mimeType' }, { name: 'fileUri' }
-        ]},
-        { name: 'functionCall', type: 'object', properties: [
-            { name: 'name' }, { name: 'args', type: 'object' }
-        ]},
-        { name: 'functionResponse', type: 'object', properties: [
-            { name: 'name' }, { name: 'response', type: 'object' }
-        ]},
-        { name: 'executableCode', type: 'object', properties: [
-            { name: 'language' }, { name: 'code' }
-        ]},
-        { name: 'codeExecutionResult', type: 'object', properties: [
-            { name: 'outcome' }, { name: 'stdout' }, { name: 'stderr' }
-        ]}
-      ]
     end
 
   },
