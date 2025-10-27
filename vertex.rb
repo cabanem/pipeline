@@ -901,7 +901,7 @@ require 'securerandom'
       help: lambda do |_|
         { body: 'Answer a question using caller-supplied context chunks (RAG-lite). Returns structured JSON with citations.' }
       end,
-      display_priority: 90
+      display_priority: 90,
       retry_on_request: ['GET', 'HEAD'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
@@ -1167,32 +1167,33 @@ require 'securerandom'
         # Build correlation ID, now (for traceability)
         t0 = Time.now
         corr = call(:build_correlation_id)
-        begin
-          call(:ensure_project_id!, connection)
-          call(:ensure_regional_location!, connection)
+        
+        proj = connection['project_id']
+        loc  = connection['location']
+        raise 'Connection is missing project_id' if proj.blank?
+        raise 'Connection is missing location'   if loc.blank?
 
-          corpus = call(:normalize_rag_corpus, connection, input['rag_corpus'])
-          error('rag_corpus is required') if corpus.blank?
+        corpus = call(:normalize_rag_corpus, connection, input['rag_corpus'])
+        error('rag_corpus is required') if corpus.blank?
 
-          loc = (connection['location'] || '').downcase
-          parent = "projects/#{connection['project_id']}/locations/#{loc}"
+        loc = (connection['location'] || '').downcase
+        parent = "projects/#{connection['project_id']}/locations/#{loc}"
 
-          payload = call(:build_rag_retrieve_payload, input['question'], corpus, input['restrict_to_file_ids'])
+        payload = call(:build_rag_retrieve_payload, input['question'], corpus, input['restrict_to_file_ids'])
 
-          url  = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
-          raw  = call(:http_call!, 'POST', url)
-                    .headers(call(:request_headers, corr))
-                    .payload(call(:json_compact, payload))
-          body  = call(:http_body_json, raw)
-          raw   = call(:normalize_retrieve_contexts!, body)
+        url  = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
+        resp = post(url)
+                .headers(call(:request_headers, corr))
+                .payload(call(:json_compact, payload))
 
-          maxn  = call(:clamp_int, (input['max_contexts'] || 20), 1, 200)
-          mapped = call(:map_context_chunks, raw, maxn)
+        raw   = call(:normalize_retrieve_contexts!, resp)
+        maxn  = call(:clamp_int, (input['max_contexts'] || 20), 1, 200)
+        mapped = call(:map_context_chunks, raw, maxn)
 
-          {
-            'question' => input['question'],
-            'contexts' => mapped
-          }.merge(call(:telemetry_envelope, t0, corr, true, call(:telemetry_success_code, raw), 'OK'))
+        {
+          'question' => input['question'],
+          'contexts' => mapped
+        }.merge(call(:telemetry_envelope, t0, corr, true, call(:telemetry_success_code, raw), 'OK'))
         rescue => e
           g = call(:extract_google_error, e)
           msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
