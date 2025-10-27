@@ -904,7 +904,7 @@ require 'securerandom'
         { body: 'Answer a question using caller-supplied context chunks (RAG-lite). Returns structured JSON with citations.' }
       end,
       display_priority: 90,
-      retry_on_request: ['GET', 'HEAD'],
+      retry_on_request: ['GET', 'HEAD', 'POST'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
 
@@ -921,11 +921,9 @@ require 'securerandom'
               { name: 'score', type: 'number' },
               { name: 'metadata', type: 'object' }
             ],
-            hint: 'Pass the top-N chunks from your retriever / process.'
-          },
+            hint: 'Pass the top-N chunks from your retriever / process.' },
 
-          { name: 'max_chunks', type: 'integer', optional: true, default: 20,
-            hint: 'Hard cap to avoid overlong prompts.' },
+          { name: 'max_chunks', type: 'integer', optional: true, default: 20, hint: 'Hard cap to avoid overlong prompts.' },
 
           { name: 'system_preamble', optional: true,
             hint: 'Optional guardrails (e.g., “only answer from context; say I don’t know otherwise”).' },
@@ -938,15 +936,12 @@ require 'securerandom'
           { name: 'salience_score', type: 'number', optional: true, hint: 'Optional pseudo-score to order with chunks' },
 
           # Prompt budgeting (optional but recommended)
-          { name: 'max_prompt_tokens', type: 'integer', optional: true, default: 3000,
-            hint: 'Hard cap on prompt tokens (excludes output). If exceeded, chunks are dropped.' },
-          { name: 'reserve_output_tokens', type: 'integer', optional: true, default: 512,
-            hint: 'Reserve this many tokens for the model’s answer.' },
-          { name: 'count_tokens_model', optional: true,
-            hint: 'If set, use this model for countTokens (defaults to `model`).' },
-          { name: 'trim_strategy', control_type: 'select', optional: true, default: 'drop_low_score',
-            pick_list: 'trim_strategies',
-            hint: 'How to shrink when over budget: drop_low_score, diverse_mmr, or truncate_chars' }
+          { name: 'max_prompt_tokens', type: 'integer', optional: true, default: 3000, hint: 'Hard cap on prompt tokens (excludes output). If exceeded, chunks are dropped.' },
+          { name: 'reserve_output_tokens', type: 'integer', optional: true, default: 512, hint: 'Reserve this many tokens for the model’s answer.' },
+          { name: 'count_tokens_model', optional: true, hint: 'If set, use this model for countTokens (defaults to `model`).' },
+          { name: 'trim_strategy', control_type: 'select', optional: true, default: 'drop_low_score', pick_list: 'trim_strategies', hint: 'How to shrink when over budget: drop_low_score, diverse_mmr, or truncate_chars' },
+          { name: 'emit_metrics', type: 'boolean', control_type: 'checkbox', optional: true, default: true, hint: 'Attach a metrics object in the output for downstream persistence.' },
+          { name: 'metrics_namespace', optional: true, hint: 'Optional tag for partitioning dashboards (e.g., "email_rag_prod").' },
         ]
       end,
       output_fields: lambda do |object_definitions, connection|
@@ -954,158 +949,169 @@ require 'securerandom'
           { name: 'answer' },
           { name: 'citations', type: 'array', of: 'object', properties: [
               { name: 'chunk_id' }, { name: 'source' }, { name: 'uri' }, { name: 'score', type: 'number' }
-            ]
-          },
+            ]},
           { name: 'responseId' },
           { name: 'usage', type: 'object', properties: [
               { name: 'promptTokenCount', type: 'integer' },
               { name: 'candidatesTokenCount', type: 'integer' },
               { name: 'totalTokenCount', type: 'integer' }
-            ]
-          }
-        ] + Array(object_definitions['envelope_fields'])
+            ]}
+        ] + Array(object_definitions['envelope_fields']) + [
+          { name: 'metrics', type: 'object', properties: object_definitions['metrics_fields'] },
+          { name: 'metrics_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] } ]
       end,
-      execute: lambda do |connection, input|
-        # Correlation id and duration for logs/analytics
-        t0 = Time.now
+      execute: lambda do |connection, raw_input|
+        input = call(:normalize_input_keys, raw_input)
+        t0   = call(:telemetry_t0)
         corr = call(:build_correlation_id)
         url = nil; req_body = nil
 
-        begin
-          model_path = call(:build_model_path_with_global_preview, connection, input['model'])
+        model_path = call(:build_model_path_with_global_preview, connection, input['model'])
 
-          max_chunks = call(:clamp_int, (input['max_chunks'] || 20), 1, 100)
-          chunks     = call(:safe_array, input['context_chunks']).first(max_chunks)
-          error('context_chunks must be a non-empty array') if chunks.blank?
+        max_chunks = call(:clamp_int, (input['max_chunks'] || 20), 1, 100)
+        chunks     = call(:safe_array, input['context_chunks']).first(max_chunks)
+        error('context_chunks must be a non-empty array') if chunks.blank?
 
-          # 2a) Build a unified list with salience (if provided) at the top
-          sal_text = (input['salience_text'].to_s.strip)
-          sal_id   = (input['salience_id'].presence || 'salience').to_s
-          sal_scr  = (input['salience_score'].presence || 1.0).to_f
-          items = []
-          if sal_text.present?
-            items << { 'id' => sal_id, 'text' => sal_text, 'score' => sal_scr, 'source' => 'salience' }
-          end
-          items.concat(chunks)
+        # 2a) Build a unified list with salience (if provided) at the top
+        sal_text = (input['salience_text'].to_s.strip)
+        sal_id   = (input['salience_id'].presence || 'salience').to_s
+        sal_scr  = (input['salience_score'].presence || 1.0).to_f
+        items = []
+        if sal_text.present?
+          items << { 'id' => sal_id, 'text' => sal_text, 'score' => sal_scr, 'source' => 'salience' }
+        end
+        items.concat(chunks)
 
-          # 2b) Token budgeting targets
-          target_total  = (input['max_prompt_tokens'].presence || 3000).to_i
-          reserve_out   = (input['reserve_output_tokens'].presence || 512).to_i
-          budget_prompt = [target_total - reserve_out, 400].max # never go below 400 for the prompt
-          model_for_count = (input['count_tokens_model'].presence || input['model']).to_s
+        # 2b) Token budgeting targets
+        target_total  = (input['max_prompt_tokens'].presence || 3000).to_i
+        reserve_out   = (input['reserve_output_tokens'].presence || 512).to_i
+        budget_prompt = [target_total - reserve_out, 400].max # never go below 400 for the prompt
+        model_for_count = (input['count_tokens_model'].presence || input['model']).to_s
 
-          # 2b-new) Selection pipeline: truncate -> (order w/ strategy) -> drop dupes -> O(log n) token-count selection
-          strategy = (input['trim_strategy'].presence || 'drop_low_score').to_s
+        # 2b-new) Selection pipeline: truncate -> (order w/ strategy) -> drop dupes -> O(log n) token-count selection
+        strategy = (input['trim_strategy'].presence || 'drop_low_score').to_s
 
-          # Pin salience if present
-          base = []
-          base << items.shift if items.first && items.first['source'] == 'salience'
+        # Pin salience if present
+        base = []
+        base << items.shift if items.first && items.first['source'] == 'salience'
 
-          # Early truncation to tame token growth
-          items = items.map { |c| c.merge('text' => call(:truncate_chunk_text, c['text'], 800)) }
+        # Early truncation to tame token growth
+        items = items.map { |c| c.merge('text' => call(:truncate_chunk_text, c['text'], 800)) }
 
-          ordered =
-            case strategy
-            when 'diverse_mmr'
-              seed = items.sort_by { |c| [-(c['score'] || 0.0).to_f, c['id'].to_s] }
-              call(:mmr_diverse_order, seed, alpha: 0.7, per_source_cap: 3)
-            when 'drop_low_score'
-              items.sort_by { |c| [-(c['score'] || 0.0).to_f, c['id'].to_s] }
-            when 'truncate_chars'
-              items # keep incoming order (after truncation)
-            else
-              items
-            end
-
-          ordered = call(:drop_near_duplicates, ordered, 0.9)
-          pool = base + ordered
-
-          sys_text = input['system_preamble'].presence ||
-            'Answer using ONLY the provided context chunks. If the context is insufficient, reply with “I don’t know.” Keep answers concise and cite chunk IDs.'
-
-          kept = call(:select_prefix_by_budget, connection, pool, input['question'], sys_text, budget_prompt, model_for_count)
-          items = kept
-
-          # 2c) Build the final blob; if empty, try to keep a trimmed salience
-          ctx_blob = call(:format_context_chunks, items)
-          if ctx_blob.to_s.strip.empty? && sal_text.present?
-            ctx_blob = call(:format_context_chunks, [
-              { 'id' => sal_id, 'text' => sal_text[0, 4000], 'score' => 1.0, 'source' => 'salience' }
-            ])
+        ordered =
+          case strategy
+          when 'diverse_mmr'
+            seed = items.sort_by { |c| [-(c['score'] || 0.0).to_f, c['id'].to_s] }
+            call(:mmr_diverse_order, seed, alpha: 0.7, per_source_cap: 3)
+          when 'drop_low_score'
+            items.sort_by { |c| [-(c['score'] || 0.0).to_f, c['id'].to_s] }
+          when 'truncate_chars'
+            items # keep incoming order (after truncation)
+          else
+            items
           end
 
-          # 3) Request
-          gen_cfg = {
-            'temperature'       => (input['temperature'].present? ? call(:safe_float, input['temperature']) : 0),
-            'maxOutputTokens'   => reserve_out,
-            'responseMimeType'  => 'application/json',
-            'responseSchema'    => {
-              'type'  => 'object',
-              'additionalProperties' => false,
-              'properties' => {
-                'answer'     => { 'type' => 'string' },
-                'citations'  => {
-                  'type'  => 'array',
-                  'items' => {
-                    'type' => 'object',
-                    'additionalProperties' => false,
-                    'properties' => {
-                      'chunk_id' => { 'type' => 'string' },
-                      'source'   => { 'type' => 'string' },
-                      'uri'      => { 'type' => 'string' },
-                      'score'    => { 'type' => 'number' }
-                    }
+        ordered = call(:drop_near_duplicates, ordered, 0.9)
+        pool = base + ordered
+
+        sys_text = input['system_preamble'].presence ||
+          'Answer using ONLY the provided context chunks. If the context is insufficient, reply with “I don’t know.” Keep answers concise and cite chunk IDs.'
+
+        kept = call(:select_prefix_by_budget, connection, pool, input['question'], sys_text, budget_prompt, model_for_count)
+        items = kept
+
+        # 2c) Build the final blob; if empty, try to keep a trimmed salience
+        ctx_blob = call(:format_context_chunks, items)
+        if ctx_blob.to_s.strip.empty? && sal_text.present?
+          ctx_blob = call(:format_context_chunks, [
+            { 'id' => sal_id, 'text' => sal_text[0, 4000], 'score' => 1.0, 'source' => 'salience' }
+          ])
+        end
+
+        # 3) Request
+        gen_cfg = {
+          'temperature'       => (input['temperature'].present? ? call(:safe_float, input['temperature']) : 0),
+          'maxOutputTokens'   => reserve_out,
+          'responseMimeType'  => 'application/json',
+          'responseSchema'    => {
+            'type'  => 'object',
+            'additionalProperties' => false,
+            'properties' => {
+              'answer'     => { 'type' => 'string' },
+              'citations'  => {
+                'type'  => 'array',
+                'items' => {
+                  'type' => 'object',
+                  'additionalProperties' => false,
+                  'properties' => {
+                    'chunk_id' => { 'type' => 'string' },
+                    'source'   => { 'type' => 'string' },
+                    'uri'      => { 'type' => 'string' },
+                    'score'    => { 'type' => 'number' }
                   }
                 }
-              },
-              'required' => ['answer']
-            }
+              }
+            },
+            'required' => ['answer']
           }
+        }
 
-          sys_inst = call(:system_instruction_from_text, sys_text)
-          contents = [
-            { 'role' => 'user', 'parts' => [ { 'text' => "Question:\n#{input['question']}\n\nContext:\n#{ctx_blob}" } ] }
-          ]
-          payload = { 'contents' => contents, 'systemInstruction' => sys_inst, 'generationConfig' => gen_cfg }
+        sys_inst = call(:system_instruction_from_text, sys_text)
+        contents = [
+          { 'role' => 'user', 'parts' => [ { 'text' => "Question:\n#{input['question']}\n\nContext:\n#{ctx_blob}" } ] }
+        ]
+        # Build via helper (single source of truth)
+        req = call(:build_generate_content_request,
+                    connection,
+                    input['model'],
+                    contents:          contents,
+                    system_text:       sys_text,
+                    generation_config: gen_cfg)
+        url      = req['url']
+        req_body = req['body']
 
-          # Derive location from model_path to avoid region/global mismatch
-          loc_from_model = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
-          url  = call(:aipl_v1_url, connection, loc_from_model, "#{model_path}:generateContent")
-          req_body = call(:json_compact, payload)
+        # POST with standard telemetry path
+        resp = post(url)
+                .headers(call(:request_headers, corr))
+                .payload(req_body)
 
-          resp = post(url).headers(call(:request_headers, corr)).payload(req_body)
+        text = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
+        parsed = call(:safe_parse_json, text)
 
-          text = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
+        base_out = {
+          'answer'     => parsed['answer'] || text,
+          'citations'  => parsed['citations'] || [],
+          'responseId' => resp['responseId'],
+          'usage'      => resp['usageMetadata']
+        }.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
 
-          # One controlled retry if nothing came back (e.g., safety or schema hiccup)
-          if text.to_s.strip.empty?
-            retry_payload = payload.dup
-            retry_payload['generationConfig'] = {
-              'temperature' => 0,
-              'maxOutputTokens' => reserve_out,
-              'responseMimeType' => 'text/plain'
-            }
-            resp2 = post(url).headers(call(:request_headers, corr)).payload(call(:json_compact, retry_payload))
-            text = resp2.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
-            resp = resp2 if text.present?
-          end
-
-          parsed = call(:safe_parse_json, text)
-
-          {
-            'answer'     => parsed['answer'] || text,
-            'citations'  => parsed['citations'] || [],
-            'responseId' => resp['responseId'],
-            'usage'      => resp['usageMetadata']
-          }.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
-
-        rescue => e
-          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
-          end
-          out
+        flags = call(:metrics_effective_flags, connection, input)
+        if flags['emit']
+          m = call(:metrics_base, connection, 'gen_answer_with_context', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
+            .merge(call(:metrics_from_generation, resp, input['temperature']))
+            .merge('model' => input['model'])
+            # This action doesn't accept max_contexts; report the cap applied:
+            .merge(call(:metrics_from_retrieve, items, input['max_chunks']))
+          base_out['metrics']    = m
+          base_out['metrics_kv'] = call(:metrics_to_kv, m)
         end
+        base_out
+
+      rescue => e
+        http_status = call(:telemetry_parse_error_code, e)
+        out = {}.merge(call(:telemetry_envelope, t0, corr, false, http_status, e.to_s))
+        ok = false
+        flags = call(:metrics_effective_flags, connection, input)
+        if flags['emit']
+          m = call(:metrics_base, connection, 'gen_answer_with_context', t0, ok, http_status, corr, { 'namespace' => flags['ns'] })
+            .merge('model' => input['model'])
+          out['metrics']    = m
+          out['metrics_kv'] = call(:metrics_to_kv, m)
+        end
+        unless call(:normalize_boolean, connection['prod_mode'])
+          out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
+        end
+        out
       end,
       sample_output: lambda do
         {
@@ -1127,20 +1133,17 @@ require 'securerandom'
       description: '',
       help: lambda do |input, picklist_label|
         {
-          learn_more_url: 'docs.cloud.google.com/vertex-ai/generative-ai/docs/rag-engine/retrieval-and-ranking',
+          body: 'Rerank candidate texts for a query using Vertex Ranking.',
+          learn_more_url: 'https://cloud.google.com/vertex-ai/generative-ai/docs/rag-engine/retrieval-and-ranking',
           learn_more_text: 'Check out Google docs for retrieval and ranking'
         }
       end,
-      display_priority: 85,
+      display_priority: 89,
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
 
-      # Hooks
-      after_response:       lambda { |code, body, headers, message| call(:after_response_shared, code, body, headers, message) },
-      after_error_response: lambda { |code, body, headers, message| call(:after_error_response_shared, code, body, headers, message) },
-
-      input_fields: lambda do |_od, connection, _cfg|
+      input_fields: lambda do |_object_definitions, _connection, _config_fields|
         [
           { name: 'query_text', optional: false },
           { name: 'records', type: 'array', of: 'object', optional: false, properties: [
@@ -1155,50 +1158,71 @@ require 'securerandom'
           { name: 'metrics_namespace', optional: true }
         ]
       end,
-      output_fields: lambda do |object_definitions, _connection, _cfg|
+      output_fields: lambda do |object_definitions, _connection|
         [
           { name: 'records', type: 'array', of: 'object', properties: [
               { name: 'id' }, { name: 'score', type: 'number' }
             ] }
         ] + Array(object_definitions['envelope_fields']) + [
-          { name: 'metrics', type: 'object', properties: object_definitions['metrics_fields'] },
-          { name: 'metrics_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] }
+          { name: 'metrics', type: 'object', properties: Array(object_definitions['metrics_fields']) },
+          { name: 'metrics_kv', type: 'array', of: 'object', properties: Array(object_definitions['kv_pair']) }
         ]
       end,
       execute: lambda do |connection, input|
-        t0 = Time.now; corr = call(:build_correlation_id)
+        t0 = Time.now
+        corr = call(:build_correlation_id)
 
         call(:ensure_project_id!, connection)
         call(:ensure_regional_location!, connection)
         loc = connection['location'].to_s.downcase
 
         # Resolve config id (not full resource) to avoid double-embedding path parts.
-        config_id = (input['ranking_config_name'].to_s.strip.empty? ?
-                    'default_ranking_config' :
-                    input['ranking_config_name'].to_s.split('/').last)
+        config_id =
+          if input['ranking_config_name'].to_s.strip.empty?
+            'default_ranking_config'
+          else
+            input['ranking_config_name'].to_s.split('/').last
+          end
 
         # Build the v1alpha URL:
         # /v1alpha/projects/{project}/locations/{location}/rankingConfigs/{config}:rank
-        url = call(:aipl_v1alpha_url, connection, loc,
-                  "projects/#{connection['project_id']}/locations/#{loc}/rankingConfigs/#{config_id}:rank")
+        url = call(
+          :aipl_v1alpha_url,
+          connection,
+          loc,
+          "projects/#{connection['project_id']}/locations/#{loc}/rankingConfigs/#{config_id}:rank"
+        )
 
         body = {
           'query'   => { 'text' => input['query_text'].to_s },
           'records' => call(:safe_array, input['records']).map { |r|
-            { 'id' => r['id'].to_s, 'content' => r['content'].to_s,
-              'metadata' => (r['metadata'].is_a?(Hash) ? r['metadata'] : nil) }.delete_if { |_k,v| v.nil? } },
+            {
+              'id'       => r['id'].to_s,
+              'content'  => r['content'].to_s,
+              'metadata' => (r['metadata'].is_a?(Hash) ? r['metadata'] : nil)
+            }.delete_if { |_k, v| v.nil? }
+          },
           'model'   => (input['rank_model'].to_s.strip.empty? ? nil : input['rank_model'].to_s.strip),
           'topN'    => (input['top_n'].to_i > 0 ? input['top_n'].to_i : nil),
           'ignoreRecordDetailsInResponse' => (input['ignore_record_details_in_response'] == true ? true : nil)
-        }.delete_if { |_k,v| v.nil? }
+        }.delete_if { |_k, v| v.nil? }
 
         req_body = call(:json_compact, body)
-        resp = post(url)
-                .headers(call(:request_headers, corr))
-                .payload(req_body)
+
+        resp =
+          post(url)
+            .headers(call(:request_headers, corr))
+            .payload(req_body)
+            .after_error_response(/.*/) do |code, _body, headers, message|
+              call(:after_error_response_shared, code, _body, headers, message)
+            end
+            .after_response do |code, body, headers, message|
+              call(:after_response_shared, code, body, headers, message)
+            end
 
         code = call(:telemetry_success_code, resp)
-        out = { 'records' => (resp['records'] || []) }.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+        out  = { 'records' => (resp['records'] || []) }
+                .merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
 
         flags = call(:metrics_effective_flags, connection, input)
         if flags['emit']
@@ -1208,25 +1232,27 @@ require 'securerandom'
           out['metrics_kv'] = call(:metrics_to_kv, m)
         end
         out
-        rescue => e
-          http_status = call(:telemetry_parse_error_code, e)
-          # Include debug echo when not in prod_mode
-          dbg = call(:debug_pack,
-                     !(call(:normalize_boolean, connection['prod_mode'])),
-                     url,
-                     req_body,
-                     call(:extract_google_error, e))
-          out = {}.merge(call(:telemetry_envelope, t0, corr, false, http_status, e.to_s))
-          out.merge!(dbg) if dbg
-          flags = call(:metrics_effective_flags, connection, input)
-          if flags['emit']
-            m = call(:metrics_base, connection, 'rank_texts_with_ranking_api', t0, false, http_status, corr, { 'namespace' => flags['ns'] })
-            out['metrics']    = m; out['metrics_kv'] = call(:metrics_to_kv, m)
-          end
-          out
+      rescue => e
+        http_status = call(:telemetry_parse_error_code, e)
+        dbg = call(
+          :debug_pack,
+          !(call(:normalize_boolean, connection['prod_mode'])),
+          url,
+          req_body,
+          call(:extract_google_error, e)
+        )
+        out = {}.merge(call(:telemetry_envelope, t0, corr, false, http_status, e.to_s))
+        out.merge!(dbg) if dbg
+
+        flags = call(:metrics_effective_flags, connection, input)
+        if flags['emit']
+          m = call(:metrics_base, connection, 'rank_texts_with_ranking_api', t0, false, http_status, corr, { 'namespace' => flags['ns'] })
+          out['metrics']    = m
+          out['metrics_kv'] = call(:metrics_to_kv, m)
         end
+        out
       end,
-      sample_output: lambda do
+      sample_output: lambda do |connection, input|
         { 'records' => [ { 'id' => 'ctx-1', 'score' => 0.92 } ],
           'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 9, 'correlation_id' => 'sample' } }
       end
@@ -1240,10 +1266,6 @@ require 'securerandom'
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
-
-      # Hooks
-      after_response:       lambda { |code, body, headers, message| call(:after_response_shared, code, body, headers, message) },
-      after_error_response: lambda { |code, body, headers, message| call(:after_error_response_shared, code, body, headers, message) },
 
       input_fields: lambda do |object_definitions, connection, config_fields|
         [
@@ -1298,6 +1320,12 @@ require 'securerandom'
         resp = post(url)
                 .headers(call(:request_headers, corr))
                 .payload(call(:json_compact, payload))
+                .after_error_response(/.*/) do |code, body, headers, message|
+                  call(:after_error_response_shared, code, body, headers, message)
+                end
+                .after_response do |code, body, headers, message|
+                  call(:after_response_shared, code, body, headers, message)
+                end
 
         raw     = call(:normalize_retrieve_contexts!, resp)
         maxn    = call(:clamp_int, (input['max_contexts'] || 20), 1, 200)
@@ -1333,10 +1361,6 @@ require 'securerandom'
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
-
-      # Hooks
-      after_response:       lambda { |code, body, headers, message| call(:after_response_shared, code, body, headers, message) },
-      after_error_response: lambda { |code, body, headers, message| call(:after_error_response_shared, code, body, headers, message) },
 
       input_fields: lambda do |object_definitions, connection, config_fields|
         [
