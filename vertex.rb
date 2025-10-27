@@ -904,7 +904,7 @@ require 'securerandom'
         { body: 'Answer a question using caller-supplied context chunks (RAG-lite). Returns structured JSON with citations.' }
       end,
       display_priority: 90,
-      retry_on_request: ['GET', 'HEAD', 'POST'],
+      retry_on_request: ['GET', 'HEAD'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
 
@@ -921,12 +921,13 @@ require 'securerandom'
               { name: 'score', type: 'number' },
               { name: 'metadata', type: 'object' }
             ],
-            hint: 'Pass the top-N chunks from your retriever / process.' },
+            hint: 'Pass the top-N chunks from your retriever / process.'
+          },
 
-          { name: 'max_chunks', type: 'integer', optional: true, default: 20, hint: 'Hard cap to avoid overlong prompts.' },
+          { name: 'max_chunks', type: 'integer', optional: true, default: 20,
+            hint: 'Hard cap to avoid overlong prompts.' },
 
-          { name: 'system_preamble', optional: true,
-            hint: 'Optional guardrails (e.g., “only answer from context; say I don’t know otherwise”).' },
+          { name: 'system_preamble', optional: true,hint: 'Optional guardrails (e.g., “only answer from context; say I don’t know otherwise”).' },
 
           { name: 'temperature', type: 'number', optional: true, hint: 'Override temperature (default 0).' },
 
@@ -939,9 +940,8 @@ require 'securerandom'
           { name: 'max_prompt_tokens', type: 'integer', optional: true, default: 3000, hint: 'Hard cap on prompt tokens (excludes output). If exceeded, chunks are dropped.' },
           { name: 'reserve_output_tokens', type: 'integer', optional: true, default: 512, hint: 'Reserve this many tokens for the model’s answer.' },
           { name: 'count_tokens_model', optional: true, hint: 'If set, use this model for countTokens (defaults to `model`).' },
-          { name: 'trim_strategy', control_type: 'select', optional: true, default: 'drop_low_score', pick_list: 'trim_strategies', hint: 'How to shrink when over budget: drop_low_score, diverse_mmr, or truncate_chars' },
-          { name: 'emit_metrics', type: 'boolean', control_type: 'checkbox', optional: true, default: true, hint: 'Attach a metrics object in the output for downstream persistence.' },
-          { name: 'metrics_namespace', optional: true, hint: 'Optional tag for partitioning dashboards (e.g., "email_rag_prod").' },
+          { name: 'trim_strategy', control_type: 'select', optional: true, default: 'drop_low_score',
+            pick_list: 'trim_strategies', hint: 'How to shrink when over budget: drop_low_score, diverse_mmr, or truncate_chars' }
         ]
       end,
       output_fields: lambda do |object_definitions, connection|
@@ -949,16 +949,16 @@ require 'securerandom'
           { name: 'answer' },
           { name: 'citations', type: 'array', of: 'object', properties: [
               { name: 'chunk_id' }, { name: 'source' }, { name: 'uri' }, { name: 'score', type: 'number' }
-            ]},
+            ]
+          },
           { name: 'responseId' },
           { name: 'usage', type: 'object', properties: [
               { name: 'promptTokenCount', type: 'integer' },
               { name: 'candidatesTokenCount', type: 'integer' },
               { name: 'totalTokenCount', type: 'integer' }
-            ]}
-        ] + Array(object_definitions['envelope_fields']) + [
-          { name: 'metrics', type: 'object', properties: object_definitions['metrics_fields'] },
-          { name: 'metrics_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] } ]
+            ]
+          }
+        ] + Array(object_definitions['envelope_fields'])
       end,
       execute: lambda do |connection, raw_input|
         input = call(:normalize_input_keys, raw_input)
