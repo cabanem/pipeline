@@ -47,14 +47,17 @@ require 'securerandom'
       type: 'custom',
 
       acquire: lambda do |connection|
-        # Scopes fixed to cloud-platform; issue a fresh token and store metadata
-        # Normalize/override if connection carries custom scopes
-        scopes = call(:auth_normalize_scopes, connection['scopes'] || ['https://www.googleapis.com/auth/cloud-platform'])
-        token  = call(:auth_issue_token!, connection, scopes)
+        scopes     = call(:const_default_scopes)   # → ['https://www.googleapis.com/auth/cloud-platform']
+        access_tok = call(:auth_build_access_token!, connection, scopes: scopes)
+        scope_key  = scopes.join(' ')
+        cached     = call(:auth_token_cache_get, connection, scope_key)
 
-        # Seed cache so later calls can reuse until ~60s before expiry
-        call(:auth_token_cache_put, connection, token['scope_key'], token)
-        { access_token: token['access_token'], token_type: token['token_type'] }
+        {
+          access_token: access_tok,
+          token_type:   'Bearer',
+          expires_in:   (cached && cached['expires_in']) || 3600,
+          expires_at:   (cached && cached['expires_at']) || (Time.now.utc + 3600 - 60).iso8601
+        }
       end,
 
       apply: lambda do |connection|
@@ -1128,12 +1131,32 @@ require 'securerandom'
       arr =
         case scopes
         when nil    then call(:const_default_scopes)
+        when nil    then 
         when String then scopes.split(/\s+/)
         when Array  then scopes
         else              call(:const_default_scopes)
         end
 
       arr.map(&:to_s).reject(&:empty?).uniq
+    end,
+    auth_get_sa_key!: lambda do |connection|
+      raw = connection['service_account_key_json'].presence ||
+            connection['service_account_json'].presence ||
+            connection['service_account_key'].presence ||
+            ''
+      error('Service account key JSON is required') if raw.to_s.strip.empty?
+      key = JSON.parse(raw) rescue nil
+      error('Invalid service account key JSON') unless key.is_a?(Hash)
+      error('Invalid service account key: missing client_email') if key['client_email'].to_s.strip.empty?
+      error('Invalid service account key: missing private_key')  if key['private_key'].to_s.strip.empty?
+      key
+    end,
+    auth_resolve_token_url!: lambda do |connection, key|
+      # Prefer explicit connection override, then key.token_uri, else Google default
+      url = connection['token_url'].presence || key['token_uri'].presence || 'https://oauth2.googleapis.com/token'
+      u = url.to_s.strip
+      error('Invalid token URL for JWT bearer exchange') if u.empty?
+      u
     end,
     auth_token_cache_get: lambda do |connection, scope_key|
       cache = (connection['__token_cache'] ||= {})
@@ -1153,77 +1176,57 @@ require 'securerandom'
       token_hash
     end,
     auth_issue_token!: lambda do |connection, scopes|
-      # 1) Parse SA JSON from connection
-      raw = connection['service_account_json'].to_s
-      error('Service account JSON is required') if raw.empty?
-      key = JSON.parse(raw) rescue nil
-      error('Invalid service account JSON') unless key.is_a?(Hash)
+      key       = call(:auth_get_sa_key!, connection)
+      token_url = call(:auth_resolve_token_url!, connection, key)
 
-      client_email = key['client_email'].to_s.strip
-      private_key  = key['private_key'].to_s
-      # Prefer explicit connection override, then SA token_uri, then Google default
-      token_url    = (connection['token_url'].presence || key['token_uri'] || 'https://oauth2.googleapis.com/token').to_s.strip
+      # Normalize private key newlines for OpenSSL
+      pk = key['private_key'].to_s.gsub("\\n", "\n")
 
-      error('Invalid client_email in SA JSON') if client_email.empty?
-      error('Invalid private_key in SA JSON')  if private_key.empty?
-      error('Invalid token_url for JWT bearer exchange') if token_url.empty?
-
-      # 1a) Normalize PEM newlines for OpenSSL
-      pk = private_key.gsub("\\n", "\n")
-
-      # 1b) Normalize scopes (non-empty, space-separated)
-      set       = call(:auth_normalize_scopes, scopes)
-      scope_str = Array(set).compact.map(&:to_s).reject(&:empty?).join(' ')
+      # Normalize scopes → space-separated string (exactly like old)
+      set       = Array(scopes).compact.map(&:to_s).reject(&:empty?)
+      scope_str = set.join(' ')
       error('Scopes are required for JWT bearer exchange') if scope_str.empty?
 
-      # 2) Build JWT assertion (aud must equal token endpoint)
-      now     = Time.now.to_i
-      payload = { iss: client_email, scope: scope_str, aud: token_url, iat: now, exp: now + 3600 }
+      # JWT claim: aud MUST equal the POST target
+      now = Time.now.to_i
+      payload = {
+        iss:   key['client_email'],
+        scope: scope_str,
+        aud:   token_url,
+        iat:   now,
+        exp:   now + 3600
+      }
+
       assertion = call(:jwt_sign_rs256, payload, pk)
 
-      # 3) Exchange for access_token (form-encoded)
-      resp = post(token_url)
-               .payload(
-                 grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-                 assertion:  assertion
-               )
-               .request_format_www_form_urlencoded
+      # Exchange (form-encoded) – let Workato parse JSON into a Hash
+      res = post(token_url)
+              .payload(
+                grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+                assertion:  assertion
+              )
+              .request_format_www_form_urlencoded
 
-      # 4) Parse flexibly and surface Google errors
-      json =
-        if resp.is_a?(Hash) && resp['access_token']
-          resp
-        elsif resp.is_a?(Hash) && resp['body']
-          begin
-            body = resp['body']
-            body.is_a?(String) ? (JSON.parse(body) rescue { 'message' => body.to_s }) :
-            body.is_a?(Hash)   ? body : {}
-          rescue
-            {}
-          end
-        else
-          {}
-        end
+      # Be tolerant: if Workato already parsed, these keys are at top level.
+      access_token = res['access_token'].to_s
+      token_type   = (res['token_type'].presence || 'Bearer').to_s
+      expires_in   = res['expires_in'].to_i
 
-      access_token = json['access_token'].to_s
-      token_type   = json['token_type'].to_s
-      expires_in   = json['expires_in'].to_i
-
+      # If still empty, surface Google’s error directly (old vs new UX)
       if access_token.empty?
-        # Collect the most useful upstream hints
-        gerr  = json['error'] || json.dig('error', 'status') || json.dig('error', 'code')
-        gdesc = json['error_description'] || json.dig('error', 'message') || json['message']
-        status = (resp.is_a?(Hash) ? (resp['status'] || resp['code']) : nil)
-        hint = [("status=#{status}" if status), ("error=#{gerr}" if gerr), ("desc=#{gdesc}" if gdesc)].compact.join(', ')
+        # Try common Google shapes
+        body_err  = (res['error_description'] || res.dig('error', 'message') || res['error'] || res['message']).to_s
+        status    = (res['status'] || res['code']).to_s
+        hint = [("status=#{status}" unless status.empty?), ("msg=#{body_err}" unless body_err.empty?)].compact.join(', ')
         error("Token exchange failed (no access_token). #{hint}")
       end
 
       ttl = (expires_in.zero? ? 3600 : expires_in)
       {
         'access_token' => access_token,
-        'token_type'   => (token_type.empty? ? 'Bearer' : token_type),
+        'token_type'   => token_type,
         'expires_in'   => ttl,
-        'expires_at'   => (Time.now.utc + ttl - 60).iso8601,
+        'expires_at'   => (Time.now.utc + ttl).iso8601,
         'scope_key'    => scope_str
       }
     end,
@@ -1391,3 +1394,65 @@ require 'securerandom'
     body: "Provide the absolute URL for API calls."
   }
 }
+
+  pick_lists_old: {
+    trim_strategies: lambda do
+      [['Drop lowest score first','drop_low_score'],
+      ['Diverse (MMR-like)','diverse_mmr'],
+      ['Truncate by characters','truncate_chars']]
+    end,
+    discovery_hosts: lambda do |_connection|
+      [
+        ['Discovery Engine (global)', 'discoveryengine.googleapis.com'],
+        ['Discovery Engine (US multi-region)', 'us-discoveryengine.googleapis.com']
+      ]
+    end,
+    modes_classification: lambda do
+      [%w[Embedding embedding], %w[Generative generative], %w[Hybrid hybrid]]
+    end,
+    modes_grounding: lambda do
+      [%w[Google\ Search google_search], %w[Vertex\ AI\ Search vertex_ai_search]]
+    end,
+    roles: lambda do
+      # Contract-conformant roles (system handled via system_preamble)
+      [['user','user'], ['model','model']]
+    end,
+    rag_source_families: lambda do
+      [
+        ['Google Cloud Storage', 'gcs'],
+        ['Google Drive', 'drive']
+      ]
+    end,
+    drive_input_type: lambda do
+      [
+        ['Drive Files', 'files'],
+        ['Drive Folder', 'folder']
+      ]
+    end,
+    distance_measures: lambda do
+      [
+        ['Cosine distance', 'COSINE_DISTANCE'],
+        ['Dot product',     'DOT_PRODUCT'],
+        ['Euclidean',       'EUCLIDEAN_DISTANCE']
+      ]
+    end,
+    iam_services: lambda do
+      [['Vertex AI','vertex'], ['AI Applications (Discovery)','discovery']]
+    end,
+    discovery_versions: lambda do
+      [
+        ['v1alpha', 'v1alpha'],
+        ['v1beta',  'v1beta'],
+        ['v1',      'v1']
+      ]
+    end
+  },
+    # ENDPOINTS
+      # Embed (host=`https://{LOCATION}-aiplatform.googleapis.com`, path=`/v1/projects/{project}/locations/{location}/publishers/google/models/{embeddingModel}:predict`)
+      # Generate (host=`https://aiplatform.googleapis.com`, path=`/v1/{model}:generateContent`)
+      # Count tokens (host=`https://LOCATION-aiplatform.googleapis.com`, path=`/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:countTokens`)
+      # Rank (host=`https://discoveryengine.googleapis.com`, path=`/v1/{rankingConfig=projects/*/locations/*/rankingConfigs/*}:rank`)
+    # DOCUMENTATION
+      # Count tokens
+        # publisher model  (https://docs.cloud.google.com/vertex-ai/generative-ai/docs/reference/rest/v1/projects.locations.publishers.models/countTokens)
+        # endpoint/tuned model (https://docs.cloud.google.com/vertex-ai/generative-ai/docs/reference/rest/v1/projects.locations.endpoints/countTokens)
