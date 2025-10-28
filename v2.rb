@@ -25,43 +25,45 @@ require 'securerandom'
   # --------- CONNECTION ---------------------------------------------------
   connection: {
     fields: [
-      # Prod/Dev toggle
-      { name: 'prod_mode',                  optional: true,   control_type: 'checkbox', label: 'Production mode',
-        type: 'boolean',  default: true, extends_schema: true, hint: 'When enabled, suppresses debug echoes and enforces strict idempotency/retry rules.' },
-      # Service account details
-      { name: 'service_account_key_json',   optional: false,  control_type: 'text-area', hint: 'Paste full JSON key' },
-      { name: 'location',                   optional: false,  control_type: 'text', hint: 'e.g., global, us-central1, us-east4' },
-      { name: 'project_id',                 optional: false,   control_type: 'text', hint: 'GCP project ID (inferred from key if blank)' },
-      { name: 'user_project',               optional: true,   control_type: 'text',      label: 'User project for quota/billing',
-        extends_schema: true, hint: 'Sets x-goog-user-project for billing/quota. Service account must have roles/serviceusage.serviceUsageConsumer on this project.' },
-      { name: 'discovery_api_version', label: 'Discovery API version', control_type: 'select', optional: true, default: 'v1alpha',
-        pick_list: 'discovery_versions', hint: 'v1alpha for AI Applications; switch to v1beta/v1 if/when you migrate.' }
+       # Single source of truth for Vertex resource addressing
+       { name: 'project',  label: 'Project',  control_type: 'text',  optional: false, hint: 'Google Cloud project ID or number used in resource names (projects/{project}).' },
+       { name: 'location', label: 'Location (region)', control_type: 'select', optional: false,
+         options: %w[ us-central1 us-east1 us-east4 us-west1 europe-west1 europe-west4 asia-east1 asia-northeast1 ],
+         hint: 'Regional location for Vertex AI and RAG resources. The same region must be used in paths and base host.' },
+       { name: 'publisher', label: 'Publisher (for model path)', control_type: 'text', optional: true, default: 'google',
+         hint: 'Used for publisher model paths: …/publishers/{publisher}/models/{model}. Default "google".' },
+
+        # Requestor-pays / quota attribution
+        { name: 'user_project', label: 'User project (x-goog-user-project)', control_type: 'text', optional: true,
+          hint: 'Optional. If set, adds x-goog-user-project for requestor-pays or quota attribution.' },
+
+        # Service account credential (JWT source)
+        { name: 'service_account_json', label: 'Service account JSON', control_type: 'text-area', optional: false,
+          hint: 'Paste the full service-account key JSON (fields like client_email, private_key). Used to mint a JWT and exchange for an access token.' }
     ],
 
     authorization: {
-      # Custom JWT-bearer --> OAuth access token exchange
+      # JWT-bearer → OAuth access token (custom)
       type: 'custom',
 
       acquire: lambda do |connection|
-        # Build token via cache-aware helper
-        scopes   = call(:const_default_scopes) # ['https://www.googleapis.com/auth/cloud-platform']
-        token    = call(:auth_build_access_token!, connection, scopes: scopes)
-        scope_key = scopes.join(' ')
+        # Parse SA JSON
+        raw = connection['service_account_json'].to_s
+        error('Service account JSON is required') if raw.empty?
+        sa = JSON.parse(raw) rescue error('Invalid service account JSON')
 
-        # Pull metadata from the cache written by auth_build_access_token!
-        cached   = (connection['__token_cache'] ||= {})[scope_key]
+        # Build access token via helper (scopes fixed to cloud-platform)
+        scopes  = ['https://www.googleapis.com/auth/cloud-platform']
+        token   = call(:auth_build_access_token!, connection, sa: sa, scopes: scopes)
 
-        # Build payload
+        # Optionally surface cache metadata
         {
           access_token: token,
-          token_type:   'Bearer',
-          expires_in:   (cached && cached['expires_in']) || 3600,
-          expires_at:   (cached && cached['expires_at']) || (Time.now + 3600 - 60).utc.iso8601
+          token_type:   'Bearer'
         }
       end,
 
       apply: lambda do |connection|
-        # Keep headers minimal; envelope/correlation lives in actions
         h = { 'Authorization' => "Bearer #{connection['access_token']}" }
         up = connection['user_project'].to_s.strip
         h['x-goog-user-project'] = up unless up.empty?
@@ -69,96 +71,95 @@ require 'securerandom'
       end,
 
       token_url: 'https://oauth2.googleapis.com/token',
-
-      # Let Workato trigger re-acquire on auth errors
       refresh_on: [401],
       detect_on:  [/UNAUTHENTICATED/i, /invalid[_-]?token/i, /expired/i, /insufficient/i]
-    },
-  
-    base_uri: lambda do |connection|
-      # This block cannot call a method, the context WithGlobalDSL does not expose 'call'
-      loc  = (connection['location'].to_s.strip.downcase)
-      loc  = 'global' if loc.empty?
-      host = (loc == 'global') ? 'aiplatform.googleapis.com' : "#{loc}-aiplatform.googleapis.com"
-      "https://#{host}/v1/"
-    end,
+    }
 
   },
 
   # --------- CONNECTION TEST ----------------------------------------------
   test: lambda do |connection|
-    proj = connection['project_id']
-    loc  = connection['location']
-    base = (connection['base_url'].presence || "https://#{loc}-aiplatform.googleapis.com").gsub(%r{/+$}, '')
-    get("#{base}/v1/projects/#{proj}/locations/#{loc}")
+    call (:auth_jwt_selfcheck, connection)
+
+    project = connection['project'].to_s.strip
+    location = connection['location'].to_s.strip
+    error('Project is required for connection test') if project.empty?
+    error('Location is required for connection test') if location.empty?
+
+    base = "https://#{location}-aiplatform.googleapis.com"
+    get("#{base}/v1/projects/#{project}/locations/#{location}")
   end,
 
   # --------- OBJECT DEFINITIONS -------------------------------------------
   object_definitions: {
     # A) Connection-scoped
     connection_config: {
-      fields: [
-        {
-          name: 'project',
-          label: 'Project',
-          type: :string,
-          optional: false,
-          hint: 'Google Cloud project ID or number used in all resource names (projects/{project}).'
-        },
-        {
-          name: 'location',
-          label: 'Location (region)',
-          type: :string,
-          optional: false,
-          control_type: 'select',
-          options: %w[
-            us-central1 us-east1 us-east4 us-west1
-            europe-west1 europe-west4
-            asia-east1 asia-northeast1
-          ],
-          hint: 'Regional location for Vertex AI and RAG resources. All request paths and any regional base URL must use this same region.'
-        },
-        {
-          name: 'publisher',
-          label: 'Publisher (for model path)',
-          type: :string,
-          optional: true,
-          default: 'google',
-          hint: 'Used when addressing publisher models (…/publishers/{publisher}/models/{model}). Default "google".'
-        }
-      ],
+      fields: lambda do |connection, config_fields|
+        [
+          {
+            name: 'project',
+            label: 'Project',
+            type: :string,
+            optional: false,
+            hint: 'Google Cloud project ID or number used in all resource names (projects/{project}).'
+          },
+          {
+            name: 'location',
+            label: 'Location (region)',
+            type: :string,
+            optional: false,
+            control_type: 'select',
+            options: %w[
+              us-central1 us-east1 us-east4 us-west1
+              europe-west1 europe-west4
+              asia-east1 asia-northeast1
+            ],
+            hint: 'Regional location for Vertex AI and RAG resources. All request paths and any regional base URL must use this same region.'
+          },
+          {
+            name: 'publisher',
+            label: 'Publisher (for model path)',
+            type: :string,
+            optional: true,
+            default: 'google',
+            hint: 'Used when addressing publisher models (…/publishers/{publisher}/models/{model}). Default "google".'
+          }
+        ]
+      end,
       additional_properties: false
     },
     headers_allowlist: {
       # Doc-only helper used in comments/examples. Do not bind these to action inputs.
-      fields: [
-        {
-          name: 'headers',
-          type: :array,
-          of: :string,
-          optional: false,
-          hint: 'Connector adds Authorization automatically from auth. Only the following headers should ever be set by the connector: Authorization, Content-Type. Per-action inputs must not affect headers.'
-        }
-      ],
-      sample_output: {
-        headers: ['Authorization', 'Content-Type']
-      },
+      fields: lambda do |connection, config_fields|
+        [
+          {
+            name: 'headers',
+            type: :array,
+            of: :string,
+            optional: false,
+            hint: 'Connector adds Authorization automatically from auth. Only the following headers should ever be set by the connector: Authorization, Content-Type. Per-action inputs must not affect headers.'
+          }
+        ]
+      end,
+      sample_output: { headers: ['Authorization', 'Content-Type'] },
       additional_properties: false
     },
     error_google_json: {
-      fields: [
-        {
-          name: 'error',
-          type: :object,
-          optional: false,
-          properties: [
-            { name: 'code', type: :integer, optional: false },
-            { name: 'message', type: :string, optional: false },
-            { name: 'status', type: :string, optional: true },
-            { name: 'details', type: :array, of: :object, optional: true }
-          ]
-        }
-      ],
+      fields: lambda do |connection, config_fields|
+        [
+          {
+            name: 'error',
+            type: :object,
+            optional: false,
+            properties: [
+              { name: 'code', type: :integer, optional: false },
+              { name: 'message', type: :string, optional: false },
+              { name: 'status', type: :string, optional: true },
+              { name: 'details', type: :array, of: :object, optional: true }
+            ]
+          }
+        ]
+      end,
       sample_output: {
         error: {
           code: 429,
@@ -175,215 +176,229 @@ require 'securerandom'
 
     # I) Small utilities
     enum_location: {
-      fields: [
-        {
-          name: 'location',
-          type: :string,
-          control_type: 'select',
-          options: %w[
-            us-central1 us-east1 us-east4 us-west1
-            europe-west1 europe-west4
-            asia-east1 asia-northeast1
-          ],
-          optional: false
-        }
-      ],
+      fields: lambda do |connection, config_fields|
+        [
+          {
+            name: 'location',
+            type: :string,
+            control_type: 'select',
+            options: %w[
+              us-central1 us-east1 us-east4 us-west1
+              europe-west1 europe-west4
+              asia-east1 asia-northeast1
+            ],
+            optional: false
+          }
+        ]
+      end,
       additional_properties: false
     },
     model_path: {
-      fields: [
-        {
-          name: 'model',
-          type: :string,
-          optional: false,
-          hint: "One of:\n- projects/{project}/locations/{location}/publishers/{publisher}/models/{model}\n- projects/{project}/locations/{location}/endpoints/{endpoint}\n\nThe {location} segment must match the connector’s selected location; when using a regional base URL, it must match the same region."
-        }
-      ],
+      fields: lambda do |connection, config_fields|
+        [
+          {
+            name: 'model',
+            type: :string,
+            optional: false,
+            hint: "One of:\n- projects/{project}/locations/{location}/publishers/{publisher}/models/{model}\n- projects/{project}/locations/{location}/endpoints/{endpoint}\n\nThe {location} segment must match the connector’s selected location; when using a regional base URL, it must match the same region."
+          }
+        ]
+      end,
       additional_properties: false
     },
     text_record: {
-      fields: [
-        { name: 'id', type: :string },
-        { name: 'title', type: :string, optional: true },
-        { name: 'content', type: :string, control_type: 'text-area' },
-        { name: 'metadata', type: :object, optional: true }
-      ],
+      fields: lambda do |connection, config_fields|
+        [
+          { name: 'id', type: :string },
+          { name: 'title', type: :string, optional: true },
+          { name: 'content', type: :string, control_type: 'text-area' },
+          { name: 'metadata', type: :object, optional: true }
+        ]
+      end,
       additional_properties: false,
       sample_output: { id: 'doc-1', title: 'Benefits', content: '...', metadata: { source: 'intranet' } }
     },
     context_chunk: {
-      fields: [
-        { name: 'id' },
-        { name: 'uri', optional: true },
-        { name: 'content', control_type: 'text-area' },
-        { name: 'score', type: :number, optional: true },
-        { name: 'metadata', type: :object, optional: true }
-      ],
-      sample_output: { id: 'c1', uri: 'gs://bucket/a.txt', content: '...', score: 0.83 }
+      fields: lambda do |connection, config_fields|
+        [
+          { name: 'id' },
+          { name: 'uri', optional: true },
+          { name: 'content', control_type: 'text-area' },
+          { name: 'score', type: :number, optional: true },
+          { name: 'metadata', type: :object, optional: true }
+        ]
+      end,
+      sample_output: { id: 'c1', uri: 'gs://bucket/a.txt', content: '...', score: 0.83 },
+      additional_properties: false
     },
 
     # B) Generative (LLM) objects
     gen_content_part: {
-      fields: [
-        { name: 'text', type: :string, optional: true },
-        {
-          name: 'inlineData',
-          type: :object,
-          optional: true,
-          properties: [
-            { name: 'mimeType', type: :string, optional: true },
-            { name: 'data', type: :string, optional: true }
-          ]
-        },
-        {
-          name: 'fileData',
-          type: :object,
-          optional: true,
-          properties: [
-            { name: 'mimeType', type: :string, optional: true },
-            { name: 'fileUri', type: :string, control_type: 'url', optional: true }
-          ]
-        }
-      ],
+      fields: lambda do |connection, config_fields|
+        [
+          { name: 'text', type: :string, optional: true },
+          {
+            name: 'inlineData',
+            type: :object,
+            optional: true,
+            properties: [
+              { name: 'mimeType', type: :string, optional: true },
+              { name: 'data', type: :string, optional: true }
+            ]
+          },
+          {
+            name: 'fileData',
+            type: :object,
+            optional: true,
+            properties: [
+              { name: 'mimeType', type: :string, optional: true },
+              { name: 'fileUri', type: :string, control_type: 'url', optional: true }
+            ]
+          }
+        ]
+      end,
       additional_properties: true
     },
     gen_content: {
-      fields: [
-        {
-          name: 'role',
-          type: :string,
-          control_type: 'select',
-          options: %w[user model system],
-          optional: false
-        },
-        {
-          name: 'parts',
-          type: :array,
-          of: :object,
-          optional: false,
-          properties: [
-            { name: 'text', type: :string, optional: true },
-            {
-              name: 'inlineData',
-              type: :object,
-              optional: true,
-              properties: [
-                { name: 'mimeType', type: :string, optional: true },
-                { name: 'data', type: :string, optional: true }
-              ]
-            },
-            {
-              name: 'fileData',
-              type: :object,
-              optional: true,
-              properties: [
-                { name: 'mimeType', type: :string, optional: true },
-                { name: 'fileUri', type: :string, control_type: 'url', optional: true }
-              ]
-            }
-          ]
-        }
-      ],
+      fields: lambda do |connection, config_fields|
+        [
+          {
+            name: 'role',
+            type: :string,
+            control_type: 'select',
+            options: %w[user model system],
+            optional: false
+          },
+          {
+            name: 'parts',
+            type: :array,
+            of: :object,
+            optional: false,
+            properties: [
+              { name: 'text', type: :string, optional: true },
+              {
+                name: 'inlineData',
+                type: :object,
+                optional: true,
+                properties: [
+                  { name: 'mimeType', type: :string, optional: true },
+                  { name: 'data', type: :string, optional: true }
+                ]
+              },
+              {
+                name: 'fileData',
+                type: :object,
+                optional: true,
+                properties: [
+                  { name: 'mimeType', type: :string, optional: true },
+                  { name: 'fileUri', type: :string, control_type: 'url', optional: true }
+                ]
+              }
+            ]
+          }
+        ]
+      end,
       additional_properties: true
     },
     gen_generation_config: {
-      fields: [
-        { name: 'temperature', type: :number, optional: true },
-        { name: 'topP', type: :number, optional: true },
-        { name: 'topK', type: :integer, optional: true },
-        { name: 'maxOutputTokens', type: :integer, optional: true },
-        { name: 'candidateCount', type: :integer, optional: true },
-        { name: 'stopSequences', type: :array, of: :string, optional: true },
-        { name: 'responseMimeType', type: :string, optional: true },
-        {
-          name: 'responseSchema',
-          type: :object,
-          optional: true,
-          properties: [],
-          hint: 'Schema for structured outputs. Rule: if responseSchema is present, responseMimeType is required.'
-        }
-      ],
+      fields: lambda do |connection, config_fields|
+        [
+          { name: 'temperature', type: :number, optional: true },
+          { name: 'topP', type: :number, optional: true },
+          { name: 'topK', type: :integer, optional: true },
+          { name: 'maxOutputTokens', type: :integer, optional: true },
+          { name: 'candidateCount', type: :integer, optional: true },
+          { name: 'stopSequences', type: :array, of: :string, optional: true },
+          { name: 'responseMimeType', type: :string, optional: true },
+          {
+            name: 'responseSchema',
+            type: :object,
+            optional: true,
+            properties: [],
+            hint: 'Schema for structured outputs. Rule: if responseSchema is present, responseMimeType is required.'
+          }
+        ]
+      end,
       additional_properties: true
     },
     gen_generate_content_request: {
-      fields: [
-        {
-          name: 'contents',
-          type: :array,
-          of: :object,
-          optional: false,
-          properties: [
-            { name: 'role', type: :string, control_type: 'select', options: %w[user model system], optional: false },
-            {
-              name: 'parts',
-              type: :array,
-              of: :object,
-              optional: false,
-              properties: [
-                { name: 'text', type: :string, optional: true },
-                { name: 'inlineData', type: :object, properties: [{ name: 'mimeType', type: :string }, { name: 'data', type: :string }], optional: true },
-                { name: 'fileData', type: :object, properties: [{ name: 'mimeType', type: :string }, { name: 'fileUri', type: :string, control_type: 'url' }], optional: true }
-              ]
-            }
-          ]
-        },
-        {
-          name: 'systemInstruction',
-          type: :object,
-          properties: [
-            { name: 'role', type: :string, control_type: 'select', options: %w[user model system] },
-            { name: 'parts', type: :array, of: :object }
-          ],
-          optional: true
-        },
-        { name: 'tools', type: :array, of: :object, optional: true },
-        { name: 'toolConfig', type: :object, optional: true },
-        { name: 'groundingConfig', type: :object, optional: true },
-        {
-          name: 'labels',
-          type: :object,
-          optional: true,
-          hint: 'String map of labels (key/value).'
-        },
-        {
-          name: 'safetySettings',
-          type: :array,
-          of: :object,
-          optional: true,
-          properties: [
-            { name: 'category', type: :string, optional: true },
-            { name: 'threshold', type: :string, optional: true }
-          ]
-        },
-        {
-          name: 'generationConfig',
-          type: :object,
-          properties: [
-            { name: 'temperature', type: :number, optional: true },
-            { name: 'topP', type: :number, optional: true },
-            { name: 'topK', type: :integer, optional: true },
-            { name: 'maxOutputTokens', type: :integer, optional: true },
-            { name: 'candidateCount', type: :integer, optional: true },
-            { name: 'stopSequences', type: :array, of: :string, optional: true },
-            { name: 'responseMimeType', type: :string, optional: true },
-            { name: 'responseSchema', type: :object, properties: [], optional: true }
-          ],
-          optional: true,
-          hint: 'If responseSchema is provided, responseMimeType must also be provided.'
-        },
-        { name: 'cachedContent', type: :string, optional: true },
-        { name: 'modelArmorConfig', type: :object, optional: true }
-      ],
+      fields: lambda do |connection, config_fields|
+        [
+          {
+            name: 'contents',
+            type: :array,
+            of: :object,
+            optional: false,
+            properties: [
+              { name: 'role', type: :string, control_type: 'select', options: %w[user model system], optional: false },
+              {
+                name: 'parts',
+                type: :array,
+                of: :object,
+                optional: false,
+                properties: [
+                  { name: 'text', type: :string, optional: true },
+                  { name: 'inlineData', type: :object, properties: [{ name: 'mimeType', type: :string }, { name: 'data', type: :string }], optional: true },
+                  { name: 'fileData', type: :object, properties: [{ name: 'mimeType', type: :string }, { name: 'fileUri', type: :string, control_type: 'url' }], optional: true }
+                ]
+              }
+            ]
+          },
+          {
+            name: 'systemInstruction',
+            type: :object,
+            properties: [
+              { name: 'role', type: :string, control_type: 'select', options: %w[user model system] },
+              { name: 'parts', type: :array, of: :object }
+            ],
+            optional: true
+          },
+          { name: 'tools', type: :array, of: :object, optional: true },
+          { name: 'toolConfig', type: :object, optional: true },
+          { name: 'groundingConfig', type: :object, optional: true },
+          { name: 'labels', type: :object, optional: true, hint: 'String map of labels (key/value).' },
+          {
+            name: 'safetySettings',
+            type: :array,
+            of: :object,
+            optional: true,
+            properties: [
+              { name: 'category', type: :string, optional: true },
+              { name: 'threshold', type: :string, optional: true }
+            ]
+          },
+          {
+            name: 'generationConfig',
+            type: :object,
+            properties: [
+              { name: 'temperature', type: :number, optional: true },
+              { name: 'topP', type: :number, optional: true },
+              { name: 'topK', type: :integer, optional: true },
+              { name: 'maxOutputTokens', type: :integer, optional: true },
+              { name: 'candidateCount', type: :integer, optional: true },
+              { name: 'stopSequences', type: :array, of: :string, optional: true },
+              { name: 'responseMimeType', type: :string, optional: true },
+              { name: 'responseSchema', type: :object, properties: [], optional: true }
+            ],
+            optional: true,
+            hint: 'If responseSchema is provided, responseMimeType must also be provided.'
+          },
+          { name: 'cachedContent', type: :string, optional: true },
+          { name: 'modelArmorConfig', type: :object, optional: true }
+        ]
+      end,
       additional_properties: false
     },
     gen_generate_content_response: {
-      fields: [
-        { name: 'responseId', type: :string, optional: true },
-        { name: 'modelVersion', type: :string, optional: true },
-        { name: 'usageMetadata', type: :object, optional: true },
-        { name: 'candidates', type: :array, of: :object, optional: true },
-        { name: 'promptFeedback', type: :object, optional: true }
-      ],
+      fields: lambda do |connection, config_fields|
+        [
+          { name: 'responseId', type: :string, optional: true },
+          { name: 'modelVersion', type: :string, optional: true },
+          { name: 'usageMetadata', type: :object, optional: true },
+          { name: 'candidates', type: :array, of: :object, optional: true },
+          { name: 'promptFeedback', type: :object, optional: true }
+        ]
+      end,
       sample_output: {
         responseId: 'r-9c7d1e7f',
         modelVersion: 'publishers/google/models/gemini-1.5-pro-002',
@@ -407,69 +422,73 @@ require 'securerandom'
 
     # C) Count tokens
     gen_count_tokens_request: {
-      fields: [
-        {
-          name: 'contents',
-          type: :array,
-          of: :object,
-          optional: true,
-          properties: [
-            { name: 'role', type: :string, control_type: 'select', options: %w[user model system], optional: false },
-            {
-              name: 'parts',
-              type: :array,
-              of: :object,
-              optional: false,
-              properties: [
-                { name: 'text', type: :string, optional: true },
-                { name: 'inlineData', type: :object, properties: [{ name: 'mimeType', type: :string }, { name: 'data', type: :string }], optional: true },
-                { name: 'fileData', type: :object, properties: [{ name: 'mimeType', type: :string }, { name: 'fileUri', type: :string, control_type: 'url' }], optional: true }
-              ]
-            }
-          ],
-          hint: 'Use this OR instances (oneOf).'
-        },
-        {
-          name: 'instances',
-          type: :array,
-          of: :object,
-          optional: true,
-          properties: [],
-          hint: 'Use this OR contents (oneOf).'
-        },
-        { name: 'tools', type: :array, of: :object, optional: true },
-        { name: 'systemInstruction', type: :object, optional: true },
-        {
-          name: 'generationConfig',
-          type: :object,
-          optional: true,
-          properties: [
-            { name: 'temperature', type: :number, optional: true },
-            { name: 'topP', type: :number, optional: true },
-            { name: 'topK', type: :integer, optional: true },
-            { name: 'maxOutputTokens', type: :integer, optional: true },
-            { name: 'candidateCount', type: :integer, optional: true },
-            { name: 'stopSequences', type: :array, of: :string, optional: true }
-          ]
-        }
-      ],
+      fields: lambda do |connection, config_fields|
+        [
+          {
+            name: 'contents',
+            type: :array,
+            of: :object,
+            optional: true,
+            properties: [
+              { name: 'role', type: :string, control_type: 'select', options: %w[user model system], optional: false },
+              {
+                name: 'parts',
+                type: :array,
+                of: :object,
+                optional: false,
+                properties: [
+                  { name: 'text', type: :string, optional: true },
+                  { name: 'inlineData', type: :object, properties: [{ name: 'mimeType', type: :string }, { name: 'data', type: :string }], optional: true },
+                  { name: 'fileData', type: :object, properties: [{ name: 'mimeType', type: :string }, { name: 'fileUri', type: :string, control_type: 'url' }], optional: true }
+                ]
+              }
+            ],
+            hint: 'Use this OR instances (oneOf).'
+          },
+          {
+            name: 'instances',
+            type: :array,
+            of: :object,
+            optional: true,
+            properties: [],
+            hint: 'Use this OR contents (oneOf).'
+          },
+          { name: 'tools', type: :array, of: :object, optional: true },
+          { name: 'systemInstruction', type: :object, optional: true },
+          {
+            name: 'generationConfig',
+            type: :object,
+            optional: true,
+            properties: [
+              { name: 'temperature', type: :number, optional: true },
+              { name: 'topP', type: :number, optional: true },
+              { name: 'topK', type: :integer, optional: true },
+              { name: 'maxOutputTokens', type: :integer, optional: true },
+              { name: 'candidateCount', type: :integer, optional: true },
+              { name: 'stopSequences', type: :array, of: :string, optional: true }
+            ]
+          }
+        ]
+      end,
       additional_properties: false
     },
     gen_count_tokens_response: {
-      fields: [
-        { name: 'totalTokens', type: :integer, optional: false },
-        { name: 'totalBillableCharacters', type: :integer, optional: true },
-        {
-          name: 'promptTokensDetails',
-          type: :array,
-          of: :object,
-          optional: true,
-          properties: [
-            { name: 'modality', type: :string, optional: true },
-            { name: 'tokenCount', type: :integer, optional: true }
-          ]
-        }
-      ],
+      fields: lambda do |connection, config_fields|
+        [
+          { name: 'totalTokens', type: :integer, optional: false },
+          { name: 'totalBillableCharacters', type: :integer, optional: true },
+          {
+            name: 'promptTokensDetails',
+            type: :array,
+            of: :object,
+            optional: true,
+            properties: [
+              { name: 'modality', type: :string, optional: true },
+              { name: 'tokenCount', type: :integer, optional: true }
+            ]
+          }
+        ]
+      end,
       sample_output: {
         totalTokens: 128,
         totalBillableCharacters: 512,
@@ -482,70 +501,74 @@ require 'securerandom'
 
     # D) Embeddings
     emb_predict_request: {
-      fields: [
-        {
-          name: 'instances',
-          type: :array,
-          of: :object,
-          optional: false,
-          properties: [
-            { name: 'content', type: :string, optional: false },
-            { name: 'title', type: :string, optional: true },
-            {
-              name: 'task_type',
-              type: :string,
-              control_type: 'select',
-              options: %w[
-                RETRIEVAL_QUERY RETRIEVAL_DOCUMENT SEMANTIC_SIMILARITY
-                CLASSIFICATION CLUSTERING QUESTION_ANSWERING FACT_VERIFICATION
-                CODE_RETRIEVAL_QUERY
-              ],
-              optional: true
-            }
-          ]
-        },
-        {
-          name: 'parameters',
-          type: :object,
-          optional: true,
-          properties: [
-            { name: 'autoTruncate', type: :boolean, optional: true },
-            { name: 'outputDimensionality', type: :integer, optional: true }
-          ]
-        }
-      ],
+      fields: lambda do |connection, config_fields|
+        [
+          {
+            name: 'instances',
+            type: :array,
+            of: :object,
+            optional: false,
+            properties: [
+              { name: 'content', type: :string, optional: false },
+              { name: 'title', type: :string, optional: true },
+              {
+                name: 'task_type',
+                type: :string,
+                control_type: 'select',
+                options: %w[
+                  RETRIEVAL_QUERY RETRIEVAL_DOCUMENT SEMANTIC_SIMILARITY
+                  CLASSIFICATION CLUSTERING QUESTION_ANSWERING FACT_VERIFICATION
+                  CODE_RETRIEVAL_QUERY
+                ],
+                optional: true
+              }
+            ]
+          },
+          {
+            name: 'parameters',
+            type: :object,
+            optional: true,
+            properties: [
+              { name: 'autoTruncate', type: :boolean, optional: true },
+              { name: 'outputDimensionality', type: :integer, optional: true }
+            ]
+          }
+        ]
+      end,
       additional_properties: false
     },
     emb_predict_response: {
-      fields: [
-        {
-          name: 'predictions',
-          type: :array,
-          of: :object,
-          optional: false,
-          properties: [
-            {
-              name: 'embeddings',
-              type: :object,
-              optional: false,
-              properties: [
-                { name: 'values', type: :array, of: :number, optional: false },
-                {
-                  name: 'statistics',
-                  type: :object,
-                  optional: true,
-                  properties: [
-                    { name: 'truncated', type: :boolean, optional: true },
-                    { name: 'token_count', type: :integer, optional: true }
-                  ],
-                  additional_properties: false
-                }
-              ],
-              additional_properties: false
-            }
-          ]
-        }
-      ],
+      fields: lambda do |connection, config_fields|
+        [
+          {
+            name: 'predictions',
+            type: :array,
+            of: :object,
+            optional: false,
+            properties: [
+              {
+                name: 'embeddings',
+                type: :object,
+                optional: false,
+                properties: [
+                  { name: 'values', type: :array, of: :number, optional: false },
+                  {
+                    name: 'statistics',
+                    type: :object,
+                    optional: true,
+                    properties: [
+                      { name: 'truncated', type: :boolean, optional: true },
+                      { name: 'token_count', type: :integer, optional: true }
+                    ],
+                    additional_properties: false
+                  }
+                ],
+                additional_properties: false
+              }
+            ]
+          }
+        ]
+      end,
       sample_output: {
         predictions: [
           {
@@ -561,85 +584,82 @@ require 'securerandom'
 
     # E) Ranking (Discovery Engine)
     rank_ranking_record: {
-      fields: [
-        { name: 'id', type: :string, optional: false },
-        { name: 'title', type: :string, optional: true },
-        { name: 'content', type: :string, optional: true, control_type: 'text-area' },
-        { name: 'metadata', type: :object, optional: true }
-      ],
+      fields: lambda do |connection, config_fields|
+        [
+          { name: 'id', type: :string, optional: false },
+          { name: 'title', type: :string, optional: true },
+          { name: 'content', type: :string, optional: true, control_type: 'text-area' },
+          { name: 'metadata', type: :object, optional: true }
+        ]
+      end,
       additional_properties: false,
-
-      # Validation note:
-      # Each record must include id and at least one of title or content.
-
-      sample_output: {
-        id: 'a',
-        title: 'Benefits overview',
-        content: 'Doc A…',
-        metadata: { source: 'intranet' }
-      },
+      sample_output: { id: 'a', title: 'Benefits overview', content: 'Doc A…', metadata: { source: 'intranet' } },
       hint: 'Each record must include id and at least one of title or content.'
     },
     rank_request: {
-      fields: [
-        {
-          name: 'query',
-          type: :object,
-          optional: false,
-          properties: [
-            {
-              name: 'text',
-              type: :string,
-              optional: false,
-              hint: 'Free-text query. You may also supply the API’s alternate form where query is a plain string; this object mirrors the RAG {text} shape.'
-            }
-          ]
-        },
-        {
-          name: 'records',
-          type: :array,
-          of: :object,
-          optional: false,
-          properties: [
-            { name: 'id', type: :string, optional: false },
-            { name: 'title', type: :string, optional: true },
-            { name: 'content', type: :string, optional: true },
-            { name: 'metadata', type: :object, optional: true }
-          ],
-          hint: 'At least one of title or content is required per record.'
-        },
-        {
-          name: 'topN',
-          type: :integer,
-          optional: true,
-          hint: 'Optional cap on number of records to return.'
-        },
-        {
-          name: 'model',
-          type: :string,
-          optional: true,
-          default: 'semantic-ranker-512@latest',
-          hint: 'Defaults to semantic-ranker-512@latest if omitted.'
-        }
-      ],
+      fields: lambda do |connection, config_fields|
+        [
+          {
+            name: 'query',
+            type: :object,
+            optional: false,
+            properties: [
+              {
+                name: 'text',
+                type: :string,
+                optional: false,
+                hint: 'Free-text query. You may also supply the API’s alternate form where query is a plain string; this object mirrors the RAG {text} shape.'
+              }
+            ]
+          },
+          {
+            name: 'records',
+            type: :array,
+            of: :object,
+            optional: false,
+            properties: [
+              { name: 'id', type: :string, optional: false },
+              { name: 'title', type: :string, optional: true },
+              { name: 'content', type: :string, optional: true },
+              { name: 'metadata', type: :object, optional: true }
+            ],
+            hint: 'At least one of title or content is required per record.'
+          },
+          {
+            name: 'topN',
+            type: :integer,
+            optional: true,
+            hint: 'Optional cap on number of records to return.'
+          },
+          {
+            name: 'model',
+            type: :string,
+            optional: true,
+            default: 'semantic-ranker-512@latest',
+            hint: 'Defaults to semantic-ranker-512@latest if omitted.'
+          }
+        ]
+      end,
       additional_properties: false
     },
     rank_response: {
-      fields: [
-        {
-          name: 'records',
-          type: :array,
-          of: :object,
-          optional: true,
-          properties: [
-            { name: 'id', type: :string, optional: false },
-            { name: 'title', type: :string, optional: true },
-            { name: 'content', type: :string, optional: true },
-            { name: 'score', type: :number, optional: false },
-            { name: 'metadata', type: :object, optional: true }
-          ]
-        }
-      ],
+      fields: lambda do |connection, config_fields|
+        [
+          {
+            name: 'records',
+            type: :array,
+            of: :object,
+            optional: true,
+            properties: [
+              { name: 'id', type: :string, optional: false },
+              { name: 'title', type: :string, optional: true },
+              { name: 'content', type: :string, optional: true },
+              { name: 'score', type: :number, optional: false },
+              { name: 'metadata', type: :object, optional: true }
+            ]
+          }
+        ]
+      end,
       sample_output: {
         records: [
           {
@@ -662,79 +682,87 @@ require 'securerandom'
 
     # F) RAG — retrieve contexts
     rag_vertex_store_resource: {
-      fields: [
-        {
-          name: 'ragCorpus',
-          type: :string,
-          optional: false,
-          hint: 'Resource name pattern: projects/{project}/locations/{location}/ragCorpora/{corpus}. The {location} must match the connector’s selected region.'
-        },
-        { name: 'ragFileIds', type: :array, of: :string, optional: true }
-      ],
+      fields: lambda do |connection, config_fields|
+        [
+          {
+            name: 'ragCorpus',
+            type: :string,
+            optional: false,
+            hint: 'Resource name pattern: projects/{project}/locations/{location}/ragCorpora/{corpus}. The {location} must match the connector’s selected region.'
+          },
+          { name: 'ragFileIds', type: :array, of: :string, optional: true }
+        ]
+      end,
       additional_properties: false
     },
     rag_vertex_store: {
-      fields: [
-        {
-          name: 'ragResources',
-          type: :array,
-          of: :object,
-          optional: false,
-          properties: [
-            { name: 'ragCorpus', type: :string, optional: false },
-            { name: 'ragFileIds', type: :array, of: :string, optional: true }
-          ]
-        }
-      ],
+      fields: lambda do |connection, config_fields|
+        [
+          {
+            name: 'ragResources',
+            type: :array,
+            of: :object,
+            optional: false,
+            properties: [
+              { name: 'ragCorpus', type: :string, optional: false },
+              { name: 'ragFileIds', type: :array, of: :string, optional: true }
+            ]
+          }
+        ]
+      end,
       additional_properties: false
     },
     rag_retrieve_contexts_request: {
-      fields: [
-        {
-          name: 'query',
-          type: :object,
-          optional: false,
-          properties: [
-            { name: 'text', type: :string, optional: false }
-          ]
-        },
-        {
-          name: 'dataSource',
-          type: :object,
-          optional: false,
-          properties: [
-            {
-              name: 'vertexRagStore',
-              type: :object,
-              optional: false,
-              properties: [
-                {
-                  name: 'ragResources',
-                  type: :array,
-                  of: :object,
-                  optional: false,
-                  properties: [
-                    { name: 'ragCorpus', type: :string, optional: false, hint: 'projects/{project}/locations/{location}/ragCorpora/{corpus}' },
-                    { name: 'ragFileIds', type: :array, of: :string, optional: true }
-                  ]
-                }
-              ]
-            }
-          ]
-        }
-      ],
+      fields: lambda do |connection, config_fields|
+        [
+          {
+            name: 'query',
+            type: :object,
+            optional: false,
+            properties: [
+              { name: 'text', type: :string, optional: false }
+            ]
+          },
+          {
+            name: 'dataSource',
+            type: :object,
+            optional: false,
+            properties: [
+              {
+                name: 'vertexRagStore',
+                type: :object,
+                optional: false,
+                properties: [
+                  {
+                    name: 'ragResources',
+                    type: :array,
+                    of: :object,
+                    optional: false,
+                    properties: [
+                      { name: 'ragCorpus', type: :string, optional: false, hint: 'projects/{project}/locations/{location}/ragCorpora/{corpus}' },
+                      { name: 'ragFileIds', type: :array, of: :string, optional: true }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      end,
       additional_properties: false
     },
     rag_retrieved_context: {
-      fields: [
-        { name: 'chunkId', type: :string, optional: true },
-        { name: 'text', type: :string, control_type: 'text-area', optional: true },
-        { name: 'score', type: :number, optional: true },
-        { name: 'sourceUri', type: :string, control_type: 'url', optional: true },
-        { name: 'sourceDisplayName', type: :string, optional: true },
-        { name: 'chunk', type: :object, optional: true },
-        { name: 'metadata', type: :object, optional: true }
-      ],
+      fields: lambda do |connection, config_fields|
+        [
+          { name: 'chunkId', type: :string, optional: true },
+          { name: 'text', type: :string, control_type: 'text-area', optional: true },
+          { name: 'score', type: :number, optional: true },
+          { name: 'sourceUri', type: :string, control_type: 'url', optional: true },
+          { name: 'sourceDisplayName', type: :string, optional: true },
+          { name: 'chunk', type: :object, optional: true },
+          { name: 'metadata', type: :object, optional: true }
+        ]
+      end,
       additional_properties: true,
       sample_output: {
         chunkId: 'hr:123#c5',
@@ -746,30 +774,32 @@ require 'securerandom'
       }
     },
     rag_retrieve_contexts_response: {
-      fields: [
-        {
-          name: 'contexts',
-          type: :object,
-          optional: true,
-          properties: [
-            {
-              name: 'contexts',
-              type: :array,
-              of: :object,
-              optional: true,
-              properties: [
-                { name: 'chunkId', type: :string, optional: true },
-                { name: 'text', type: :string, optional: true },
-                { name: 'score', type: :number, optional: true },
-                { name: 'sourceUri', type: :string, control_type: 'url', optional: true },
-                { name: 'sourceDisplayName', type: :string, optional: true },
-                { name: 'chunk', type: :object, optional: true },
-                { name: 'metadata', type: :object, optional: true }
-              ]
-            }
-          ]
-        }
-      ],
+      fields: lambda do |connection, config_fields|
+        [
+          {
+            name: 'contexts',
+            type: :object,
+            optional: true,
+            properties: [
+              {
+                name: 'contexts',
+                type: :array,
+                of: :object,
+                optional: true,
+                properties: [
+                  { name: 'chunkId', type: :string, optional: true },
+                  { name: 'text', type: :string, optional: true },
+                  { name: 'score', type: :number, optional: true },
+                  { name: 'sourceUri', type: :string, control_type: 'url', optional: true },
+                  { name: 'sourceDisplayName', type: :string, optional: true },
+                  { name: 'chunk', type: :object, optional: true },
+                  { name: 'metadata', type: :object, optional: true }
+                ]
+              }
+            ]
+          }
+        ]
+      end,
       sample_output: {
         contexts: {
           contexts: [
@@ -797,13 +827,15 @@ require 'securerandom'
 
     # G) Operations (LRO)
     ops_operation: {
-      fields: [
-        { name: 'name', type: :string, optional: true, hint: 'Full LRO name: projects/{project}/locations/{location}/operations/{operationId}' },
-        { name: 'done', type: :boolean, optional: true },
-        { name: 'error', type: :object, optional: true },
-        { name: 'metadata', type: :object, optional: true },
-        { name: 'response', type: :object, optional: true }
-      ],
+      fields: lambda do |connection, config_fields|
+        [
+          { name: 'name', type: :string, optional: true, hint: 'Full LRO name: projects/{project}/locations/{location}/operations/{operationId}' },
+          { name: 'done', type: :boolean, optional: true },
+          { name: 'error', type: :object, optional: true },
+          { name: 'metadata', type: :object, optional: true },
+          { name: 'response', type: :object, optional: true }
+        ]
+      end,
       sample_output: {
         name: 'projects/demo/locations/us-east4/operations/op-123',
         done: false,
@@ -822,22 +854,26 @@ require 'securerandom'
 
     # H) Pagination helpers
     pg_page_request: {
-      fields: [
-        {
-          name: 'pageSize',
-          type: :integer,
-          optional: true,
-          hint: 'Number of items to return (1–1000). Requests above 1000 are rejected by the API.',
-          control_type: 'number'
-        },
-        { name: 'pageToken', type: :string, optional: true }
-      ],
+      fields: lambda do |connection, config_fields|
+        [
+          {
+            name: 'pageSize',
+            type: :integer,
+            optional: true,
+            hint: 'Number of items to return (1–1000). Requests above 1000 are rejected by the API.',
+            control_type: 'number'
+          },
+          { name: 'pageToken', type: :string, optional: true }
+        ]
+      end,
       additional_properties: false
     },
     pg_page_response: {
-      fields: [
-        { name: 'nextPageToken', type: :string, optional: true }
-      ],
+      fields: lambda do |connection, config_fields|
+        [
+          { name: 'nextPageToken', type: :string, optional: true }
+        ]
+      end,
       sample_output: { nextPageToken: 'gAAAAABlP...' },
       additional_properties: false
     }
@@ -1059,8 +1095,8 @@ require 'securerandom'
         ]
       end,
       execute: lambda do |connection, input|
-        host = call(:aiplatform_host, connection)
-        path = call(:path_ranking_rank, connection, input['ranking_config'])
+        host = 'discoveryengine.googleapis.com'
+        path = "/v1/#{input['ranking_config']}:rank"
         body = { query: { text: input['query_text'] }, records: input['records'] }
 
         post("https://#{host}#{path}")
@@ -1077,6 +1113,194 @@ require 'securerandom'
 
   # --------- METHODS ------------------------------------------------------
   methods: {
+
+    # --- Auth (JWT → OAuth) ---------------------------------------------------
+    const_default_scopes: lambda do
+      ['https://www.googleapis.com/auth/cloud-platform']
+    end,
+
+    b64url: lambda do |bytes|
+      Base64.urlsafe_encode64(bytes).gsub(/=+$/, '')
+    end,
+
+    jwt_sign_rs256: lambda do |claims, private_key_pem|
+      header = { alg: 'RS256', typ: 'JWT' }
+      enc_h  = call(:b64url, header.to_json)
+      enc_p  = call(:b64url, claims.to_json)
+      input  = "#{enc_h}.#{enc_p}"
+
+      rsa = OpenSSL::PKey::RSA.new(private_key_pem.to_s)
+      sig = rsa.sign(OpenSSL::Digest::SHA256.new, input)
+
+      "#{input}.#{call(:b64url, sig)}"
+    end,
+
+    auth_normalize_scopes: lambda do |scopes|
+      arr =
+        case scopes
+        when nil    then call(:const_default_scopes)
+        when String then scopes.split(/\s+/)
+        when Array  then scopes
+        else              call(:const_default_scopes)
+        end
+
+      arr.map(&:to_s).reject(&:empty?).uniq
+    end,
+
+    auth_token_cache_get: lambda do |connection, scope_key|
+      cache = (connection['__token_cache'] ||= {})
+      tok   = cache[scope_key]
+      return nil unless tok.is_a?(Hash) && tok['access_token'].to_s != '' && tok['expires_at'].to_s != ''
+      exp = (Time.parse(tok['expires_at']) rescue nil)
+      return nil unless exp && Time.now < (exp - 60) # 60-sec skew buffer
+      tok
+    end,
+
+    auth_token_cache_put: lambda do |connection, scope_key, token_hash|
+      # Don’t cache broken tokens
+      error('Auth error: missing access_token in token response') if token_hash['access_token'].to_s.empty?
+      error('Auth error: missing expires_at in token response')   if token_hash['expires_at'].to_s.empty?
+
+      cache = (connection['__token_cache'] ||= {})
+      cache[scope_key] = token_hash
+      token_hash
+    end,
+
+    auth_issue_token!: lambda do |connection, scopes|
+      # 1) Parse the service account JSON from the new connection field
+      raw = connection['service_account_json'].to_s
+      error('Service account JSON is required') if raw.empty?
+
+      key = JSON.parse(raw) rescue nil
+      error('Invalid service account JSON') unless key.is_a?(Hash)
+
+      client_email = key['client_email'].to_s.strip
+      private_key  = key['private_key'].to_s
+      token_url    = (key['token_uri'].to_s.strip.empty? ? 'https://oauth2.googleapis.com/token' : key['token_uri'].to_s.strip)
+
+      error('Invalid service account key: missing client_email') if client_email.empty?
+      error('Invalid service account key: missing private_key')  if private_key.empty?
+
+      # Normalize PEM newlines to satisfy OpenSSL
+      pk = private_key.gsub(/\\n/, "\n")
+
+      # 2) Build JWT assertion (aud must be the token endpoint)
+      now       = Time.now.to_i
+      scope_str = scopes.join(' ')
+      payload = {
+        iss:   client_email,
+        scope: scope_str,
+        aud:   token_url,
+        iat:   now,
+        exp:   now + 3600
+      }
+
+      assertion = call(:jwt_sign_rs256, payload, pk)
+
+      # 3) Exchange for access_token (WWW-Form)
+      resp = post(token_url)
+              .payload(
+                grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+                assertion:  assertion
+              )
+              .request_format_www_form_urlencoded
+
+      # Workato usually gives parsed JSON; if not, fall back to body→JSON
+      json =
+        if resp.is_a?(Hash) && resp['access_token']
+          resp
+        elsif resp.is_a?(Hash) && resp['body']
+          begin
+            JSON.parse(resp['body'])
+          rescue
+            {}
+          end
+        else
+          {}
+        end
+
+      access_token = json['access_token'].to_s
+      token_type   = json['token_type'].to_s
+      expires_in   = json['expires_in'].to_i
+
+      error("Token exchange failed#{json['error'] ? ": #{json['error']}" : ''}") if access_token.empty?
+
+      {
+        'access_token' => access_token,
+        'token_type'   => (token_type.empty? ? 'Bearer' : token_type),
+        'expires_in'   => (expires_in > 0 ? expires_in : 3600),
+        'expires_at'   => (Time.now + (expires_in > 0 ? expires_in : 3600)).utc.iso8601,
+        'scope_key'    => scope_str
+      }
+    end,
+
+    auth_build_access_token!: lambda do |connection, scopes: nil|
+      set = call(:auth_normalize_scopes, scopes)
+      scope_key = set.join(' ')
+
+      if (cached = call(:auth_token_cache_get, connection, scope_key))
+        return cached['access_token']
+      end
+
+      fresh = call(:auth_issue_token!, connection, set)
+      call(:auth_token_cache_put, connection, scope_key, fresh)['access_token']
+    end,
+    # --- Local JWT sanity check (no network) ---------------------------------
+    b64url_decode: lambda do |str|
+      # URL-safe base64 decode with padding fix
+      s = str.to_s
+      s += '=' * ((4 - s.length % 4) % 4)
+      Base64.urlsafe_decode64(s)
+    end,
+
+    auth_jwt_selfcheck!: lambda do |connection|
+      raw = connection['service_account_json'].to_s
+      error('Service account JSON is required') if raw.empty?
+
+      key = JSON.parse(raw) rescue nil
+      error('Invalid service account JSON') unless key.is_a?(Hash)
+
+      client_email = key['client_email'].to_s.strip
+      private_key  = key['private_key'].to_s
+      error('Invalid service account key: missing client_email') if client_email.empty?
+      error('Invalid service account key: missing private_key')  if private_key.empty?
+
+      # Normalize PEM newlines
+      pk_pem = private_key.gsub(/\\n/, "\n")
+      rsa    = OpenSSL::PKey::RSA.new(pk_pem) # will raise on malformed PEM
+
+      # Build a tiny, throwaway JWT
+      now = Time.now.to_i
+      claims = {
+        iss: client_email,
+        sub: client_email,
+        iat: now,
+        exp: now + 300,
+        aud: 'selfcheck' # arbitrary audience; we’re not sending this anywhere
+      }
+
+      jwt = call(:jwt_sign_rs256, claims, pk_pem)
+
+      # Verify the signature locally using the public key
+      parts = jwt.split('.')
+      error('JWT selfcheck failed: malformed token') unless parts.length == 3
+
+      signed_input = [parts[0], parts[1]].join('.')
+      sig          = call(:b64url_decode, parts[2])
+
+      ok = rsa.public_key.verify(OpenSSL::Digest::SHA256.new, sig, signed_input)
+      error('JWT selfcheck failed: signature verify false (bad key?)') unless ok
+
+      # Also ensure header/payload parse cleanly (sanity)
+      header  = JSON.parse(call(:b64url_decode, parts[0])) rescue {}
+      payload = JSON.parse(call(:b64url_decode, parts[1])) rescue {}
+      error('JWT selfcheck failed: bad header')  unless header['alg'] == 'RS256' && header['typ'] == 'JWT'
+      error('JWT selfcheck failed: bad payload') unless payload['iss'].to_s == client_email
+
+      # Return something minimally useful for logs
+      { ok: true, kid: header['kid'], iss: payload['iss'] }
+    end,
+
     coerce_integer: lambda do |v, fallback|
       Integer(v) rescue fallback
     end,
@@ -1109,6 +1333,18 @@ require 'securerandom'
       error('Model id required') if mm.empty?
       mm
     end,
+    normalize_debug_blob: lambda do |_connection, blob|
+      # Always return the original blob (no redaction)
+      blob
+    end,
+    log_debug: lambda do |what, payload=nil|
+      # Emits structured debug; recipe authors can decide what to persist/share.
+      call(:telemetry_debug, { what: what, payload: payload })
+    end,
+    build_request_opts: lambda do |connection, base_opts|
+      # Unconditional behavior (no prod/dev adjustment)
+      base_opts
+    end,
     # --- REQUIRED ENV HELPERS (SDK-compliant signatures) -----------------
     ensure_project_id!: lambda do |connection|
       pid = connection['project'].to_s.strip
@@ -1125,17 +1361,17 @@ require 'securerandom'
     end,
     default_headers: lambda do |connection|
       h = { 'Content-Type' => 'application/json; charset=utf-8' }
-      if (qp = connection['quota_project_id'].to_s.strip).present?
-        h['x-goog-user-project'] = qp
-      end
+      up = connection['user_project'].to_s.strip
+      h['x-goog-user-project'] = up unless up.empty?
       h
     end,
-    # --- PATH BUILDERS ----------------------------------------------------
     path_generate_content: lambda do |connection, model|
-      "/v1/projects/#{call(:ensure_project_id!, connection)}/locations/#{call(:ensure_location!, connection)}/publishers/google/models/#{model}:generateContent"
+      pub = (connection['publisher'].presence || 'google')
+      "/v1/projects/#{call(:ensure_project_id!, connection)}/locations/#{call(:ensure_location!, connection)}/publishers/#{pub}/models/#{model}:generateContent"
     end,
     path_embeddings_predict: lambda do |connection, model|
-      "/v1/projects/#{call(:ensure_project_id!, connection)}/locations/#{call(:ensure_location!, connection)}/publishers/google/models/#{model}:predict"
+      pub = (connection['publisher'].presence || 'google')
+      "/v1/projects/#{call(:ensure_project_id!, connection)}/locations/#{call(:ensure_location!, connection)}/publishers/#{pub}/models/#{model}:predict"
     end,
     path_rag_retrieve_contexts: lambda do |_connection, rag_corpus|
       "/v1/#{rag_corpus}:retrieveContexts"
@@ -1158,7 +1394,6 @@ require 'securerandom'
   # --------- CUSTOM ACTION SUPPORT ----------------------------------------
   custom_action: true,
   custom_action_help: {
-    body: "For actions calling host 'aiplatform.googleapis.com/v1', use relative paths. " \
-          "For actions calling other endpoints (e.g. discovery engine), provide the absolute URL."
+    body: "Provide the absolute URL for API calls."
   }
 }
