@@ -47,20 +47,14 @@ require 'securerandom'
       type: 'custom',
 
       acquire: lambda do |connection|
-        # Parse SA JSON
-        raw = connection['service_account_json'].to_s
-        error('Service account JSON is required') if raw.empty?
-        sa = JSON.parse(raw) rescue error('Invalid service account JSON')
+        # Scopes fixed to cloud-platform; issue a fresh token and store metadata
+        # Normalize/override if connection carries custom scopes
+        scopes = call(:auth_normalize_scopes, connection['scopes'] || ['https://www.googleapis.com/auth/cloud-platform'])
+        token  = call(:auth_issue_token!, connection, scopes)
 
-        # Build access token via helper (scopes fixed to cloud-platform)
-        scopes  = ['https://www.googleapis.com/auth/cloud-platform']
-        token   = call(:auth_build_access_token!, connection, sa: sa, scopes: scopes)
-
-        # Optionally surface cache metadata
-        {
-          access_token: token,
-          token_type:   'Bearer'
-        }
+        # Seed cache so later calls can reuse until ~60s before expiry
+        call(:auth_token_cache_put, connection, token['scope_key'], token)
+        { access_token: token['access_token'], token_type: token['token_type'] }
       end,
 
       apply: lambda do |connection|
@@ -79,8 +73,6 @@ require 'securerandom'
 
   # --------- CONNECTION TEST ----------------------------------------------
   test: lambda do |connection|
-    call (:auth_jwt_selfcheck, connection)
-
     project = connection['project'].to_s.strip
     location = connection['location'].to_s.strip
     error('Project is required for connection test') if project.empty?
@@ -980,7 +972,7 @@ require 'securerandom'
       title: 'RAG (Serving): Retrieve contexts',
       subtitle: '',
       description: '',
-      display_priority: 1
+      display_priority: 1,
       help: lambda do |_input, _picklist_label|
         { body: '' }
       end,
@@ -1118,11 +1110,9 @@ require 'securerandom'
     const_default_scopes: lambda do
       ['https://www.googleapis.com/auth/cloud-platform']
     end,
-
     b64url: lambda do |bytes|
       Base64.urlsafe_encode64(bytes).gsub(/=+$/, '')
     end,
-
     jwt_sign_rs256: lambda do |claims, private_key_pem|
       header = { alg: 'RS256', typ: 'JWT' }
       enc_h  = call(:b64url, header.to_json)
@@ -1134,7 +1124,6 @@ require 'securerandom'
 
       "#{input}.#{call(:b64url, sig)}"
     end,
-
     auth_normalize_scopes: lambda do |scopes|
       arr =
         case scopes
@@ -1146,7 +1135,6 @@ require 'securerandom'
 
       arr.map(&:to_s).reject(&:empty?).uniq
     end,
-
     auth_token_cache_get: lambda do |connection, scope_key|
       cache = (connection['__token_cache'] ||= {})
       tok   = cache[scope_key]
@@ -1155,7 +1143,6 @@ require 'securerandom'
       return nil unless exp && Time.now < (exp - 60) # 60-sec skew buffer
       tok
     end,
-
     auth_token_cache_put: lambda do |connection, scope_key, token_hash|
       # Don’t cache broken tokens
       error('Auth error: missing access_token in token response') if token_hash['access_token'].to_s.empty?
@@ -1165,53 +1152,52 @@ require 'securerandom'
       cache[scope_key] = token_hash
       token_hash
     end,
-
     auth_issue_token!: lambda do |connection, scopes|
-      # 1) Parse the service account JSON from the new connection field
+      # 1) Parse SA JSON from connection
       raw = connection['service_account_json'].to_s
       error('Service account JSON is required') if raw.empty?
-
       key = JSON.parse(raw) rescue nil
       error('Invalid service account JSON') unless key.is_a?(Hash)
 
       client_email = key['client_email'].to_s.strip
       private_key  = key['private_key'].to_s
-      token_url    = (key['token_uri'].to_s.strip.empty? ? 'https://oauth2.googleapis.com/token' : key['token_uri'].to_s.strip)
+      # Prefer explicit connection override, then SA token_uri, then Google default
+      token_url    = (connection['token_url'].presence || key['token_uri'] || 'https://oauth2.googleapis.com/token').to_s.strip
 
-      error('Invalid service account key: missing client_email') if client_email.empty?
-      error('Invalid service account key: missing private_key')  if private_key.empty?
+      error('Invalid client_email in SA JSON') if client_email.empty?
+      error('Invalid private_key in SA JSON')  if private_key.empty?
+      error('Invalid token_url for JWT bearer exchange') if token_url.empty?
 
-      # Normalize PEM newlines to satisfy OpenSSL
-      pk = private_key.gsub(/\\n/, "\n")
+      # 1a) Normalize PEM newlines for OpenSSL
+      pk = private_key.gsub("\\n", "\n")
 
-      # 2) Build JWT assertion (aud must be the token endpoint)
-      now       = Time.now.to_i
-      scope_str = scopes.join(' ')
-      payload = {
-        iss:   client_email,
-        scope: scope_str,
-        aud:   token_url,
-        iat:   now,
-        exp:   now + 3600
-      }
+      # 1b) Normalize scopes (non-empty, space-separated)
+      set       = call(:auth_normalize_scopes, scopes)
+      scope_str = Array(set).compact.map(&:to_s).reject(&:empty?).join(' ')
+      error('Scopes are required for JWT bearer exchange') if scope_str.empty?
 
+      # 2) Build JWT assertion (aud must equal token endpoint)
+      now     = Time.now.to_i
+      payload = { iss: client_email, scope: scope_str, aud: token_url, iat: now, exp: now + 3600 }
       assertion = call(:jwt_sign_rs256, payload, pk)
 
-      # 3) Exchange for access_token (WWW-Form)
+      # 3) Exchange for access_token (form-encoded)
       resp = post(token_url)
-              .payload(
-                grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-                assertion:  assertion
-              )
-              .request_format_www_form_urlencoded
+               .payload(
+                 grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+                 assertion:  assertion
+               )
+               .request_format_www_form_urlencoded
 
-      # Workato usually gives parsed JSON; if not, fall back to body→JSON
+      # 4) Parse flexibly and surface Google errors
       json =
         if resp.is_a?(Hash) && resp['access_token']
           resp
         elsif resp.is_a?(Hash) && resp['body']
           begin
-            JSON.parse(resp['body'])
+            body = resp['body']
+            body.is_a?(String) ? (JSON.parse(body) rescue { 'message' => body.to_s }) :
+            body.is_a?(Hash)   ? body : {}
           rescue
             {}
           end
@@ -1223,17 +1209,24 @@ require 'securerandom'
       token_type   = json['token_type'].to_s
       expires_in   = json['expires_in'].to_i
 
-      error("Token exchange failed#{json['error'] ? ": #{json['error']}" : ''}") if access_token.empty?
+      if access_token.empty?
+        # Collect the most useful upstream hints
+        gerr  = json['error'] || json.dig('error', 'status') || json.dig('error', 'code')
+        gdesc = json['error_description'] || json.dig('error', 'message') || json['message']
+        status = (resp.is_a?(Hash) ? (resp['status'] || resp['code']) : nil)
+        hint = [("status=#{status}" if status), ("error=#{gerr}" if gerr), ("desc=#{gdesc}" if gdesc)].compact.join(', ')
+        error("Token exchange failed (no access_token). #{hint}")
+      end
 
+      ttl = (expires_in.zero? ? 3600 : expires_in)
       {
         'access_token' => access_token,
         'token_type'   => (token_type.empty? ? 'Bearer' : token_type),
-        'expires_in'   => (expires_in > 0 ? expires_in : 3600),
-        'expires_at'   => (Time.now + (expires_in > 0 ? expires_in : 3600)).utc.iso8601,
+        'expires_in'   => ttl,
+        'expires_at'   => (Time.now.utc + ttl - 60).iso8601,
         'scope_key'    => scope_str
       }
     end,
-
     auth_build_access_token!: lambda do |connection, scopes: nil|
       set = call(:auth_normalize_scopes, scopes)
       scope_key = set.join(' ')
@@ -1245,6 +1238,7 @@ require 'securerandom'
       fresh = call(:auth_issue_token!, connection, set)
       call(:auth_token_cache_put, connection, scope_key, fresh)['access_token']
     end,
+
     # --- Local JWT sanity check (no network) ---------------------------------
     b64url_decode: lambda do |str|
       # URL-safe base64 decode with padding fix
@@ -1252,7 +1246,6 @@ require 'securerandom'
       s += '=' * ((4 - s.length % 4) % 4)
       Base64.urlsafe_decode64(s)
     end,
-
     auth_jwt_selfcheck!: lambda do |connection|
       raw = connection['service_account_json'].to_s
       error('Service account JSON is required') if raw.empty?
@@ -1304,6 +1297,7 @@ require 'securerandom'
     coerce_integer: lambda do |v, fallback|
       Integer(v) rescue fallback
     end,
+
     normalize_error!: lambda do |code, body, _headers|
       parsed = begin
         body.is_a?(String) && !body.empty? ? JSON.parse(body) : (body || {})
