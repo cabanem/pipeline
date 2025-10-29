@@ -31,8 +31,7 @@ require 'securerandom'
       # Service account details
       { name: 'service_account_key_json',   optional: false,  control_type: 'text-area', 
         hint: 'Paste full JSON key' },
-      { name: 'location',                   optional: false,  control_type: 'text',
-        hint: 'e.g., global, us-central1, us-east4' },
+      { name: 'location',                   optional: false,  control_type: 'text', hint: 'e.g., global, us-central1, us-east4' },
       { name: 'project_id',                 optional: false,   control_type: 'text',
         hint: 'GCP project ID (inferred from key if blank)' },
       { name: 'user_project',               optional: true,   control_type: 'text',      label: 'User project for quota/billing',
@@ -826,6 +825,10 @@ require 'securerandom'
             hint: 'Choose output shape: records-only, enriched records, or generator-ready context_chunks.' },
           { name: 'source_key', optional: true, hint: 'Metadata key to use for source (default: "source")' },
           { name: 'uri_key',    optional: true, hint: 'Metadata key to use for uri (default: "uri")' }
+          # Optional override when your connection 'location' is regional (e.g., us-central1)
+          { name: 'ai_apps_location', label: 'AI-Apps location (override)', control_type: 'select', pick_list: 'ai_apps_locations', optional: true,
+            hint: 'Ranking/Search use multi-regions only: global, us, or eu. Leave blank to derive from connection location.' }
+
         ]
       end,
       output_fields: lambda do |object_definitions, _connection|
@@ -850,10 +853,8 @@ require 'securerandom'
         corr = call(:build_correlation_id)
 
         call(:ensure_project_id!, connection)
-        # Ranking API uses AI Applications locations (global/us/eu multiregions).
-        loc = connection['location'].to_s.downcase.presence || 'global'
-        allowed = %w[global us eu]
-        error("Ranking API location '#{loc}' is not supported. Use one of: #{allowed.join(', ')}") unless allowed.include?(loc)
+        # Normalize connection region → AI-Apps multi-region (global|us|eu), allow per-action override
+        loc = call(:aiapps_loc_resolve, connection, input['ai_apps_location'])
 
         # Resolve config id (not full resource) to avoid double-embedding path parts.
         config_id =
@@ -1466,25 +1467,25 @@ require 'securerandom'
 
   # --------- PICK LISTS ---------------------------------------------------
   pick_lists: {
-   # What to emit from rerank for ergonomics/BC:
-   # - records_only:     [{id, score, rank}]
-   # - enriched_records: [{id, score, rank, content, metadata}]
-   # - context_chunks:   enriched records + generator-ready context_chunks
-   rerank_emit_shapes: lambda do
-     [
-       ['Records only (id, score, rank)','records_only'],
-       ['Enriched records (adds content/metadata)','enriched_records'],
-       ['Context chunks (enriched + context_chunks)','context_chunks']
-     ]
-   end,
-   gen_generate_modes: lambda do
-     [
-       ['Plain (no grounding)','plain'],
-       ['Grounded via Google Search','grounded_google'],
-       ['Grounded via Vertex AI Search','grounded_vertex'],
-       ['RAG-lite (provided context)','rag_with_context']
-     ]
-   end,
+    # What to emit from rerank for ergonomics/BC:
+    # - records_only:     [{id, score, rank}]
+    # - enriched_records: [{id, score, rank, content, metadata}]
+    # - context_chunks:   enriched records + generator-ready context_chunks
+    rerank_emit_shapes: lambda do
+      [
+        ['Records only (id, score, rank)','records_only'],
+        ['Enriched records (adds content/metadata)','enriched_records'],
+        ['Context chunks (enriched + context_chunks)','context_chunks']
+      ]
+    end,
+    gen_generate_modes: lambda do
+      [
+        ['Plain (no grounding)','plain'],
+        ['Grounded via Google Search','grounded_google'],
+        ['Grounded via Vertex AI Search','grounded_vertex'],
+        ['RAG-lite (provided context)','rag_with_context']
+      ]
+    end,
     trim_strategies: lambda do
       [['Drop lowest score first','drop_low_score'],
       ['Diverse (MMR-like)','diverse_mmr'],
@@ -1499,30 +1500,25 @@ require 'securerandom'
     modes_classification: lambda do
       [%w[Embedding embedding], %w[Generative generative], %w[Hybrid hybrid]]
     end,
-
     modes_grounding: lambda do
       [%w[Google\ Search google_search], %w[Vertex\ AI\ Search vertex_ai_search]]
     end,
-
     roles: lambda do
       # Contract-conformant roles (system handled via system_preamble)
       [['user','user'], ['model','model']]
     end,
-
     rag_source_families: lambda do
       [
         ['Google Cloud Storage', 'gcs'],
         ['Google Drive', 'drive']
       ]
     end,
-
     drive_input_type: lambda do
       [
         ['Drive Files', 'files'],
         ['Drive Folder', 'folder']
       ]
     end,
-
     distance_measures: lambda do
       [
         ['Cosine distance', 'COSINE_DISTANCE'],
@@ -1530,16 +1526,21 @@ require 'securerandom'
         ['Euclidean',       'EUCLIDEAN_DISTANCE']
       ]
     end,
-
     iam_services: lambda do
       [['Vertex AI','vertex'], ['AI Applications (Discovery)','discovery']]
     end,
-
     discovery_versions: lambda do
       [
         ['v1alpha', 'v1alpha'],
         ['v1beta',  'v1beta'],
         ['v1',      'v1']
+      ]
+    end,
+    ai_apps_locations: lambda do
+      [
+        ['Global (recommended default)', 'global'],
+        ['US (multi-region)', 'us'],
+        ['EU (multi-region)', 'eu']
       ]
     end
 
@@ -1660,8 +1661,6 @@ require 'securerandom'
       error(env)
     end,
 
-    # --- Canonical per-request headers (Authorization + routing) ----------
-    # NOTE: signature changed — arg3 is user_project, not "extra" hash.
     request_headers_auth: lambda do |_connection, correlation_id, user_project=nil, request_params=nil|
       h = {
         'X-Correlation-Id' => correlation_id.to_s,
@@ -2013,6 +2012,24 @@ require 'securerandom'
     end,
 
     # --- URL and resource building ----------------------------------------
+    # Map a Vertex "region" (e.g., us-central1, europe-west1) to AI-Apps multi-region (global|us|eu)
+    region_to_aiapps_loc: lambda do |raw|
+      v = raw.to_s.strip.downcase
+      return 'global' if v.empty? || v == 'global'
+      return 'us' if v.start_with?('us-')
+      return 'eu' if v.start_with?('eu-') || v.start_with?('europe-')
+      # If user typed a multi-region already, pass through:
+      return v if %w[us eu global].include?(v)
+      # Safe fallback: prefer global (Ranking supports global/us/eu only)
+      'global'
+    end,
+
+    # Resolve AI-Apps (Discovery/Ranking) location with optional override
+    aiapps_loc_resolve: lambda do |connection, override=nil|
+      o = override.to_s.strip.downcase
+      return o if %w[us eu global].include?(o)
+      call(:region_to_aiapps_loc, connection['location'])
+    end,
     aipl_service_host: lambda do |connection, loc=nil|
       l = (loc || connection['location']).to_s.downcase
       (l.blank? || l == 'global') ? 'aiplatform.googleapis.com' : "#{l}-aiplatform.googleapis.com"
@@ -2020,8 +2037,6 @@ require 'securerandom'
     aipl_v1_url: lambda do |connection, loc, path|
       "https://#{call(:aipl_service_host, connection, loc)}/v1/#{path}"
     end,
-
-    # Needed for preview/alpha endpoints (e.g., Ranking API)
     aipl_v1alpha_url: lambda do |connection, loc, path|
       "https://#{call(:aipl_service_host, connection, loc)}/v1alpha/#{path}"
     end,
@@ -2118,7 +2133,8 @@ require 'securerandom'
       error('rag_file must be a full resource name like projects/{p}/locations/{l}/ragCorpora/{c}/ragFiles/{id}')
     end,
     discovery_host: lambda do |connection, loc=nil|
-      l = (loc || connection['location']).to_s.downcase
+      # Accept regional input and normalize to multi-region for host selection
+      l = call(:aiapps_loc_resolve, connection, loc)
       # AI Applications commonly use 'global' or 'us' multi-region
       host = (l == 'us') ? 'us-discoveryengine.googleapis.com' : 'discoveryengine.googleapis.com'
       (connection['discovery_host_custom'].presence || host)
