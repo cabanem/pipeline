@@ -824,7 +824,7 @@ require 'securerandom'
           { name: 'emit_shape', control_type: 'select', pick_list: 'rerank_emit_shapes', optional: true, default: 'context_chunks',
             hint: 'Choose output shape: records-only, enriched records, or generator-ready context_chunks.' },
           { name: 'source_key', optional: true, hint: 'Metadata key to use for source (default: "source")' },
-          { name: 'uri_key',    optional: true, hint: 'Metadata key to use for uri (default: "uri")' }
+          { name: 'uri_key',    optional: true, hint: 'Metadata key to use for uri (default: "uri")' },
           # Optional override when your connection 'location' is regional (e.g., us-central1)
           { name: 'ai_apps_location', label: 'AI-Apps location (override)', control_type: 'select', pick_list: 'ai_apps_locations', optional: true,
             hint: 'Ranking/Search use multi-regions only: global, us, or eu. Leave blank to derive from connection location.' }
@@ -878,7 +878,8 @@ require 'securerandom'
         )
 
         body = {
-          'query'   => { 'text' => input['query_text'].to_s },
+          # Ranking expects a scalar string for 'query'
+          'query'   => input['query_text'].to_s,
           'records' => call(:safe_array, input['records']).map { |r|
             {
               'id'       => r['id'].to_s,
@@ -962,7 +963,9 @@ require 'securerandom'
           { name: 'rag_corpus', optional: false, hint: 'Accepts either full resource name (e.g., "projects/{project}/locations/{region}/ragCorpora/{corpus}") or the "corpus"' },
           { name: 'question', optional: false },
           { name: 'restrict_to_file_ids', type: 'array', of: 'string', optional: true },
-          { name: 'max_contexts', type: 'integer', optional: true, default: 20 }
+          { name: 'max_contexts', type: 'integer', optional: true, default: 20 },
+          { name: 'llm_ranker_model', label: 'LLM ranker model (optional)', optional: true,
+            hint: 'Gemini model to re-rank retrieved contexts on Vertex host (e.g., gemini-2.0-flash). Leave blank to disable.' }
         ]
       end,
       output_fields: lambda do |object_definitions, connection|
@@ -1004,7 +1007,13 @@ require 'securerandom'
         parent = "projects/#{connection['project_id']}/locations/#{loc}"
         req_params = "parent=#{parent}"
 
-        payload = call(:build_rag_retrieve_payload, input['question'], corpus, input['restrict_to_file_ids'])
+        payload = call(
+          :build_rag_retrieve_payload,
+          input['question'],
+          corpus,
+          input['restrict_to_file_ids'],
+          { 'llmRankerModel' => (input['llm_ranker_model'].presence || nil) }
+        )
 
         url  = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
         resp = post(url)
@@ -1019,6 +1028,11 @@ require 'securerandom'
           'question' => input['question'],
           'contexts' => mapped
         }.merge(call(:telemetry_envelope, t0, corr, true, call(:telemetry_success_code, raw), 'OK'))
+        # annotate telemetry with ranking when enabled
+        if input['llm_ranker_model'].to_s.strip.length > 0
+          (out['telemetry'] ||= {})['rank'] = { 'mode' => 'llm', 'model' => input['llm_ranker_model'].to_s }
+        end
+        out
       rescue => e
         g = call(:extract_google_error, e)
         msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
@@ -1034,7 +1048,7 @@ require 'securerandom'
             'metadata_json' => '{"page":7}' }
           ],
           'ok' => true,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 22, 'correlation_id' => 'sample' }
+          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 22, 'correlation_id' => 'sample', 'rank' => { 'mode': 'llm', 'model': 'gemini-2.0-flash' } }
         }
       end
     },
@@ -1057,6 +1071,8 @@ require 'securerandom'
           { name: 'temperature', type: 'number', optional: true, hint: 'Default 0' },
           { name: 'emit_context_chunks', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
             hint: 'If enabled, returns generator-ready context_chunks alongside the answer.' },
+          { name: 'llm_ranker_model', label: 'LLM ranker model (optional)', optional: true,
+            hint: 'Gemini model to re-rank retrieved contexts on Vertex host (e.g., gemini-2.0-flash). Leave blank to disable.' },
           { name: 'return_rationale', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
             hint: 'If enabled, model returns a brief rationale (1–2 sentences) for traceability.' },
           { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
@@ -1113,7 +1129,13 @@ require 'securerandom'
         parent = "projects/#{connection['project_id']}/locations/#{loc}"
         req_params_retr = "parent=#{parent}"
 
-        retrieve_payload = call(:build_rag_retrieve_payload, input['question'], corpus, input['restrict_to_file_ids'])
+        retrieve_payload = call(
+          :build_rag_retrieve_payload,
+          input['question'],
+          corpus,
+          input['restrict_to_file_ids'],
+          { 'llmRankerModel' => (input['llm_ranker_model'].presence || nil) }
+        )
         retr_url      = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
         retr_req_body = call(:json_compact, retrieve_payload)
         retr_resp = post(retr_url)
@@ -1217,6 +1239,11 @@ require 'securerandom'
         if call(:normalize_boolean, input['emit_context_chunks'])
           out['context_chunks'] = chunks
         end
+        
+        # annotate telemetry with ranking when enabled
+        if input['llm_ranker_model'].to_s.strip.length > 0
+          (out['telemetry'] ||= {})['rank'] = { 'mode' => 'llm', 'model' => input['llm_ranker_model'].to_s }
+        end
 
         # Attach request preview / debug in non-prod when requested
         unless call(:normalize_boolean, connection['prod_mode'])
@@ -1253,7 +1280,7 @@ require 'securerandom'
           'responseId' => 'resp-123',
           'usage' => { 'promptTokenCount' => 298, 'candidatesTokenCount' => 156, 'totalTokenCount' => 454 },
           'ok' => true,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 44, 'correlation_id' => 'sample' }
+          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 44, 'correlation_id' => 'sample', 'rank' => { 'mode': 'llm', 'model': 'gemini-2.0-flash' } }
         }
       end
     },
@@ -2251,13 +2278,32 @@ require 'securerandom'
       return '' if raw.nil? || raw == false
       raw.to_s.strip
     end,
-    build_rag_retrieve_payload: lambda do |question, rag_corpus, restrict_ids = []|
+    build_rag_retrieve_payload: lambda do |question, rag_corpus, restrict_ids = [], opts = {}|
+      # Backward-compatible extension: optional opts hash supports LLM re-ranking and simple knobs.
+      # opts:
+      #   'llmRankerModel' -> String model name, e.g., "gemini-2.0-flash"
+      #   'topK'           -> Integer cap for retrieval prior to ranking (optional)
       rag_res = { 'ragCorpus' => rag_corpus }
       ids     = call(:sanitize_drive_ids, restrict_ids, allow_empty: true, label: 'restrict_to_file_ids')
       rag_res['ragFileIds'] = ids if ids.present?
+
+      query = { 'text' => question.to_s }
+      # Attach ragRetrievalConfig only when needed (keeps payload minimal)
+      rr_cfg = {}
+      if opts.is_a?(Hash)
+        if opts['topK']
+          rr_cfg['topK'] = call(:safe_integer, opts['topK'])
+        end
+        llm = opts['llmRankerModel'].to_s.strip
+        if llm.length > 0
+          rr_cfg['ranking'] = { 'llmRanker' => { 'modelName' => llm } }
+        end
+      end
+      query['ragRetrievalConfig'] = rr_cfg unless rr_cfg.empty?
+
       {
-        'query'          => { 'text'          => question.to_s },
-        # NOTE: union member is supplied at top-level (not wrapped in "dataSource")
+        'query'          => query,
+        # union member supplied at top-level (not wrapped in "dataSource")
         'vertexRagStore' => { 'ragResources'  => [rag_res] }
       }
     end,
