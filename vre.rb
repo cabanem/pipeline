@@ -416,6 +416,7 @@ require 'securerandom'
         # 1. Invariants
         t0   = Time.now
         corr = call(:build_correlation_id)
+        url = nil; req_body = nil
         begin
           # 2. Build the request
           subj = (input['subject'] || '').to_s.strip
@@ -631,7 +632,7 @@ require 'securerandom'
       execute: lambda do |connection, input|
         t0   = Time.now
         corr = call(:build_correlation_id)
-        url = nil; req_body = nil
+        url = nil; req_body = nil; req_params = nil
         begin
           # 1) Heuristic focus text (strip quotes, signatures, legal footers, tracking junk)
           subj  = (input['subject'] || '').to_s
@@ -707,6 +708,7 @@ require 'securerandom'
 
           loc = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
           url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
+          req_params = "model=#{model_path}"
           req_body = call(:json_compact, payload)
           resp = post(url).headers(call(:request_headers_auth, connection, corr, nil, req_params)).payload(req_body)
 
@@ -1288,6 +1290,7 @@ require 'securerandom'
         # Correlation id and duration for logs / analytics
         t0 = Time.now
         corr = call(:build_correlation_id)
+        url = nil; req_body = nil
 
         begin
           model_path = call(:build_embedding_model_path, connection, input['model'])
@@ -1373,6 +1376,7 @@ require 'securerandom'
         # Correlation id and duration for logs / analytics
         t0 = Time.now
         corr = call(:build_correlation_id)
+        url = nil; req_body = nil
 
         # Compute model path
         model_path = call(:build_model_path_with_global_preview, connection, input['model'])
@@ -1386,12 +1390,13 @@ require 'securerandom'
         url = call(:aipl_v1_url, connection, loc_from_model, "#{model_path}:countTokens")
 
         begin
-        resp = post(url)
-                  .headers(call(:request_headers_auth, connection, corr, nil, "model=#{model_path}"))
-                    .payload(call(:json_compact, {
-                      'contents'          => contents,
-                      'systemInstruction' => sys_inst
-                    }))
+          req_body = call(:json_compact, {
+            'contents'          => contents,
+            'systemInstruction' => sys_inst
+          })
+          resp = post(url)
+                    .headers(call(:request_headers_auth, connection, corr, nil, "model=#{model_path}"))
+                    .payload(req_body)
           code = call(:telemetry_success_code, resp)
           resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
         rescue => e
@@ -1728,7 +1733,7 @@ require 'securerandom'
 
     # ---------- Rerank helpers (tidy + reusable) --------------------------
     rerank_enrich_records: lambda do |input_records, ranked_min|
-      # Build index of caller-provided records by id for O(1) lookups.
+      # Build index of caller-provided records by id
       idx = {}
       call(:safe_array, input_records).each do |r|
         next unless r
@@ -1739,7 +1744,7 @@ require 'securerandom'
           'metadata' => (r['metadata'].is_a?(Hash) ? r['metadata'] : nil)
         }
       end
-      # Merge in place preserving rank order
+      # Merge preserving rank order
       call(:safe_array, ranked_min).map do |r|
         src = idx[r['id']]
         r.merge('content' => (src && src['content']),
@@ -1747,11 +1752,9 @@ require 'securerandom'
       end
     end,
     derive_source_uri: lambda do |md, source_key='source', uri_key='uri'|
-      # md can be nil; keys may vary across pipelines.
       m = md.is_a?(Hash) ? md : {}
       source = m[source_key] || m['source'] || m['displayName']
       uri = m[uri_key]
-      # Common fallbacks users see from Rag Store / Discovery / DIY
       %w[sourceUri gcsUri url uri].each { |k| uri ||= m[k] }
       { 'source' => source, 'uri' => uri }
     end,
@@ -1760,13 +1763,13 @@ require 'securerandom'
         md = r['metadata'] || {}
         der = call(:derive_source_uri, md, source_key, uri_key)
         {
-          'id'          => r['id'],
-          'text'        => r['content'].to_s,
-          'score'       => r['score'],
-          'source'      => der['source'],
-          'uri'         => der['uri'],
-          'metadata'    => md,
-          'metadata_kv' => md.map { |k,v| { 'key' => k.to_s, 'value' => v } },
+          'id'            => r['id'],
+          'text'          => r['content'].to_s,
+          'score'         => r['score'],
+          'source'        => der['source'],
+          'uri'           => der['uri'],
+          'metadata'      => md,
+          'metadata_kv'   => md.map { |k,v| { 'key' => k.to_s, 'value' => v } },
           'metadata_json' => (md.nil? || md.empty?) ? nil : md.to_json
         }
       end
@@ -2016,6 +2019,13 @@ require 'securerandom'
     end,
     aipl_v1_url: lambda do |connection, loc, path|
       "https://#{call(:aipl_service_host, connection, loc)}/v1/#{path}"
+    end,
+    aipl_v1_url: lambda do |connection, loc, path|
+      "https://#{call(:aipl_service_host, connection, loc)}/v1/#{path}"
+    end,
+    # Needed for preview/alpha endpoints (e.g., Ranking API)
+    aipl_v1alpha_url: lambda do |connection, loc, path|
+      "https://#{call(:aipl_service_host, connection, loc)}/v1alpha/#{path}"
     end,
     endpoint_predict_url: lambda do |connection, endpoint|
       ep = call(:normalize_endpoint_identifier, endpoint).to_s
