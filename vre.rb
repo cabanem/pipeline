@@ -344,7 +344,7 @@ require 'securerandom'
   # --------- ACTIONS ------------------------------------------------------
   actions: {
 
-    # 1) Email categorization (100)
+    # 1) Email categorization
     gen_categorize_email: {
       title: 'Email: Categorize email',
       subtitle: 'Classify an email into a category',
@@ -798,7 +798,6 @@ require 'securerandom'
           'ok'=>true, 'telemetry'=>{ 'http_status'=>200, 'message'=>'OK', 'duration_ms'=>12, 'correlation_id'=>'sample' } }
       end
     },
-
     rank_texts_with_ranking_api: {
       title: 'Ranking API: Rerank texts',
       subtitle: 'projects.locations.rankingConfigs:rank',
@@ -827,13 +826,28 @@ require 'securerandom'
             hint: 'If true, response returns only {id, score}. Useful when you only need scores.' },
           { name: 'ranking_config_name', optional: true, hint: 'Full name or simple id. Blank → default_ranking_config' },
           { name: 'emit_metrics', type: 'boolean', control_type: 'checkbox', optional: true, default: true },
-          { name: 'metrics_namespace', optional: true }
+          { name: 'metrics_namespace', optional: true },
+          # --- New tidy knobs ---
+          { name: 'emit_shape', control_type: 'select', pick_list: 'rerank_emit_shapes', optional: true, default: 'context_chunks',
+            hint: 'Choose output shape: records-only, enriched records, or generator-ready context_chunks.' },
+          { name: 'source_key', optional: true, hint: 'Metadata key to use for source (default: "source")' },
+          { name: 'uri_key',    optional: true, hint: 'Metadata key to use for uri (default: "uri")' }
         ]
       end,
       output_fields: lambda do |object_definitions, _connection|
         [
+          # Always present; shape controls richness
           { name: 'records', type: 'array', of: 'object', properties: [
-              { name: 'id' }, { name: 'score', type: 'number' }
+              { name: 'id' }, { name: 'score', type: 'number' }, { name: 'rank', type: 'integer' },
+              { name: 'content' }, { name: 'metadata', type: 'object' }
+            ] },
+          # Present when emit_shape == 'context_chunks'
+          { name: 'context_chunks', type: 'array', of: 'object', properties: [
+              { name: 'id' }, { name: 'text' }, { name: 'score', type: 'number' },
+              { name: 'source' }, { name: 'uri' },
+              { name: 'metadata', type: 'object' },
+              { name: 'metadata_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] },
+              { name: 'metadata_json' }
             ] }
         ] + Array(object_definitions['envelope_fields'])
       end,
@@ -885,8 +899,30 @@ require 'securerandom'
                  .payload(req_body)
 
         code = call(:telemetry_success_code, resp)
-        out  = { 'records' => (resp['records'] || []) }
-                .merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+        # Minimal ranked list from API (or accurate when API omits details)
+        ranked_min = Array(resp['records']).each_with_index.map { |r, i|
+          { 'id' => r['id'].to_s, 'score' => r['score'].to_f, 'rank' => i + 1 }
+        }
+
+        # Enrich from caller input; centralized helpers keep this tidy
+        enriched = call(:rerank_enrich_records, input['records'], ranked_min)
+
+        # Shape
+        shape = (input['emit_shape'].presence || 'context_chunks').to_s
+        out_records =
+          case shape
+          when 'records_only'     then ranked_min
+          when 'enriched_records' then enriched
+          else                          enriched
+          end
+
+        out = { 'records' => out_records }
+        if shape == 'context_chunks'
+          out['context_chunks'] = call(:context_chunks_from_enriched, enriched,
+                                       (input['source_key'].presence || 'source'),
+                                       (input['uri_key'].presence    || 'uri'))
+        end
+        out = out.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
 
         out
       rescue => e
@@ -899,13 +935,21 @@ require 'securerandom'
         end
         error(env)   # <-- raise so Workato marks step failed and retries if applicable
       end,
-      sample_output: lambda do |connection, input|
-        { 'records' => [ { 'id' => 'ctx-1', 'score' => 0.92 } ],
-          'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 9, 'correlation_id' => 'sample' } }
+      sample_output: lambda do |_connection, _input|
+        {
+          'records' => [
+            { 'id' => 'ctx-1', 'score' => 0.92, 'rank' => 1, 'content' => '...', 'metadata' => { 'source' => 'handbook', 'uri' => 'https://...' } }
+          ],
+          'context_chunks' => [
+            { 'id' => 'ctx-1', 'text' => '...', 'score' => 0.92, 'source' => 'handbook', 'uri' => 'https://...',
+              'metadata' => { 'page' => 7 }, 'metadata_kv' => [{ 'key' => 'page', 'value' => 7 }], 'metadata_json' => '{"page":7}' }
+          ],
+          'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 9, 'correlation_id' => 'sample' }
+        }
       end
     },
 
-    # RAG store engine (80-86)
+    # RAG store engine
     rag_retrieve_contexts: {
       title: 'RAG (Serving): Retrieve contexts',
       subtitle: 'projects.locations:retrieveContexts (Vertex RAG Store)',
@@ -1011,14 +1055,28 @@ require 'securerandom'
           { name: 'restrict_to_file_ids', type: 'array', of: 'string', optional: true },
           { name: 'max_contexts', type: 'integer', optional: true, default: 12 },
           { name: 'system_preamble', optional: true, hint: 'e.g., Only answer from retrieved contexts; say “I don’t know” otherwise.' },
-          { name: 'temperature', type: 'number', optional: true, hint: 'Default 0' }
+          { name: 'temperature', type: 'number', optional: true, hint: 'Default 0' },
+          { name: 'emit_context_chunks', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+            hint: 'If enabled, returns generator-ready context_chunks alongside the answer.' },
+          { name: 'return_rationale', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+            hint: 'If enabled, model returns a brief rationale (1–2 sentences) for traceability.' },
+          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
         ]
       end,
       output_fields: lambda do |object_definitions, connection|
         [
           { name: 'answer' },
+          { name: 'rationale' },
           { name: 'citations', type: 'array', of: 'object', properties: [
               { name: 'chunk_id' }, { name: 'source' }, { name: 'uri' }, { name: 'score', type: 'number' }
+            ]
+          },
+          { name: 'context_chunks', type: 'array', of: 'object', properties: [
+              { name: 'id' }, { name: 'text' }, { name: 'score', type: 'number' },
+              { name: 'source' }, { name: 'uri' },
+              { name: 'metadata', type: 'object' },
+              { name: 'metadata_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] },
+              { name: 'metadata_json' }
             ]
           },
           { name: 'responseId' },
@@ -1038,8 +1096,10 @@ require 'securerandom'
         ]
       end,
       execute: lambda do |connection, input|
-        t0 = Time.now
+        t0   = Time.now
         corr = call(:build_correlation_id)
+        retr_url = nil; retr_req_body = nil
+        gen_url  = nil;  gen_req_body  = nil
 
         # Validate inputs
         proj = connection['project_id']
@@ -1051,33 +1111,13 @@ require 'securerandom'
         corpus = call(:normalize_rag_corpus, connection, input['rag_corpus'])
         error('rag_corpus is required') if corpus.blank?
 
-        loc    = (connection['location'] || '').downcase
         parent = "projects/#{connection['project_id']}/locations/#{loc}"
         req_params_retr = "parent=#{parent}"
 
         retrieve_payload = call(:build_rag_retrieve_payload, input['question'], corpus, input['restrict_to_file_ids'])
-
-        retr_url  = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
+        retr_url      = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
         retr_req_body = call(:json_compact, retrieve_payload)
-
-        # Precompute model path & generation scaffold used by both real and validate-only flows
-        model_path = call(:build_model_path_with_global_preview, connection, input['model'])
-        gen_cfg = {
-          'temperature'       => (input['temperature'].present? ? call(:safe_float, input['temperature']) : 0),
-          'maxOutputTokens'   => 1024,
-          'responseMimeType'  => 'application/json',
-          'responseSchema'    => {
-            'type'=>'object','additionalProperties'=>false,
-            'properties'=>{'answer'=>{'type'=>'string'},'citations'=>{'type'=>'array','items'=>{'type'=>'object','additionalProperties'=>false,'properties'=>{'chunk_id'=>{'type'=>'string'},'source'=>{'type'=>'string'},'uri'=>{'type'=>'string'},'score'=>{'type'=>'number'}}}}},
-            'required'=>['answer']
-          }
-        }
-        sys_text = (input['system_preamble'].presence ||
-          'Answer using ONLY the retrieved context chunks. If the context is insufficient, reply with “I don’t know.” Keep answers concise and include citations with chunk_id, source, uri, and score.')
-        sys_inst = { 'role'=>'system','parts'=>[{'text'=>sys_text}] }
-
-
-        retr_resp = call(:http_call!, 'POST', retr_url)
+        retr_resp = post(retr_url)
                       .headers(call(:request_headers_auth, connection, corr, nil, req_params_retr))
                       .payload(retr_req_body)
         raw_ctxs = call(:normalize_retrieve_contexts!, retr_resp)
@@ -1097,6 +1137,7 @@ require 'securerandom'
             'type'        => 'object', 'additionalProperties' => false,
             'properties'  => {
               'answer'    => { 'type' => 'string' },
+              'rationale' => { 'type' => 'string' },
               'citations' => {
                 'type'    => 'array',
                 'items'   => {
@@ -1114,9 +1155,11 @@ require 'securerandom'
           }
         }
 
+        want_rat = call(:normalize_boolean, input['return_rationale'])
         sys_text = (input['system_preamble'].presence ||
-          'Answer using ONLY the retrieved context chunks. If the context is insufficient, reply with “I don’t know.” '\
-          'Keep answers concise and include citations with chunk_id, source, uri, and score.')
+          "Answer using ONLY the retrieved context chunks. If the context is insufficient, reply with “I don’t know.” "\
+          "Keep answers concise and include citations with chunk_id, source, uri, and score."\
+          "#{want_rat ? ' Also include a brief rationale (1–2 sentences) explaining which chunks support the answer.' : ''}")
         sys_inst = { 'role' => 'system', 'parts' => [ { 'text' => sys_text } ] }
 
         ctx_blob = call(:format_context_chunks, chunks)
@@ -1135,35 +1178,79 @@ require 'securerandom'
 
         # Derive location from model path to avoid region/global mismatch
         loc_from_model = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
-        gen_url  = call(:aipl_v1_url, connection, loc_from_model, "#{model_path}:generateContent")
+        gen_url      = call(:aipl_v1_url, connection, loc_from_model, "#{model_path}:generateContent")
         gen_req_body = call(:json_compact, gen_payload)
         req_params_gen = "model=#{model_path}"
-        gen_raw   = call(:http_call!, 'POST', gen_url)
-                      .headers(call(:request_headers_auth, connection, corr, nil, req_params_gen))
-                      .payload(gen_req_body)
-
-
-        gen_body  = call(:http_body_json, gen_raw)
-        text      = gen_body.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
+        gen_resp = post(gen_url)
+                     .headers(call(:request_headers_auth, connection, corr, nil, req_params_gen))
+                     .payload(gen_req_body)
+        text      = gen_resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
         parsed = call(:safe_parse_json, text)
 
-        {
-          'answer'     => (parsed['answer'] || text),
-          'citations'  => (parsed['citations'] || []),
-          'responseId' => gen_body['responseId'],
-          'usage'      => gen_body['usageMetadata']
-        }.merge(call(:telemetry_envelope, t0, corr, true, call(:telemetry_success_code, gen_raw), 'OK'))
+        out = {
+          'answer'          => (parsed['answer'] || text),
+          'rationale'       => (parsed['rationale'] || nil),
+          'citations'       => (parsed['citations'] || []),
+          'responseId'      => gen_resp['responseId'],
+          'usage'           => gen_resp['usageMetadata']
+        }.merge(call(:telemetry_envelope, t0, corr, true, call(:telemetry_success_code, gen_resp), 'OK'))
+
+        # Enrich citations with source/uri from matching context chunks (best-effort)
+        begin
+          if out['citations'].is_a?(Array) && chunks.is_a?(Array)
+            by_id = {}; chunks.each { |c| by_id[c['id'].to_s] = c }
+            out['citations'] = out['citations'].map do |c|
+              h = c.is_a?(Hash) ? c.dup : {}
+              cid = h['chunk_id'].to_s
+              if cid != '' && by_id[cid]
+                h['source'] ||= by_id[cid]['source']
+                h['uri']    ||= by_id[cid]['uri']
+                h['score']  ||= by_id[cid]['score']
+              end
+              h
+            end
+          end
+        rescue
+          # non-fatal; leave citations as-is
+        end
+
+        # Optional emission of generator-ready context chunks (same shape used elsewhere)
+        if call(:normalize_boolean, input['emit_context_chunks'])
+          out['context_chunks'] = chunks
+        end
+
+        # Attach request preview / debug in non-prod when requested
+        unless call(:normalize_boolean, connection['prod_mode'])
+          if call(:normalize_boolean, input['debug'])
+            out = out.merge(call(:request_preview_pack, gen_url, 'POST',
+                                 call(:request_headers_auth, connection, corr, nil, req_params_gen),
+                                 gen_req_body))
+          end
+        end
+        out
       rescue => e
         g = call(:extract_google_error, e)
         msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-        {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
+        env = call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg)
+        # Optional debug attachment in non-prod:
+        if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
+          env['debug'] = call(:debug_pack, true, gen_url || retr_url, (gen_req_body || retr_req_body), g)
+        end
+        error(env)  # raise so Workato marks the step failed and retries if applicable
       end,
       sample_output: lambda do
         {
           'answer' => 'Employees may carry over up to 40 hours of PTO.',
+          'rationale' => 'Policy paragraph [doc-42#c3] states the carryover cap explicitly.',
           'citations' => [
             { 'chunk_id' => 'doc-42#c3', 'source' => 'handbook', 'uri' => 'https://drive.google.com/file/d/abc...', 'score' => 0.91 }
           ],
+          'context_chunks' => [
+            { 'id' => 'doc-42#c3', 'text' => 'Employees may carry over up to 40 hours...', 'score' => 0.91,
+              'source' => 'handbook', 'uri' => 'https://drive.google.com/file/d/abc...',
+              'metadata' => { 'page' => 7 }, 'metadata_kv' => [{ 'key' => 'page', 'value' => 7 }], 'metadata_json' => '{"page":7}' }
+          ],
+
           'responseId' => 'resp-123',
           'usage' => { 'promptTokenCount' => 298, 'candidatesTokenCount' => 156, 'totalTokenCount' => 454 },
           'ok' => true,
@@ -1172,7 +1259,7 @@ require 'securerandom'
       end
     },
 
-    # Utility (5-10)
+    # Utility
     embed_text: {
       title: 'Embeddings: Embed text',
       subtitle: 'Get embeddings from a publisher embedding model',
@@ -1380,6 +1467,17 @@ require 'securerandom'
 
   # --------- PICK LISTS ---------------------------------------------------
   pick_lists: {
+   # What to emit from rerank for ergonomics/BC:
+   # - records_only:     [{id, score, rank}]
+   # - enriched_records: [{id, score, rank, content, metadata}]
+   # - context_chunks:   enriched records + generator-ready context_chunks
+   rerank_emit_shapes: lambda do
+     [
+       ['Records only (id, score, rank)','records_only'],
+       ['Enriched records (adds content/metadata)','enriched_records'],
+       ['Context chunks (enriched + context_chunks)','context_chunks']
+     ]
+   end,
    gen_generate_modes: lambda do
      [
        ['Plain (no grounding)','plain'],
@@ -1626,6 +1724,52 @@ require 'securerandom'
         }
       end
       { 'nearestNeighbors' => list }
+    end,
+
+    # ---------- Rerank helpers (tidy + reusable) --------------------------
+    rerank_enrich_records: lambda do |input_records, ranked_min|
+      # Build index of caller-provided records by id for O(1) lookups.
+      idx = {}
+      call(:safe_array, input_records).each do |r|
+        next unless r
+        id  = (r['id'] || r[:id]).to_s
+        next if id.empty?
+        idx[id] = {
+          'content'  => (r['content']  || r[:content]).to_s,
+          'metadata' => (r['metadata'].is_a?(Hash) ? r['metadata'] : nil)
+        }
+      end
+      # Merge in place preserving rank order
+      call(:safe_array, ranked_min).map do |r|
+        src = idx[r['id']]
+        r.merge('content' => (src && src['content']),
+                'metadata' => (src && src['metadata']))
+      end
+    end,
+    derive_source_uri: lambda do |md, source_key='source', uri_key='uri'|
+      # md can be nil; keys may vary across pipelines.
+      m = md.is_a?(Hash) ? md : {}
+      source = m[source_key] || m['source'] || m['displayName']
+      uri = m[uri_key]
+      # Common fallbacks users see from Rag Store / Discovery / DIY
+      %w[sourceUri gcsUri url uri].each { |k| uri ||= m[k] }
+      { 'source' => source, 'uri' => uri }
+    end,
+    context_chunks_from_enriched: lambda do |enriched_records, source_key='source', uri_key='uri'|
+      call(:safe_array, enriched_records).map do |r|
+        md = r['metadata'] || {}
+        der = call(:derive_source_uri, md, source_key, uri_key)
+        {
+          'id'          => r['id'],
+          'text'        => r['content'].to_s,
+          'score'       => r['score'],
+          'source'      => der['source'],
+          'uri'         => der['uri'],
+          'metadata'    => md,
+          'metadata_kv' => md.map { |k,v| { 'key' => k.to_s, 'value' => v } },
+          'metadata_json' => (md.nil? || md.empty?) ? nil : md.to_json
+        }
+      end
     end,
 
     # --- Telemetry and resilience -----------------------------------------
