@@ -1008,24 +1008,32 @@ require 'securerandom'
             }
           }
         }
-
         rc = input['rag_corpus'].to_s.strip
         unless rc.empty?
-          body['data_source'] = {
-            'vertexRagStore' => {
-              'ragResources' => [{ 'ragCorpus' => rc }]
-            }
+          # 'data_source' is a union; include only the chosen member at top level.
+          body['vertexRagStore'] = {
+            'ragResources' => [{ 'ragCorpus' => rc }]
           }
         end
 
         result = post("https://#{host}#{path}")
           .headers(call(:default_headers, connection))
           .payload(body)
-          .after_response { |code, body, headers, _| call(:normalize_response!, code, body, headers) }
-          .after_error_response { |code, body, headers, _| call(:normalize_error!, code, body, headers) }
+          .after_response do |code, body, headers, _|
+            parsed = call(:safe_parse_json, body)
+            call(:normalize_response!, code, parsed, headers)
+          end
+          .after_error_response do |code, body, headers, _|
+            parsed = call(:safe_parse_json, body)
+            call(:normalize_error!, code, parsed, headers)
+          end
 
         # API returns: { contexts: { contexts: [ ... ] } }
-        arr = (result.dig('contexts', 'contexts') || [])
+        arr = []
+        # result is guaranteed Hash-ish after safe_parse_json, but be defensive anyway
+        if result.respond_to?(:dig)
+          arr = result.dig('contexts', 'contexts') || []
+        end
 
         mapped = arr.map do |c|
           {
@@ -1382,6 +1390,16 @@ require 'securerandom'
       base_opts
     end,
     # --- REQUIRED ENV HELPERS (SDK-compliant signatures) -----------------
+    safe_parse_json: lambda do |maybe_string|
+      return maybe_string unless maybe_string.is_a?(String)
+      begin
+        parse_json(maybe_string)
+      rescue
+        # If the server lied about content-type or returned pretty text,
+        # keep the original; the caller can handle/log.
+        maybe_string
+      end
+    end,
     ensure_project_id!: lambda do |connection|
       pid = connection['project'].to_s.strip
       error('Project is required') if pid.empty?
@@ -1397,7 +1415,10 @@ require 'securerandom'
     end,
     default_headers: lambda do |connection|
       # Deliberately keep these minimal to avoid duplication of headers
-      { 'Content-Type' => 'application/json; charset=utf-8' }
+      {
+      'Content-Type' => 'application/json; charset=utf-8',
+      'Accept' => 'application/json'
+      }
     end,
     path_generate_content: lambda do |connection, model|
       pub = (connection['publisher'].presence || 'google')
