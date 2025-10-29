@@ -64,11 +64,8 @@ require 'securerandom'
       end,
 
       apply: lambda do |connection|
-        # Keep headers minimal; envelope/correlation lives in actions
-        h = { 'Authorization' => "Bearer #{connection['access_token']}" }
-        up = connection['user_project'].to_s.strip
-        h['x-goog-user-project'] = up unless up.empty?
-        headers(h)
+        # Auth-only. All Google routing headers must be set per request.
+        headers('Authorization' => "Bearer #{connection['access_token']}")
       end,
 
       token_url: 'https://oauth2.googleapis.com/token',
@@ -78,13 +75,8 @@ require 'securerandom'
       detect_on:  [/UNAUTHENTICATED/i, /invalid[_-]?token/i, /expired/i, /insufficient/i]
     },
   
-    base_uri: lambda do |connection|
-      # This block cannot call a method, the context WithGlobalDSL does not expose 'call'
-      loc  = (connection['location'].to_s.strip.downcase)
-      loc  = 'global' if loc.empty?
-      host = (loc == 'global') ? 'aiplatform.googleapis.com' : "#{loc}-aiplatform.googleapis.com"
-      "https://#{host}/v1/"
-    end,
+    # No base_uri. Every action constructs an absolute URL to prevent host bleed.
+    # base_uri intentionally omitted
 
   },
 
@@ -710,7 +702,7 @@ require 'securerandom'
           url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
           req_params = "model=#{model_path}"
           req_body = call(:json_compact, payload)
-          resp = post(url).headers(call(:request_headers_auth, connection, corr, nil, req_params)).payload(req_body)
+          resp = post(url).headers(call(:request_headers_auth, connection, corr, connection['user_project'], req_params)).payload(req_body)
 
           text   = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
           parsed = call(:safe_parse_json, text)
@@ -873,11 +865,9 @@ require 'securerandom'
 
         req_params = "ranking_config=projects/#{connection['project_id']}/locations/#{loc}/rankingConfigs/#{config_id}"
 
-        # Build the v1alpha URL:
-        
-        # Vertex AI Ranking API is on Discovery Engine (Vertex AI Search) host
-        # /v1alpha/projects/{project}/locations/{location}/rankingConfigs/{config}:rank
-        ver = (connection['discovery_api_version'].presence || 'v1').to_s
+        # Build absolute URL to Discovery Engine Ranking API (no base_uri usage)
+        # POST https://discoveryengine.googleapis.com/{ver}/projects/*/locations/*/rankingConfigs/*:rank
+        ver = (connection['discovery_api_version'].presence || 'v1alpha').to_s
         url = call(
           :discovery_url,
           connection,
@@ -903,7 +893,7 @@ require 'securerandom'
         req_body = call(:json_compact, body)
 
         resp = post(url)
-                 .headers(call(:request_headers_auth, connection, corr, nil, req_params))
+                 .headers(call(:request_headers_auth, connection, corr, connection['user_project'], req_params))
                  .payload(req_body)
 
         code = call(:telemetry_success_code, resp)
@@ -1017,7 +1007,7 @@ require 'securerandom'
 
         url  = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
         resp = post(url)
-                .headers(call(:request_headers_auth, connection, corr, nil, req_params))
+                .headers(call(:request_headers_auth, connection, corr, connection['user_project'], req_params))
                 .payload(call(:json_compact, payload))
 
         raw     = call(:normalize_retrieve_contexts!, resp)
@@ -1190,7 +1180,7 @@ require 'securerandom'
         gen_req_body = call(:json_compact, gen_payload)
         req_params_gen = "model=#{model_path}"
         gen_resp = post(gen_url)
-                     .headers(call(:request_headers_auth, connection, corr, nil, req_params_gen))
+                     .headers(call(:request_headers_auth, connection, corr, connection['user_project'], req_params_gen))
                      .payload(gen_req_body)
         text      = gen_resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
         parsed = call(:safe_parse_json, text)
@@ -1231,7 +1221,7 @@ require 'securerandom'
         unless call(:normalize_boolean, connection['prod_mode'])
           if call(:normalize_boolean, input['debug'])
             out = out.merge(call(:request_preview_pack, gen_url, 'POST',
-                                 call(:request_headers_auth, connection, corr, nil, req_params_gen),
+                                 call(:request_headers_auth, connection, corr, connection['user_project'], req_params_gen),
                                  gen_req_body))
           end
         end
@@ -1401,7 +1391,7 @@ require 'securerandom'
             'systemInstruction' => sys_inst
           })
           resp = post(url)
-                    .headers(call(:request_headers_auth, connection, corr, nil, "model=#{model_path}"))
+                    .headers(call(:request_headers_auth, connection, corr, connection['user_project'], "model=#{model_path}"))
                     .payload(req_body)
           code = call(:telemetry_success_code, resp)
           resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
@@ -1437,7 +1427,6 @@ require 'securerandom'
             hint: 'Operation name or full path, e.g., projects/{p}/locations/{l}/operations/{id}' }
         ]
       end,
-
       output_fields: lambda do |_|
         [
           { name: 'name' }, { name: 'done', type: 'boolean' },
@@ -1450,7 +1439,6 @@ require 'securerandom'
           ]}
         ]
       end,
-
       execute: lambda do |connection, input|
         t0 = Time.now
         corr = call(:build_correlation_id)
@@ -1460,7 +1448,7 @@ require 'securerandom'
           op = input['operation'].to_s.sub(%r{^/v1/}, '')
           loc = (connection['location'].presence || 'us-central1').to_s.downcase
           url = call(:aipl_v1_url, connection, loc, op.start_with?('projects/') ? op : "projects/#{connection['project_id']}/locations/#{loc}/operations/#{op}")
-          resp = get(url).headers(call(:request_headers_auth, connection, corr))
+          resp = get(url).headers(call(:request_headers_auth, connection, corr, connection['user_project'], nil))
           code = call(:telemetry_success_code, resp)
           resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
         rescue => e
@@ -1651,7 +1639,7 @@ require 'securerandom'
         'generationConfig'  => gen_cfg
       }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
 
-      resp = post(url).headers(call(:request_headers_auth, connection, corr, nil, req_params))
+      resp = post(url).headers(call(:request_headers_auth, connection, corr, connection['user_project'], req_params))
                       .payload(call(:json_compact, payload))
       code = call(:telemetry_success_code, resp)
 
@@ -1673,14 +1661,20 @@ require 'securerandom'
     end,
 
     # --- Canonical per-request headers (Authorization + routing) ----------
-    request_headers_auth: lambda do |_connection, correlation_id, extra=nil, request_params=nil|
-      # Auth header comes from connection.authorization.apply
-      # Workato sets JSON headers when .payload is used. Keep this minimal.
-      h = { 'X-Correlation-Id' => correlation_id.to_s }
+    # NOTE: signature changed — arg3 is user_project, not "extra" hash.
+    request_headers_auth: lambda do |_connection, correlation_id, user_project=nil, request_params=nil|
+      h = {
+        'X-Correlation-Id' => correlation_id.to_s,
+        'Content-Type'     => 'application/json',
+        'Accept'           => 'application/json'
+      }
+      up = user_project.to_s.strip
+      h['x-goog-user-project']   = up unless up.empty?
       rp = request_params.to_s.strip
       h['x-goog-request-params'] = rp unless rp.empty?
-      extra.is_a?(Hash) ? h.merge(extra) : h
+      h
     end,
+
     # --- HTTP -------------------------------------------------------------
     http_call!: lambda do |verb, url|
       v = verb.to_s.upcase
@@ -2026,9 +2020,7 @@ require 'securerandom'
     aipl_v1_url: lambda do |connection, loc, path|
       "https://#{call(:aipl_service_host, connection, loc)}/v1/#{path}"
     end,
-    aipl_v1_url: lambda do |connection, loc, path|
-      "https://#{call(:aipl_service_host, connection, loc)}/v1/#{path}"
-    end,
+
     # Needed for preview/alpha endpoints (e.g., Ranking API)
     aipl_v1alpha_url: lambda do |connection, loc, path|
       "https://#{call(:aipl_service_host, connection, loc)}/v1alpha/#{path}"
@@ -2451,7 +2443,7 @@ require 'securerandom'
       (instances || []).each_slice(max) do |slice|
         url  = call(:aipl_v1_url, connection, loc, "#{model_path}:predict")
         resp = post(url)
-                .headers(call(:request_headers_auth, connection, (corr || call(:build_correlation_id)), nil, req_params))
+                .headers(call(:request_headers_auth, connection, (corr || call(:build_correlation_id)), connection['user_project'], req_params))
                 .payload({
                   'instances'  => slice,
                   'parameters' => (params.presence || {})
@@ -2564,7 +2556,7 @@ require 'securerandom'
       loc  = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
       url  = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
       resp = post(url)
-               .headers(call(:request_headers_auth, connection, (corr || call(:build_correlation_id)), nil, req_params))
+               .headers(call(:request_headers_auth, connection, (corr || call(:build_correlation_id)), connection['user_project'], req_params))
                .payload(call(:json_compact, payload))
 
       text   = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s.strip
@@ -2592,14 +2584,6 @@ require 'securerandom'
       loc = (connection['location'] || '').to_s.downcase
       error("RAG corpus requires regional location; got '#{loc}'") if loc.blank? || loc == 'global'
       "projects/#{connection['project_id']}/locations/#{loc}/ragCorpora/#{v}"
-    end,
-
-    # --- Hints ------------------------------------------------------------
-    model_id_hint: lambda do
-      'Free-text model id. Short: "gemini-2.5-pro" or "text-embedding-005". ' +
-      'Publisher form: "publishers/google/models/{id}". ' +
-      'Full: "projects/{project}/locations/{region}/publishers/google/models/{id}". ' +
-      'Tip: find ids in Vertex Model Garden or via REST GET v1/projects/{project}/locations/{region}/publishers/google/models/*.'
     end,
 
     # --- Miscellaneous ----------------------------------------------------
@@ -2828,7 +2812,7 @@ require 'securerandom'
       }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
 
       begin
-        post(url).headers(call(:request_headers_auth, connection, (corr || call(:build_correlation_id)), nil, req_params))
+        post(url).headers(call(:request_headers_auth, connection, (corr || call(:build_correlation_id)), connection['user_project'], req_params))
                  .payload(call(:json_compact, payload))
 
       rescue
