@@ -163,19 +163,16 @@ require 'securerandom'
           { name: 'temperature', type: 'number', optional: true, ngIf: 'input.mode == "rag_with_context"' },
           { name: 'rag_corpus', optional: true, hint: 'projects/{project}/locations/{region}/ragCorpora/{corpus}',
             ngIf: 'input.mode == "grounded_rag_store"' },
-          { name: 'similarity_top_k', type: 'integer', optional: true, hint: 'Retrieval topK before ranking (1–200)',
-            ngIf: 'input.mode == "grounded_rag_store"' },
-          { name: 'vector_distance_threshold', type: 'number', optional: true, hint: 'Mutually exclusive with similarity threshold',
-            ngIf: 'input.mode == "grounded_rag_store"' },
-          { name: 'vector_similarity_threshold', type: 'number', optional: true,
-            hint: 'Mutually exclusive with distance threshold',
-            ngIf: 'input.mode == "grounded_rag_store"' },
-          { name: 'rank_service_model', optional: true,
-            hint: 'Semantic ranker (e.g., semantic-ranker-512@latest). Do not set with llm_ranker_model.',
-            ngIf: 'input.mode == "grounded_rag_store"' },
-          { name: 'llm_ranker_model', optional: true,
-            hint: 'Gemini ranker (e.g., gemini-2.0-flash). Do not set with rank_service_model.',
-            ngIf: 'input.mode == "grounded_rag_store"' }
+          { name: 'rag_retrieval_config', label: 'Retrieval config', type: 'object',
+            properties: object_definitions['rag_retrieval_config'],
+            ngIf: 'input.mode == "grounded_rag_store"', optional: true },
+          # Back-compat single fields (optional)
+          { name: 'similarity_top_k', type: 'integer', optional: true, ngIf: 'input.mode == "grounded_rag_store"',
+            hint: 'Pre-ranking candidate cap (1–200).' },
+          { name: 'vector_distance_threshold', type: 'number', optional: true, ngIf: 'input.mode == "grounded_rag_store"' },
+          { name: 'vector_similarity_threshold', type: 'number', optional: true, ngIf: 'input.mode == "grounded_rag_store"' },
+          { name: 'rank_service_model', optional: true, ngIf: 'input.mode == "grounded_rag_store"' },
+          { name: 'llm_ranker_model', optional: true, ngIf: 'input.mode == "grounded_rag_store"' }
         ]
       end
     },
@@ -969,38 +966,47 @@ require 'securerandom'
     rag_retrieve_contexts: {
       title: 'RAG (Serving): Retrieve contexts',
       subtitle: 'projects.locations:retrieveContexts (Vertex RAG Store)',
+      help: lambda do |_|
+        {
+          body:
+            'Retrieves contexts from a Vertex RAG corpus. ' \
+            'Knobs: top_k limits pre-ranking candidates; use EITHER vector_distance_threshold OR vector_similarity_threshold (not both). ' \
+            'Pick ONE ranker: rank_service_model (semantic ranker) OR llm_ranker_model (Gemini). ' \
+            'Guidance: if your index uses COSINE distance, distance≈1−similarity (so distance≤0.30 ≈ similarity≥0.70). ' \
+            'Start with top_k=20, then tighten by threshold; add a ranker only if you need stricter ordering.'
+        }
+      end,
       display_priority: 86,
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
 
-      input_fields: lambda do
+      input_fields: lambda do |object_definitions, _connection, _config_fields|
         [
-          { name: 'rag_corpus', optional: false, hint: 'Accepts either full resource name (e.g., "projects/{project}/locations/{region}/ragCorpora/{corpus}") or the "corpus"' },
+          { name: 'rag_corpus', optional: false,
+            hint: 'Accepts either full resource name (e.g., "projects/{project}/locations/{region}/ragCorpora/{corpus}") or the "corpus"' },
           { name: 'question', optional: false },
           { name: 'restrict_to_file_ids', type: 'array', of: 'string', optional: true },
           { name: 'max_contexts', type: 'integer', optional: true, default: 20 },
-          # ---- New retrieval knobs ----
-          { name: 'similarity_top_k', type: 'integer', optional: true, hint: 'Retrieval topK before ranking (1–200)' },
-          { name: 'vector_distance_threshold', type: 'number', optional: true, hint: 'Mutually exclusive with similarity threshold' },
-          { name: 'vector_similarity_threshold', type: 'number', optional: true, hint: 'Mutually exclusive with distance threshold' },
-          { name: 'rank_service_model', optional: true, hint: 'Semantic ranker, e.g., semantic-ranker-512@latest' },
-          { name: 'llm_ranker_model', label: 'LLM ranker model (optional)', optional: true,
-            hint: 'Gemini model (e.g., gemini-2.0-flash). Do not set with rank_service_model.' }
+
+          # Preferred object (teams can use this)
+          { name: 'rag_retrieval_config', label: 'Retrieval config', type: 'object',
+            properties: object_definitions['rag_retrieval_config'], optional: true,
+            hint: 'Set top_k, exactly one threshold (distance OR similarity), and exactly one ranker (semantic OR LLM).' }
+
+          # (If you kept legacy flat fields for BC, they can remain here; not required.)
         ]
       end,
-      output_fields: lambda do |object_definitions, connection|
+
+      output_fields: lambda do |object_definitions, _connection|
         [
           { name: 'question' },
           { name: 'contexts', type: 'array', of: 'object', properties: [
-              { name: 'id' },
-              { name: 'text' },
-              { name: 'score', type: 'number' },
-              { name: 'source' },
-              { name: 'uri' },
+              { name: 'id' }, { name: 'text' }, { name: 'score', type: 'number' },
+              { name: 'source' }, { name: 'uri' },
               { name: 'metadata', type: 'object' },
               { name: 'metadata_kv', label: 'metadata (KV)', type: 'array', of: 'object', properties: object_definitions['kv_pair'] },
-              { name: 'metadata_json', label: 'metadata (JSON)', }
+              { name: 'metadata_json', label: 'metadata (JSON)' }
             ]
           }
         ] + [
@@ -1008,14 +1014,17 @@ require 'securerandom'
           { name: 'telemetry', type: 'object', properties: [
             { name: 'http_status', type: 'integer' },
             { name: 'message' }, { name: 'duration_ms', type: 'integer' },
-            { name: 'correlation_id' }
+            { name: 'correlation_id' },
+            { name: 'retrieval', type: 'object' },
+            { name: 'rank', type: 'object' }
           ]}
         ]
       end,
+
       execute: lambda do |connection, input|
-        t0 = Time.now
+        t0   = Time.now
         corr = call(:build_correlation_id)
-        
+
         proj = connection['project_id']
         loc  = connection['location']
         raise 'Connection missing project_id' if proj.blank?
@@ -1024,79 +1033,66 @@ require 'securerandom'
         corpus = call(:normalize_rag_corpus, connection, input['rag_corpus'])
         error('rag_corpus is required') if corpus.blank?
 
-        loc = (connection['location'] || '').downcase
-        parent = "projects/#{connection['project_id']}/locations/#{loc}"
-        req_params = "parent=#{parent}"
+        loc     = (connection['location'] || '').downcase
+        parent  = "projects/#{connection['project_id']}/locations/#{loc}"
+        req_par = "parent=#{parent}"
+
+        # Merge + validate retrieval options from object/flat inputs
+        opts = call(:build_retrieval_opts_from_input!, input)
 
         payload = call(
           :build_rag_retrieve_payload,
           input['question'],
           corpus,
           input['restrict_to_file_ids'],
-          { 'llmRankerModel' => (input['llm_ranker_model'].presence || nil) }
+          opts
         )
-
-        # Validate unions early
-        call(:guard_threshold_union!, input['vector_distance_threshold'], input['vector_similarity_threshold'])
-        call(:guard_ranker_union!, input['rank_service_model'], input['llm_ranker_model'])
-
-        payload = call(
-          :build_rag_retrieve_payload,
-          input['question'],
-          corpus,
-          input['restrict_to_file_ids'],
-          {
-            'topK'                    => input['similarity_top_k'],
-            'vectorDistanceThreshold' => input['vector_distance_threshold'],
-            'vectorSimilarityThreshold'=> input['vector_similarity_threshold'],
-            'rankServiceModel'        => input['rank_service_model'],
-            'llmRankerModel'          => input['llm_ranker_model']
-          }
-        )       
 
         url  = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
         resp = post(url)
-                .headers(call(:request_headers_auth, connection, corr, connection['user_project'], req_params))
+                .headers(call(:request_headers_auth, connection, corr, connection['user_project'], req_par))
                 .payload(call(:json_compact, payload))
 
-        raw     = call(:normalize_retrieve_contexts!, resp)
-        maxn    = call(:clamp_int, (input['max_contexts'] || 20), 1, 200)
-        mapped  = call(:map_context_chunks, raw, maxn)
+        raw   = call(:normalize_retrieve_contexts!, resp)
+        maxn  = call(:clamp_int, (input['max_contexts'] || 20), 1, 200)
+        mapped= call(:map_context_chunks, raw, maxn)
 
         out = {
           'question' => input['question'],
           'contexts' => mapped
-        }.merge(call(:telemetry_envelope, t0, corr, true, call(:telemetry_success_code, raw), 'OK'))
-        # annotate telemetry with retrieval & ranking preview
-        (out['telemetry'] ||= {})['retrieval'] = {
-          'top_k' => (input['similarity_top_k'].to_i if input['similarity_top_k'].present?),
-          'filter' => (
-            if input['vector_distance_threshold'].present?
-              { 'type' => 'distance', 'value' => input['vector_distance_threshold'].to_f }
-            elsif input['vector_similarity_threshold'].present?
-              { 'type' => 'similarity', 'value' => input['vector_similarity_threshold'].to_f }
-            end
-          )
-        }.compact
-        if input['rank_service_model'].to_s.strip != ''
-          (out['telemetry'] ||= {})['rank'] = { 'mode' => 'rank_service', 'model' => input['rank_service_model'].to_s }
-        elsif input['llm_ranker_model'].to_s.strip != ''
-          (out['telemetry'] ||= {})['rank'] = { 'mode' => 'llm', 'model' => input['llm_ranker_model'].to_s }
+        }.merge(call(:telemetry_envelope, t0, corr, true, call(:telemetry_success_code, resp), 'OK'))
+
+        # Telemetry preview from canonical opts:
+        (out['telemetry'] ||= {})['retrieval'] = {}.tap do |h|
+          h['top_k'] = opts['topK'].to_i if opts['topK']
+          if opts['vectorDistanceThreshold']
+            h['filter'] = { 'type' => 'distance',  'value' => opts['vectorDistanceThreshold'].to_f }
+          elsif opts['vectorSimilarityThreshold']
+            h['filter'] = { 'type' => 'similarity','value' => opts['vectorSimilarityThreshold'].to_f }
+          end
         end
+        if opts['rankServiceModel']
+          (out['telemetry'] ||= {})['rank'] = { 'mode' => 'rank_service', 'model' => opts['rankServiceModel'] }
+        elsif opts['llmRankerModel']
+          (out['telemetry'] ||= {})['rank'] = { 'mode' => 'llm', 'model' => opts['llmRankerModel'] }
+        end
+
         out
       rescue => e
         g = call(:extract_google_error, e)
         msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
         {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
       end,
+
       sample_output: lambda do
         {
           'question' => 'What is the PTO carryover policy?',
           'contexts' => [
             { 'id' => 'doc-42#c3', 'text' => 'Employees may carry over up to 40 hours...', 'score' => 0.91,
-            'source' => 'handbook', 'uri' => 'https://drive.google.com/file/d/abc...', 'metadata' => { 'page' => 7 },
-            'metadata_kv' => [ { 'key' => 'page', 'value' => 7 } ],
-            'metadata_json' => '{"page":7}' }
+              'source' => 'handbook', 'uri' => 'https://drive.google.com/file/d/abc...',
+              'metadata' => { 'page' => 7 },
+              'metadata_kv' => [ { 'key' => 'page', 'value' => 7 } ],
+              'metadata_json' => '{"page":7}' }
           ],
           'ok' => true,
           'telemetry' => {
@@ -1110,34 +1106,43 @@ require 'securerandom'
     rag_answer: {
       title: 'RAG (Serving): Retrieve + answer (one-shot)',
       subtitle: 'Retrieve contexts from a corpus and generate a cited answer',
+      help: lambda do |input, _picklist_label|
+        { body:
+          'One-shot retrieve+answer with citations. ' \
+          'Tuning: top_k controls candidate pool; apply ONE threshold (distance OR similarity) to prune; pick ONE ranker (rank_service_model OR llm_ranker_model). ' \
+          'Interpretation: surfaced context scores reflect retrieval similarity; re-ranking may change order but not the underlying scores. ' \
+          'Start with top_k=12, threshold to drop tails (e.g., similarity≥0.75 or distance≤0.25 for COSINE), then add a ranker if you still see off-topic chunks.'
+        }
+      end,
       display_priority: 86,
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
 
-      input_fields: lambda do |object_definitions, connection, config_fields|
+      input_fields: lambda do |object_definitions, _connection, _config_fields|
         [
           { name: 'model', label: 'Model', optional: false, control_type: 'text' },
-          { name: 'rag_corpus', optional: false, hint: 'projects/{project}/locations/{region}/ragCorpora/{corpus}' },
+          { name: 'rag_corpus', optional: false, hint: 'RAG corpus: projects/{project}/locations/{region}/ragCorpora/{corpus}' },
           { name: 'question', optional: false },
           { name: 'restrict_to_file_ids', type: 'array', of: 'string', optional: true },
           { name: 'max_contexts', type: 'integer', optional: true, default: 12 },
+
+          # Preferred (object) retrieval config
+          { name: 'rag_retrieval_config', label: 'Retrieval config', type: 'object',
+            properties: object_definitions['rag_retrieval_config'], optional: true,
+            hint: 'Use this to set top_k, a single threshold (distance OR similarity), and one ranker (semantic OR LLM).' },
+
           { name: 'system_preamble', optional: true, hint: 'e.g., Only answer from retrieved contexts; say “I don’t know” otherwise.' },
           { name: 'temperature', type: 'number', optional: true, hint: 'Default 0' },
           { name: 'emit_context_chunks', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
             hint: 'If enabled, returns generator-ready context_chunks alongside the answer.' },
-          { name: 'similarity_top_k', type: 'integer', optional: true, hint: 'Retrieval topK before ranking (1–100)' },
-          { name: 'vector_distance_threshold', type: 'number', optional: true, hint: 'Mutually exclusive with similarity threshold' },
-          { name: 'vector_similarity_threshold', type: 'number', optional: true, hint: 'Mutually exclusive with distance threshold' },
-          { name: 'rank_service_model', optional: true, hint: 'Semantic ranker (e.g., semantic-ranker-512@latest). Do not set with llm_ranker_model.' },
-          { name: 'llm_ranker_model', label: 'LLM ranker model (optional)', optional: true,
-            hint: 'Gemini model (e.g., gemini-2.0-flash). Do not set with rank_service_model.' },
           { name: 'return_rationale', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
             hint: 'If enabled, model returns a brief rationale (1–2 sentences) for traceability.' },
           { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
         ]
       end,
-      output_fields: lambda do |object_definitions, connection|
+
+      output_fields: lambda do |object_definitions, _connection|
         [
           { name: 'answer' },
           { name: 'rationale' },
@@ -1165,58 +1170,54 @@ require 'securerandom'
           { name: 'telemetry', type: 'object', properties: [
             { name: 'http_status', type: 'integer' },
             { name: 'message' }, { name: 'duration_ms', type: 'integer' },
-            { name: 'correlation_id' }
+            { name: 'correlation_id' },
+            { name: 'retrieval', type: 'object' },
+            { name: 'rank', type: 'object' }
           ]}
         ]
       end,
+
       execute: lambda do |connection, input|
         t0   = Time.now
         corr = call(:build_correlation_id)
         retr_url = nil; retr_req_body = nil
         gen_url  = nil;  gen_req_body  = nil
 
-        # Validate inputs
+        # Validate connection
         proj = connection['project_id']
         loc  = (connection['location'] || '').to_s.downcase
         error('Connection is missing project_id') if proj.to_s.empty?
         error('Connection is missing location (must be regional)') if loc.empty? || loc == 'global'
 
-        # 1) Retrieve contexts (inline call to same API used by rag_retrieve_contexts)
+        # Retrieve contexts (inline)
         corpus = call(:normalize_rag_corpus, connection, input['rag_corpus'])
         error('rag_corpus is required') if corpus.blank?
 
-        parent = "projects/#{connection['project_id']}/locations/#{loc}"
-        req_params_retr = "parent=#{parent}"
+        parent        = "projects/#{connection['project_id']}/locations/#{loc}"
+        req_params_re = "parent=#{parent}"
 
-        # Validate unions early
-        call(:guard_threshold_union!, input['vector_distance_threshold'], input['vector_similarity_threshold'])
-        call(:guard_ranker_union!, input['rank_service_model'], input['llm_ranker_model'])
+        # Merge + validate retrieval options from object/flat inputs
+        opts = call(:build_retrieval_opts_from_input!, input)
 
         retrieve_payload = call(
           :build_rag_retrieve_payload,
           input['question'],
           corpus,
           input['restrict_to_file_ids'],
-          {
-            'topK'                    => input['similarity_top_k'],
-            'vectorDistanceThreshold' => input['vector_distance_threshold'],
-            'vectorSimilarityThreshold'=> input['vector_similarity_threshold'],
-            'rankServiceModel'        => input['rank_service_model'],
-            'llmRankerModel'          => input['llm_ranker_model']
-          }
+          opts
         )
         retr_url      = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
         retr_req_body = call(:json_compact, retrieve_payload)
         retr_resp = post(retr_url)
-                      .headers(call(:request_headers_auth, connection, corr, nil, req_params_retr))
+                      .headers(call(:request_headers_auth, connection, corr, nil, req_params_re))
                       .payload(retr_req_body)
         raw_ctxs = call(:normalize_retrieve_contexts!, retr_resp)
 
-        maxn  = call(:clamp_int, (input['max_contexts'] || 12), 1, 100)
+        maxn   = call(:clamp_int, (input['max_contexts'] || 12), 1, 100)
         chunks = call(:map_context_chunks, raw_ctxs, maxn)
         error('No contexts retrieved; check corpus/permissions/region') if chunks.empty?
 
-        # 2) Generate structured answer with parsed context
+        # Generate structured answer with parsed contexts
         model_path = call(:build_model_path_with_global_preview, connection, input['model'])
 
         gen_cfg = {
@@ -1254,10 +1255,7 @@ require 'securerandom'
 
         ctx_blob = call(:format_context_chunks, chunks)
         contents = [
-          { 'role' => 'user', 'parts' => [
-              { 'text' => "Question:\n#{input['question']}\n\nContext:\n#{ctx_blob}" }
-            ]
-          }
+          { 'role' => 'user', 'parts' => [ { 'text' => "Question:\n#{input['question']}\n\nContext:\n#{ctx_blob}" } ] }
         ]
 
         gen_payload = {
@@ -1266,26 +1264,26 @@ require 'securerandom'
           'generationConfig'  => gen_cfg
         }
 
-        # Derive location from model path to avoid region/global mismatch
+        # Route by model path location
         loc_from_model = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
         gen_url      = call(:aipl_v1_url, connection, loc_from_model, "#{model_path}:generateContent")
         gen_req_body = call(:json_compact, gen_payload)
-        req_params_gen = "model=#{model_path}"
+        req_params_g = "model=#{model_path}"
         gen_resp = post(gen_url)
-                     .headers(call(:request_headers_auth, connection, corr, connection['user_project'], req_params_gen))
-                     .payload(gen_req_body)
-        text      = gen_resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
+                    .headers(call(:request_headers_auth, connection, corr, connection['user_project'], req_params_g))
+                    .payload(gen_req_body)
+        text   = gen_resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
         parsed = call(:safe_parse_json, text)
 
         out = {
-          'answer'          => (parsed['answer'] || text),
-          'rationale'       => (parsed['rationale'] || nil),
-          'citations'       => (parsed['citations'] || []),
-          'responseId'      => gen_resp['responseId'],
-          'usage'           => gen_resp['usageMetadata']
+          'answer'     => (parsed['answer'] || text),
+          'rationale'  => (parsed['rationale'] || nil),
+          'citations'  => (parsed['citations'] || []),
+          'responseId' => gen_resp['responseId'],
+          'usage'      => gen_resp['usageMetadata']
         }.merge(call(:telemetry_envelope, t0, corr, true, call(:telemetry_success_code, gen_resp), 'OK'))
 
-        # Enrich citations with source/uri from matching context chunks (best-effort)
+        # Enrich citations from retrieved chunks (best-effort)
         begin
           if out['citations'].is_a?(Array) && chunks.is_a?(Array)
             by_id = {}; chunks.each { |c| by_id[c['id'].to_s] = c }
@@ -1304,47 +1302,46 @@ require 'securerandom'
           # non-fatal; leave citations as-is
         end
 
-        # Optional emission of generator-ready context chunks (same shape used elsewhere)
+        # Optional emission of generator-ready context chunks
         if call(:normalize_boolean, input['emit_context_chunks'])
           out['context_chunks'] = chunks
         end
-        
-        # annotate telemetry with retrieval & ranking preview
-        (out['telemetry'] ||= {})['retrieval'] = {
-          'top_k' => (input['similarity_top_k'].to_i if input['similarity_top_k'].present?),
-          'filter' => (
-            if input['vector_distance_threshold'].present?
-              { 'type' => 'distance', 'value' => input['vector_distance_threshold'].to_f }
-            elsif input['vector_similarity_threshold'].present?
-              { 'type' => 'similarity', 'value' => input['vector_similarity_threshold'].to_f }
-            end
-          )
-        }.compact
-        if input['rank_service_model'].to_s.strip != ''
-          (out['telemetry'] ||= {})['rank'] = { 'mode' => 'rank_service', 'model' => input['rank_service_model'].to_s }
-        elsif input['llm_ranker_model'].to_s.strip != ''
-          (out['telemetry'] ||= {})['rank'] = { 'mode' => 'llm', 'model' => input['llm_ranker_model'].to_s }
+
+        # Telemetry preview from canonical opts:
+        (out['telemetry'] ||= {})['retrieval'] = {}.tap do |h|
+          h['top_k'] = opts['topK'].to_i if opts['topK']
+          if opts['vectorDistanceThreshold']
+            h['filter'] = { 'type' => 'distance',  'value' => opts['vectorDistanceThreshold'].to_f }
+          elsif opts['vectorSimilarityThreshold']
+            h['filter'] = { 'type' => 'similarity','value' => opts['vectorSimilarityThreshold'].to_f }
+          end
+        end
+        if opts['rankServiceModel']
+          (out['telemetry'] ||= {})['rank'] = { 'mode' => 'rank_service', 'model' => opts['rankServiceModel'] }
+        elsif opts['llmRankerModel']
+          (out['telemetry'] ||= {})['rank'] = { 'mode' => 'llm', 'model' => opts['llmRankerModel'] }
         end
 
-        # Attach request preview / debug in non-prod when requested
+        # Debug preview in non-prod
         unless call(:normalize_boolean, connection['prod_mode'])
           if call(:normalize_boolean, input['debug'])
             out = out.merge(call(:request_preview_pack, gen_url, 'POST',
-                                 call(:request_headers_auth, connection, corr, connection['user_project'], req_params_gen),
-                                 gen_req_body))
+                                call(:request_headers_auth, connection, corr, connection['user_project'], req_params_g),
+                                gen_req_body))
           end
         end
+
         out
       rescue => e
-        g = call(:extract_google_error, e)
+        g   = call(:extract_google_error, e)
         msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
         env = call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg)
-        # Optional debug attachment in non-prod:
         if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
           env['debug'] = call(:debug_pack, true, gen_url || retr_url, (gen_req_body || retr_req_body), g)
         end
-        error(env)  # raise so Workato marks the step failed and retries if applicable
+        error(env)
       end,
+
       sample_output: lambda do
         {
           'answer' => 'Employees may carry over up to 40 hours of PTO.',
@@ -1357,7 +1354,6 @@ require 'securerandom'
               'source' => 'handbook', 'uri' => 'https://drive.google.com/file/d/abc...',
               'metadata' => { 'page' => 7 }, 'metadata_kv' => [{ 'key' => 'page', 'value' => 7 }], 'metadata_json' => '{"page":7}' }
           ],
-
           'responseId' => 'resp-123',
           'usage' => { 'promptTokenCount' => 298, 'candidatesTokenCount' => 156, 'totalTokenCount' => 454 },
           'ok' => true,
@@ -1655,12 +1651,65 @@ require 'securerandom'
         ['US (multi-region)', 'us'],
         ['EU (multi-region)', 'eu']
       ]
-    end
+    end,
+    rag_retrieval_filter: {
+      fields: lambda do
+        [
+          { name: 'vector_distance_threshold', type: 'number',
+            hint: 'Use ONLY ONE of distance or similarity. COSINE: distance≈1−similarity.' },
+          { name: 'vector_similarity_threshold', type: 'number',
+            hint: 'Use ONLY ONE of similarity or distance.' }
+        ]
+      end
+    },
+    rag_ranking: {
+      fields: lambda do
+        [
+          { name: 'rank_service_model', hint: 'Semantic ranker (Discovery). Example: semantic-ranker-512@latest' },
+          { name: 'llm_ranker_model',   hint: 'Gemini re-ranker (e.g., gemini-2.0-flash)' }
+        ]
+      end
+    },
+    rag_retrieval_config: {
+      fields: lambda do |connection, config_fields, object_definitions|
+        [
+          { name: 'top_k', type: 'integer', hint: 'Candidate cap before ranking. Rule of thumb: 20–50.' },
+          { name: 'filter',  type: 'object', properties: object_definitions['rag_retrieval_filter'] },
+          { name: 'ranking', type: 'object', properties: object_definitions['rag_ranking'] }
+        ]
+      end
+    }
 
   },
 
   # --------- METHODS ------------------------------------------------------
   methods: {
+    # Build canonical retrieval opts from either the object field
+    #   input['rag_retrieval_config'] OR legacy flat fields on the action.
+    # Returns a Hash suitable for build_rag_retrieve_payload.
+    build_retrieval_opts_from_input!: lambda do |input|
+      cfg = (input['rag_retrieval_config'].is_a?(Hash) ? input['rag_retrieval_config'] : {})
+      filt = cfg['filter'].is_a?(Hash) ? cfg['filter'] : {}
+      rank = cfg['ranking'].is_a?(Hash) ? cfg['ranking'] : {}
+
+      topk = cfg['top_k'] || input['similarity_top_k']
+      dist = filt['vector_distance_threshold']   || input['vector_distance_threshold']
+      sim  = filt['vector_similarity_threshold'] || input['vector_similarity_threshold']
+      rsm  = rank['rank_service_model']          || input['rank_service_model']
+      llm  = rank['llm_ranker_model']            || input['llm_ranker_model']
+
+      # Validate oneof unions
+      call(:guard_threshold_union!, dist, sim)
+      call(:guard_ranker_union!, rsm, llm)
+
+      {
+        'topK'                         => topk,
+        'vectorDistanceThreshold'      => dist,
+        'vectorSimilarityThreshold'    => sim,
+        'rankServiceModel'             => rsm,
+        'llmRankerModel'               => llm
+      }.delete_if { |_k, v| v.nil? || v == '' }
+    end,
     gen_generate_core!: lambda do |connection, input|
       t0   = Time.now
       corr = call(:build_correlation_id)
