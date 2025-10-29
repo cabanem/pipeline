@@ -125,41 +125,57 @@ require 'securerandom'
 
     gen_generate_input: {
       fields: lambda do |connection, config_fields, object_definitions|
-        mode = (config_fields['mode'] || 'plain').to_s
-        base = [
+        [
           { name: 'mode', control_type: 'select', pick_list: 'gen_generate_modes', optional: false, default: 'plain' },
           { name: 'model', optional: false, control_type: 'text' },
-          { name: 'contents', type: 'array', of: 'object', properties: object_definitions['content'], optional: true },
+
+          # Show 'contents' for plain/grounded modes; hide for rag_with_context
+          { name: 'contents',
+            type: 'array', of: 'object', properties: object_definitions['content'], optional: true,
+            ngIf: 'input.mode != "rag_with_context"' },
+
           { name: 'system_preamble', optional: true },
           { name: 'generation_config', type: 'object', properties: object_definitions['generation_config'] },
           { name: 'safetySettings', type: 'array', of: 'object', properties: object_definitions['safety_setting'] },
           { name: 'toolConfig', type: 'object' },
-          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
-        ]
-        grounded = [
-          { name: 'vertex_ai_search_datastore', optional: true },
-          { name: 'vertex_ai_search_serving_config', optional: true }
-        ]
-        rag = [
-          { name: 'question', optional: true },
-          { name: 'context_chunks', type: 'array', of: 'object', optional: true, properties: [
+          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true },
+
+          # ---------- Grounding (only when grounded_* modes) ----------
+          # Google Search has no extra inputs; just reveal hint line if desired
+          { name: 'grounding_info', label: 'Grounding via Google Search',
+            hint: 'Uses the built-in googleSearch tool.',
+            ngIf: 'input.mode == "grounded_google"', optional: true },
+
+          # Vertex AI Search XOR parameters (only show in grounded_vertex)
+          { name: 'vertex_ai_search_datastore',
+            hint: 'projects/.../locations/.../collections/default_collection/dataStores/...',
+            ngIf: 'input.mode == "grounded_vertex"', optional: true },
+          { name: 'vertex_ai_search_serving_config',
+            hint: 'projects/.../locations/.../collections/.../engines/.../servingConfigs/default_config',
+            ngIf: 'input.mode == "grounded_vertex"', optional: true },
+
+          # ---------- RAG-lite (only when rag_with_context) ----------
+          { name: 'question', optional: true, ngIf: 'input.mode == "rag_with_context"' },
+          { name: 'context_chunks', type: 'array', of: 'object', optional: true,
+            properties: [
               { name: 'id' }, { name: 'text', optional: false }, { name: 'source' }, { name: 'uri' },
               { name: 'score', type: 'number' }, { name: 'metadata', type: 'object' }
-          ]},
-          { name: 'max_chunks', type: 'integer', optional: true, default: 20 },
-          { name: 'salience_text', optional: true }, { name: 'salience_id', optional: true },
-          { name: 'salience_score', type: 'number', optional: true },
-          { name: 'max_prompt_tokens', type: 'integer', optional: true, default: 3000 },
-          { name: 'reserve_output_tokens', type: 'integer', optional: true, default: 512 },
-          { name: 'count_tokens_model', optional: true },
-          { name: 'trim_strategy', control_type: 'select', pick_list: 'trim_strategies', optional: true, default: 'drop_low_score' },
-          { name: 'temperature', type: 'number', optional: true }
+            ],
+            ngIf: 'input.mode == "rag_with_context"'
+          },
+          { name: 'max_chunks', type: 'integer', optional: true, default: 20, ngIf: 'input.mode == "rag_with_context"' },
+          { name: 'salience_text', optional: true, ngIf: 'input.mode == "rag_with_context"' },
+          { name: 'salience_id', optional: true, ngIf: 'input.mode == "rag_with_context"' },
+          { name: 'salience_score', type: 'number', optional: true, ngIf: 'input.mode == "rag_with_context"' },
+          { name: 'max_prompt_tokens', type: 'integer', optional: true, default: 3000, ngIf: 'input.mode == "rag_with_context"' },
+          { name: 'reserve_output_tokens', type: 'integer', optional: true, default: 512, ngIf: 'input.mode == "rag_with_context"' },
+          { name: 'count_tokens_model', optional: true, ngIf: 'input.mode == "rag_with_context"' },
+          { name: 'trim_strategy', control_type: 'select', pick_list: 'trim_strategies',
+            optional: true, default: 'drop_low_score', ngIf: 'input.mode == "rag_with_context"' },
+          { name: 'temperature', type: 'number', optional: true, ngIf: 'input.mode == "rag_with_context"' }
         ]
-        mode == 'grounded_google' || mode == 'grounded_vertex' ? (base + grounded) :
-          (mode == 'rag_with_context' ? (base + rag) : base)
       end
     },
-
     gen_generate_content_input: {
       fields: lambda do |_connection, config_fields, object_definitions|
         show_adv = (config_fields['show_advanced'] == true)
