@@ -112,7 +112,6 @@ require 'securerandom'
         ]
       end
     },
-
     gen_generate_input: {
       fields: lambda do |connection, config_fields, object_definitions|
         [
@@ -160,9 +159,23 @@ require 'securerandom'
           { name: 'max_prompt_tokens', type: 'integer', optional: true, default: 3000, ngIf: 'input.mode == "rag_with_context"' },
           { name: 'reserve_output_tokens', type: 'integer', optional: true, default: 512, ngIf: 'input.mode == "rag_with_context"' },
           { name: 'count_tokens_model', optional: true, ngIf: 'input.mode == "rag_with_context"' },
-          { name: 'trim_strategy', control_type: 'select', pick_list: 'trim_strategies',
-            optional: true, default: 'drop_low_score', ngIf: 'input.mode == "rag_with_context"' },
-          { name: 'temperature', type: 'number', optional: true, ngIf: 'input.mode == "rag_with_context"' }
+          { name: 'trim_strategy', control_type: 'select', pick_list: 'trim_strategies', optional: true, default: 'drop_low_score', ngIf: 'input.mode == "rag_with_context"' },
+          { name: 'temperature', type: 'number', optional: true, ngIf: 'input.mode == "rag_with_context"' },
+          { name: 'rag_corpus', optional: true, hint: 'projects/{project}/locations/{region}/ragCorpora/{corpus}',
+            ngIf: 'input.mode == "grounded_rag_store"' },
+          { name: 'similarity_top_k', type: 'integer', optional: true, hint: 'Retrieval topK before ranking (1–200)',
+            ngIf: 'input.mode == "grounded_rag_store"' },
+          { name: 'vector_distance_threshold', type: 'number', optional: true, hint: 'Mutually exclusive with similarity threshold',
+            ngIf: 'input.mode == "grounded_rag_store"' },
+          { name: 'vector_similarity_threshold', type: 'number', optional: true,
+            hint: 'Mutually exclusive with distance threshold',
+            ngIf: 'input.mode == "grounded_rag_store"' },
+          { name: 'rank_service_model', optional: true,
+            hint: 'Semantic ranker (e.g., semantic-ranker-512@latest). Do not set with llm_ranker_model.',
+            ngIf: 'input.mode == "grounded_rag_store"' },
+          { name: 'llm_ranker_model', optional: true,
+            hint: 'Gemini ranker (e.g., gemini-2.0-flash). Do not set with rank_service_model.',
+            ngIf: 'input.mode == "grounded_rag_store"' }
         ]
       end
     },
@@ -247,7 +260,6 @@ require 'securerandom'
         ]
       end
     },
-
     embed_output: {
       # Align to contract: embeddings object, not array
       fields: lambda do
@@ -280,7 +292,6 @@ require 'securerandom'
         ]
       end
     },
-
     batch_job: {
       fields: lambda do |_|
         [
@@ -297,7 +308,6 @@ require 'securerandom'
         ]
       end
     },
-
     envelope_fields: {
       fields: lambda do |_|
         [
@@ -311,7 +321,6 @@ require 'securerandom'
         ]
       end
     },
-
     safety_setting: {
       fields: lambda do
         [
@@ -320,7 +329,6 @@ require 'securerandom'
         ]
       end
     },
-
     kv_pair: {
       fields: lambda do
         [
@@ -923,6 +931,14 @@ require 'securerandom'
                                        (input['uri_key'].presence    || 'uri'))
         end
         out = out.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+        # annotate ranking call provenance for observability
+        (out['telemetry'] ||= {})['ranking'] = {
+          'api'       => 'discoveryengine.ranking:rank',
+          'version'   => (connection['discovery_api_version'].presence || 'v1alpha'),
+          'location'  => call(:aiapps_loc_resolve, connection, input['ai_apps_location']),
+          'config_id' => config_id,
+          'model'     => (input['rank_model'].to_s.strip if input['rank_model'].present?)
+        }.compact
 
         out
       rescue => e
@@ -964,8 +980,13 @@ require 'securerandom'
           { name: 'question', optional: false },
           { name: 'restrict_to_file_ids', type: 'array', of: 'string', optional: true },
           { name: 'max_contexts', type: 'integer', optional: true, default: 20 },
+          # ---- New retrieval knobs ----
+          { name: 'similarity_top_k', type: 'integer', optional: true, hint: 'Retrieval topK before ranking (1–200)' },
+          { name: 'vector_distance_threshold', type: 'number', optional: true, hint: 'Mutually exclusive with similarity threshold' },
+          { name: 'vector_similarity_threshold', type: 'number', optional: true, hint: 'Mutually exclusive with distance threshold' },
+          { name: 'rank_service_model', optional: true, hint: 'Semantic ranker, e.g., semantic-ranker-512@latest' },
           { name: 'llm_ranker_model', label: 'LLM ranker model (optional)', optional: true,
-            hint: 'Gemini model to re-rank retrieved contexts on Vertex host (e.g., gemini-2.0-flash). Leave blank to disable.' }
+            hint: 'Gemini model (e.g., gemini-2.0-flash). Do not set with rank_service_model.' }
         ]
       end,
       output_fields: lambda do |object_definitions, connection|
@@ -1015,6 +1036,24 @@ require 'securerandom'
           { 'llmRankerModel' => (input['llm_ranker_model'].presence || nil) }
         )
 
+        # Validate unions early
+        call(:guard_threshold_union!, input['vector_distance_threshold'], input['vector_similarity_threshold'])
+        call(:guard_ranker_union!, input['rank_service_model'], input['llm_ranker_model'])
+
+        payload = call(
+          :build_rag_retrieve_payload,
+          input['question'],
+          corpus,
+          input['restrict_to_file_ids'],
+          {
+            'topK'                    => input['similarity_top_k'],
+            'vectorDistanceThreshold' => input['vector_distance_threshold'],
+            'vectorSimilarityThreshold'=> input['vector_similarity_threshold'],
+            'rankServiceModel'        => input['rank_service_model'],
+            'llmRankerModel'          => input['llm_ranker_model']
+          }
+        )       
+
         url  = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
         resp = post(url)
                 .headers(call(:request_headers_auth, connection, corr, connection['user_project'], req_params))
@@ -1024,12 +1063,24 @@ require 'securerandom'
         maxn    = call(:clamp_int, (input['max_contexts'] || 20), 1, 200)
         mapped  = call(:map_context_chunks, raw, maxn)
 
-        {
+        out = {
           'question' => input['question'],
           'contexts' => mapped
         }.merge(call(:telemetry_envelope, t0, corr, true, call(:telemetry_success_code, raw), 'OK'))
-        # annotate telemetry with ranking when enabled
-        if input['llm_ranker_model'].to_s.strip.length > 0
+        # annotate telemetry with retrieval & ranking preview
+        (out['telemetry'] ||= {})['retrieval'] = {
+          'top_k' => (input['similarity_top_k'].to_i if input['similarity_top_k'].present?),
+          'filter' => (
+            if input['vector_distance_threshold'].present?
+              { 'type' => 'distance', 'value' => input['vector_distance_threshold'].to_f }
+            elsif input['vector_similarity_threshold'].present?
+              { 'type' => 'similarity', 'value' => input['vector_similarity_threshold'].to_f }
+            end
+          )
+        }.compact
+        if input['rank_service_model'].to_s.strip != ''
+          (out['telemetry'] ||= {})['rank'] = { 'mode' => 'rank_service', 'model' => input['rank_service_model'].to_s }
+        elsif input['llm_ranker_model'].to_s.strip != ''
           (out['telemetry'] ||= {})['rank'] = { 'mode' => 'llm', 'model' => input['llm_ranker_model'].to_s }
         end
         out
@@ -1048,7 +1099,11 @@ require 'securerandom'
             'metadata_json' => '{"page":7}' }
           ],
           'ok' => true,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 22, 'correlation_id' => 'sample', 'rank' => { 'mode': 'llm', 'model': 'gemini-2.0-flash' } }
+          'telemetry' => {
+            'http_status' => 200, 'message' => 'OK', 'duration_ms' => 22, 'correlation_id' => 'sample',
+            'retrieval' => { 'top_k' => 20, 'filter' => { 'type' => 'distance', 'value' => 0.35 } },
+            'rank' => { 'mode': 'rank_service', 'model': 'semantic-ranker-512@latest' }
+          }
         }
       end
     },
@@ -1071,8 +1126,12 @@ require 'securerandom'
           { name: 'temperature', type: 'number', optional: true, hint: 'Default 0' },
           { name: 'emit_context_chunks', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
             hint: 'If enabled, returns generator-ready context_chunks alongside the answer.' },
+          { name: 'similarity_top_k', type: 'integer', optional: true, hint: 'Retrieval topK before ranking (1–100)' },
+          { name: 'vector_distance_threshold', type: 'number', optional: true, hint: 'Mutually exclusive with similarity threshold' },
+          { name: 'vector_similarity_threshold', type: 'number', optional: true, hint: 'Mutually exclusive with distance threshold' },
+          { name: 'rank_service_model', optional: true, hint: 'Semantic ranker (e.g., semantic-ranker-512@latest). Do not set with llm_ranker_model.' },
           { name: 'llm_ranker_model', label: 'LLM ranker model (optional)', optional: true,
-            hint: 'Gemini model to re-rank retrieved contexts on Vertex host (e.g., gemini-2.0-flash). Leave blank to disable.' },
+            hint: 'Gemini model (e.g., gemini-2.0-flash). Do not set with rank_service_model.' },
           { name: 'return_rationale', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
             hint: 'If enabled, model returns a brief rationale (1–2 sentences) for traceability.' },
           { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
@@ -1129,12 +1188,22 @@ require 'securerandom'
         parent = "projects/#{connection['project_id']}/locations/#{loc}"
         req_params_retr = "parent=#{parent}"
 
+        # Validate unions early
+        call(:guard_threshold_union!, input['vector_distance_threshold'], input['vector_similarity_threshold'])
+        call(:guard_ranker_union!, input['rank_service_model'], input['llm_ranker_model'])
+
         retrieve_payload = call(
           :build_rag_retrieve_payload,
           input['question'],
           corpus,
           input['restrict_to_file_ids'],
-          { 'llmRankerModel' => (input['llm_ranker_model'].presence || nil) }
+          {
+            'topK'                    => input['similarity_top_k'],
+            'vectorDistanceThreshold' => input['vector_distance_threshold'],
+            'vectorSimilarityThreshold'=> input['vector_similarity_threshold'],
+            'rankServiceModel'        => input['rank_service_model'],
+            'llmRankerModel'          => input['llm_ranker_model']
+          }
         )
         retr_url      = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
         retr_req_body = call(:json_compact, retrieve_payload)
@@ -1240,8 +1309,20 @@ require 'securerandom'
           out['context_chunks'] = chunks
         end
         
-        # annotate telemetry with ranking when enabled
-        if input['llm_ranker_model'].to_s.strip.length > 0
+        # annotate telemetry with retrieval & ranking preview
+        (out['telemetry'] ||= {})['retrieval'] = {
+          'top_k' => (input['similarity_top_k'].to_i if input['similarity_top_k'].present?),
+          'filter' => (
+            if input['vector_distance_threshold'].present?
+              { 'type' => 'distance', 'value' => input['vector_distance_threshold'].to_f }
+            elsif input['vector_similarity_threshold'].present?
+              { 'type' => 'similarity', 'value' => input['vector_similarity_threshold'].to_f }
+            end
+          )
+        }.compact
+        if input['rank_service_model'].to_s.strip != ''
+          (out['telemetry'] ||= {})['rank'] = { 'mode' => 'rank_service', 'model' => input['rank_service_model'].to_s }
+        elsif input['llm_ranker_model'].to_s.strip != ''
           (out['telemetry'] ||= {})['rank'] = { 'mode' => 'llm', 'model' => input['llm_ranker_model'].to_s }
         end
 
@@ -1280,7 +1361,11 @@ require 'securerandom'
           'responseId' => 'resp-123',
           'usage' => { 'promptTokenCount' => 298, 'candidatesTokenCount' => 156, 'totalTokenCount' => 454 },
           'ok' => true,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 44, 'correlation_id' => 'sample', 'rank' => { 'mode': 'llm', 'model': 'gemini-2.0-flash' } }
+          'telemetry' => {
+            'http_status' => 200, 'message' => 'OK', 'duration_ms' => 44, 'correlation_id' => 'sample',
+            'retrieval' => { 'top_k' => 12, 'filter' => { 'type' => 'similarity', 'value' => 0.8 } },
+            'rank' => { 'mode': 'llm', 'model': 'gemini-2.0-flash' }
+          }
         }
       end
     },
@@ -1510,7 +1595,8 @@ require 'securerandom'
         ['Plain (no grounding)','plain'],
         ['Grounded via Google Search','grounded_google'],
         ['Grounded via Vertex AI Search','grounded_vertex'],
-        ['RAG-lite (provided context)','rag_with_context']
+        ['RAG-lite (provided context)','rag_with_context'],
+        ['Grounded via Vertex RAG Store (tool)','grounded_rag_store']
       ]
     end,
     trim_strategies: lambda do
@@ -1606,6 +1692,34 @@ require 'securerandom'
           if (ds.blank? && scfg.blank?) || (ds.present? && scfg.present?)
         vas = {}; vas['datastore'] = ds unless ds.blank?; vas['servingConfig'] = scfg unless scfg.blank?
         tools = [ { 'retrieval' => { 'vertexAiSearch' => vas } } ]
+      when 'grounded_rag_store'
+        # Build the retrieval tool payload for Vertex RAG Store
+        corpus = call(:normalize_rag_corpus, connection, input['rag_corpus'])
+        error('rag_corpus is required for grounded_rag_store') if corpus.blank?
+        # Guards for unions
+        call(:guard_threshold_union!, input['vector_distance_threshold'], input['vector_similarity_threshold'])
+        call(:guard_ranker_union!, input['rank_service_model'], input['llm_ranker_model'])
+
+        vr = { 'ragResources' => [ { 'ragCorpus' => corpus } ] }
+        # Optional knobs
+        filt = {}
+        if input['vector_distance_threshold'].present?
+          filt['vectorDistanceThreshold'] = call(:safe_float, input['vector_distance_threshold'])
+        elsif input['vector_similarity_threshold'].present?
+          filt['vectorSimilarityThreshold'] = call(:safe_float, input['vector_similarity_threshold'])
+        end
+        rconf = {}
+        if input['rank_service_model'].to_s.strip != ''
+          rconf['rankService'] = { 'modelName' => input['rank_service_model'].to_s.strip }
+        elsif input['llm_ranker_model'].to_s.strip != ''
+          rconf['llmRanker']   = { 'modelName' => input['llm_ranker_model'].to_s.strip }
+        end
+        retrieval_cfg = {}
+        retrieval_cfg['similarityTopK'] = call(:clamp_int, (input['similarity_top_k'] || 0), 1, 200) if input['similarity_top_k'].present?
+        retrieval_cfg['filter']  = filt unless filt.empty?
+        retrieval_cfg['ranking'] = rconf unless rconf.empty?
+
+        tools = [ { 'retrieval' => { 'vertexRagStore' => vr.merge( (retrieval_cfg.empty? ? {} : { 'ragRetrievalConfig' => retrieval_cfg }) ) } } ]
       when 'rag_with_context'
         # Build RAG-lite prompt + JSON schema
         q        = input['question'].to_s
@@ -1687,7 +1801,6 @@ require 'securerandom'
       end
       error(env)
     end,
-
     request_headers_auth: lambda do |_connection, correlation_id, user_project=nil, request_params=nil|
       h = {
         'X-Correlation-Id' => correlation_id.to_s,
@@ -2278,11 +2391,25 @@ require 'securerandom'
       return '' if raw.nil? || raw == false
       raw.to_s.strip
     end,
+    guard_threshold_union!: lambda do |dist, sim|
+      return true if dist.nil? || dist.to_s == ''
+      return true if sim.nil?  || sim.to_s  == ''
+      error('Provide only one of vector_distance_threshold OR vector_similarity_threshold')
+    end,
+    guard_ranker_union!: lambda do |rank_service_model, llm_ranker_model|
+      r = rank_service_model.to_s.strip
+      l = llm_ranker_model.to_s.strip
+      return true if r.empty? || l.empty?
+      error('Provide only one of rank_service_model OR llm_ranker_model')
+    end,
     build_rag_retrieve_payload: lambda do |question, rag_corpus, restrict_ids = [], opts = {}|
-      # Backward-compatible extension: optional opts hash supports LLM re-ranking and simple knobs.
-      # opts:
-      #   'llmRankerModel' -> String model name, e.g., "gemini-2.0-flash"
-      #   'topK'           -> Integer cap for retrieval prior to ranking (optional)
+      # Backward-compatible extension: optional opts hash supports:
+      #   'topK'                         -> Integer
+      #   'vectorDistanceThreshold'      -> Float (mutually exclusive with similarity)
+      #   'vectorSimilarityThreshold'    -> Float (mutually exclusive with distance)
+      #   'rankServiceModel'             -> String (semantic ranker)
+      #   'llmRankerModel'               -> String (Gemini ranker)
+
       rag_res = { 'ragCorpus' => rag_corpus }
       ids     = call(:sanitize_drive_ids, restrict_ids, allow_empty: true, label: 'restrict_to_file_ids')
       rag_res['ragFileIds'] = ids if ids.present?
@@ -2292,11 +2419,25 @@ require 'securerandom'
       rr_cfg = {}
       if opts.is_a?(Hash)
         if opts['topK']
-          rr_cfg['topK'] = call(:safe_integer, opts['topK'])
+          rr_cfg['topK'] = call(:clamp_int, (opts['topK'] || 0), 1, 200)
         end
-        llm = opts['llmRankerModel'].to_s.strip
-        if llm.length > 0
-          rr_cfg['ranking'] = { 'llmRanker' => { 'modelName' => llm } }
+        # Filter union
+        dist = opts['vectorDistanceThreshold']
+        sim  = opts['vectorSimilarityThreshold']
+        call(:guard_threshold_union!, dist, sim)
+        filt = {}
+        filt['vectorDistanceThreshold']   = call(:safe_float, dist) if !dist.nil?
+        filt['vectorSimilarityThreshold'] = call(:safe_float, sim)  if !sim.nil?
+        rr_cfg['filter'] = filt unless filt.empty?
+
+        # Ranking union
+        rsm = (opts['rankServiceModel'].to_s.strip)
+        llm = (opts['llmRankerModel'].to_s.strip)
+        call(:guard_ranker_union!, rsm, llm)
+        if rsm != ''
+          rr_cfg['ranking'] = { 'rankService' => { 'modelName' => rsm } }
+        elsif llm != ''
+          rr_cfg['ranking'] = { 'llmRanker'   => { 'modelName' => llm } }
         end
       end
       query['ragRetrievalConfig'] = rr_cfg unless rr_cfg.empty?
