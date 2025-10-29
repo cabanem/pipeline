@@ -1016,14 +1016,18 @@ require 'securerandom'
           }
         end
 
-        result = post("https://#{host}#{path}")
+        raw = post("https://#{host}#{path}")
           .headers(call(:default_headers, connection))
           .payload(body)
-          .after_response { |code, body, headers, _| call(:normalize_response!, code, body, headers) }
-          .after_error_response { |code, body, headers, _| call(:normalize_error!, code, body, headers) }
+          #.after_response { |code, body, headers, _| call(:normalize_response!, code, body, headers) }
+          #.after_error_response { |code, body, headers, _| call(:normalize_error!, code, body, headers) }
 
-        # API returns: { contexts: { contexts: [ ... ] } }
-        arr = (result.dig('contexts', 'contexts') || [])
+        result = call(:safe_parse_json, raw)
+        
+        # API returns: { "contexts": { "contexts": [ ... ] } }
+        arr = []
+        arr = result.dig('contexts', 'contexts') if result.respond_to?(:dig)
+        arr ||= []
 
         mapped = arr.map do |c|
           {
