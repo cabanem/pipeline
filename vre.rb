@@ -89,7 +89,33 @@ require 'securerandom'
 
   # --------- OBJECT DEFINITIONS -------------------------------------------
   object_definitions: {
-
+    rag_retrieval_filter: {
+      fields: lambda do
+        [
+          { name: 'vector_distance_threshold', type: 'number',
+            hint: 'Use ONLY ONE of distance or similarity. COSINE: distance≈1−similarity.' },
+          { name: 'vector_similarity_threshold', type: 'number',
+            hint: 'Use ONLY ONE of similarity or distance.' }
+        ]
+      end
+    },
+    rag_ranking: {
+      fields: lambda do
+        [
+          { name: 'rank_service_model', hint: 'Semantic ranker (Discovery). Example: semantic-ranker-512@latest' },
+          { name: 'llm_ranker_model',   hint: 'Gemini re-ranker (e.g., gemini-2.0-flash)' }
+        ]
+      end
+    },
+    rag_retrieval_config: {
+      fields: lambda do |connection, config_fields, object_definitions|
+        [
+          { name: 'top_k', type: 'integer', hint: 'Candidate cap before ranking. Rule of thumb: 20–50.' },
+          { name: 'filter',  type: 'object', properties: object_definitions['rag_retrieval_filter'] },
+          { name: 'ranking', type: 'object', properties: object_definitions['rag_ranking'] }
+        ]
+      end
+    },
     content_part: {
       fields: lambda do |connection, config_fields|
         [
@@ -250,10 +276,18 @@ require 'securerandom'
             { name: 'content', type: 'object', properties: [
                 { name: 'role' },
                 { name: 'parts', type: 'array', of: 'object', properties: [
-                    { name: 'text' }, { name: 'inlineData', type: 'object' }, { name: 'fileData', type: 'object' }
+                    # Align with object_definitions['content_part'] for symmetry
+                    { name: 'text' },
+                    { name: 'inlineData', type: 'object', properties: [ { name: 'mimeType' }, { name: 'data' } ]},
+                    { name: 'fileData',   type: 'object', properties: [ { name: 'mimeType' }, { name: 'fileUri' } ]},
+                    { name: 'functionCall',        type: 'object' },
+                    { name: 'functionResponse',    type: 'object' },
+                    { name: 'executableCode',      type: 'object' },
+                    { name: 'codeExecutionResult', type: 'object' }
                 ]}
             ]}
-          ]}
+          ]},
+          { name: 'raw_parts', type: 'array', of: 'object', properties: object_definitions['content_part'] }
         ]
       end
     },
@@ -776,8 +810,15 @@ require 'securerandom'
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
-      input_fields:  lambda { |od, c, cf| od['gen_generate_input'] },
+      input_fields:  lambda do |od, c, cf|
+        # Reuse existing input object and add a single, optional toggle for parts
+        od['gen_generate_input'] + [
+          { name: 'emit_parts', type: 'boolean', control_type: 'checkbox', optional: true, default: false,
+            hint: 'If enabled, surfaces candidates[0].content.parts as raw_parts.' }
+        ]
+      end,
       output_fields: lambda do |od, c|
+        # generate_content_output now includes optional raw_parts; keep parsed + envelope
         Array(od['generate_content_output']) + [
           { name: 'parsed', type: 'object', properties: [
               { name: 'answer' },
@@ -1138,10 +1179,11 @@ require 'securerandom'
             hint: 'If enabled, returns generator-ready context_chunks alongside the answer.' },
           { name: 'return_rationale', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
             hint: 'If enabled, model returns a brief rationale (1–2 sentences) for traceability.' },
+          { name: 'emit_parts', type: 'boolean', control_type: 'checkbox', optional: true, default: false,
+            hint: 'If enabled, include candidates[0].content.parts as raw_parts in the output.' },
           { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
         ]
       end,
-
       output_fields: lambda do |object_definitions, _connection|
         [
           { name: 'answer' },
@@ -1166,6 +1208,7 @@ require 'securerandom'
             ]
           },
           { name: 'request_preview', type: 'object' },
+          { name: 'raw_parts', type: 'array', of: 'object', properties: object_definitions['content_part'] },
           { name: 'ok', type: 'boolean' },
           { name: 'telemetry', type: 'object', properties: [
             { name: 'http_status', type: 'integer' },
@@ -1272,8 +1315,9 @@ require 'securerandom'
         gen_resp = post(gen_url)
                     .headers(call(:request_headers_auth, connection, corr, connection['user_project'], req_params_g))
                     .payload(gen_req_body)
-        text   = gen_resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
-        parsed = call(:safe_parse_json, text)
+        parts  = Array(gen_resp.dig('candidates', 0, 'content', 'parts'))
+        text   = parts.first && parts.first['text'].to_s
+        parsed = call(:safe_parse_json, (text || ''))
 
         out = {
           'answer'     => (parsed['answer'] || text),
@@ -1305,6 +1349,11 @@ require 'securerandom'
         # Optional emission of generator-ready context chunks
         if call(:normalize_boolean, input['emit_context_chunks'])
           out['context_chunks'] = chunks
+        end
+
+        # Optional emission of raw parts for downstream consumers
+        if call(:normalize_boolean, input['emit_parts'])
+          out['raw_parts'] = parts
         end
 
         # Telemetry preview from canonical opts:
@@ -1651,39 +1700,15 @@ require 'securerandom'
         ['US (multi-region)', 'us'],
         ['EU (multi-region)', 'eu']
       ]
-    end,
-    rag_retrieval_filter: {
-      fields: lambda do
-        [
-          { name: 'vector_distance_threshold', type: 'number',
-            hint: 'Use ONLY ONE of distance or similarity. COSINE: distance≈1−similarity.' },
-          { name: 'vector_similarity_threshold', type: 'number',
-            hint: 'Use ONLY ONE of similarity or distance.' }
-        ]
-      end
-    },
-    rag_ranking: {
-      fields: lambda do
-        [
-          { name: 'rank_service_model', hint: 'Semantic ranker (Discovery). Example: semantic-ranker-512@latest' },
-          { name: 'llm_ranker_model',   hint: 'Gemini re-ranker (e.g., gemini-2.0-flash)' }
-        ]
-      end
-    },
-    rag_retrieval_config: {
-      fields: lambda do |connection, config_fields, object_definitions|
-        [
-          { name: 'top_k', type: 'integer', hint: 'Candidate cap before ranking. Rule of thumb: 20–50.' },
-          { name: 'filter',  type: 'object', properties: object_definitions['rag_retrieval_filter'] },
-          { name: 'ranking', type: 'object', properties: object_definitions['rag_ranking'] }
-        ]
-      end
-    }
+    end
 
   },
 
   # --------- METHODS ------------------------------------------------------
   methods: {
+    extract_candidate_parts: lambda do |resp|
+      Array(resp.dig('candidates', 0, 'content', 'parts'))
+    end,
     # Build canonical retrieval opts from either the object field
     #   input['rag_retrieval_config'] OR legacy flat fields on the action.
     # Returns a Hash suitable for build_rag_retrieve_payload.
@@ -1839,6 +1864,9 @@ require 'securerandom'
         text   = resp.dig('candidates',0,'content','parts',0,'text').to_s
         parsed = call(:safe_parse_json, text)
         out['parsed'] = { 'answer'=>parsed['answer'] || text, 'citations'=>parsed['citations'] || [] }
+      end
+      if call(:normalize_boolean, input['emit_parts'])
+        out['raw_parts'] = call(:extract_candidate_parts, resp)
       end
       out
     rescue => e
