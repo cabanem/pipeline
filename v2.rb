@@ -881,7 +881,7 @@ require 'securerandom'
       subtitle: '',
       description: '',
       display_priority: 95,
-      retry_on_request: ['GET','HEAD'],
+      # Idempotent POSTs are retried via retry_on_response only
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
 
@@ -889,7 +889,10 @@ require 'securerandom'
         [
           { name: 'model', optional: false, hint: 'e.g., text-embedding-004' },
           { name: 'texts', type: :array, of: :string, optional: false },
-          { name: 'task_type', optional: true }
+          { name: 'task_type', label: 'Task type', type: :string, optional: true,
+            hint: 'e.g., RETRIEVAL_QUERY or RETRIEVAL_DOCUMENT' },
+          { name: 'auto_truncate', label: 'Auto truncate', type: :boolean, optional: true },
+          { name: 'output_dimensionality', label: 'Output dimensionality', type: :integer, optional: true }
         ]
       end,
       output_fields: lambda do |_|
@@ -909,15 +912,29 @@ require 'securerandom'
 
         post("https://#{host}#{path}")
           .headers(call(:default_headers, connection))
-          .payload({
-            instances: input['texts'].map { |t| { content: t } },
-            parameters: { task_type: input['task_type'] }.compact
-          })
+          .payload(begin
+            instances = input['texts'].map do |t|
+              h = { content: t }
+              h[:task_type] = input['task_type'] if input['task_type'].present?
+              h
+            end
+            params = {}
+            params[:autoTruncate] = true if input['auto_truncate']
+            if input['output_dimensionality'].present?
+              params[:outputDimensionality] = input['output_dimensionality']
+            end
+            { instances: instances, parameters: params.presence }.compact
+          end)
           .after_response      { |code, body, headers, _msg| call(:normalize_response!, code, body, headers) }
           .after_error_response{ |code, body, headers, _msg| call(:normalize_error!,   code, body, headers) }
       end,
       sample_output: lambda do
-        #
+        {
+          predictions: [
+            { embeddings: { values: [0.0123, -0.0045, 0.9981, 0.2301, -0.5512] } }
+          ],
+          _http: { status: 200, headers: {} }
+        }
       end
     },
     gen_content: {
@@ -928,7 +945,7 @@ require 'securerandom'
         { body: '' }
       end,
       display_priority: 94,
-      retry_on_request: ['GET','HEAD'],
+      # Idempotent POSTs are retried via retry_on_response only
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
 
@@ -946,7 +963,9 @@ require 'securerandom'
           { name: 'candidates', type: :array, of: :object, properties: [
             { name: 'content', type: :object }
           ]},
-          { name: '_meta', type: :object }
+          { name: 'usageMetadata', type: :object },
+          { name: 'promptFeedback', type: :object },
+          { name: '_http', type: :object }
         ]
       end,
       execute: lambda do |connection, input|
@@ -967,51 +986,103 @@ require 'securerandom'
           .after_error_response{ |code, body, headers, _msg| call(:normalize_error!,   code, body, headers) }
       end,
       sample_output: lambda do
-        #
+        {
+          candidates: [
+            { content: { role: 'model', parts: [ { text: 'Hello world.' } ] } }
+          ],
+          usageMetadata: { promptTokenCount: 12, candidatesTokenCount: 28, totalTokenCount: 40 },
+          promptFeedback: { safetyRatings: [] },
+          _http: { status: 200, headers: {} }
+        }
       end
+    },
+    count_tokens: {
+      title: 'Generative: Count tokens',
+      subtitle: '',
+      description: '',
+      display_priority: 93,
+      # Idempotent POSTs are retried via retry_on_response only
+      retry_on_response: [408,429,500,502,503,504],
+      max_retries: 3,
 
+      input_fields: lambda do |object_definitions|
+        object_definitions['gen_count_tokens_request']
+      end,
+      output_fields: lambda do |object_definitions|
+        object_definitions['gen_count_tokens_response']
+      end,
+      execute: lambda do |connection, input|
+        model = call(:normalize_model!, input['model'] || input['modelId'] || input['model_name'] || '')
+        host  = call(:aiplatform_host, connection)
+        path = "/v1/projects/#{call(:ensure_project_id!, connection)}/locations/#{call(:ensure_location!, connection)}/publishers/#{(connection['publisher'].presence || 'google')}/models/#{model}:countTokens"
+
+        body = {}
+        body[:contents] = input['contents'] if input['contents'].present?
+        body[:instances] = input['instances'] if input['instances'].present?
+        body[:systemInstruction] = input['systemInstruction'] if input['systemInstruction'].present?
+        body[:tools] = input['tools'] if input['tools'].present?
+        body[:generationConfig] = input['generationConfig'] if input['generationConfig'].present?
+
+        post("https://#{host}#{path}")
+          .headers(call(:default_headers, connection))
+          .payload(body)
+          .after_response { |code, body, headers, _| call(:normalize_response!, code, body, headers) }
+          .after_error_response { |code, body, headers, _| call(:normalize_error!, code, body, headers) }
+      end,
+      sample_output: lambda do
+        { totalTokens: 128, totalBillableCharacters: 512 }
+      end
     },
     rag_retrieve_contexts: {
       title: 'RAG (Serving): Retrieve contexts',
       subtitle: '',
       description: '',
-      display_priority: 1,
-      help: lambda do |_input, _picklist_label|
-        { body: '' }
-      end,
       display_priority: 86,
-      retry_on_request: ['GET','HEAD'],
+      # Idempotent POSTs are retried via retry_on_response only
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
 
       input_fields: lambda do |_|
         [
-          { name: 'rag_corpus', optional: false, hint: 'projects/{p}/locations/{l}/ragCorpora/{corpus}' },
+          { name: 'rag_corpus', optional: true, hint: 'projects/{p}/locations/{l}/ragCorpora/{corpus}; leave blank for location-scoped' },
           { name: 'query', optional: false },
           { name: 'max_contexts', type: :integer, optional: true, default: 12 }
         ]
       end,
       output_fields: lambda do |object_definitions|
         [
-          { name: 'contexts', type: :array, of: :object, properties: object_definitions['context_chunk'][:fields] },
-          { name: '_meta', type: :object }
+          { name: 'contexts', type: :array, of: :object, properties: object_definitions['context_chunk'] },
+          { name: '_http', type: :object }
         ]
       end,
       execute: lambda do |connection, input|
         host = call(:aiplatform_host, connection)
-        path = call(:path_rag_retrieve_contexts, connection, input['rag_corpus'])
+        path = input['rag_corpus'].present? ? call(:path_rag_retrieve_contexts, connection, input['rag_corpus']) : call(:path_rag_retrieve_contexts_location, connection)
+
         body = {
-          query: input['query'],
+          query: { text: input['query'] },
+          dataSource: {
+            vertexRagStore: {
+              ragResources: input['rag_corpus'].present? ? [ { ragCorpus: input['rag_corpus'] } ] : []
+            }
+          },
           retrievalConfig: { maxContexts: call(:coerce_integer, input['max_contexts'], 12) }
-        }
+        }.compact
+
         post("https://#{host}#{path}")
           .headers(call(:default_headers, connection))
           .payload(body)
-          .after_response { |code, body, headers, msg| call(:normalize_response!, code, body, headers) }
-          .after_error_response { |code, body, headers, msg| call(:normalize_error!, code, body, headers) }
+          .after_response { |code, body, headers, _| call(:normalize_response!, code, body, headers) }
+          .after_error_response { |code, body, headers, _| call(:normalize_error!, code, body, headers) }
       end,
       sample_output: lambda do
-        {}
+        {
+          contexts: [
+            { id: 'hr:123#c5', uri: 'gs://corp/hr/benefits.pdf#page=3', content: 'Open enrollment closes November 15.', score: 0.83, metadata: { page: 3 } },
+            { id: 'policy:88#c2', uri: 'https://intranet/policies/benefits', content: 'Employees must complete elections by Nov 15.', score: 0.79, metadata: { department: 'HR' } }
+          ],
+          _http: { status: 200, headers: {} }
+        }
       end
     },
     rag_answer: {
@@ -1022,14 +1093,14 @@ require 'securerandom'
         { body: 'Answer a question using caller-supplied context chunks (RAG-lite). Returns structured JSON with citations.' }
       end,
       display_priority: 92,
-      retry_on_request: ['GET','HEAD'],
+      # Idempotent POSTs are retried via retry_on_response only
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
 
       input_fields: lambda do |_|
         [
           { name: 'model', optional: false },
-          { name: 'rag_corpus', optional: false },
+          { name: 'rag_corpus', optional: true, hint: 'projects/{p}/locations/{l}/ragCorpora/{corpus}; leave blank for location-scoped' },
           { name: 'question', optional: false },
           { name: 'max_contexts', type: :integer, optional: true, default: 12 }
         ]
@@ -1038,24 +1109,74 @@ require 'securerandom'
         [
           { name: 'answer', type: :string },
           { name: 'citations', type: :array, of: :object },
-          { name: '_meta', type: :object }
+          { name: '_http', type: :object }
         ]
       end,
       execute: lambda do |connection, input|
         host = call(:aiplatform_host, connection)
-        path = call(:path_rag_answer, connection, input['rag_corpus'])
-        body = { question: input['question'], answerGenerationConfig: { model: input['model'], maxContexts: call(:coerce_integer, input['max_contexts'], 12) } }
 
-        post("https://#{host}#{path}")
+        # 1) Retrieve contexts
+        retrieve_path = if input['rag_corpus'].present?
+          "/v1/#{input['rag_corpus']}:retrieveContexts"
+        else
+          "/v1/projects/#{call(:ensure_project_id!, connection)}/locations/#{call(:ensure_location!, connection)}:retrieveContexts"
+        end
+        retrieve_body = {
+          query: { text: input['question'] },
+          dataSource: { vertexRagStore: { ragResources: input['rag_corpus'].present? ? [ { ragCorpus: input['rag_corpus'] } ] : [] } },
+          retrievalConfig: { maxContexts: call(:coerce_integer, input['max_contexts'], 12) }
+        }.compact
+        ctx = post("https://#{host}#{retrieve_path}")
           .headers(call(:default_headers, connection))
-          .payload(body)
-          .after_response      { |code, body, headers, _msg| call(:normalize_response!, code, body, headers) }
-          .after_error_response{ |code, body, headers, _msg| call(:normalize_error!,   code, body, headers) }
+          .payload(retrieve_body)
+          .after_response { |code, body, headers, _| call(:normalize_response!, code, body, headers) }
+          .after_error_response { |code, body, headers, _| call(:normalize_error!, code, body, headers) }
+
+        # 2) Grounded prompt
+        context_text = if ctx['contexts'].is_a?(Hash) && ctx['contexts']['contexts'].is_a?(Array)
+          ctx['contexts']['contexts'].map{ |c| c['text'] || c['content'] }.compact.join("\n\n")
+        else
+          ''
+        end
+        prompt = <<~PROMPT
+          Use the following context to answer the question. Quote sources if present.
+          Context:
+          #{context_text}
+
+          Question:
+          #{input['question']}
+        PROMPT
+
+        # 3) Generate answer
+        model = call(:normalize_model!, input['model'])
+        gen_path = call(:path_generate_content, connection, model)
+        gen_body = { contents: [ { role: 'user', parts: [ { text: prompt } ] } ], generationConfig: { temperature: 0.2 } }
+        gen = post("https://#{host}#{gen_path}")
+          .headers(call(:default_headers, connection))
+          .payload(gen_body)
+          .after_response { |code, body, headers, _| call(:normalize_response!, code, body, headers) }
+          .after_error_response { |code, body, headers, _| call(:normalize_error!, code, body, headers) }
+
+        {
+          answer: (((gen['candidates']||[])[0]||{})['content']||{})['parts']&.map{ |p| p['text'] }.to_a.join,
+          citations: if ctx['contexts'].is_a?(Hash) && ctx['contexts']['contexts'].is_a?(Array)
+            ctx['contexts']['contexts'].map { |c| { uri: c['sourceUri'] || c['uri'], score: c['score'] } }
+          else
+            []
+          end,
+          _http: { status: 200 }
+        }
       end,
       sample_output: lambda do
-        #
+        {
+          answer: "Open enrollment closes November 15. See Benefits Guide 2024 (page 3).",
+          citations: [
+            { uri: "gs://corp/hr/benefits.pdf#page=3", score: 0.83 },
+            { uri: "https://intranet/policies/benefits", score: 0.79 }
+          ],
+          _http: { status: 200, headers: {} }
+        }
       end
-
     },
     rank_texts: {
       title: 'Ranking API: Rank records',
@@ -1065,7 +1186,7 @@ require 'securerandom'
         { body: '' }
       end,
       display_priority: 89,
-      retry_on_request: ['GET','HEAD'],
+      # Idempotent POSTs are retried via retry_on_response only
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
 
@@ -1077,41 +1198,105 @@ require 'securerandom'
             properties: [
               { name: 'id', optional: false },
               { name: 'title', optional: true },
-              { name: 'content', optional: false, control_type: 'text-area' },
-              { name: 'metadata', type: 'object', optional: true }
+              { name: 'content', optional: true },
+              { name: 'metadata', type: 'object,', optional: true }
             ]
           }
         ]
       end,
       output_fields: lambda do |_|
         [
-          { name: 'ranked_records', type: :array, of: :object },
-          { name: '_meta', type: :object }
+          { name: 'records', type: :array, of: :object, properties: [
+            { name: 'id' },
+            { name: 'score', type: :number, optional: true },
+            { name: 'metadata', type: :object, optional: true }
+          ]},
+          { name: '_http', type: :object }
         ]
       end,
       execute: lambda do |connection, input|
-        host = 'discoveryengine.googleapis.com'
-        path = "/v1/#{input['ranking_config']}:rank"
+        host = call(:aiplatform_host, connection)
+        path = call(:path_ranking_rank, connection, input['ranking_config'])
         body = { query: { text: input['query_text'] }, records: input['records'] }
 
         post("https://#{host}#{path}")
           .headers(call(:default_headers, connection))
           .payload(body)
-          .after_response { |code, body, headers, msg| call(:normalize_response!, code, body, headers) }
-          .after_error_response { |code, body, headers, msg| call(:normalize_error!, code, body, headers) }
+          .after_response { |code, body, headers, _| call(:normalize_response!, code, body, headers) }
+          .after_error_response { |code, body, headers, _| call(:normalize_error!, code, body, headers) }
       end,
       sample_output: lambda do
-        {}
+        {
+          records: [
+            { id: 'a', score: 0.91 },
+            { id: 'b', score: 0.44 }
+          ],
+          _http: { status: 200 }
+        }
+      end
+    },
+    operations_get: {
+      title: 'Operations: Get',
+      subtitle: 'Check long-running operation',
+      description: '',
+      display_priority: 60,
+      # Idempotent POSTs are retried via retry_on_response only
+      retry_on_response: [408,429,500,502,503,504],
+      max_retries: 3,
+
+      input_fields: lambda do |_|
+        [
+          { name: 'name', optional: true, hint: 'Full resource name, e.g. projects/{p}/locations/{l}/operations/{id}' },
+          { name: 'operation_id', optional: true, hint: 'If name is blank, supply operation_id and the connector will build the name.' }
+        ]
+      end,
+      output_fields: lambda do |object_definitions|
+        object_definitions['ops_operation']
+      end,
+      execute: lambda do |connection, input|
+        host = call(:aiplatform_host, connection)
+        name = input['name'].presence || "projects/#{call(:ensure_project_id!, connection)}/locations/#{call(:ensure_location!, connection)}/operations/#{input['operation_id']}"
+        path = "/v1/#{name}"
+        get("https://#{host}#{path}")
+          .headers(call(:default_headers, connection))
+          .after_response { |code, body, headers, _| call(:normalize_response!, code, body, headers) }
+          .after_error_response { |code, body, headers, _| call(:normalize_error!, code, body, headers) }
+      end,
+      sample_output: lambda do
+        { name: 'projects/demo/locations/us-east4/operations/op-123', done: false }
       end
     }
   },
 
   # --------- METHODS ------------------------------------------------------
   methods: {
+    # -------- Utilities ---------------------------------------------------
+    log_debug: lambda do |msg, data = {}|
+      call(:telemetry_debug, msg, data)
+    end,
+    telemetry_debug: lambda do |msg, data = {}|
+      # Simple, safe debug logger (no-op friendly)
+      call(:workato_logger).call("DEBUG: #{msg} #{data.to_json}")
+    end,
+    validate_location_coherence!: lambda do |connection, resource|
+      return true unless resource.is_a?(String) && resource.include?('/locations/')
+      loc = resource[%r{/locations/([^/]+)}, 1]
+      if loc && loc != connection['location']
+        error("Region mismatch: resource location '#{loc}' != connection.location '#{connection['location']}'")
+      end
+      true
+    end,
 
     # --- Auth (JWT → OAuth) ---------------------------------------------------
-    const_default_scopes: lambda do
-      ['https://www.googleapis.com/auth/cloud-platform']
+    const_default_scopes: -> { ['https://www.googleapis.com/auth/cloud-platform'] },
+    auth_normalize_scopes: lambda do |scopes|
+      arr = case scopes
+            when nil    then call(:const_default_scopes)
+            when String then scopes.split(/\s+/)
+            when Array  then scopes
+            else             call(:const_default_scopes)
+            end
+      arr.map(&:to_s).reject(&:empty?).uniq
     end,
     b64url: lambda do |bytes|
       Base64.urlsafe_encode64(bytes).gsub(/=+$/, '')
@@ -1128,15 +1313,12 @@ require 'securerandom'
       "#{input}.#{call(:b64url, sig)}"
     end,
     auth_normalize_scopes: lambda do |scopes|
-      arr =
-        case scopes
-        when nil    then call(:const_default_scopes)
-        when nil    then 
-        when String then scopes.split(/\s+/)
-        when Array  then scopes
-        else              call(:const_default_scopes)
-        end
-
+      arr = case scopes
+            when nil    then call(:const_default_scopes)
+            when String then scopes.split(/\s+/)
+            when Array  then scopes
+            else             call(:const_default_scopes)
+            end
       arr.map(&:to_s).reject(&:empty?).uniq
     end,
     auth_get_sa_key!: lambda do |connection|
@@ -1296,11 +1478,9 @@ require 'securerandom'
       # Return something minimally useful for logs
       { ok: true, kid: header['kid'], iss: payload['iss'] }
     end,
-
     coerce_integer: lambda do |v, fallback|
       Integer(v) rescue fallback
     end,
-
     normalize_error!: lambda do |code, body, _headers|
       parsed = begin
         body.is_a?(String) && !body.empty? ? JSON.parse(body) : (body || {})
@@ -1311,18 +1491,9 @@ require 'securerandom'
       error({ 'code' => code, 'message' => err['message'], 'details' => err['details'] })
     end,
     normalize_response!: lambda do |code, body, headers|
-      parsed = begin
-        body.is_a?(String) && !body.empty? ? JSON.parse(body) : (body || {})
-      rescue
-        {}
-      end
-      meta = (parsed['_meta'] ||= {})
-      meta['http_status']    = code
-      meta['request_id']     = headers['x-request-id'] || headers['X-Request-Id']
-      meta['retry_after']    = headers['Retry-After']
-      meta['etag']           = headers['ETag']
-      meta['last_modified']  = headers['Last-Modified']
-      meta['model_version']  = headers['x-goog-model-id'] || headers['X-Model-Version']
+      # Workato passes parsed JSON as body; ensure a Hash
+      parsed = body.is_a?(Hash) ? body : (body.present? ? JSON.parse(body) : {})
+      parsed['_http'] = { 'status' => code, 'headers' => headers }
       parsed
     end,
     normalize_model!: lambda do |m|
@@ -1333,10 +1504,6 @@ require 'securerandom'
     normalize_debug_blob: lambda do |_connection, blob|
       # Always return the original blob (no redaction)
       blob
-    end,
-    log_debug: lambda do |what, payload=nil|
-      # Emits structured debug; recipe authors can decide what to persist/share.
-      call(:telemetry_debug, { what: what, payload: payload })
     end,
     build_request_opts: lambda do |connection, base_opts|
       # Unconditional behavior (no prod/dev adjustment)
@@ -1357,10 +1524,8 @@ require 'securerandom'
       "#{call(:ensure_location!, connection)}-aiplatform.googleapis.com"
     end,
     default_headers: lambda do |connection|
-      h = { 'Content-Type' => 'application/json; charset=utf-8' }
-      up = connection['user_project'].to_s.strip
-      h['x-goog-user-project'] = up unless up.empty?
-      h
+      # Deliberately keep these minimal to avoid duplication of headers
+      { 'Content-Type' => 'application/json; charset=utf-8' }
     end,
     path_generate_content: lambda do |connection, model|
       pub = (connection['publisher'].presence || 'google')
@@ -1370,14 +1535,14 @@ require 'securerandom'
       pub = (connection['publisher'].presence || 'google')
       "/v1/projects/#{call(:ensure_project_id!, connection)}/locations/#{call(:ensure_location!, connection)}/publishers/#{pub}/models/#{model}:predict"
     end,
-    path_rag_retrieve_contexts: lambda do |_connection, rag_corpus|
-      "/v1/#{rag_corpus}:retrieveContexts"
+    path_rag_retrieve_contexts_location: lambda do |connection|
+      "/v1/projects/#{call(:ensure_project_id!, connection)}/locations/#{call(:ensure_location!, connection)}:retrieveContexts"
     end,
     path_rag_answer: lambda do |_connection, rag_corpus|
       "/v1/#{rag_corpus}:answer"
     end,
     path_ranking_rank: lambda do |_connection, ranking_config|
-      "/v1/#{ranking_config}:rank"
+      "/v1alpha/#{ranking_config}:rank"
     end
 
   },
@@ -1395,64 +1560,17 @@ require 'securerandom'
   }
 }
 
-  pick_lists_old: {
-    trim_strategies: lambda do
-      [['Drop lowest score first','drop_low_score'],
-      ['Diverse (MMR-like)','diverse_mmr'],
-      ['Truncate by characters','truncate_chars']]
-    end,
-    discovery_hosts: lambda do |_connection|
-      [
-        ['Discovery Engine (global)', 'discoveryengine.googleapis.com'],
-        ['Discovery Engine (US multi-region)', 'us-discoveryengine.googleapis.com']
-      ]
-    end,
-    modes_classification: lambda do
-      [%w[Embedding embedding], %w[Generative generative], %w[Hybrid hybrid]]
-    end,
-    modes_grounding: lambda do
-      [%w[Google\ Search google_search], %w[Vertex\ AI\ Search vertex_ai_search]]
-    end,
-    roles: lambda do
-      # Contract-conformant roles (system handled via system_preamble)
-      [['user','user'], ['model','model']]
-    end,
-    rag_source_families: lambda do
-      [
-        ['Google Cloud Storage', 'gcs'],
-        ['Google Drive', 'drive']
-      ]
-    end,
-    drive_input_type: lambda do
-      [
-        ['Drive Files', 'files'],
-        ['Drive Folder', 'folder']
-      ]
-    end,
-    distance_measures: lambda do
-      [
-        ['Cosine distance', 'COSINE_DISTANCE'],
-        ['Dot product',     'DOT_PRODUCT'],
-        ['Euclidean',       'EUCLIDEAN_DISTANCE']
-      ]
-    end,
-    iam_services: lambda do
-      [['Vertex AI','vertex'], ['AI Applications (Discovery)','discovery']]
-    end,
-    discovery_versions: lambda do
-      [
-        ['v1alpha', 'v1alpha'],
-        ['v1beta',  'v1beta'],
-        ['v1',      'v1']
-      ]
-    end
-  },
     # ENDPOINTS
       # Embed (host=`https://{LOCATION}-aiplatform.googleapis.com`, path=`/v1/projects/{project}/locations/{location}/publishers/google/models/{embeddingModel}:predict`)
       # Generate (host=`https://aiplatform.googleapis.com`, path=`/v1/{model}:generateContent`)
       # Count tokens (host=`https://LOCATION-aiplatform.googleapis.com`, path=`/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:countTokens`)
-      # Rank (host=`https://discoveryengine.googleapis.com`, path=`/v1/{rankingConfig=projects/*/locations/*/rankingConfigs/*}:rank`)
+      # Rank (host=`https://discoveryengine.googleapis.com`, path=`/v1alpha/{rankingConfig=projects/*/locations/*/rankingConfigs/*}:rank`)
     # DOCUMENTATION
-      # Count tokens
-        # publisher model  (https://docs.cloud.google.com/vertex-ai/generative-ai/docs/reference/rest/v1/projects.locations.publishers.models/countTokens)
-        # endpoint/tuned model (https://docs.cloud.google.com/vertex-ai/generative-ai/docs/reference/rest/v1/projects.locations.endpoints/countTokens)
+      # 1. RAG Engine 
+        # 1a. (https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/rag-api-v1)
+        # 1.b (https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/rag-output-explained)
+      # 2. Embedding (https://ai.google.dev/gemini-api/docs/embeddings)
+      # 3. Ranking (https://docs.cloud.google.com/generative-ai-app-builder/docs/ranking)
+      # 4. Count tokens
+        # 4a. publisher model  (https://docs.cloud.google.com/vertex-ai/generative-ai/docs/reference/rest/v1/projects.locations.publishers.models/countTokens)
+        # 4b. endpoint/tuned model (https://docs.cloud.google.com/vertex-ai/generative-ai/docs/reference/rest/v1/projects.locations.endpoints/countTokens)
