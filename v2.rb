@@ -997,8 +997,9 @@ require 'securerandom'
         ]
       end,
       execute: lambda do |connection, input|
-        host = call(:aiplatform_host, connection)
         path = call(:path_rag_retrieve_contexts, connection)
+        # Build the canonical parent for routing + header hints
+        parent = "projects/#{call(:ensure_project_id!, connection)}/locations/#{call(:ensure_location!, connection)}"
 
         body = {
           'query' => {
@@ -1016,21 +1017,38 @@ require 'securerandom'
           }
         end
 
-        raw = post("https://#{host}#{path}")
-          .headers(call(:default_headers, connection))
-          .payload(body)
-          #.after_response { |code, body, headers, _| call(:normalize_response!, code, body, headers) }
-          #.after_error_response { |code, body, headers, _| call(:normalize_error!, code, body, headers) }
+        # Add Google's routing hint header
+        extra = { 'x-goog-request-params' => "parent=#{parent}" }
+        # Push requestor-pays/quota attribution if configured
+        up = connection['user_project'].to_s.strip
+        extra['x-goog-user-project'] = up unless up.empty?
 
+        raw = post("https://#{host}#{path}")
+                 .headers(call(:default_headers, connection).merge(extra))
+          .payload(body)
+
+        # Workato normally returns a hash, but parse to hash anyway
         result = call(:safe_parse_json, raw)
-        
-        # API returns: { "contexts": { "contexts": [ ... ] } }
-        arr = []
-        arr = result.dig('contexts', 'contexts') if result.respond_to?(:dig)
-        arr ||= []
+
+        # Handle both REST shapes:
+        # (A) { "contexts": [ ... ] }
+        # (B) { "contexts": { "contexts": [ ... ] } }
+        arr =
+          if result.is_a?(Hash)
+            if result['contexts'].is_a?(Array)
+              result['contexts']
+            elsif result.dig('contexts', 'contexts').is_a?(Array)
+              result.dig('contexts', 'contexts')
+            else
+              []
+            end
+          else
+            []
+          end
 
         mapped = arr.map do |c|
           {
+            # ID is best-effort; not always present
             'id' => c.dig('chunk', 'id') || c.dig('chunk', 'chunkId'),
             'uri' => c['sourceUri'],
             'content' => c['text'],
