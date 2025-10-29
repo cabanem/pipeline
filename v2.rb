@@ -1019,21 +1019,11 @@ require 'securerandom'
         result = post("https://#{host}#{path}")
           .headers(call(:default_headers, connection))
           .payload(body)
-          .after_response do |code, body, headers, _|
-            parsed = call(:safe_parse_json, body)
-            call(:normalize_response!, code, parsed, headers)
-          end
-          .after_error_response do |code, body, headers, _|
-            parsed = call(:safe_parse_json, body)
-            call(:normalize_error!, code, parsed, headers)
-          end
+          .after_response { |code, body, headers, _| call(:normalize_response!, code, body, headers) }
+          .after_error_response { |code, body, headers, _| call(:normalize_error!, code, body, headers) }
 
         # API returns: { contexts: { contexts: [ ... ] } }
-        arr = []
-        # result is guaranteed Hash-ish after safe_parse_json, but be defensive anyway
-        if result.respond_to?(:dig)
-          arr = result.dig('contexts', 'contexts') || []
-        end
+        arr = (result.dig('contexts', 'contexts') || [])
 
         mapped = arr.map do |c|
           {
