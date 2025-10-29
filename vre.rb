@@ -858,8 +858,10 @@ require 'securerandom'
         corr = call(:build_correlation_id)
 
         call(:ensure_project_id!, connection)
-        call(:ensure_regional_location!, connection)
-        loc = connection['location'].to_s.downcase
+        # Ranking API uses AI Applications locations (global/us/eu multiregions).
+        loc = connection['location'].to_s.downcase.presence || 'global'
+        allowed = %w[global us eu]
+        error("Ranking API location '#{loc}' is not supported. Use one of: #{allowed.join(', ')}") unless allowed.include?(loc)
 
         # Resolve config id (not full resource) to avoid double-embedding path parts.
         config_id =
@@ -872,12 +874,16 @@ require 'securerandom'
         req_params = "ranking_config=projects/#{connection['project_id']}/locations/#{loc}/rankingConfigs/#{config_id}"
 
         # Build the v1alpha URL:
+        
+        # Vertex AI Ranking API is on Discovery Engine (Vertex AI Search) host
         # /v1alpha/projects/{project}/locations/{location}/rankingConfigs/{config}:rank
+        ver = (connection['discovery_api_version'].presence || 'v1').to_s
         url = call(
-          :aipl_v1alpha_url,
+          :discovery_url,
           connection,
           loc,
-          "projects/#{connection['project_id']}/locations/#{loc}/rankingConfigs/#{config_id}:rank"
+          "projects/#{connection['project_id']}/locations/#{loc}/rankingConfigs/#{config_id}:rank",
+          ver
         )
 
         body = {
