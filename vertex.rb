@@ -719,13 +719,185 @@ require 'securerandom'
     },
 
     # Generate content (90)
+    gen_generate: {
+      title: 'Generative: Unified generate',
+      subtitle: 'Free, grounded, or RAG-lite (one action)',
+      display_priority: 95,
+      retry_on_request: ['GET','HEAD'],
+      retry_on_response: [408,429,500,502,503,504],
+      max_retries: 3,
+
+      input_fields: lambda do |object_definitions, connection, _|
+        [
+          { name: 'model', optional: false, control_type: 'text', hint: call(:model_id_hint) },
+          # Path A: direct contents
+          { name: 'contents', type: 'array', of: 'object', properties: object_definitions['content'], optional: true,
+            hint: 'Provide either contents OR question+context_chunks' },
+          # Path B: question + context chunks (RAG-lite)
+          { name: 'question', optional: true },
+          { name: 'context_chunks', type: 'array', of: 'object', optional: true, properties: [
+              { name: 'id' }, { name: 'text', optional: false }, { name: 'source' }, { name: 'uri' },
+              { name: 'score', type: 'number' }, { name: 'metadata', type: 'object' }
+            ]
+          },
+          # Grounding
+          { name: 'grounding', control_type: 'select', optional: true, default: 'none',
+            pick_list: 'modes_grounding', hint: 'none, google_search, or vertex_ai_search' },
+          { name: 'vertex_ai_search_datastore', optional: true },
+          { name: 'vertex_ai_search_serving_config', optional: true },
+          # Schema preset (for answer/citations JSON)
+          { name: 'schema_preset', control_type: 'select', optional: true, default: 'none',
+            pick_list: [['None','none'], ['Answer with citations','answer_with_citations']] },
+          # Common knobs
+          { name: 'system_preamble', optional: true },
+          { name: 'generation_config', type: 'object', properties: object_definitions['generation_config'] },
+          { name: 'safetySettings', type: 'array', of: 'object', properties: object_definitions['safety_setting'] },
+          { name: 'toolConfig', type: 'object' },
+          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
+        ]
+      end,
+
+      output_fields: lambda do |object_definitions, _|
+        # Union: raw candidates (free/grounded) OR structured answer (RAG-lite)
+        Array(object_definitions['generate_content_output']) +
+        [
+          { name: 'answer' },
+          { name: 'citations', type: 'array', of: 'object', properties: [
+              { name: 'chunk_id' }, { name: 'source' }, { name: 'uri' }, { name: 'score', type: 'number' }
+            ]
+          },
+          { name: 'usage', type: 'object', properties: [
+              { name: 'promptTokenCount', type: 'integer' },
+              { name: 'candidatesTokenCount', type: 'integer' },
+              { name: 'totalTokenCount', type: 'integer' }
+            ]
+          }
+        ] + Array(object_definitions['envelope_fields'])
+      end,
+
+      execute: lambda do |connection, raw_input|
+        t0   = Time.now
+        corr = call(:build_correlation_id)
+        input = call(:normalize_input_keys, raw_input)
+        begin
+          # Decide path: contents vs question+chunks (XOR)
+          has_contents = call(:safe_array, input['contents']).any?
+          has_rag      = input['question'].to_s.strip != '' || call(:safe_array, input['context_chunks']).any?
+          error('Provide either contents OR question+context_chunks') if has_contents && has_rag
+          error('Provide contents or question+context_chunks') unless has_contents || has_rag
+
+          # Build contents
+          contents =
+            if has_rag
+              chunks = call(:safe_array, input['context_chunks'])
+              ctx_blob = call(:format_context_chunks, chunks)
+              [{ 'role' => 'user', 'parts' => [ { 'text' => "Question:\n#{input['question']}\n\nContext:\n#{ctx_blob}" } ] }]
+            else
+              call(:sanitize_contents!, input['contents'])
+            end
+          error('At least one non-system message with non-empty parts is required in contents') if contents.blank?
+
+          # Grounding tools
+          tools = nil
+          case input['grounding'].to_s
+          when 'google_search'
+            tools = [ { 'googleSearch' => {} } ]
+          when 'vertex_ai_search'
+            ds   = input['vertex_ai_search_datastore'].to_s
+            scfg = input['vertex_ai_search_serving_config'].to_s
+            error('Provide exactly one of vertex_ai_search_datastore OR vertex_ai_search_serving_config') \
+              if (ds.blank? && scfg.blank?) || (ds.present? && scfg.present?)
+            vas = {}; vas['datastore'] = ds unless ds.blank?; vas['servingConfig'] = scfg unless scfg.blank?
+            tools = [ { 'retrieval' => { 'vertexAiSearch' => vas } } ]
+          end
+
+          # Generation config (+ optional schema preset)
+          gen_cfg = call(:sanitize_generation_config, input['generation_config']) || {}
+          if input['schema_preset'].to_s == 'answer_with_citations'
+            gen_cfg = (gen_cfg || {}).merge({
+              'responseMimeType' => 'application/json',
+              'responseSchema'   => {
+                'type' => 'object', 'additionalProperties' => false,
+                'properties' => {
+                  'answer' => { 'type' => 'string' },
+                  'citations' => {
+                    'type' => 'array', 'items' => {
+                      'type' => 'object', 'additionalProperties' => false,
+                      'properties' => {
+                        'chunk_id' => { 'type' => 'string' },
+                        'source'   => { 'type' => 'string' },
+                        'uri'      => { 'type' => 'string' },
+                        'score'    => { 'type' => 'number' }
+                      }
+                    }
+                  }
+                },
+                'required' => ['answer']
+              }
+            })
+          end
+
+          req = call(:build_generate_content_request,
+                     connection, input['model'],
+                     contents: contents,
+                     system_text: input['system_preamble'],
+                     tools: tools,
+                     tool_config: call(:safe_obj, input['toolConfig']),
+                     safety_settings: call(:sanitize_safety!, input['safetySettings']),
+                     generation_config: gen_cfg)
+
+          resp = post(req['url'])
+                   .headers(call(:request_headers_auth, connection, corr, nil, req['req_params']))
+                   .payload(req['body'])
+
+          code = call(:telemetry_success_code, resp)
+          if input['schema_preset'].to_s == 'answer_with_citations'
+            text   = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
+            parsed = call(:safe_parse_json, text)
+            {
+              'answer' => parsed['answer'] || text,
+              'citations' => parsed['citations'] || [],
+              'usage' => resp['usageMetadata']
+            }.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          else
+            resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          end
+        rescue => e
+          g   = call(:extract_google_error, e)
+          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
+          env = call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg)
+          if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
+            env['debug'] = call(:debug_pack, true, req && req['url'], req && req['body'], g)
+          end
+          error(env)
+        end
+      end,
+
+      sample_output: lambda do
+        # Mixed-mode sample: both raw candidates and structured fields present
+        {
+          'responseId' => 'resp-abc',
+          'candidates' => [
+            { 'finishReason' => 'STOP',
+              'content' => { 'role' => 'model', 'parts' => [ { 'text' => 'Sample text.' } ] } }
+          ],
+          'answer' => 'Employees may carry over up to 40 hours of PTO.',
+          'citations' => [ { 'chunk_id' => 'doc-42#c3', 'source' => 'handbook', 'uri' => 'https://..', 'score' => 0.91 } ],
+          'usage' => { 'promptTokenCount' => 123, 'candidatesTokenCount' => 80, 'totalTokenCount' => 203 },
+          'ok' => true,
+          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 15, 'correlation_id' => 'sample' }
+        }
+      end
+    },
+
     gen_generate_content: {
       title: 'Generative: Generate content (Gemini)',
       subtitle: 'Generate content from a prompt',
       help: lambda do  |input, picklist_label|
         { body: 'Provide a prompt to generate content from an LLM. Uses "POST :generateContent".'}
       end,
-      display_priority: 90,
+      deprecated: true,
+      display_priority: 1,
       retry_on_request: ['GET','HEAD'], # removed "POST" to preserve idempotency, prevent duplication of jobs
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
@@ -815,7 +987,8 @@ require 'securerandom'
       title: 'Generative: Generate (grounded)',
       subtitle: 'Generate with grounding via Google Search or Vertex AI Search',
       description: '',
-      display_priority: 90,
+      deprecated: true,
+      display_priority: 1,
       retry_on_request: [ 'GET', 'HEAD' ],
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
@@ -920,7 +1093,8 @@ require 'securerandom'
       help: lambda do |input, picklist_label|
         { body: 'Answer a question using caller-supplied context chunks (RAG-lite). Returns structured JSON with citations.' }
       end,
-      display_priority: 90,
+      deprecated: true,
+      display_priority: 1,
       retry_on_request: ['GET', 'HEAD'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
@@ -1767,6 +1941,33 @@ require 'securerandom'
 
   # --------- METHODS ------------------------------------------------------
   methods: {
+     # --- Generative -------------------------------------------------------
+    build_generate_content_request: lambda do |connection, model_id,
+                                              contents:,
+                                              system_text: nil,
+                                              tools: nil,
+                                              tool_config: nil,
+                                              safety_settings: nil,
+                                              generation_config: nil,
+                                              req_params_extra: nil|
+      # Resolve model → path and region
+      model_path = call(:build_model_path_with_global_preview, connection, model_id)
+      loc_from_model = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
+      url = call(:aipl_v1_url, connection, loc_from_model, "#{model_path}:generateContent")
+
+      payload = {
+        'contents'          => contents,
+        'systemInstruction' => call(:system_instruction_from_text, system_text),
+        'tools'             => tools,
+        'toolConfig'        => tool_config,
+        'safetySettings'    => safety_settings,
+        'generationConfig'  => generation_config
+      }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
+
+      { 'url' => url, 'body' => call(:json_compact, payload), 'model_path' => model_path,
+        'req_params' => ["model=#{model_path}", (req_params_extra.to_s.strip.presence)].compact.join('&') }
+    end,
+
     # --- Canonical per-request headers (Authorization + routing) ----------
     request_headers_auth: lambda do |_connection, correlation_id, extra=nil, request_params=nil|
       # Auth header comes from connection.authorization.apply
