@@ -1021,6 +1021,7 @@ require 'securerandom'
           env['debug'] = call(:debug_pack, true, url, req_body, g)
         end
         error(env)   # <-- raise so Workato marks step failed and retries if applicable
+      end
       end,
       sample_output: lambda do |_connection, _input|
         {
@@ -1720,11 +1721,12 @@ require 'securerandom'
       output_fields: lambda do |_object_definitions, _connection|
         [{ name: 'status' }, { name: 'http_status' }]
       end,
-      execute: lambda do |_connection, input|
+      execute: lambda do |connection, input|
         # Canonical severities accepted by Cloud Logging facets:
         # DEFAULT, DEBUG, INFO, NOTICE, WARNING, ERROR, CRITICAL, ALERT, EMERGENCY
         started_at = Time.now.utc.iso8601
         t0 = Time.now
+        corr = call(:build_correlation_id)
         project = input['project_id']
         log_id  = input['log_id']
         nonstandard_prefix = 'NONSTANDARD/' # backend-only tag for abnormal values
@@ -1747,11 +1749,12 @@ require 'securerandom'
           end
         }
         begin
+          # Reuse standard header builder (adds auth, optional x-goog-user-project, x-goog-request-params)
+          req_headers = call(:request_headers_auth, connection, corr, connection['user_project'], nil)
           resp = post("https://logging.googleapis.com/v2/entries:write")
-            .headers('Authorization' => "Bearer #{connection['access_token']}",
-                    'Content-Type' => 'application/json')
-            .payload(body)
-            .request_format_json
+                    .headers(req_headers)
+                    .payload(call(:json_compact, body))
+                    .request_format_json
           # Shape the return to match output_fields
           http_status = (resp['status'] || resp['status_code'] || 200).to_i
           out = { 'status' => 'ok', 'http_status' => http_status }
@@ -1760,11 +1763,12 @@ require 'securerandom'
         rescue => e
           call(:tail_log_emit!, connection, :logs_write, started_at, t0, nil, e)
           # Re-raise normalized so Workato retry/metrics apply; include code when we can parse it
-          code = (e.respond_to?(:[]) && (e['status'] || e.dig('response','status') || e.dig('error','code'))).to_i
+          code = call(:telemetry_parse_error_code, e)
+          code = 500 if code.to_i == 0
           error({
             'status'  => 'error',
             'message' => e.to_s,
-            'code'    => (code == 0 ? 500 : code)
+            'code'    => code
           })
         end
       end
