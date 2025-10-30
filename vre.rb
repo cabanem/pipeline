@@ -441,6 +441,7 @@ require 'securerandom'
       end,
       execute: lambda do |connection, input|
         # 1. Invariants
+        started_at = Time.now.utc.iso8601 # for logging
         t0   = Time.now
         corr = call(:build_correlation_id)
         url = nil; req_body = nil
@@ -561,6 +562,8 @@ require 'securerandom'
           end
           result['preproc'] = preproc if preproc
 
+          call(:tail_log_emit!, connection, :gen_categorize_email, started_at, t0, result, nil)
+          
           # Attach telemetry and RETURN the hash
           result = result.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
           result
@@ -568,6 +571,7 @@ require 'securerandom'
           g   = call(:extract_google_error, e)
           msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
           env = call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg)
+          call(:tail_log_emit!, connection, :gen_categorize_email, started_at, t0, nil, e)
           # Optional debug attachment in non-prod:
           if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
             env['debug'] = call(:debug_pack, true, url, req_body, g)
@@ -661,6 +665,8 @@ require 'securerandom'
         ]
       end,
       execute: lambda do |connection, input|
+        started_at = Time.now.utc.iso8601 # for logging
+
         t0   = Time.now
         corr = call(:build_correlation_id)
         url = nil; req_body = nil; req_params = nil
@@ -774,18 +780,20 @@ require 'securerandom'
           unless call(:normalize_boolean, connection['prod_mode'])
             out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
           end
+          call(:tail_log_emit!, connection, :email_extract_salient_span, started_at, t0, out, nil)
+          
           out
         rescue => e
           g   = call(:extract_google_error, e)
           msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
           out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
+          call(:tail_log_emit!, connection, :email_extract_salient_span, started_at, t0, nil, e)
           unless call(:normalize_boolean, connection['prod_mode'])
             out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
           end
           out
         end
       end,
-
       sample_output: lambda do
         {
           'salient_span'   => 'Can you approve the Q4 budget increase by Friday, October 24?',
@@ -836,8 +844,17 @@ require 'securerandom'
         ] + Array(od['envelope_fields'])
       end,
       execute: lambda do |connection, raw_input|
+        started_at = Time.now.utc.iso8601
+        t0 = Time.now.to_f
         input = call(:normalize_input_keys, raw_input)
-        call(:gen_generate_core!, connection, input)
+        begin
+          result = call(:gen_generate_core!, connection, input)
+          call(:tail_log_emit!, connection, :gen_generate, started_at, t0, result, nil)
+          result
+        rescue => e
+          call(:tail_log_emit!, connection, :gen_generate, started_at, t0, nil, e)
+          raise
+        end
       end,
       sample_output: lambda do
         { 'responseId'=>'resp-x',
@@ -886,7 +903,6 @@ require 'securerandom'
           # Optional override when your connection 'location' is regional (e.g., us-central1)
           { name: 'ai_apps_location', label: 'AI-Apps location (override)', control_type: 'select', pick_list: 'ai_apps_locations', optional: true,
             hint: 'Ranking/Search use multi-regions only: global, us, or eu. Leave blank to derive from connection location.' }
-
         ]
       end,
       output_fields: lambda do |object_definitions, _connection|
@@ -907,8 +923,10 @@ require 'securerandom'
         ] + Array(object_definitions['envelope_fields'])
       end,
       execute: lambda do |connection, input|
+        started_at = Time.now.utc.iso8601
         t0   = Time.now
         corr = call(:build_correlation_id)
+        url = nil; req_body = nil
 
         call(:ensure_project_id!, connection)
         # Normalize connection region → AI-Apps multi-region (global|us|eu), allow per-action override
@@ -952,6 +970,7 @@ require 'securerandom'
 
         req_body = call(:json_compact, body)
 
+        begin
         resp = post(url)
                  .headers(call(:request_headers_auth, connection, corr, connection['user_project'], req_params))
                  .payload(req_body)
@@ -990,11 +1009,13 @@ require 'securerandom'
           'model'     => (input['rank_model'].to_s.strip if input['rank_model'].present?)
         }.compact
 
+        call(:tail_log_emit!, connection, :rank_texts_with_ranking_api, started_at, t0, out, nil)
         out
       rescue => e
         g   = call(:extract_google_error, e)
         msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
         env = call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg)
+        call(:tail_log_emit!, connection, :rank_texts_with_ranking_api, started_at, t0, nil, e)
         # Optional debug attachment in non-prod:
         if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
           env['debug'] = call(:debug_pack, true, url, req_body, g)
@@ -1052,7 +1073,6 @@ require 'securerandom'
           # (If you kept legacy flat fields for BC, they can remain here; not required.)
         ]
       end,
-
       output_fields: lambda do |object_definitions, _connection|
         [
           { name: 'question' },
@@ -1075,10 +1095,11 @@ require 'securerandom'
           ]}
         ]
       end,
-
       execute: lambda do |connection, input|
+        started_at = Time.now.utc.iso8601
         t0   = Time.now
         corr = call(:build_correlation_id)
+        retr_url = nil; retr_req_body = nil
 
         proj = connection['project_id']
         loc  = connection['location']
@@ -1103,10 +1124,11 @@ require 'securerandom'
           opts
         )
 
-        url  = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
-        resp = post(url)
+        retr_url  = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
+        retr_req_body = call(:json_compact, payload)
+        resp = post(retr_url)
                 .headers(call(:request_headers_auth, connection, corr, connection['user_project'], req_par))
-                .payload(call(:json_compact, payload))
+                .payload(retr_req_body)
 
         raw   = call(:normalize_retrieve_contexts!, resp)
         maxn  = call(:clamp_int, (input['max_contexts'] || 20), 1, 200)
@@ -1132,13 +1154,16 @@ require 'securerandom'
           (out['telemetry'] ||= {})['rank'] = { 'mode' => 'llm', 'model' => opts['llmRankerModel'] }
         end
 
+        call(:tail_log_emit!, connection, :rag_retrieve_contexts, started_at, t0, out, nil)
         out
       rescue => e
         g = call(:extract_google_error, e)
         msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-        {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
-      end,
+        env = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
+        call(:tail_log_emit!, connection, :rag_retrieve_contexts, started_at, t0, nil, e)
+        env
 
+      end,
       sample_output: lambda do
         {
           'question' => 'What is the PTO carryover policy?',
@@ -1198,7 +1223,6 @@ require 'securerandom'
           { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
         ]
       end,
-
       output_fields: lambda do |object_definitions, _connection|
         [
           { name: 'answer' },
@@ -1233,8 +1257,9 @@ require 'securerandom'
           ]}
         ]
       end,
-
       execute: lambda do |connection, input|
+        # Begin logging
+        started_at = Time.now.utc.iso8601
         t0   = Time.now
         corr = call(:build_correlation_id)
         retr_url = nil; retr_req_body = nil
@@ -1388,6 +1413,7 @@ require 'securerandom'
           end
         end
 
+        call(:tail_log_emit!, connection, :rag_answer, started_at, t0, out, nil)
         out
       rescue => e
         g   = call(:extract_google_error, e)
@@ -1396,6 +1422,7 @@ require 'securerandom'
         if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
           env['debug'] = call(:debug_pack, true, gen_url || retr_url, (gen_req_body || retr_req_body), g)
         end
+        call(:tail_log_emit!, connection, :rag_answer, started_at, t0, nil, e)
         error(env)
       end,
 
@@ -1454,6 +1481,7 @@ require 'securerandom'
       end,
       execute: lambda do |connection, input|
         # Correlation id and duration for logs / analytics
+        started_at = Time.now.utc.iso8601
         t0 = Time.now
         corr = call(:build_correlation_id)
         url = nil; req_body = nil
@@ -1488,8 +1516,10 @@ require 'securerandom'
             'outputDimensionality' => input['outputDimensionality']
           })
 
-          call(:predict_embeddings, connection, model_path, instances, params, corr)
-            .merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+          result = call(:predict_embeddings, connection, model_path, instances, params, corr)
+          result = result.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+          call(:tail_log_emit!, connection, :embed_text, started_at, t0, result, nil)
+          result
         rescue => e
           g   = call(:extract_google_error, e)
           msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
@@ -1498,6 +1528,7 @@ require 'securerandom'
           if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
             env['debug'] = call(:debug_pack, true, url, req_body, g)
           end
+          call(:tail_log_emit!, connection, :embed_text, started_at, t0, nil, e)
           error(env)   # <-- raise so Workato marks step failed and retries if applicable
         end
       end,
@@ -1546,6 +1577,7 @@ require 'securerandom'
       end,
       execute:  lambda do |connection, input|
         # Correlation id and duration for logs / analytics
+        started_at = Time.now.utc.iso8601
         t0 = Time.now
         corr = call(:build_correlation_id)
         url = nil; req_body = nil
@@ -1570,7 +1602,9 @@ require 'securerandom'
                     .headers(call(:request_headers_auth, connection, corr, connection['user_project'], "model=#{model_path}"))
                     .payload(req_body)
           code = call(:telemetry_success_code, resp)
-          resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          result = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          call(:tail_log_emit!, connection, :count_tokens, started_at, t0, result, nil)
+          result
         rescue => e
           g   = call(:extract_google_error, e)
           msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
@@ -1579,6 +1613,7 @@ require 'securerandom'
           if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
             env['debug'] = call(:debug_pack, true, url, req_body, g)
           end
+          call(:tail_log_emit!, connection, :count_tokens, started_at, t0, nil, e)
           error(env)   # <-- raise so Workato marks step failed and retries if applicable
         end
       end,
@@ -1622,6 +1657,7 @@ require 'securerandom'
         ]
       end,
       execute: lambda do |connection, input|
+        started_at = Time.now.utc.iso8601
         t0 = Time.now
         corr = call(:build_correlation_id)
         begin
@@ -1632,9 +1668,13 @@ require 'securerandom'
           url = call(:aipl_v1_url, connection, loc, op.start_with?('projects/') ? op : "projects/#{connection['project_id']}/locations/#{loc}/operations/#{op}")
           resp = get(url).headers(call(:request_headers_auth, connection, corr, connection['user_project'], nil))
           code = call(:telemetry_success_code, resp)
-          resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          result = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          call(:tail_log_emit!, connection, :operations_get, started_at, t0, result, nil)
+          result
         rescue => e
-          {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
+          env = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
+          call(:tail_log_emit!, connection, :operations_get, started_at, t0, nil, e)
+          env
         end
       end,
 
@@ -1681,6 +1721,8 @@ require 'securerandom'
       execute: lambda do |_connection, input|
         # Canonical severities accepted by Cloud Logging facets:
         # DEFAULT, DEBUG, INFO, NOTICE, WARNING, ERROR, CRITICAL, ALERT, EMERGENCY
+        started_at = Time.now.utc.iso8601
+        t0 = Time.now
         project = input['project_id']
         log_id  = input['log_id']
         nonstandard_prefix = 'NONSTANDARD/' # backend-only tag for abnormal values
@@ -1702,11 +1744,18 @@ require 'securerandom'
             }.compact
           end
         }
-        post("https://logging.googleapis.com/v2/entries:write")
-          .headers('Authorization' => "Bearer #{connection['access_token']}",
-                  'Content-Type' => 'application/json')
-          .payload(body)
-          .request_format_json
+        begin
+          resp = post("https://logging.googleapis.com/v2/entries:write")
+            .headers('Authorization' => "Bearer #{connection['access_token']}",
+                    'Content-Type' => 'application/json')
+            .payload(body)
+            .request_format_json
+          call(:tail_log_emit!, connection, :logs_write, started_at, t0, {status: 'ok'}, nil)
+          resp
+        rescue => e
+          call(:tail_log_emit!, connection, :logs_write, started_at, t0, nil, e)
+          raise
+        end
       end,
       output_fields: lambda do |_object_definitions, _connection|
         [{ name: 'status' }, { name: 'http_status' }]
@@ -1836,43 +1885,161 @@ require 'securerandom'
       avg  = topk.sum / topk.length.to_f
       [[avg, 0.0].max, 1.0].min.round(4)
     end,
-    # Normalize arbitrary severity strings to Cloud Logging canonicals.
-    # - Upcases and trims input.
-    # - Maps common aliases (WARN->WARNING, FATAL->CRITICAL, TRACE->DEBUG, etc.).
-    # - If still non-standard, prefixes with NONSTANDARD/ (or provided prefix).
+
+    # --- Tail logging helpers -------------------------------------------------
+    # Lightweight context to track timing/correlation across an action run.
+    tail_log_begin!: lambda do |connection, action_id, input|
+      {
+        action_id: action_id.to_s,
+        started_at: (Time.now.utc.iso8601 rescue Time.at((Time.now.to_f*1000).to_i/1000.0).utc.iso8601),
+        t0: (Time.now.to_f rescue Time.now),
+        corr_id: (SecureRandom.uuid rescue "#{rand}-#{Time.now.to_i}"),
+        project_id: connection['project_id'] || connection['gcp_project_id'],
+        log_id: 'workato_vertex_rag' # keep internal; no builder knob required
+      }
+    end,
+    tail_log_end!: lambda do |connection, ctx, result, error|
+      # Build a compact envelope; scrub obvious big/PII fields
+      latency_ms = (((Time.now.to_f - ctx[:t0]) * 1000).round rescue nil)
+      status = error ? 'error' : 'ok'
+
+      # Pull some soft identifiers if you have them in the connection
+      env  = connection['environment'] || 'prod'
+      app  = 'vertex_rag_engine'
+
+      entry = {
+        logName: "projects/#{ctx[:project_id]}/logs/#{ctx[:log_id]}",
+        resource: { type: 'global', labels: { project_id: ctx[:project_id] } },
+        severity: (error ? 'ERROR' : 'INFO'),
+        labels: {
+          connector: app,
+          action: ctx[:action_id],
+          correlation_id: ctx[:corr_id],
+          env: env
+        },
+        jsonPayload: {
+          status: status,
+          started_at: ctx[:started_at],
+          ended_at: (Time.now.utc.iso8601 rescue nil),
+          latency_ms: latency_ms,
+          request_meta: {
+            # include only safe breadcrumbs; avoid bodies/tokens
+            recipe_id: connection['__recipe_id'],
+            job_id: connection['__job_id'],
+            region: connection['location'] || connection['region']
+          },
+          result_meta: call(:_shrink_result_meta, result),
+          error: call(:_normalize_error, error)
+        }
+      }.compact
+
+      call(:_tail_log_post, connection, [entry])
+    rescue => swallow
+      # Never raise from logging; tail logger must be fire-and-forget
+      nil
+    end,
+    _normalize_error: lambda do |e|
+      return nil unless e
+      # Workato errors vary; capture stable fields only
+      h = {
+        class: e.class.to_s,
+        message: e.message.to_s[0, 1024],
+        http_status: (e.dig(:response, :status) rescue nil),
+        code: (e.dig(:error, :code) rescue nil)
+      }.compact
+      h
+    end,
+    
+    # --- ultra-thin tail logger (one call; safe; no wrappers) -----------------
+    tail_log_emit!: lambda do |connection, action_id, started_at, t0, result, error|
+      # Fast-exit if no project or disabled
+      project = (connection['project_id'] || connection['gcp_project_id']).to_s.strip
+      return nil if project.empty? || connection['disable_tail_logging'] == true
+
+      # Timing
+      now = Time.now
+      begun = started_at || now.utc.iso8601
+      t0f = (t0 || now.to_f).to_f
+      latency_ms = ((now.to_f - t0f) * 1000).round
+
+      # Envelope
+      env  = connection['environment'] || 'prod'
+      app  = 'vertex_rag_engine'
+      corr = (connection['correlation_id'] || SecureRandom.uuid)
+      log_id = 'workato_vertex_rag'
+      severity = error ? 'ERROR' : 'INFO'
+
+      entry = {
+        logName: "projects/#{project}/logs/#{log_id}",
+        resource: { type: 'global', labels: { project_id: project } },
+        severity: severity,
+        labels: {
+          connector: app,
+          action: action_id.to_s,
+          correlation_id: corr,
+          env: env
+        },
+        jsonPayload: {
+          status: (error ? 'error' : 'ok'),
+          started_at: begun,
+          ended_at: now.utc.iso8601,
+          latency_ms: latency_ms,
+          request_meta: {
+            recipe_id: connection['__recipe_id'],
+            job_id: connection['__job_id'],
+            region: connection['location'] || connection['region']
+          },
+          result_meta: call(:_tl_shrink_meta, result),
+          error: call(:_tl_norm_error, error)
+        }
+      }
+      call(:_tl_post_logs, connection, [entry])
+    rescue
+      nil
+    end,
+    _tl_norm_error: lambda do |e|
+      return nil unless e
+      { class: e.class.to_s, message: e.message.to_s[0, 1024],
+        http_status: (e.dig(:response, :status) rescue nil),
+        code: (e.dig(:error, :code) rescue nil) }.compact
+    end,
+    _tl_shrink_meta: lambda do |r|
+      return nil if r.nil?
+      case r
+      when Hash
+        kept = %w[id name count total items_length model model_version index datapoints_upserted]
+        h = {}
+        kept.each do |k|
+          v = r[k] || r[k.to_sym]
+          next if v.nil?
+          h[k] = v.is_a?(Array) ? v.length : v
+        end
+        h.empty? ? { summary: 'present' } : h
+      when Array then { items_length: r.length }
+      else { summary: r.to_s[0, 128] }
+      end
+    end,
+    _tl_post_logs: lambda do |connection, entries|
+      return nil if entries.nil? || entries.empty?
+      post("https://logging.googleapis.com/v2/entries:write")
+        .headers('Authorization' => "Bearer #{connection['access_token']}",
+                'Content-Type' => 'application/json')
+        .payload(entries: entries)
+        .request_format_json
+        .after_error_response(400..599) { |_| nil }
+      nil
+    end,
     normalize_severity: lambda do |s, prefix = 'NONSTANDARD/'|
       raw = s.to_s.upcase.strip
       return 'INFO' if raw.empty?
-
-      # Canonical set from Google Cloud Logging
       canonical = %w[DEFAULT DEBUG INFO NOTICE WARNING ERROR CRITICAL ALERT EMERGENCY]
-
-      # Common aliases we see in the wild
       alias_map = {
-        'WARN'   => 'WARNING',
-        'WARNING' => 'WARNING',
-        'ERR'    => 'ERROR',
-        'ERROR'  => 'ERROR',
-        'SEVERE' => 'ERROR',
-        'FATAL'  => 'CRITICAL',
-        'CRIT'   => 'CRITICAL',
-        'TRACE'  => 'DEBUG',
-        'DBG'    => 'DEBUG',
-        'EMERG'  => 'EMERGENCY',
-        'NOTICE' => 'NOTICE',
-        'INFO'   => 'INFO',
-        'DEFAULT'=> 'DEFAULT'
+        'WARN'=>'WARNING','ERR'=>'ERROR','SEVERE'=>'ERROR',
+        'FATAL'=>'CRITICAL','CRIT'=>'CRITICAL','TRACE'=>'DEBUG','DBG'=>'DEBUG','EMERG'=>'EMERGENCY'
       }
-
       mapped = alias_map[raw] || raw
-      # Cap length defensively; Logging accepts strings but we keep it tidy
       mapped = mapped[0, 64]
-
-      if canonical.include?(mapped)
-        mapped
-      else
-        "#{prefix}#{mapped}"
-      end
+      canonical.include?(mapped) ? mapped : "#{prefix}#{mapped}"
     end,
     gen_generate_core!: lambda do |connection, input|
       t0   = Time.now
