@@ -353,7 +353,7 @@ require 'securerandom'
       end
     },
     rag_retrieval_config: {
-      fields: lambda do |_connection, _config_fields, _object_definitions|
+      fields: lambda do |_connection, _config_fields, object_definitions|
         [
           { name: 'top_k', type: 'integer', hint: 'Candidate cap before ranking. Rule of thumb: 20–50.' },
           { name: 'filter',  type: 'object', properties: object_definitions['rag_retrieval_filter'] },
@@ -372,7 +372,11 @@ require 'securerandom'
       title: 'Email: Categorize email',
       subtitle: 'Classify an email into a category',
       help: lambda do |input, picklist_label|
-        { body: 'Classify an email into one of the provided categories using embeddings (default) or a generative referee.'}
+        {
+          body: 'Classify an email into one of the provided categories using embeddings (default) or a generative referee.',
+          learn_more_url: 'https://ai.google.dev/gemini-api/docs/models',
+          learn_more_text: 'Find a current list of available Gemini models'
+        }
       end,
       display_priority: 100,
       retry_on_request: ['GET', 'HEAD'],
@@ -601,7 +605,11 @@ require 'securerandom'
       subtitle: 'Pull the most important sentence/paragraph from an email',
       display_priority: 100,
       help: lambda do |_|
-        { body: 'Heuristically trims boilerplate/quotes, then asks the model for the single most important span (<= 500 chars), with rationale, tags, and optional call-to-action metadata.' }
+        { 
+          body: 'Heuristically trims boilerplate/quotes, then asks the model for the single most important span (<= 500 chars), with rationale, tags, and optional call-to-action metadata.',
+          learn_more_url: 'https://ai.google.dev/gemini-api/docs/models',
+          learn_more_text: 'Find a current list of available Gemini models'
+        }
       end,
 
       retry_on_request: ['GET','HEAD'],
@@ -800,13 +808,15 @@ require 'securerandom'
       subtitle: 'Plain / Grounded / RAG-lite',
       help: lambda do |_|
         {
-          body: 'Select an option from the "Mode" field, then fill only the fields rendered by the recipe builder.'\
-                'Required fields -- RAG-LITE: [question, context_chunks, max_chunks, salience_text, ' \
+          body: "Select an option from the `Mode` field, then fill only the fields rendered by the recipe builder. "\
+                "Required fields per mode: `RAG-LITE`: [question, context_chunks, max_chunks, salience_text, " \
                 'salience_id, salience_score, max_prompt_tokens, reserve_output_tokens, count_tokens_model, ' \
-                'trim_strategy, temperature]' \
-                '-- VERTEX-SEARCH ONLY: [vertex_ai_search_datastore, vertex_ai_search_serving_config]' \
-                '-- RAG-STORE ONLY: [rag_corpus, rag_retrieval_config, similarity_top_k, vector_distance_threshold,'\
-                'vector_similarity_threshold, rank_service_model, llm_ranker_model]'
+                'trim_strategy, temperature].  ' \
+                '`VERTEX-SEARCH ONLY`: [vertex_ai_search_datastore, vertex_ai_search_serving_config].   ' \
+                '`RAG-STORE ONLY`: [rag_corpus, rag_retrieval_config, similarity_top_k, vector_distance_threshold,'\
+                'vector_similarity_threshold, rank_service_model, llm_ranker_model]. ',
+          learn_more_url: 'https://ai.google.dev/gemini-api/docs/models',
+          learn_more_text: 'Find a current list of available Gemini models'
         }
       end,
       display_priority: 90,
@@ -1007,10 +1017,12 @@ require 'securerandom'
         {
           body:
             'Retrieves contexts from a Vertex RAG corpus. ' \
-            'Knobs: top_k limits pre-ranking candidates; use EITHER vector_distance_threshold OR vector_similarity_threshold (not both). ' \
+            'Modifiers: top_k limits pre-ranking candidates; use EITHER vector_distance_threshold OR vector_similarity_threshold (not both). ' \
             'Pick ONE ranker: rank_service_model (semantic ranker) OR llm_ranker_model (Gemini). ' \
             'Guidance: if your index uses COSINE distance, distance≈1−similarity (so distance≤0.30 ≈ similarity≥0.70). ' \
-            'Start with top_k=20, then tighten by threshold; add a ranker only if you need stricter ordering.'
+            'Start with top_k=20, then tighten by threshold; add a ranker only if you need stricter ordering.',
+          learn_more_url: 'https://docs.cloud.google.com/vertex-ai/generative-ai/docs/model-reference/rag-api-v1',
+          learn_more_text: 'Find out more about the RAG Engine API'
         }
       end,
       display_priority: 86,
@@ -1148,7 +1160,9 @@ require 'securerandom'
           'One-shot retrieve+answer with citations. ' \
           'Tuning: top_k controls candidate pool; apply ONE threshold (distance OR similarity) to prune; pick ONE ranker (rank_service_model OR llm_ranker_model). ' \
           'Interpretation: surfaced context scores reflect retrieval similarity; re-ranking may change order but not the underlying scores. ' \
-          'Start with top_k=12, threshold to drop tails (e.g., similarity≥0.75 or distance≤0.25 for COSINE), then add a ranker if you still see off-topic chunks.'
+          'Start with top_k=12, threshold to drop tails (e.g., similarity≥0.75 or distance≤0.25 for COSINE), then add a ranker if you still see off-topic chunks.',
+          learn_more_url: 'https://docs.cloud.google.com/vertex-ai/generative-ai/docs/model-reference/rag-api-v1',
+          learn_more_text: 'Find out more about the RAG Engine API'
         }
       end,
       display_priority: 86,
@@ -1158,7 +1172,7 @@ require 'securerandom'
 
       input_fields: lambda do |object_definitions, _connection, _config_fields|
         [
-          { name: 'model', label: 'Model', optional: false, control_type: 'text' },
+          { name: 'model', label: 'Model', optional: false, control_type: 'text', hint: 'Find a current list of available Gemini models at `https://ai.google.dev/gemini-api/docs/models`'},
           { name: 'rag_corpus', optional: false, hint: 'RAG corpus: projects/{project}/locations/{region}/ragCorpora/{corpus}' },
           { name: 'question', optional: false },
           { name: 'restrict_to_file_ids', type: 'array', of: 'string', optional: true },
@@ -1408,7 +1422,11 @@ require 'securerandom'
       title: 'Embeddings: Embed text',
       subtitle: 'Get embeddings from a publisher embedding model',
       help: lambda do |_|
-        { body: 'POST :predict on a publisher embedding model' }
+        {
+          body: 'POST :predict on a publisher embedding model',
+          learn_more_url: 'https://docs.cloud.google.com/vertex-ai/generative-ai/docs/model-reference/text-embeddings-api',
+          learn_more_text: 'Find more information about the Text embeddings API'
+        }
       end,
       display_priority: 7,
       retry_on_request: ['GET', 'HEAD'],
@@ -1493,8 +1511,13 @@ require 'securerandom'
       end
     },
     count_tokens: {
-      title: 'Utility: Count tokens',
+      title: 'Count tokens',
       description: 'POST :countTokens on a publisher model',
+      help: lambda do |_|
+        {
+          learn_more_url: 'https://docs.cloud.google.com/vertex-ai/generative-ai/docs/model-reference/count-tokens',
+          learn_more_text: 'Check out Google docs for the CountTokens API'
+        }
       display_priority: 5,
       retry_on_request: ['GET', 'HEAD'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
@@ -1560,7 +1583,7 @@ require 'securerandom'
       end
     },
     operations_get: {
-      title: 'Operations: Get (poll LRO)',
+      title: 'Get (poll) long running operation',
       subtitle: 'google.longrunning.operations.get',
       display_priority: 5,
       retry_on_request: ['GET','HEAD'],
