@@ -601,7 +601,7 @@ require 'securerandom'
       end
     },
     email_extract_salient_span: {
-      title: 'Email: Extract salient span',
+      title: 'Email Extract salient span',
       subtitle: 'Pull the most important sentence/paragraph from an email',
       display_priority: 100,
       help: lambda do |_|
@@ -804,7 +804,7 @@ require 'securerandom'
       end
     },
     gen_generate: {
-      title: 'Generative: Generate (configurable)',
+      title: 'Query a generative endpoint (configurable)',
       subtitle: 'Plain / Grounded / RAG-lite',
       help: lambda do |_|
         {
@@ -844,7 +844,7 @@ require 'securerandom'
       end
     },
     rank_texts_with_ranking_api: {
-      title: 'Ranking API: Rerank texts',
+      title: 'Rerank contexts',
       subtitle: 'projects.locations.rankingConfigs:rank',
       description: '',
       help: lambda do |input, picklist_label|
@@ -1011,7 +1011,7 @@ require 'securerandom'
 
     # RAG store engine
     rag_retrieve_contexts: {
-      title: 'RAG (Serving): Retrieve contexts',
+      title: 'RAG Engine: Fetch contexts',
       subtitle: 'projects.locations:retrieveContexts (Vertex RAG Store)',
       help: lambda do |_|
         {
@@ -1153,7 +1153,7 @@ require 'securerandom'
       end
     },
     rag_answer: {
-      title: 'RAG (Serving): Retrieve + answer (one-shot)',
+      title: 'RAG Engine: Get grounded response (one-shot)',
       subtitle: 'Retrieve contexts from a corpus and generate a cited answer',
       help: lambda do |input, _picklist_label|
         { body:
@@ -1419,7 +1419,7 @@ require 'securerandom'
 
     # Utility
     embed_text: {
-      title: 'Embeddings: Embed text',
+      title: 'Embed text',
       subtitle: 'Get embeddings from a publisher embedding model',
       help: lambda do |_|
         {
@@ -1518,6 +1518,7 @@ require 'securerandom'
           learn_more_url: 'https://docs.cloud.google.com/vertex-ai/generative-ai/docs/model-reference/count-tokens',
           learn_more_text: 'Check out Google docs for the CountTokens API'
         }
+      end,
       display_priority: 5,
       retry_on_request: ['GET', 'HEAD'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
@@ -1585,6 +1586,12 @@ require 'securerandom'
     operations_get: {
       title: 'Get (poll) long running operation',
       subtitle: 'google.longrunning.operations.get',
+      help: lambda do |_|
+        {
+          learn_more_url: 'https://docs.cloud.google.com/vertex-ai/docs/general/long-running-operations',
+          learn_more_text: 'Find out more about Long running operations'
+        }
+      end,
       display_priority: 5,
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
