@@ -1,0 +1,8 @@
+timestamp,action,status,http_status,latency_ms,retrieval_top_k,retrieval_filter,retrieval_filter_val,rank_mode,rank_model,contexts_returned,tokens_prompt,tokens_candidates,tokens_total,gen_finish_reason,confidence,safety_blocked,answered_unknown,correlation_id,env,recipe_id,job_id,region
+2025-10-30T15:07:21Z,rag_retrieve_contexts,ok,200,842,20.0,distance,0.35,rank_service,semantic-ranker-512@latest,14.0,,,,,,,,afeec3f9-5fd2-43ba-b429-f3c46482ab61,prod,R-1001,J-9001,us-central1
+2025-10-30T15:08:04Z,rank_texts_with_ranking_api,ok,200,296,20.0,distance,0.35,rank_service,semantic-ranker-512@latest,12.0,,,,,,,,5db19687-1f9c-492b-85c3-bd7ec036954d,prod,R-1001,J-9001,us-central1
+2025-10-30T15:08:38Z,rag_answer,ok,200,1287,12.0,similarity,0.8,llm,gemini-2.0-flash,9.0,298.0,156.0,454.0,STOP,0.82,False,False,65527f55-8b8d-481d-aad0-d257e6a6b2c8,prod,R-1001,J-9001,us-central1
+2025-10-30T15:10:23Z,gen_generate,ok,200,1011,,,,,,6.0,220.0,120.0,340.0,STOP,0.76,False,False,e0bbc03e-d103-41e5-9c12-f7edeff643e3,prod,R-1001,J-9002,us-central1
+2025-10-30T15:10:53Z,rank_texts_with_ranking_api,error,403,330,20.0,distance,0.35,rank_service,semantic-ranker-512@latest,,,,,,,,,d09955f4-08d0-4241-8d48-99000393d256,prod,R-1001,J-9003,global
+2025-10-30T15:12:28Z,rag_retrieve_contexts,ok,200,910,12.0,similarity,0.78,,,11.0,,,,,,,,f2decb70-371d-4921-8714-9d677340c4bb,dev,R-2002,J-9100,us-east4
+2025-10-30T15:13:18Z,gen_generate,ok,200,1190,,,,,,8.0,310.0,140.0,450.0,MAX_TOKENS,0.61,False,False,78e3eef3-a829-45c9-8371-ed3bc842811c,dev,R-2002,J-9101,us-east4
