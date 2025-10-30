@@ -37,7 +37,11 @@ require 'securerandom'
       { name: 'user_project',               optional: true,   control_type: 'text',      label: 'User project for quota/billing',
         extends_schema: true, hint: 'Sets x-goog-user-project for billing/quota. Service account must have roles/serviceusage.serviceUsageConsumer on this project.' },
       { name: 'discovery_api_version', label: 'Discovery API version', control_type: 'select', optional: true, default: 'v1alpha',
-        pick_list: 'discovery_versions', hint: 'v1alpha for AI Applications; switch to v1beta/v1 if/when you migrate.' }
+        pick_list: 'discovery_versions', hint: 'v1alpha for AI Applications; switch to v1beta/v1 if/when you migrate.' },
+      # Facets logging feature-flag (on by default)
+      { name: 'enable_facets_logging', label: 'Enable facets in tail logs',
+        type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+        hint: 'Adds a compact jsonPayload.facets block (retrieval/ranking/generation metrics). No effect on action outputs.' }
     ],
 
     authorization: {
@@ -555,24 +559,33 @@ require 'securerandom'
             error("Unknown mode: #{mode}")
           end
 
-          # --- post-processing / salience blend & attachments ---
+          # Post-processing / salience blend & attachments
           if preproc && preproc['importance']
             blend = [[(input['confidence_blend'] || 0.15).to_f, 0.0].max, 0.5].min
             result['confidence'] = [[result['confidence'].to_f + blend * (preproc['importance'].to_f - 0.5), 0.0].max, 1.0].min
           end
           result['preproc'] = preproc if preproc
-
-          call(:tail_log_emit!, connection, :gen_categorize_email, started_at, t0, result, nil)
           
-          # Attach telemetry and RETURN the hash
+          # Attach telemetry envelope
           result = result.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+
+          # Build and emit to Google Cloud
+          facets = call(:compute_facets_for!, 'gen_categorize_email', result)
+          call(:tail_log_emit!, connection, :gen_categorize_email, started_at, t0, result, nil, facets)
+
           result
         rescue => e
+          # Extract Google error
           g   = call(:extract_google_error, e)
           msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
+
+          # Construct telmetry envelope
           env = call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg)
-          call(:tail_log_emit!, connection, :gen_categorize_email, started_at, t0, nil, e)
-          # Optional debug attachment in non-prod:
+
+          # Emit logging to Google Cloud
+          call(:tail_log_emit!, connection, :gen_categorize_email, started_at, t0, nil, e, nil)
+
+          # Construct and emit debug attachment, as applicable
           if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
             env['debug'] = call(:debug_pack, true, url, req_body, g)
           end
@@ -615,7 +628,6 @@ require 'securerandom'
           learn_more_text: 'Find a current list of available Gemini models'
         }
       end,
-
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
@@ -780,14 +792,16 @@ require 'securerandom'
           unless call(:normalize_boolean, connection['prod_mode'])
             out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
           end
-          call(:tail_log_emit!, connection, :email_extract_salient_span, started_at, t0, out, nil)
-          
+
+          # Compute facets (tokens_total, etc.) and emit
+          facets = call(:compute_facets_for!, 'email_extract_salient_span', out)
+          call(:tail_log_emit!, connection, :email_extract_salient_span, started_at, t0, out, nil, facets)
           out
         rescue => e
           g   = call(:extract_google_error, e)
           msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
           out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
-          call(:tail_log_emit!, connection, :email_extract_salient_span, started_at, t0, nil, e)
+          call(:tail_log_emit!, connection, :email_extract_salient_span, started_at, t0, nil, e, nil)
           unless call(:normalize_boolean, connection['prod_mode'])
             out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
           end
@@ -849,10 +863,11 @@ require 'securerandom'
         input = call(:normalize_input_keys, raw_input)
         begin
           result = call(:gen_generate_core!, connection, input)
-          call(:tail_log_emit!, connection, :gen_generate, started_at, t0, result, nil)
+          facets = call(:compute_facets_for!, 'gen_generate', result)
+          call(:tail_log_emit!, connection, :gen_generate, started_at, t0, result, nil, facets)
           result
         rescue => e
-          call(:tail_log_emit!, connection, :gen_generate, started_at, t0, nil, e)
+          call(:tail_log_emit!, connection, :gen_generate, started_at, t0, nil, e, nil)
           raise
         end
       end,
@@ -1009,13 +1024,18 @@ require 'securerandom'
           'model'     => (input['rank_model'].to_s.strip if input['rank_model'].present?)
         }.compact
 
-        call(:tail_log_emit!, connection, :rank_texts_with_ranking_api, started_at, t0, out, nil)
+        # Facets: capture rank mode/model when present
+        rank_facets = {
+          'rank_mode'  => out.dig('telemetry','ranking','api') ? 'rank_service' : nil,
+          'rank_model' => out.dig('telemetry','ranking','model')
+        }.delete_if { |_k,v| v.nil? }
+        call(:tail_log_emit!, connection, :rank_texts_with_ranking_api, started_at, t0, out, nil, rank_facets)
         out
       rescue => e
         g   = call(:extract_google_error, e)
         msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
         env = call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg)
-        call(:tail_log_emit!, connection, :rank_texts_with_ranking_api, started_at, t0, nil, e)
+        call(:tail_log_emit!, connection, :rank_texts_with_ranking_api, started_at, t0, nil, e, nil)
         # Optional debug attachment in non-prod:
         if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
           env['debug'] = call(:debug_pack, true, url, req_body, g)
@@ -1155,13 +1175,14 @@ require 'securerandom'
           (out['telemetry'] ||= {})['rank'] = { 'mode' => 'llm', 'model' => opts['llmRankerModel'] }
         end
 
-        call(:tail_log_emit!, connection, :rag_retrieve_contexts, started_at, t0, out, nil)
+        facets = call(:compute_facets_for!, 'rag_retrieve_contexts', out)
+        call(:tail_log_emit!, connection, :rag_retrieve_contexts, started_at, t0, out, nil, facets)
         out
       rescue => e
         g = call(:extract_google_error, e)
         msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
         env = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
-        call(:tail_log_emit!, connection, :rag_retrieve_contexts, started_at, t0, nil, e)
+        call(:tail_log_emit!, connection, :rag_retrieve_contexts, started_at, t0, nil, e, nil)
         env
 
       end,
@@ -1414,7 +1435,8 @@ require 'securerandom'
           end
         end
 
-        call(:tail_log_emit!, connection, :rag_answer, started_at, t0, out, nil)
+        facets = call(:compute_facets_for!, 'rag_answer', out)
+        call(:tail_log_emit!, connection, :rag_answer, started_at, t0, out, nil, facets)
         out
       rescue => e
         g   = call(:extract_google_error, e)
@@ -1423,7 +1445,7 @@ require 'securerandom'
         if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
           env['debug'] = call(:debug_pack, true, gen_url || retr_url, (gen_req_body || retr_req_body), g)
         end
-        call(:tail_log_emit!, connection, :rag_answer, started_at, t0, nil, e)
+        call(:tail_log_emit!, connection, :rag_answer, started_at, t0, nil, e, nil)
         error(env)
       end,
 
@@ -1773,7 +1795,6 @@ require 'securerandom'
         end
       end
     }
-
   },
 
   # --------- PICK LISTS ---------------------------------------------------
@@ -1961,7 +1982,7 @@ require 'securerandom'
       }.compact
       h
     end,
-    tail_log_emit!: lambda do |connection, action_id, started_at, t0, result, error|
+    tail_log_emit!: lambda do |connection, action_id, started_at, t0, result, error, facets=nil|
       # Fast-exit if no project or disabled
       project = (connection['project_id'] || connection['gcp_project_id']).to_s.strip
       return nil if project.empty? || connection['disable_tail_logging'] == true
@@ -2004,6 +2025,11 @@ require 'securerandom'
           error: call(:_tl_norm_error, error)
         }
       }
+      # Attach compact facets if enabled and provided
+      if call(:_facets_enabled?, connection)
+        fac = facets.is_a?(Hash) ? facets.dup : {}
+        entry[:jsonPayload][:facets] = fac if fac.any?
+      end
       call(:_tl_post_logs, connection, [entry])
     rescue
       nil
@@ -2052,6 +2078,87 @@ require 'securerandom'
       mapped = mapped[0, 64]
       canonical.include?(mapped) ? mapped : "#{prefix}#{mapped}"
     end,
+
+    # -- Facets plumbing ----------------------------------------------------
+    _facets_enabled?: lambda do |connection|
+      # default true; explicit false disables
+      v = connection['enable_facets_logging']
+      v.nil? ? true : (v == true)
+    end,
+    _facet_bool:   lambda { |v| v == true },
+    _facet_int:    lambda { |v| (v.is_a?(Numeric) || v.to_s =~ /\A-?\d+\z/) ? v.to_i : nil },
+    _facet_float:  lambda { |v| (v.is_a?(Numeric) || v.to_s =~ /\A-?\d+(\.\d+)?\z/) ? v.to_f : nil },
+    _facet_str:    lambda { |v, max=128| s = v.to_s; s.empty? ? nil : s[0, max] },
+    _facet_any?:   lambda { |h| h.is_a?(Hash) && h.any? },
+    _facet_safety_blocked?: lambda do |cand|
+      Array(cand && cand['safetyRatings']).any? { |r| r.is_a?(Hash) && r['blocked'] == true }
+    end,
+    _facet_finish_reason: lambda do |resp|
+      Array(resp['candidates']).first && Array(resp['candidates']).first['finishReason']
+    end,
+    _facet_tokens: lambda do |usage|
+      return {} unless usage.is_a?(Hash)
+      {
+        'tokens_prompt'     => usage['promptTokenCount'],
+        'tokens_candidates' => usage['candidatesTokenCount'],
+        'tokens_total'      => usage['totalTokenCount']
+      }.delete_if { |_k,v| v.nil? }
+    end,
+    compute_facets_for!: lambda do |action_id, out, extras = {}|
+      # out: action result hash (success path). Compact, redaction-safe, no PII.
+      return {} unless out.is_a?(Hash)
+      h = {}
+      tel = out['telemetry'].is_a?(Hash) ? out['telemetry'] : {}
+      ret = tel['retrieval'].is_a?(Hash) ? tel['retrieval'] : {}
+      rnk = tel['rank'].is_a?(Hash)      ? tel['rank']      : {}
+
+      # Retrieval knobs
+      h['retrieval_top_k']       = call(:_facet_int, ret['top_k'])
+      if ret['filter'].is_a?(Hash)
+        h['retrieval_filter']     = call(:_facet_str, ret['filter']['type'])
+        h['retrieval_filter_val'] = call(:_facet_float, ret['filter']['value'])
+      end
+
+      # Ranker provenance
+      h['rank_mode']  = call(:_facet_str, rnk['mode'])
+      h['rank_model'] = call(:_facet_str, rnk['model'], 256)
+
+      # Context counts (works for both retrieve→contexts and rag-lite→context_chunks)
+      ctxs = out['contexts'] || out['context_chunks']
+      h['contexts_returned'] = Array(ctxs).length
+
+      # Token usage (usage or usageMetadata)
+      usage = out['usage'] || out['usageMetadata']
+      h.merge!(call(:_facet_tokens, usage))
+
+      # Generation outcome fields (if present)
+      # Try structured finishReason first (from candidates), otherwise from parsed meta if caller attached it later.
+      fr = call(:_facet_finish_reason, out)
+      h['gen_finish_reason'] = call(:_facet_str, fr) if fr
+
+      # Safety: true if any candidate blocked
+      c0 = Array(out['candidates']).first || {}
+      h['safety_blocked'] = call(:_facet_bool, call(:_facet_safety_blocked?, c0)) if c0 && c0.any?
+
+      # Confidence proxy (rag-lite)
+      h['confidence'] = call(:_facet_float, out['confidence']) if out.key?('confidence')
+
+      # Abstention detection (simple heuristic)
+      ans = out['answer']
+      if ans.is_a?(String)
+        h['answered_unknown'] = true if ans.strip =~ /\A(?i:(i\s+don[’']?t\s+know|cannot\s+answer|no\s+context|not\s+enough\s+context))/
+      end
+
+      # Merge caller extras (pre-sanitized small scalars only)
+      extras = extras.is_a?(Hash) ? extras.dup : {}
+      extras.delete_if { |_k,v| v.is_a?(Array) || v.is_a?(Hash) } # avoid bloat
+      h.merge!(extras)
+
+      # Final compaction: drop nils/empties
+      h.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
+      h
+    end,
+
     gen_generate_core!: lambda do |connection, input|
       t0   = Time.now
       corr = call(:build_correlation_id)
