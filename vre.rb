@@ -845,7 +845,7 @@ require 'securerandom'
       end,
       execute: lambda do |connection, raw_input|
         started_at = Time.now.utc.iso8601
-        t0 = Time.now.to_f
+        t0 = t0 = Time.now
         input = call(:normalize_input_keys, raw_input)
         begin
           result = call(:gen_generate_core!, connection, input)
@@ -1717,7 +1717,9 @@ require 'securerandom'
           ]}
         ]
       end,
-      
+      output_fields: lambda do |_object_definitions, _connection|
+        [{ name: 'status' }, { name: 'http_status' }]
+      end,
       execute: lambda do |_connection, input|
         # Canonical severities accepted by Cloud Logging facets:
         # DEFAULT, DEBUG, INFO, NOTICE, WARNING, ERROR, CRITICAL, ALERT, EMERGENCY
@@ -1750,15 +1752,21 @@ require 'securerandom'
                     'Content-Type' => 'application/json')
             .payload(body)
             .request_format_json
-          call(:tail_log_emit!, connection, :logs_write, started_at, t0, {status: 'ok'}, nil)
-          resp
+          # Shape the return to match output_fields
+          http_status = (resp['status'] || resp['status_code'] || 200).to_i
+          out = { 'status' => 'ok', 'http_status' => http_status }
+          call(:tail_log_emit!, connection, :logs_write, started_at, t0, out, nil)
+          out
         rescue => e
           call(:tail_log_emit!, connection, :logs_write, started_at, t0, nil, e)
-          raise
+          # Re-raise normalized so Workato retry/metrics apply; include code when we can parse it
+          code = (e.respond_to?(:[]) && (e['status'] || e.dig('response','status') || e.dig('error','code'))).to_i
+          error({
+            'status'  => 'error',
+            'message' => e.to_s,
+            'code'    => (code == 0 ? 500 : code)
+          })
         end
-      end,
-      output_fields: lambda do |_object_definitions, _connection|
-        [{ name: 'status' }, { name: 'http_status' }]
       end
     }
 
@@ -1891,8 +1899,8 @@ require 'securerandom'
     tail_log_begin!: lambda do |connection, action_id, input|
       {
         action_id: action_id.to_s,
-        started_at: (Time.now.utc.iso8601 rescue Time.at((Time.now.to_f*1000).to_i/1000.0).utc.iso8601),
-        t0: (Time.now.to_f rescue Time.now),
+        started_at: (Time.now.utc.iso8601 rescue Time.at((t0 = Time.now*1000).to_i/1000.0).utc.iso8601),
+        t0: (t0 = Time.now rescue Time.now),
         corr_id: (SecureRandom.uuid rescue "#{rand}-#{Time.now.to_i}"),
         project_id: connection['project_id'] || connection['gcp_project_id'],
         log_id: 'workato_vertex_rag' # keep internal; no builder knob required
@@ -1900,7 +1908,7 @@ require 'securerandom'
     end,
     tail_log_end!: lambda do |connection, ctx, result, error|
       # Build a compact envelope; scrub obvious big/PII fields
-      latency_ms = (((Time.now.to_f - ctx[:t0]) * 1000).round rescue nil)
+      latency_ms = (((t0 = Time.now - ctx[:t0]) * 1000).round rescue nil)
       status = error ? 'error' : 'ok'
 
       # Pull some soft identifiers if you have them in the connection
@@ -1933,7 +1941,7 @@ require 'securerandom'
         }
       }.compact
 
-      call(:_tail_log_post, connection, [entry])
+      call(:_tl_post_logs, connection, [entry])
     rescue => swallow
       # Never raise from logging; tail logger must be fire-and-forget
       nil
@@ -1949,8 +1957,6 @@ require 'securerandom'
       }.compact
       h
     end,
-    
-    # --- ultra-thin tail logger (one call; safe; no wrappers) -----------------
     tail_log_emit!: lambda do |connection, action_id, started_at, t0, result, error|
       # Fast-exit if no project or disabled
       project = (connection['project_id'] || connection['gcp_project_id']).to_s.strip
@@ -1967,7 +1973,8 @@ require 'securerandom'
       app  = 'vertex_rag_engine'
       corr = (connection['correlation_id'] || SecureRandom.uuid)
       log_id = 'workato_vertex_rag'
-      severity = error ? 'ERROR' : 'INFO'
+      # Normalize severity (maps WARN->WARNING, etc.; prefixes NONSTANDARD/ for unknowns)
+      severity = call(:normalize_severity, (error ? 'ERROR' : 'INFO'))
 
       entry = {
         logName: "projects/#{project}/logs/#{log_id}",
