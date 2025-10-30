@@ -1623,7 +1623,7 @@ require 'securerandom'
         ['Context chunks (enriched + context_chunks)','context_chunks']
       ]
     end,
-    gen_generate_modes: lambda do
+    gen_generate_modes: lambda do |_connection|
       [
         ['Plain (no grounding)','plain'],
         ['Grounded via Google Search','grounded_google'],
@@ -1632,7 +1632,7 @@ require 'securerandom'
         ['Grounded via Vertex RAG Store (tool)','grounded_rag_store']
       ]
     end,
-    trim_strategies: lambda do
+    trim_strategies: lambda do  |_connection|
       [['Drop lowest score first','drop_low_score'],
       ['Diverse (MMR-like)','diverse_mmr'],
       ['Truncate by characters','truncate_chars']]
@@ -1643,46 +1643,46 @@ require 'securerandom'
         ['Discovery Engine (US multi-region)', 'us-discoveryengine.googleapis.com']
       ]
     end,
-    modes_classification: lambda do
+    modes_classification: lambda do |_connection|
       [%w[Embedding embedding], %w[Generative generative], %w[Hybrid hybrid]]
     end,
-    modes_grounding: lambda do
+    modes_grounding: lambda do |_connection|
       [%w[Google\ Search google_search], %w[Vertex\ AI\ Search vertex_ai_search]]
     end,
-    roles: lambda do
+    roles: lambda do |_connection|
       # Contract-conformant roles (system handled via system_preamble)
       [['user','user'], ['model','model']]
     end,
-    rag_source_families: lambda do
+    rag_source_families: lambda do |_connection|
       [
         ['Google Cloud Storage', 'gcs'],
         ['Google Drive', 'drive']
       ]
     end,
-    drive_input_type: lambda do
+    drive_input_type: lambda do |_connection|
       [
         ['Drive Files', 'files'],
         ['Drive Folder', 'folder']
       ]
     end,
-    distance_measures: lambda do
+    distance_measures: lambda do |_connection|
       [
         ['Cosine distance', 'COSINE_DISTANCE'],
         ['Dot product',     'DOT_PRODUCT'],
         ['Euclidean',       'EUCLIDEAN_DISTANCE']
       ]
     end,
-    iam_services: lambda do
+    iam_services: lambda do |_connection|
       [['Vertex AI','vertex'], ['AI Applications (Discovery)','discovery']]
     end,
-    discovery_versions: lambda do
+    discovery_versions: lambda do |_connection|
       [
         ['v1alpha', 'v1alpha'],
         ['v1beta',  'v1beta'],
         ['v1',      'v1']
       ]
     end,
-    ai_apps_locations: lambda do
+    ai_apps_locations: lambda do |_connection|
       [
         ['Global (recommended default)', 'global'],
         ['US (multi-region)', 'us'],
