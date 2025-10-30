@@ -1642,7 +1642,51 @@ require 'securerandom'
         { 'name' => 'projects/p/locations/us-central1/operations/123', 'done' => false,
           'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 8, 'correlation_id' => 'sample' } }
       end
+    },
+    logs_write: {
+      title: 'Logs: write (Cloud Logging)',
+      subtitle: 'Send structured logs to GCP',
+      help: lambda do |_| 
+        { body: 'Write structured logs to Google Cloud Logging.' }
+      end,
+      input_fields: lambda do |object_definitions, connection|
+        [
+          { name: 'project_id', optional: false },
+          { name: 'log_id', label: 'Log ID', optional: false, hint: 'e.g., workato_vertex_rag' },
+          { name: 'entries', type: 'array', of: 'object', optional: false, properties: [
+            { name: 'severity', control_type: 'select', pick_list: 'logging_severities', optional: true, default: 'INFO' },
+            { name: 'labels', type: 'object', properties: [] },
+            { name: 'jsonPayload', type: 'object', properties: [] }
+          ]}
+        ]
+      end,
+      execute: lambda do |_connection, input|
+        project = input['project_id']
+        log_id  = input['log_id']
+        body = {
+          entries: (input['entries'] || []).map do |e|
+            {
+              logName: "projects/#{project}/logs/#{log_id}",
+              resource: { type: 'global', labels: { project_id: project } },
+              severity: (e['severity'] || 'INFO'),
+              labels: e['labels'],
+              jsonPayload: e['jsonPayload']
+            }.compact
+          end
+        }
+        post("https://logging.googleapis.com/v2/entries:write")
+          .headers('Authorization' => "Bearer #{connection['access_token']}",
+                  'Content-Type' => 'application/json')
+          .payload(body)
+          .request_format_json
+      end,
+      output_fields: lambda do |_object_definitions, _connection|
+        [{ name: 'status' }, { name: 'http_status' }]
+      end
     }
+},
+
+
 
   },
 
@@ -1724,6 +1768,9 @@ require 'securerandom'
         ['US (multi-region)', 'us'],
         ['EU (multi-region)', 'eu']
       ]
+    end,
+    logging_severities: lambda do |_connection|
+      %w[DEFAULT DEBUG INFO NOTICE WARNING ERROR CRITICAL ALERT EMERGENCY].map { |s| [s, s] }
     end
 
   },
