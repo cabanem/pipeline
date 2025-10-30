@@ -1647,28 +1647,56 @@ require 'securerandom'
       title: 'Logs: write (Cloud Logging)',
       subtitle: 'Send structured logs to GCP',
       help: lambda do |_| 
-        { body: 'Write structured logs to Google Cloud Logging.' }
+        { 
+          body: 'Write structured logs to Google Cloud Logging. Canonical severities accepted by GCP logging facets include: '\
+                'DEFAULT, DEBUG, INFO, NOTICE, WARNING, ERROR, CRITICAL, ALERT, EMERGENCY. '
+        }
       end,
       input_fields: lambda do |object_definitions, connection|
         [
           { name: 'project_id', optional: false },
           { name: 'log_id', label: 'Log ID', optional: false, hint: 'e.g., workato_vertex_rag' },
           { name: 'entries', type: 'array', of: 'object', optional: false, properties: [
-            { name: 'severity', control_type: 'select', pick_list: 'logging_severities', optional: true, default: 'INFO' },
+            {
+              name: 'severity',
+              label: 'Severity',
+              control_type: 'select',
+              pick_list: 'logging_severities',
+              optional: true,
+              default: 'INFO',
+              toggle_hint: 'Or enter a custom severity',
+              toggle_field: {
+                name: 'severity_custom',
+                label: 'Custom severity (text)',
+                type: 'string',
+                hint: 'E.g., INFO, WARNING, ERROR — or your own label'
+              }
+            },
             { name: 'labels', type: 'object', properties: [] },
             { name: 'jsonPayload', type: 'object', properties: [] }
           ]}
         ]
       end,
+      
       execute: lambda do |_connection, input|
+        # Canonical severities accepted by Cloud Logging facets:
+        # DEFAULT, DEBUG, INFO, NOTICE, WARNING, ERROR, CRITICAL, ALERT, EMERGENCY
         project = input['project_id']
         log_id  = input['log_id']
+        nonstandard_prefix = 'NONSTANDARD/' # backend-only tag for abnormal values
         body = {
           entries: (input['entries'] || []).map do |e|
+          # Prefer custom severity (toggle), then dropdown, then default; normalize afterwards
+          sev_raw = begin
+            sc = e['severity_custom'].to_s.strip
+            sd = e['severity'].to_s.strip
+            sc.empty? ? (sd.empty? ? 'INFO' : sd) : sc
+          end
+          sev = call(:normalize_severity, sev_raw, nonstandard_prefix)
             {
               logName: "projects/#{project}/logs/#{log_id}",
               resource: { type: 'global', labels: { project_id: project } },
-              severity: (e['severity'] || 'INFO'),
+              severity: sev,
               labels: e['labels'],
               jsonPayload: e['jsonPayload']
             }.compact
@@ -1684,9 +1712,6 @@ require 'securerandom'
         [{ name: 'status' }, { name: 'http_status' }]
       end
     }
-},
-
-
 
   },
 
@@ -1810,6 +1835,44 @@ require 'securerandom'
       topk = arr.sort.reverse.first([[k, 1].max, arr.length].min)
       avg  = topk.sum / topk.length.to_f
       [[avg, 0.0].max, 1.0].min.round(4)
+    end,
+    # Normalize arbitrary severity strings to Cloud Logging canonicals.
+    # - Upcases and trims input.
+    # - Maps common aliases (WARN->WARNING, FATAL->CRITICAL, TRACE->DEBUG, etc.).
+    # - If still non-standard, prefixes with NONSTANDARD/ (or provided prefix).
+    normalize_severity: lambda do |s, prefix = 'NONSTANDARD/'|
+      raw = s.to_s.upcase.strip
+      return 'INFO' if raw.empty?
+
+      # Canonical set from Google Cloud Logging
+      canonical = %w[DEFAULT DEBUG INFO NOTICE WARNING ERROR CRITICAL ALERT EMERGENCY]
+
+      # Common aliases we see in the wild
+      alias_map = {
+        'WARN'   => 'WARNING',
+        'WARNING' => 'WARNING',
+        'ERR'    => 'ERROR',
+        'ERROR'  => 'ERROR',
+        'SEVERE' => 'ERROR',
+        'FATAL'  => 'CRITICAL',
+        'CRIT'   => 'CRITICAL',
+        'TRACE'  => 'DEBUG',
+        'DBG'    => 'DEBUG',
+        'EMERG'  => 'EMERGENCY',
+        'NOTICE' => 'NOTICE',
+        'INFO'   => 'INFO',
+        'DEFAULT'=> 'DEFAULT'
+      }
+
+      mapped = alias_map[raw] || raw
+      # Cap length defensively; Logging accepts strings but we keep it tidy
+      mapped = mapped[0, 64]
+
+      if canonical.include?(mapped)
+        mapped
+      else
+        "#{prefix}#{mapped}"
+      end
     end,
     gen_generate_core!: lambda do |connection, input|
       t0   = Time.now
