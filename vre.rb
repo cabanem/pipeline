@@ -213,7 +213,7 @@ require 'securerandom'
       end
     },
     generation_config: {
-      fields: lambda do
+      fields: lambda do |_connection, _config_fields|
         [
           { name: 'temperature',       type: 'number'  },
           { name: 'topP',              type: 'number'  },
@@ -227,7 +227,7 @@ require 'securerandom'
       end
     },
     generate_content_output: {
-      fields: lambda do
+      fields: lambda do |_connection, _config_fields|
         [
           { name: 'responseId' },
           { name: 'modelVersion' },
@@ -259,7 +259,7 @@ require 'securerandom'
     },
     embed_output: {
       # Align to contract: embeddings object, not array
-      fields: lambda do
+      fields: lambda do |_connection, _config_fields|
         [
           { name: 'predictions', type: 'array', of: 'object', properties: [
               { name: 'embeddings', type: 'object', properties: [
@@ -282,7 +282,7 @@ require 'securerandom'
       end
     },
     predict_output: {
-      fields: lambda do
+      fields: lambda do |_connection, _config_fields|
         [
           { name: 'predictions', type: 'array', of: 'object' },
           { name: 'deployedModelId' }
@@ -290,7 +290,7 @@ require 'securerandom'
       end
     },
     batch_job: {
-      fields: lambda do |_|
+      fields: lambda do |_connection, _config_fields|
         [
           { name: 'name' },
           { name: 'displayName' },
@@ -306,7 +306,7 @@ require 'securerandom'
       end
     },
     envelope_fields: {
-      fields: lambda do |_|
+      fields: lambda do |_connection, _config_fields|
         [
           { name: 'ok', type: 'boolean' },
           { name: 'telemetry', type: 'object', properties: [
@@ -319,7 +319,7 @@ require 'securerandom'
       end
     },
     safety_setting: {
-      fields: lambda do
+      fields: lambda do |_connection, _config_fields|
         [
           { name: 'category'  },   # e.g., HARM_CATEGORY_*
           { name: 'threshold' }    # e.g., BLOCK_LOW_AND_ABOVE
@@ -327,10 +327,37 @@ require 'securerandom'
       end
     },
     kv_pair: {
-      fields: lambda do
+      fields: lambda do |_connection, _config_fields|
         [
           { name: 'key' },
           { name: 'value' }
+        ]
+      end
+    },
+    rag_retrieval_filter: {
+      fields: lambda do |_connection, _config_fields|
+        [
+          { name: 'vector_distance_threshold',   type: 'number',
+            hint: 'Use ONLY ONE of distance or similarity. COSINE: distance≈1−similarity.' },
+          { name: 'vector_similarity_threshold', type: 'number',
+            hint: 'Use ONLY ONE of similarity or distance.' }
+        ]
+      end
+    },
+    rag_ranking: {
+      fields: lambda do |_connection, _config_fields|
+        [
+          { name: 'rank_service_model', hint: 'Semantic ranker (Discovery). Example: semantic-ranker-512@latest' },
+          { name: 'llm_ranker_model',   hint: 'Gemini re-ranker (e.g., gemini-2.0-flash)' }
+        ]
+      end
+    },
+    rag_retrieval_config: {
+      fields: lambda do |_connection, _config_fields, _object_definitions|
+        [
+          { name: 'top_k', type: 'integer', hint: 'Candidate cap before ranking. Rule of thumb: 20–50.' },
+          { name: 'filter',  type: 'object', properties: object_definitions['rag_retrieval_filter'] },
+          { name: 'ranking', type: 'object', properties: object_definitions['rag_ranking'] }
         ]
       end
     }
@@ -768,7 +795,6 @@ require 'securerandom'
         }
       end
     },
-
     gen_generate: {
       title: 'Generative: Generate (configurable)',
       subtitle: 'Plain / Grounded / RAG-lite',
@@ -1389,7 +1415,7 @@ require 'securerandom'
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
 
-      input_fields: lambda do |_|
+      input_fields: lambda do |_object_definitions, _connection, _config_fields|
         [
           { name: 'model', label: 'Embedding model', optional: false, control_type: 'text', default: 'text-embedding-005' },
           { name: 'texts', type: 'array', of: 'string', optional: false },
@@ -1399,7 +1425,7 @@ require 'securerandom'
             hint: 'Optional dimensionality reduction (see model docs).' }
         ]
       end,
-      output_fields: lambda do |object_definitions|
+      output_fields: lambda do |_object_definitions, _connection|
         Array(object_definitions['embed_output']) + Array(object_definitions['envelope_fields'])
       end,
       execute: lambda do |connection, input|
@@ -1541,13 +1567,13 @@ require 'securerandom'
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
 
-      input_fields: lambda do
+      input_fields: lambda do |_object_definitions, _connection, _config_fields|
         [
           { name: 'operation', optional: false,
             hint: 'Operation name or full path, e.g., projects/{p}/locations/{l}/operations/{id}' }
         ]
       end,
-      output_fields: lambda do |_|
+      output_fields: lambda do |_object_definitions, _connection|
         [
           { name: 'name' }, { name: 'done', type: 'boolean' },
           { name: 'metadata', type: 'object' }, { name: 'error', type: 'object' }
@@ -1590,7 +1616,7 @@ require 'securerandom'
     # - records_only:     [{id, score, rank}]
     # - enriched_records: [{id, score, rank, content, metadata}]
     # - context_chunks:   enriched records + generator-ready context_chunks
-    rerank_emit_shapes: lambda do
+    rerank_emit_shapes: lambda do |_connection|
       [
         ['Records only (id, score, rank)','records_only'],
         ['Enriched records (adds content/metadata)','enriched_records'],
@@ -1662,34 +1688,7 @@ require 'securerandom'
         ['US (multi-region)', 'us'],
         ['EU (multi-region)', 'eu']
       ]
-    end,
-    rag_retrieval_filter: {
-      fields: lambda do
-        [
-          { name: 'vector_distance_threshold', type: 'number',
-            hint: 'Use ONLY ONE of distance or similarity. COSINE: distance≈1−similarity.' },
-          { name: 'vector_similarity_threshold', type: 'number',
-            hint: 'Use ONLY ONE of similarity or distance.' }
-        ]
-      end
-    },
-    rag_ranking: {
-      fields: lambda do
-        [
-          { name: 'rank_service_model', hint: 'Semantic ranker (Discovery). Example: semantic-ranker-512@latest' },
-          { name: 'llm_ranker_model',   hint: 'Gemini re-ranker (e.g., gemini-2.0-flash)' }
-        ]
-      end
-    },
-    rag_retrieval_config: {
-      fields: lambda do |connection, config_fields, object_definitions|
-        [
-          { name: 'top_k', type: 'integer', hint: 'Candidate cap before ranking. Rule of thumb: 20–50.' },
-          { name: 'filter',  type: 'object', properties: object_definitions['rag_retrieval_filter'] },
-          { name: 'ranking', type: 'object', properties: object_definitions['rag_ranking'] }
-        ]
-      end
-    }
+    end
 
   },
   
@@ -1860,6 +1859,9 @@ require 'securerandom'
         env['debug'] = call(:debug_pack, true, url, payload, g)
       end
       error(env)
+    end,
+    json_parse_safe: lambda do |body|
+      call(:safe_json, body) || {}
     end,
     request_headers_auth: lambda do |_connection, correlation_id, user_project=nil, request_params=nil|
       h = {
