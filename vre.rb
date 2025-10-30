@@ -826,6 +826,7 @@ require 'securerandom'
       input_fields:  lambda { |od, c, cf| od['gen_generate_input'] },
       output_fields: lambda do |od, c|
         Array(od['generate_content_output']) + [
+          { name: 'confidence', type: 'number' },
           { name: 'parsed', type: 'object', properties: [
               { name: 'answer' },
               { name: 'citations', type: 'array', of: 'object', properties: [
@@ -839,8 +840,13 @@ require 'securerandom'
         call(:gen_generate_core!, connection, input)
       end,
       sample_output: lambda do
-        { 'responseId'=>'resp-x', 'candidates'=>[{'content'=>{'parts'=>[{'text'=>'...'}]}}], 'parsed'=>{'answer'=>'...','citations'=>[]},
-          'ok'=>true, 'telemetry'=>{ 'http_status'=>200, 'message'=>'OK', 'duration_ms'=>12, 'correlation_id'=>'sample' } }
+        { 'responseId'=>'resp-x',
+          'candidates'=>[{'content'=>{'parts'=>[{'text'=>'...'}]}}],
+          'confidence'=>0.84,
+          'parsed'=>{'answer'=>'...','citations'=>[{'chunk_id'=>'doc-1#c2','score'=>0.88}]} ,
+          'ok'=>true,
+          'telemetry'=>{ 'http_status'=>200, 'message'=>'OK', 'duration_ms'=>12, 'correlation_id'=>'sample',
+                         'confidence'=>{'basis'=>'citations_topk_avg','k'=>3,'n'=>1} } }
       end
     },
     rank_texts_with_ranking_api: {
@@ -1750,6 +1756,14 @@ require 'securerandom'
         'llmRankerModel'               => llm
       }.delete_if { |_k, v| v.nil? || v == '' }
     end,
+    # Heuristic: average of top-K citation scores, clamped to [0,1]. Returns nil if no scores.
+    overall_confidence_from_citations: lambda do |citations, k=3|
+      arr = Array(citations).map { |c| (c.is_a?(Hash) ? c['score'] : nil) }.compact.map(&:to_f)
+      return nil if arr.empty?
+      topk = arr.sort.reverse.first([[k, 1].max, arr.length].min)
+      avg  = topk.sum / topk.length.to_f
+      [[avg, 0.0].max, 1.0].min.round(4)
+    end,
     gen_generate_core!: lambda do |connection, input|
       t0   = Time.now
       corr = call(:build_correlation_id)
@@ -1879,6 +1893,11 @@ require 'securerandom'
         text   = resp.dig('candidates',0,'content','parts',0,'text').to_s
         parsed = call(:safe_parse_json, text)
         out['parsed'] = { 'answer'=>parsed['answer'] || text, 'citations'=>parsed['citations'] || [] }
+        # Compute overall confidence from cited chunk scores, if available
+        conf = call(:overall_confidence_from_citations, out['parsed']['citations'])
+        out['confidence'] = conf if conf
+        (out['telemetry'] ||= {})['confidence'] = { 'basis' => 'citations_topk_avg', 'k' => 3,
+                                                    'n' => Array(out.dig('parsed','citations')).length }
       end
       out
     rescue => e
