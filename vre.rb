@@ -121,7 +121,7 @@ require 'securerandom'
         [
           { name: 'mode', control_type: 'select', pick_list: 'gen_generate_modes', optional: false, default: 'plain' },
           { name: 'model', optional: false, control_type: 'text' },
-
+          { name: 'correlation_id', label: 'Correlation ID', optional: true, hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
           # Show 'contents' for plain/grounded modes; hide for rag_with_context
           { name: 'contents',
             type: 'array', of: 'object', properties: object_definitions['content'], optional: true,
@@ -393,6 +393,7 @@ require 'securerandom'
         [
           { name: 'mode', control_type: 'select', pick_list: 'modes_classification', optional: false, default: 'embedding',
             hint: 'embedding (deterministic), generative (LLM-only), or hybrid (embeddings + LLM referee).' },
+          { name: 'correlation_id', label: 'Correlation ID', optional: true, hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
 
           { name: 'subject', optional: true },
           { name: 'body',    optional: true },
@@ -449,7 +450,7 @@ require 'securerandom'
         # 1. Invariants
         started_at = Time.now.utc.iso8601 # for logging
         t0   = Time.now
-        corr = call(:build_correlation_id)
+        cid = call(:ensure_correlation_id!, input)
         url = nil; req_body = nil
         begin
           # 2. Build the request
@@ -501,7 +502,7 @@ require 'securerandom'
               { 'content' => txt, 'task_type' => 'RETRIEVAL_DOCUMENT' }
             end
 
-            emb_resp = call(:predict_embeddings, connection, emb_model_path, [email_inst] + cat_insts, {}, corr)
+            emb_resp = call(:predict_embeddings, connection, emb_model_path, [email_inst] + cat_insts, {}, cid)
             preds    = call(:safe_array, emb_resp && emb_resp['predictions'])
             error('Embedding model returned no predictions') if preds.empty?
 
@@ -528,7 +529,7 @@ require 'securerandom'
             if (mode == 'hybrid' || input['return_explanation']) && input['generative_model'].present?
               top_k     = [[(input['top_k'] || 3).to_i, 1].max, cats.length].min
               shortlist = scores.first(top_k).map { |h| h['category'] }
-              referee   = call(:llm_referee, connection, input['generative_model'], email_text, shortlist, cats, input['fallback_category'], corr)
+              referee   = call(:llm_referee, connection, input['generative_model'], email_text, shortlist, cats, input['fallback_category'], cid)
               result['referee'] = referee
 
               if referee['category'].present? && shortlist.include?(referee['category'])
@@ -542,7 +543,7 @@ require 'securerandom'
 
           elsif mode == 'generative'
             error('generative_model is required when mode=generative') if input['generative_model'].blank?
-            referee = call(:llm_referee, connection, input['generative_model'], email_text, cats.map { |c| c['name'] }, cats, input['fallback_category'], corr)
+            referee = call(:llm_referee, connection, input['generative_model'], email_text, cats.map { |c| c['name'] }, cats, input['fallback_category'], cid)
             chosen =
               if referee['confidence'].to_f < min_conf && input['fallback_category'].present?
                 input['fallback_category']
@@ -569,7 +570,7 @@ require 'securerandom'
           result['preproc'] = preproc if preproc
           
           # Attach telemetry envelope
-          result = result.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+          result = result.merge(call(:telemetry_envelope, t0, cid, true, 200, 'OK'))
 
           # Facets (compact metrics block) + local log
           facets = call(:compute_facets_for!, 'gen_categorize_email', result)
@@ -652,7 +653,7 @@ require 'securerandom'
         [
           { name: 'subject', optional: true },
           { name: 'body',    optional: false, hint: 'Raw email body (HTML or plain text). Quoted replies and signatures are pruned automatically.' },
-
+          { name: 'correlation_id', label: 'Correlation ID', optional: true, hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
           { name: 'generative_model', label: 'Generative model', control_type: 'text', optional: true, default: 'gemini-2.0-flash' },
           { name: 'max_span_chars', type: 'integer', optional: true, default: 500, hint: 'Hard cap for the extracted span.' },
           { name: 'include_entities', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
@@ -696,7 +697,7 @@ require 'securerandom'
         started_at = Time.now.utc.iso8601 # for logging
 
         t0   = Time.now
-        corr = call(:build_correlation_id)
+        cid = call(:ensure_correlation_id!, input)
         url = nil; req_body = nil; req_params = nil
         begin
           # 1) Heuristic focus text (strip quotes, signatures, legal footers, tracking junk)
@@ -775,7 +776,7 @@ require 'securerandom'
           url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
           req_params = "model=#{model_path}"
           req_body = call(:json_compact, payload)
-          resp = post(url).headers(call(:request_headers_auth, connection, corr, connection['user_project'], req_params)).payload(req_body)
+          resp = post(url).headers(call(:request_headers_auth, connection, cid, connection['user_project'], req_params)).payload(req_body)
 
           text   = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
           parsed = call(:safe_parse_json, text)
@@ -803,7 +804,7 @@ require 'securerandom'
             'focus_preview'  => focus,
             'responseId'     => resp['responseId'],
             'usage'          => resp['usageMetadata']
-          }.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+          }.merge(call(:telemetry_envelope, t0, cid, true, 200, 'OK'))
 
           unless call(:normalize_boolean, connection['prod_mode'])
             out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
@@ -820,7 +821,7 @@ require 'securerandom'
         rescue => e
           g   = call(:extract_google_error, e)
           msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
+          out = {}.merge(call(:telemetry_envelope, t0, cid, false, call(:telemetry_parse_error_code, e), msg))
           unless call(:normalize_boolean, connection['prod_mode'])
             out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
           end
@@ -883,8 +884,9 @@ require 'securerandom'
         started_at = Time.now.utc.iso8601
         t0 = Time.now
         input = call(:normalize_input_keys, raw_input)
+        cid   = call(:ensure_correlation_id!, input)
         begin
-          result = call(:gen_generate_core!, connection, input)
+          result = call(:gen_generate_core!, connection, input, cid)
           facets = call(:compute_facets_for!, 'gen_generate', result)
           (result['telemetry'] ||= {})['facets'] = facets
           call(:local_log_attach!, result,
@@ -897,7 +899,7 @@ require 'securerandom'
         rescue => e
           g   = call(:extract_google_error, e)
           msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          env = call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg)
+          env = call(:telemetry_envelope, t0, cid, false, call(:telemetry_parse_error_code, e), msg)
           call(:local_log_attach!, env,
             call(:local_log_entry, :gen_generate, started_at, t0, nil, e, { 'google_error' => g }))
           raise
@@ -945,6 +947,7 @@ require 'securerandom'
           { name: 'records', type: 'array', of: 'object', optional: false, properties: [
               { name: 'id', optional: false }, { name: 'content', optional: false }, { name: 'metadata', type: 'object' }
             ], hint: 'id + content required.' },
+          { name: 'correlation_id', label: 'Correlation ID', optional: true, hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
           { name: 'rank_model', optional: true, hint: 'e.g., semantic-ranker-default@latest' },
           { name: 'top_n', type: 'integer', optional: true },
           { name: 'ignore_record_details_in_response', type: 'boolean', control_type: 'checkbox', optional: true,
@@ -982,7 +985,7 @@ require 'securerandom'
       execute: lambda do |connection, input|
         started_at = Time.now.utc.iso8601
         t0   = Time.now
-        corr = call(:build_correlation_id)
+        cid = call(:ensure_correlation_id!, input)
         url = nil; req_body = nil
 
         call(:ensure_project_id!, connection)
@@ -1029,7 +1032,7 @@ require 'securerandom'
 
         begin
         resp = post(url)
-                 .headers(call(:request_headers_auth, connection, corr, connection['user_project'], req_params))
+                 .headers(call(:request_headers_auth, connection, cid, connection['user_project'], req_params))
                  .payload(req_body)
 
         code = call(:telemetry_success_code, resp)
@@ -1056,7 +1059,7 @@ require 'securerandom'
                                        (input['source_key'].presence || 'source'),
                                        (input['uri_key'].presence    || 'uri'))
         end
-        out = out.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+        out = out.merge(call(:telemetry_envelope, t0, cid, true, code, 'OK'))
         # annotate ranking call provenance for observability
         (out['telemetry'] ||= {})['ranking'] = {
           'api'       => 'discoveryengine.ranking:rank',
@@ -1084,7 +1087,7 @@ require 'securerandom'
       rescue => e
         g   = call(:extract_google_error, e)
         msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-        env = call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg)
+        env = call(:telemetry_envelope, t0, cid, false, call(:telemetry_parse_error_code, e), msg)
         # Optional debug attachment in non-prod:
         if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
           env['debug'] = call(:debug_pack, true, url, req_body, g)
@@ -1133,6 +1136,7 @@ require 'securerandom'
 
       input_fields: lambda do |object_definitions, _connection, _config_fields|
         [
+          { name: 'correlation_id', label: 'Correlation ID', optional: true, hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
           { name: 'rag_corpus', optional: false,
             hint: 'Accepts either full resource name (e.g., "projects/{project}/locations/{region}/ragCorpora/{corpus}") or the "corpus"' },
           { name: 'question', optional: false },
@@ -1169,7 +1173,7 @@ require 'securerandom'
       execute: lambda do |connection, input|
         started_at = Time.now.utc.iso8601
         t0   = Time.now
-        corr = call(:build_correlation_id)
+        cid = call(:ensure_correlation_id!, input)
         retr_url = nil; retr_req_body = nil
 
         proj = connection['project_id']
@@ -1199,7 +1203,7 @@ require 'securerandom'
         retr_req_body = call(:json_compact, payload)
         # Retrieval must not depend on user-project billing; align with rag_answer
         resp = post(retr_url)
-                 .headers(call(:headers_rag, connection, corr, req_par))
+                 .headers(call(:headers_rag, connection, cid, req_par))
                  .payload(retr_req_body)
 
 
@@ -1210,7 +1214,7 @@ require 'securerandom'
         out = {
           'question' => input['question'],
           'contexts' => mapped
-        }.merge(call(:telemetry_envelope, t0, corr, true, call(:telemetry_success_code, resp), 'OK'))
+        }.merge(call(:telemetry_envelope, t0, cid, true, call(:telemetry_success_code, resp), 'OK'))
 
         # Telemetry preview from canonical opts:
         (out['telemetry'] ||= {})['retrieval'] = {}.tap do |h|
@@ -1238,7 +1242,7 @@ require 'securerandom'
       rescue => e
         g = call(:extract_google_error, e)
         msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-        env = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
+        env = {}.merge(call(:telemetry_envelope, t0, cid, false, call(:telemetry_parse_error_code, e), msg))
         call(:local_log_attach!,
              env,
              call(:local_log_entry, :rag_retrieve_contexts, started_at, t0, nil, e, { 'google_error' => g }))
@@ -1289,6 +1293,7 @@ require 'securerandom'
 
       input_fields: lambda do |object_definitions, _connection, _config_fields|
         [
+          { name: 'correlation_id', label: 'Correlation ID', optional: true, hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
           { name: 'model', label: 'Model', optional: false, control_type: 'text', hint: 'Find a current list of available Gemini models at `https://ai.google.dev/gemini-api/docs/models`'},
           { name: 'rag_corpus', optional: false, hint: 'RAG corpus: projects/{project}/locations/{region}/ragCorpora/{corpus}' },
           { name: 'question', optional: false },
@@ -1347,7 +1352,7 @@ require 'securerandom'
         # Begin logging
         started_at = Time.now.utc.iso8601
         t0   = Time.now
-        corr = call(:build_correlation_id)
+        cid = call(:ensure_correlation_id!, input)
         retr_url = nil; retr_req_body = nil
         gen_url  = nil;  gen_req_body  = nil
 
@@ -1377,7 +1382,7 @@ require 'securerandom'
         retr_url      = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
         retr_req_body = call(:json_compact, retrieve_payload)
         retr_resp = post(retr_url)
-                      .headers(call(:request_headers_auth, connection, corr, nil, req_params_re))
+                      .headers(call(:request_headers_auth, connection, cid, nil, req_params_re))
                       .payload(retr_req_body)
         raw_ctxs = call(:normalize_retrieve_contexts!, retr_resp)
 
@@ -1449,7 +1454,7 @@ require 'securerandom'
           'citations'  => (parsed['citations'] || []),
           'responseId' => gen_resp['responseId'],
           'usage'      => gen_resp['usageMetadata']
-        }.merge(call(:telemetry_envelope, t0, corr, true, call(:telemetry_success_code, gen_resp), 'OK'))
+        }.merge(call(:telemetry_envelope, t0, cid, true, call(:telemetry_success_code, gen_resp), 'OK'))
 
         # Enrich citations from retrieved chunks (best-effort)
         begin
@@ -1494,7 +1499,7 @@ require 'securerandom'
         unless call(:normalize_boolean, connection['prod_mode'])
           if call(:normalize_boolean, input['debug'])
             out = out.merge(call(:request_preview_pack, gen_url, 'POST',
-                                call(:request_headers_auth, connection, corr, connection['user_project'], req_params_g),
+                                call(:request_headers_auth, connection, cid, connection['user_project'], req_params_g),
                                 gen_req_body))
           end
         end
@@ -1510,7 +1515,7 @@ require 'securerandom'
       rescue => e
         g   = call(:extract_google_error, e)
         msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-        env = call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg)
+        env = call(:telemetry_envelope, t0, cid, false, call(:telemetry_parse_error_code, e), msg)
         if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
           env['debug'] = call(:debug_pack, true, gen_url || retr_url, (gen_req_body || retr_req_body), g)
         end
@@ -1570,6 +1575,7 @@ require 'securerandom'
 
       input_fields: lambda do |_object_definitions, _connection, _config_fields|
         [
+          { name: 'correlation_id', label: 'Correlation ID', optional: true, hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
           { name: 'model', label: 'Embedding model', optional: false, control_type: 'text', default: 'text-embedding-005' },
           { name: 'texts', type: 'array', of: 'string', optional: false },
           { name: 'task', hint: 'Optional: RETRIEVAL_QUERY or RETRIEVAL_DOCUMENT' },
@@ -1585,7 +1591,7 @@ require 'securerandom'
         # Correlation id and duration for logs / analytics
         started_at = Time.now.utc.iso8601
         t0 = Time.now
-        corr = call(:build_correlation_id)
+        cid = call(:ensure_correlation_id!, input)
         url = nil; req_body = nil
 
         begin
@@ -1618,8 +1624,8 @@ require 'securerandom'
             'outputDimensionality' => input['outputDimensionality']
           })
 
-          result = call(:predict_embeddings, connection, model_path, instances, params, corr)
-          result = result.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+          result = call(:predict_embeddings, connection, model_path, instances, params, cid)
+          result = result.merge(call(:telemetry_envelope, t0, cid, true, 200, 'OK'))
 
           # Facets + local log
           extras_for_facets = {
@@ -1641,7 +1647,7 @@ require 'securerandom'
         rescue => e
           g   = call(:extract_google_error, e)
           msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          env = call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg)
+          env = call(:telemetry_envelope, t0, cid, false, call(:telemetry_parse_error_code, e), msg)
           # Optional debug attachment in non-prod:
           if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
             env['debug'] = call(:debug_pack, true, url, req_body, g)
@@ -1689,6 +1695,7 @@ require 'securerandom'
 
       input_fields: lambda do |object_definitions, connection, config_fields|
         [
+          { name: 'correlation_id', label: 'Correlation ID', optional: true, hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
           { name: 'model', label: 'Model', optional: false, control_type: 'text' },
           { name: 'contents', type: 'array', of: 'object', properties: object_definitions['content'], optional: false },
           { name: 'system_preamble', label: 'System preamble (text)', optional: true }
@@ -1705,7 +1712,7 @@ require 'securerandom'
         # Correlation id and duration for logs / analytics
         started_at = Time.now.utc.iso8601
         t0 = Time.now
-        corr = call(:build_correlation_id)
+        cid = call(:ensure_correlation_id!, input)
         url = nil; req_body = nil
 
         # Compute model path
@@ -1725,10 +1732,10 @@ require 'securerandom'
             'systemInstruction' => sys_inst
           })
           resp = post(url)
-                    .headers(call(:request_headers_auth, connection, corr, connection['user_project'], "model=#{model_path}"))
+                    .headers(call(:request_headers_auth, connection, cid, connection['user_project'], "model=#{model_path}"))
                     .payload(req_body)
           code = call(:telemetry_success_code, resp)
-          result = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          result = resp.merge(call(:telemetry_envelope, t0, cid, true, code, 'OK'))
 
           # Facets + local log
           extras_for_facets = {
@@ -1749,7 +1756,7 @@ require 'securerandom'
         rescue => e
           g   = call(:extract_google_error, e)
           msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          env = call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg)
+          env = call(:telemetry_envelope, t0, cid, false, call(:telemetry_parse_error_code, e), msg)
           # Optional debug attachment in non-prod:
           if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
             env['debug'] = call(:debug_pack, true, url, req_body, g)
@@ -1793,6 +1800,7 @@ require 'securerandom'
 
       input_fields: lambda do |_object_definitions, _connection, _config_fields|
         [
+          { name: 'correlation_id', label: 'Correlation ID', optional: true, hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
           { name: 'operation', optional: false,
             hint: 'Operation name or full path, e.g., projects/{p}/locations/{l}/operations/{id}' }
         ]
@@ -1812,16 +1820,16 @@ require 'securerandom'
       execute: lambda do |connection, input|
         started_at = Time.now.utc.iso8601
         t0 = Time.now
-        corr = call(:build_correlation_id)
+        cid = call(:ensure_correlation_id!, input)
         begin
           call(:ensure_project_id!, connection)
           # Accept either full /v1/... or name-only
           op = input['operation'].to_s.sub(%r{^/v1/}, '')
           loc = (connection['location'].presence || 'us-central1').to_s.downcase
           url = call(:aipl_v1_url, connection, loc, op.start_with?('projects/') ? op : "projects/#{connection['project_id']}/locations/#{loc}/operations/#{op}")
-          resp = get(url).headers(call(:request_headers_auth, connection, corr, connection['user_project'], nil))
+          resp = get(url).headers(call(:request_headers_auth, connection, cid, connection['user_project'], nil))
           code = call(:telemetry_success_code, resp)
-          result = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+          result = resp.merge(call(:telemetry_envelope, t0, cid, true, code, 'OK'))
 
           # Facets + local log
           extras_for_facets = {
@@ -1840,7 +1848,7 @@ require 'securerandom'
           result
         rescue => e
           g   = call(:extract_google_error, e)
-          env = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
+          env = {}.merge(call(:telemetry_envelope, t0, cid, false, call(:telemetry_parse_error_code, e), e.to_s))
           # Local log (error path)
           call(:local_log_attach!, env,
             call(:local_log_entry, :operations_get, started_at, t0, nil, e, { 'google_error' => g, 'operation' => input['operation'] }))
@@ -1859,6 +1867,157 @@ require 'securerandom'
               'done' => false
             }
           }
+        }
+      end
+    },
+    log_assemble: {
+      title: 'Logs: Assemble entries',
+      subtitle: 'Normalize, summarize, and optionally flatten',
+      help: lambda do |_|
+        {
+          body: 'Takes an array of log objects or raw JSON/NDJSON, normalizes fields, groups by correlation_id, and emits summary + timeline + flat table.',
+          learn_more_text: 'Designed to post-process local_logs emitted by other actions.'
+        }
+      end,
+      display_priority: 4,
+      input_fields: lambda do |_od, _c, _cf|
+        [
+          { name: 'logs', type: 'array', of: 'object', optional: true,
+            hint: 'Preferred: pass an array of log objects (e.g., telemetry.local_logs).' },
+          { name: 'logs_json', control_type: 'text-area', optional: true,
+            hint: 'Alternative: paste JSON array or NDJSON.' },
+          { name: 'correlation_id', optional: true, hint: 'Filter to a single correlation.' },
+          { name: 'since', optional: true, hint: 'ISO string or epoch millis (inclusive)' },
+          { name: 'until', optional: true, hint: 'ISO string or epoch millis (inclusive)' },
+          { name: 'redact', type: 'boolean', control_type: 'checkbox', optional: true, default: true },
+          { name: 'flatten', type: 'boolean', control_type: 'checkbox', optional: true, default: false }
+        ]
+      end,
+      output_fields: lambda do |_od, _c|
+        [
+          { name: 'ingest_count', type: 'integer' },
+          { name: 'valid_count',  type: 'integer' },
+          { name: 'error_count',  type: 'integer' },
+          { name: 'correlations', type: 'array', of: 'object', properties: [
+              { name: 'correlation_id' }, { name: 't_first' }, { name: 't_last' },
+              { name: 'duration_ms', type: 'integer' },
+              { name: 'counts', type: 'object' },
+              { name: 'by_event', type: 'object' },
+              { name: 'errors', type: 'array', of: 'object' },
+              { name: 'facets', type: 'object' }
+            ]
+          },
+          { name: 'timeline', type: 'array', of: 'object', properties: [
+              { name: 'ts' }, { name: 'action' }, { name: 'event' }, { name: 'level' },
+              { name: 'status' }, { name: 'correlation_id' }, { name: 'latency_ms', type: 'integer' },
+              { name: 'delta_ms_prev', type: 'integer' },
+              { name: 'facets', type: 'object' }, { name: 'error', type: 'object' }
+            ]
+          },
+          { name: 'table', type: 'array', of: 'object' }
+        ]
+      end,
+      sample_output: lambda do
+        {
+          'ingest_count' => 3, 'valid_count' => 3, 'error_count' => 0,
+          'correlations' => [
+            { 'correlation_id' => 'cid-123', 't_first' => '2025-10-31T01:13:02.114Z',
+              't_last' => '2025-10-31T01:13:03.987Z', 'duration_ms' => 1873,
+              'counts' => { 'INFO' => 2, 'ERROR' => 1 },
+              'by_event' => { 'begin' => 1, 'end' => 1, 'error' => 1 },
+              'errors' => [ { 'message' => 'Invalid value (query)', 'code' => 'BadRequest', 'where' => 'rag_retrieve_contexts' } ],
+              'facets' => { 'model' => 'text-embedding-005' }
+            }
+          ],
+          'timeline' => [
+            { 'ts' => '2025-10-31T01:13:02.114Z', 'action' => 'embed_text', 'event' => 'begin', 'level' => 'INFO',
+              'status' => 'ok', 'correlation_id' => 'cid-123', 'latency_ms' => 0, 'delta_ms_prev' => nil }
+          ],
+          'table' => [
+            { 'correlation_id' => 'cid-123', 'ts' => '2025-10-31T01:13:03.987Z',
+              'action' => 'gen_answer', 'event' => 'end', 'status' => 'ok',
+              'duration_ms' => 1873, 'delta_ms_prev' => 441, 'facets.model' => 'gemini-2.0-pro' }
+          ]
+        }
+      end,
+      execute: lambda do |_connection, input|
+        # 1) Ingest
+        raw = call(:safe_array, input['logs'])
+        if raw.empty? && input['logs_json'].to_s.strip != ''
+          raw = call(:la_json_parse_safe!, input['logs_json'])
+        end
+        ingest_count = raw.length
+
+        # 2) Normalize & optional redaction
+        valid = []
+        raw.each do |e|
+          next unless e.is_a?(Hash)
+          h = call(:la_norm_entry!, e)
+          if call(:normalize_boolean, input['redact'])
+            h = call(:redact_json, h)
+          end
+          valid << h
+        end
+
+        # 3) Filter by ts and correlation
+        since = call(:la_parse_ts, input['since'])
+        till  = call(:la_parse_ts, input['until'])
+        cid_filter = input['correlation_id'].to_s.strip
+        valid.select! do |e|
+          ok = true
+          if cid_filter != ''
+            ok &&= (e['correlation_id'].to_s == cid_filter || e['correlation'].to_s == cid_filter)
+          end
+          if since
+            te = call(:la_parse_ts, e['ts'])
+            ok &&= te && te >= since
+          end
+          if till
+            te = call(:la_parse_ts, e['ts'])
+            ok &&= te && te <= till
+          end
+          ok
+        end
+
+        # 4) Sort and compute deltas per correlation
+        valid.sort_by! { |e| e['ts'].to_s }
+        by_cid = call(:la_group_by, valid, 'correlation_id')
+        timeline = []
+        by_cid.each do |cid, events|
+          prev = nil
+          events.sort_by! { |e| e['ts'].to_s }
+          events.each do |e|
+            cur = call(:la_parse_ts, e['ts'])
+            e['delta_ms_prev'] = (prev ? call(:la_ms_between, prev, cur) : nil)
+            timeline << e
+            prev = cur
+          end
+        end
+
+        # 5) Build summaries
+        correlations = by_cid.map { |cid, events| call(:la_build_summary, cid, events) }
+
+        # 6) Optional flatten for Sheets/BigQuery
+        table = []
+        if call(:normalize_boolean, input['flatten'])
+          timeline.each do |e|
+            base = e.dup
+            fac  = (base.delete('facets') || {})
+            err  = (base.delete('error')  || {})
+            row  = call(:la_flatten_hash, base)
+            row.merge!(call(:la_flatten_hash, fac, 'facets')) unless fac.empty?
+            row.merge!(call(:la_flatten_hash, err, 'error'))  unless err.empty?
+            table << row
+          end
+        end
+
+        {
+          'ingest_count' => ingest_count,
+          'valid_count'  => valid.length,
+          'error_count'  => ingest_count - valid.length,
+          'correlations' => correlations,
+          'timeline'     => timeline,
+          'table'        => table
         }
       end
     }
@@ -1951,6 +2110,10 @@ require 'securerandom'
   
   # --------- METHODS ------------------------------------------------------
   methods: {
+    ensure_correlation_id!: lambda do |input|
+      cid = input['correlation_id']
+      (cid.is_a?(String) && cid.strip != '') ? cid.strip : SecureRandom.uuid
+    end,
 
     # Heuristic: average of top-K citation scores, clamped to [0,1]. Returns nil if no scores.
     overall_confidence_from_citations: lambda do |citations, k=3|
@@ -2035,6 +2198,11 @@ require 'securerandom'
       extras = extras.is_a?(Hash) ? extras.dup : {}
       extras.delete_if { |_k,v| v.is_a?(Array) || v.is_a?(Hash) } # avoid bloat
       h.merge!(extras)
+    
+      # Always surface correlation_id for downstream grouping (Sheets/BigQuery)
+      if tel['correlation_id'].to_s.strip != ''
+        h['correlation_id'] = tel['correlation_id'].to_s.strip
+      end
 
       # Final compaction: drop nils/empties
       h.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
@@ -2072,9 +2240,9 @@ require 'securerandom'
       container
     end,
 
-    gen_generate_core!: lambda do |connection, input|
+    gen_generate_core!: lambda do |connection, input, corr=nil|
       t0   = Time.now
-      corr = call(:build_correlation_id)
+      corr = (corr.to_s.strip.empty? ? call(:build_correlation_id) : corr.to_s.strip)
       mode = (input['mode'] || 'plain').to_s
 
       # Model + location
@@ -3377,6 +3545,112 @@ require 'securerandom'
         end
       end
       ordered_items.first(lo)
+    end,
+
+    # --- Log-assemble helpers --------------------------------------------
+    la_json_parse_safe!: lambda do |text|
+      return [] unless text.is_a?(String) && text.strip != ''
+      begin
+        j = JSON.parse(text)
+        j.is_a?(Array) ? j : [j]
+      rescue
+        text.lines.map(&:strip).reject(&:empty?).map { |ln| JSON.parse(ln) rescue nil }.compact
+      end
+    end,
+    la_parse_ts: lambda do |v|
+      case v
+      when Integer then Time.at(v / 1000.0).utc
+      when Float   then Time.at(v / 1000.0).utc
+      when String
+        begin Time.parse(v).utc rescue nil end
+      else nil
+      end
+    end,
+    la_ms_between: lambda do |t1, t2|
+      return nil unless t1 && t2
+      ((t2 - t1) * 1000.0).round
+    end,
+    la_flatten_hash: lambda do |h, prefix=''|
+      return {} unless h.is_a?(Hash)
+      flat = {}
+      h.each do |k,v|
+        key = prefix == '' ? k.to_s : "#{prefix}.#{k}"
+        if v.is_a?(Hash)
+          flat.merge!(call(:la_flatten_hash, v, key))
+        else
+          flat[key] = v
+        end
+      end
+      flat
+    end,
+    la_norm_entry!: lambda do |raw|
+      h = raw.is_a?(Hash) ? raw.dup : {}
+      # Lift common aliases
+      h['ts']            ||= h['timestamp'] || h['time'] || h['t']
+      h['level']         ||= (h['severity'] || 'INFO').to_s.upcase
+      h['action']        ||= h['action_name'] || h['actor'] || 'unknown'
+      h['event']         ||= h['stage'] || h['step'] || 'event'
+      h['status']        ||= (h['ok'] == false || h['error'] ? 'error' : 'ok')
+      h['correlation_id']||= h['correlation'] || h['trace_id'] || h.dig('telemetry','correlation_id')
+      # Timestamps
+      t = call(:la_parse_ts, h['ts'])
+      h['ts'] = (t || Time.now.utc).iso8601(3)
+      # Latency
+      if h['latency_ms'].is_a?(String) then h['latency_ms'] = h['latency_ms'].to_i end
+      if !h['latency_ms'] && (h['t_start'] || h['t_end'])
+        t1 = call(:la_parse_ts, h['t_start']); t2 = call(:la_parse_ts, h['t_end'])
+        h['latency_ms'] = call(:la_ms_between, t1, t2)
+      end
+      # Error normalization
+      err = h['error']
+      if err.is_a?(String)
+        h['error'] = { 'message' => err }
+      elsif err.is_a?(Hash)
+        h['error'] = {
+          'message' => err['message'] || err['msg'],
+          'code'    => err['code'] || err['status'],
+          'where'   => err['where'] || h['action'],
+          'raw'     => err
+        }
+      end
+      # Facets: prefer telemetry.facets if present
+      h['facets'] ||= h.dig('telemetry','facets') || h['context'] || h['meta'] || {}
+      h
+    end,
+    la_group_by: lambda do |arr, key|
+      out = Hash.new { |hh,k| hh[k] = [] }
+      Array(arr).each { |e| out[(e[key].to_s rescue '')] << e }
+      out
+    end,
+    la_build_summary: lambda do |cid, events|
+      sorted = Array(events).sort_by { |e| e['ts'].to_s }
+      t_first = Time.parse(sorted.first['ts']) rescue nil
+      t_last  = Time.parse(sorted.last['ts'])  rescue nil
+      counts = Hash.new(0)
+      by_event = Hash.new(0)
+      errs = []
+      facets_merged = {}
+      sorted.each do |e|
+        counts[e['level']] += 1 if e['level']
+        by_event[e['event']] += 1 if e['event']
+        if e['error'].is_a?(Hash)
+          sig = [e['error']['message'], e['error']['where']].compact.join('|')
+          errs << e['error'] unless errs.any? { |x| [x['message'], x['where']].compact.join('|') == sig }
+        end
+        if e['facets'].is_a?(Hash)
+          e['facets'].each { |k,v| facets_merged[k] ||= v }
+        end
+      end
+      {
+        'correlation_id' => (cid == '' ? nil : cid),
+        't_first'        => (t_first&.iso8601(3)),
+        't_last'         => (t_last&.iso8601(3)),
+        'duration_ms'    => (call(:la_ms_between, t_first, t_last) || 0),
+        'counts'         => counts,
+        'by_event'       => by_event,
+        'errors'         => errs,
+        'facets'         => facets_merged
+      }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
     end
 
   },
