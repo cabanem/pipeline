@@ -1139,12 +1139,9 @@ require 'securerandom'
           { name: 'restrict_to_file_ids', type: 'array', of: 'string', optional: true },
           { name: 'max_contexts', type: 'integer', optional: true, default: 20 },
 
-          # Preferred object (teams can use this)
           { name: 'rag_retrieval_config', label: 'Retrieval config', type: 'object',
             properties: object_definitions['rag_retrieval_config'], optional: true,
             hint: 'Set top_k, exactly one threshold (distance OR similarity), and exactly one ranker (semantic OR LLM).' }
-
-          # (If you kept legacy flat fields for BC, they can remain here; not required.)
         ]
       end,
       output_fields: lambda do |object_definitions, _connection|
@@ -1166,7 +1163,6 @@ require 'securerandom'
             { name: 'correlation_id' },
             { name: 'retrieval', type: 'object' },
             { name: 'rank', type: 'object' }
-            {}
           ]}
         ]
       end,
@@ -1955,32 +1951,7 @@ require 'securerandom'
   
   # --------- METHODS ------------------------------------------------------
   methods: {
-    # Build canonical retrieval opts from either the object field
-    #   input['rag_retrieval_config'] OR legacy flat fields on the action.
-    # Returns a Hash suitable for build_rag_retrieve_payload.
-    build_retrieval_opts_from_input!: lambda do |input|
-      cfg = (input['rag_retrieval_config'].is_a?(Hash) ? input['rag_retrieval_config'] : {})
-      filt = cfg['filter'].is_a?(Hash) ? cfg['filter'] : {}
-      rank = cfg['ranking'].is_a?(Hash) ? cfg['ranking'] : {}
 
-      topk = cfg['top_k'] || input['similarity_top_k']
-      dist = filt['vector_distance_threshold']   || input['vector_distance_threshold']
-      sim  = filt['vector_similarity_threshold'] || input['vector_similarity_threshold']
-      rsm  = rank['rank_service_model']          || input['rank_service_model']
-      llm  = rank['llm_ranker_model']            || input['llm_ranker_model']
-
-      # Validate oneof unions
-      call(:guard_threshold_union!, dist, sim)
-      call(:guard_ranker_union!, rsm, llm)
-
-      {
-        'topK'                         => topk,
-        'vectorDistanceThreshold'      => dist,
-        'vectorSimilarityThreshold'    => sim,
-        'rankServiceModel'             => rsm,
-        'llmRankerModel'               => llm
-      }.delete_if { |_k, v| v.nil? || v == '' }
-    end,
     # Heuristic: average of top-K citation scores, clamped to [0,1]. Returns nil if no scores.
     overall_confidence_from_citations: lambda do |citations, k=3|
       arr = Array(citations).map { |c| (c.is_a?(Hash) ? c['score'] : nil) }.compact.map(&:to_f)
@@ -1990,271 +1961,6 @@ require 'securerandom'
       [[avg, 0.0].max, 1.0].min.round(4)
     end,
 
-    # --- Tail logging helpers -------------------------------------------------
-    # Lightweight context to track timing/correlation across an action run.
-    tail_log_begin!: lambda do |connection, action_id, input|
-      {
-        action_id: action_id.to_s,
-        started_at: (Time.now.utc.iso8601 rescue Time.at((t0 = Time.now*1000).to_i/1000.0).utc.iso8601),
-        t0: (t0 = Time.now rescue Time.now),
-        corr_id: (SecureRandom.uuid rescue "#{rand}-#{Time.now.to_i}"),
-        project_id: connection['project_id'] || connection['gcp_project_id'],
-        log_id: 'workato_vertex_rag' # keep internal; no builder knob required
-      }
-    end,
-    tail_log_end!: lambda do |connection, ctx, result, error|
-      # Build a compact envelope; scrub obvious big/PII fields
-      latency_ms = (((t0 = Time.now - ctx[:t0]) * 1000).round rescue nil)
-      status = error ? 'error' : 'ok'
-
-      # Pull some soft identifiers if you have them in the connection
-      env  = connection['environment'] || 'prod'
-      app  = 'vertex_rag_engine'
-
-      entry = {
-        logName: "projects/#{ctx[:project_id]}/logs/#{ctx[:log_id]}",
-        resource: { type: 'global', labels: { project_id: ctx[:project_id] } },
-        severity: (error ? 'ERROR' : 'INFO'),
-        labels: {
-          connector: app,
-          action: ctx[:action_id],
-          correlation_id: ctx[:corr_id],
-          env: env
-        },
-        jsonPayload: {
-          status: status,
-          started_at: ctx[:started_at],
-          ended_at: (Time.now.utc.iso8601 rescue nil),
-          latency_ms: latency_ms,
-          request_meta: {
-            # include only safe breadcrumbs; avoid bodies/tokens
-            recipe_id: connection['__recipe_id'],
-            job_id: connection['__job_id'],
-            region: connection['location'] || connection['region']
-          },
-          result_meta: call(:_shrink_result_meta, result),
-          error: call(:_normalize_error, error)
-        }
-      }.compact
-
-      call(:_tl_post_logs, connection, [entry])
-    rescue => swallow
-      # Never raise from logging; tail logger must be fire-and-forget
-      nil
-    end,
-    _normalize_error: lambda do |e|
-      return nil unless e
-      # Workato errors vary; capture stable fields only
-      h = {
-        class: e.class.to_s,
-        message: e.message.to_s[0, 1024],
-        http_status: (e.dig(:response, :status) rescue nil),
-        code: (e.dig(:error, :code) rescue nil)
-      }.compact
-      h
-    end,
-    tail_log_emit!: lambda do |connection, action_id, started_at, t0, result, error, facets=nil|
-      # Resolve project (guard) and respect feature flag
-      begin
-        call(:ensure_project_id!, connection)
-      rescue
-        # If ensure fails we still fast-exit; never raise from logger
-      end
-      project = (connection['project_id'] || connection['gcp_project_id']).to_s.strip
-      return nil if project.empty? || connection['disable_tail_logging'] == true
-
-      # Timing
-      now = Time.now
-      begun = started_at || now.utc.iso8601
-      t0f = (t0 || now.to_f).to_f
-      latency_ms = ((now.to_f - t0f) * 1000).round
-
-      # Envelope
-      env  = connection['environment'] || 'prod'
-      app  = 'vertex_rag_engine'
-      # Prefer action-scoped correlation id from the result envelope; fallback to connection or fresh UUID
-      corr = begin
-        (result && result['telemetry'] && result['telemetry']['correlation_id']) ||
-        connection['correlation_id'] ||
-        SecureRandom.uuid
-      rescue
-        SecureRandom.uuid
-      end
-      log_id = 'workato_vertex_rag'
-      # Normalize severity (maps WARN->WARNING, etc.; prefixes NONSTANDARD/ for unknowns)
-      severity = call(:normalize_severity, (error ? 'ERROR' : 'INFO'))
-
-      entry = {
-        logName: "projects/#{project}/logs/#{log_id}",
-        resource: { type: 'global', labels: { project_id: project } },
-        severity: severity,
-        labels: {
-          connector: app,
-          action: action_id.to_s,
-          correlation_id: corr,
-          env: env,
-          # Duplicate a couple of request IDs into labels for faster filtering
-          recipe_id: connection['__recipe_id'],
-          job_id:    connection['__job_id'],
-          special: 'workato'
-        },
-        jsonPayload: {
-          status: (error ? 'error' : 'ok'),
-          started_at: begun,
-          ended_at: now.utc.iso8601,
-          latency_ms: latency_ms,
-          request_meta: {
-            recipe_id: connection['__recipe_id'],
-            job_id: connection['__job_id'],
-            region: connection['location'] || connection['region'],
-            special: 'workato'
-          },
-          result_meta: call(:_tl_shrink_meta, result),
-          error: call(:_tl_norm_error, error)
-        }
-      }
-      # Attach compact facets if enabled and provided
-      if call(:_facets_enabled?, connection)
-        fac = facets.is_a?(Hash) ? facets.dup : {}
-        entry[:jsonPayload][:facets] = fac if fac.any?
-      end
-      call(:_tl_post_logs, connection, [entry])
-    rescue => e
-      unless call(:normalize_boolean, connection['prod_mode'])
-        connection['__last_tail_log_error'] = {
-          timestamp: Time.now.utc.iso8601,
-          method: '_tl_post_logs',
-          message: e.message,
-          class: e.class.to_s
-        }
-      end
-      nil
-    end,
-    _tl_norm_error: lambda do |e|
-      return nil unless e
-      { class: e.class.to_s, message: e.message.to_s[0, 1024],
-        http_status: (e.dig(:response, :status) rescue nil),
-        code: (e.dig(:error, :code) rescue nil) }.compact
-    end,
-    _tl_shrink_meta: lambda do |r|
-      return nil if r.nil?
-      case r
-      when Hash
-        kept = %w[id name count total items_length model model_version index datapoints_upserted]
-        h = {}
-        kept.each do |k|
-          v = r[k] || r[k.to_sym]
-          next if v.nil?
-          h[k] = v.is_a?(Array) ? v.length : v
-        end
-        h.empty? ? { summary: 'present' } : h
-      when Array then { items_length: r.length }
-      else { summary: r.to_s[0, 128] }
-      end
-    end,
-    _tl_post_logs: lambda do |connection, entries|
-      return nil if entries.nil? || entries.empty?
-      # Build routing hint: x-goog-request-params requires log_name
-      project = (connection['project_id'] || connection['gcp_project_id']).to_s.strip
-      log_id  = begin
-        ln = entries.first && (entries.first[:logName] || entries.first['logName']).to_s
-        # Expect "projects/<p>/logs/<id>"; be robust if callers pass full logName.
-        m = ln.match(%r{^projects/[^/]+/logs/(.+)$})
-        m ? m[1] : (ln.split('/').last)
-      rescue
-        nil
-      end
-      req_params = (project.empty? || log_id.to_s.empty?) ? nil : "log_name=projects/#{project}/logs/#{log_id}"
-
-      # Correlation id for the write itself
-      corr = connection['correlation_id'] || SecureRandom.uuid
-
-      # Allow force remint to be toggled (default: false). Avoid unconditional remint.
-      force_remint = call(:normalize_boolean, connection['logging_force_remint'])
-      hdrs = call(:headers_logging, connection, corr, req_params, {
-        force_remint: force_remint,
-        cache_salt:   'logging',
-        on_error:     :return_nil
-      })
-      # If auth failed, skip silently (logger must never raise)
-      return nil if hdrs.nil?
-      # Cloud Logging requires JSON body; keep it compact.
-      body = { 'entries' => entries }
-      resp = post("https://logging.googleapis.com/v2/entries:write")
-        .headers(hdrs)
-        .payload(call(:json_compact, body))
-        .request_format_json
-      resp
-    end,
-    normalize_severity: lambda do |s, prefix = 'NONSTANDARD/'|
-      raw = s.to_s.upcase.strip
-      return 'INFO' if raw.empty?
-      canonical = %w[DEFAULT DEBUG INFO NOTICE WARNING ERROR CRITICAL ALERT EMERGENCY]
-      alias_map = {
-        'WARN'=>'WARNING','ERR'=>'ERROR','SEVERE'=>'ERROR',
-        'FATAL'=>'CRITICAL','CRIT'=>'CRITICAL','TRACE'=>'DEBUG','DBG'=>'DEBUG','EMERG'=>'EMERGENCY'
-      }
-      mapped = alias_map[raw] || raw
-      mapped = mapped[0, 64]
-      canonical.include?(mapped) ? mapped : "#{prefix}#{mapped}"
-    end,
-    tail_log_emit_min!: lambda do |connection, action_sym, started_at, t0, result, error|
-      begin
-        # 1) Resolve project (fast-fail if missing)
-        project = (connection['project_id'] || connection['gcp_project_id']).to_s.strip
-        return nil if project.empty? || connection['disable_tail_logging'] == true
-
-        # 2) Get a token (use cached if present; otherwise mint once)
-        token = connection['access_token'].to_s
-        if token.empty?
-          set  = call(:const_default_scopes)
-          tokh = call(:auth_issue_token!, connection, set)
-          token = tokh['access_token'].to_s
-          connection['access_token'] = token
-        end
-        return nil if token.to_s.empty?
-
-        # 3) Build a tiny entry (no facets, no bloat)
-        now   = Time.now
-        began = (started_at || now.utc.iso8601)
-        durms = (((t0 || now).to_f - now.to_f) * -1000).round  # if t0 given, compute; else 0
-        env   = (connection['environment'] || 'prod').to_s
-        corr  = (result && result.dig('telemetry','correlation_id')) || connection['correlation_id'] || SecureRandom.uuid
-        log_id = 'workato_vertex_rag'
-        entry = {
-          logName: "projects/#{project}/logs/#{log_id}",
-          resource: { type: 'global', labels: { project_id: project } },
-          severity: (error ? 'ERROR' : 'INFO'),
-          labels: {
-            connector: 'vertex_rag_engine',
-            action: action_sym.to_s,
-            correlation_id: corr,
-            env: env
-          },
-          jsonPayload: {
-            status: (error ? 'error' : 'ok'),
-            started_at: began,
-            ended_at: now.utc.iso8601,
-            latency_ms: (t0 ? ((now.to_f - t0.to_f) * 1000).round : durms),
-            result_meta: (result.is_a?(Hash) ? { summary: 'present' } : nil),
-            error: (error ? { class: error.class.to_s, message: error.message.to_s[0,512] } : nil)
-          }
-        }
-
-        # 4) POST directly to Logging
-        post("https://logging.googleapis.com/v2/entries:write")
-          .headers({
-            'Authorization'   => "Bearer #{token}",
-            'Content-Type'    => 'application/json',
-            'Accept'          => 'application/json'
-          })
-          .payload({ entries: [entry] })
-          .request_format_json
-      rescue
-        # Never raise from the logger
-        nil
-      end
-    end,
     # -- Facets plumbing ----------------------------------------------------
     _facets_enabled?: lambda do |connection|
       # default true; explicit false disables
@@ -2334,6 +2040,8 @@ require 'securerandom'
       h.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
       h
     end,
+
+    # -- Local logging 
     local_log_entry: lambda do |action_id, started_at, t0, result=nil, err=nil, extras=nil|
       now  = Time.now
       beg  = started_at || now.utc.iso8601
@@ -2509,37 +2217,6 @@ require 'securerandom'
       end
       error(env)
     end,
-    json_parse_safe: lambda do |body|
-      call(:safe_json, body) || {}
-    end,
-
-
-    # --- HTTP -------------------------------------------------------------
-    http_call!: lambda do |verb, url|
-      v = verb.to_s.upcase
-      case v
-      when 'GET'    then get(url)
-      when 'POST'   then post(url)
-      when 'PUT'    then put(url)
-      when 'PATCH'  then patch(url)
-      when 'DELETE' then delete(url)
-      else error("Unsupported HTTP verb: #{verb}")
-      end
-    end,
-    http_body_json: lambda do |resp|
-      # Accepts Workato HTTP response object OR already-parsed Hash/Array/String.
-      # Normalizes to a Hash (or {}).
-      if resp.is_a?(Hash) && resp.key?('body')
-        parsed = call(:safe_json, resp['body'])
-        parsed.nil? ? {} : parsed
-      elsif resp.is_a?(String)
-        call(:safe_json, resp) || {}
-      elsif resp.is_a?(Hash) || resp.is_a?(Array)
-        resp
-      else
-        {}
-      end
-    end,
     request_preview_pack: lambda do |url, verb, headers, payload|
       {
         'request_preview' => {
@@ -2549,25 +2226,6 @@ require 'securerandom'
           'payload' => call(:redact_json, payload)
         }
       }
-    end,
-    # Stabilized output shaper for neighbors
-    shape_neighbors: lambda do |resp|
-      body = call(:http_body_json, resp)
-      list = Array(body['nearestNeighbors']).map do |nn|
-        neighbors = Array(nn['neighbors']).map do |n|
-          {
-            'datapoint' => n['datapoint'],
-            'distance'  => n['distance'].to_f.round(6),
-            'crowdingTagCount' => n['crowdingTagCount'].to_i
-          }
-        end
-        # Deterministic order: by distance ASC, then datapointId
-        { 'neighbors' => neighbors.sort_by { |x|
-            [x['distance'], x.dig('datapoint','datapointId').to_s]
-          }
-        }
-      end
-      { 'nearestNeighbors' => list }
     end,
 
     # ---------- Rerank helpers (tidy + reusable) --------------------------
@@ -2721,54 +2379,33 @@ require 'securerandom'
         'error_body'   => (google_error && google_error['raw']) || google_error
       }
     end,
-    after_response_shared: lambda do |code, body, headers, message|
-      parsed = call(:json_parse_safe, body)
 
-      meta = (parsed['_meta'] ||= {})
-      meta['http_status']    = code
-      meta['request_id']     = headers['X-Request-Id'] || headers['x-request-id']
-      meta['retry_after']    = headers['Retry-After']
-      meta['rate_limit_rem'] = headers['X-RateLimit-Remaining']
-      meta['etag']           = headers['ETag']
-      meta['last_modified']  = headers['Last-Modified']
-      meta['model_version']  = headers['x-goog-model-id'] || headers['X-Model-Version']
+    # Build canonical retrieval opts from either the object field
+    #   input['rag_retrieval_config'] OR legacy flat fields on the action.
+    # Returns a Hash suitable for build_rag_retrieve_payload.
+    build_retrieval_opts_from_input!: lambda do |input|
+      cfg = (input['rag_retrieval_config'].is_a?(Hash) ? input['rag_retrieval_config'] : {})
+      filt = cfg['filter'].is_a?(Hash) ? cfg['filter'] : {}
+      rank = cfg['ranking'].is_a?(Hash) ? cfg['ranking'] : {}
 
-      meta['next_page_token'] ||= parsed['nextPageToken'] || parsed['next_page_token']
+      topk = cfg['top_k'] || input['similarity_top_k']
+      dist = filt['vector_distance_threshold']   || input['vector_distance_threshold']
+      sim  = filt['vector_similarity_threshold'] || input['vector_similarity_threshold']
+      rsm  = rank['rank_service_model']          || input['rank_service_model']
+      llm  = rank['llm_ranker_model']            || input['llm_ranker_model']
 
-      if parsed['error'].is_a?(Hash)
-        e = parsed['error']
-        error({
-          'code'     => e['code'] || code,
-          'status'   => e['status'],
-          'message'  => e['message'] || message || 'Request failed',
-          'details'  => e['details']
-        })
-      else
-        parsed
-      end
+      # Validate oneof unions
+      call(:guard_threshold_union!, dist, sim)
+      call(:guard_ranker_union!, rsm, llm)
+
+      {
+        'topK'                         => topk,
+        'vectorDistanceThreshold'      => dist,
+        'vectorSimilarityThreshold'    => sim,
+        'rankServiceModel'             => rsm,
+        'llmRankerModel'               => llm
+      }.delete_if { |_k, v| v.nil? || v == '' }
     end,
-    after_error_response_shared: lambda do |code, body, headers, message|
-      json = call(:json_parse_safe, body)
-      normalized = { 'code' => code }
-
-      if json['error'].is_a?(Hash)
-        e = json['error']
-        normalized['status']   = e['status']
-        normalized['message']  = e['message'] || message || 'Request failed'
-        normalized['details']  = e['details']
-      else
-        normalized['message']  = message || json['message'] || 'Request failed'
-        normalized['raw']      = json unless json.empty?
-      end
-
-      normalized['retryable']     = [408, 429, 500, 502, 503, 504].include?(code)
-      normalized['retry_after']   = headers['Retry-After']
-      normalized['request_id']    = headers['X-Request-Id'] || headers['x-request-id']
-      normalized['model_version'] = headers['x-goog-model-id'] || headers['X-Model-Version']
-
-      error(normalized) # re-raise so Workato’s retry/metrics kick in
-    end,
-
     # --- Auth (JWT → OAuth) -----------------------------------------------
     const_default_scopes: lambda { ['https://www.googleapis.com/auth/cloud-platform'].freeze },
     b64url: lambda do |bytes|
@@ -2855,29 +2492,14 @@ require 'securerandom'
       # Retrieval calls: NEVER send x-goog-user-project
       call(:request_headers_auth, connection, correlation_id, nil, request_params)
     end,
-    headers_logging: lambda do |connection, correlation_id, request_params=nil, opts=nil|
-      # Logging calls: x-goog-user-project is *opt-in* and must be sane.
-      # Enable only when explicitly requested AND non-blank.
-      use_up = call(:normalize_boolean, connection['use_user_project_for_logging'])
-      up_val = connection['user_project'].to_s.strip
-      user_project = (use_up && !up_val.empty?) ? up_val : nil
-
-      # Allow callers to force a fresh token (rare). Default is cached token.
-      # Also let logging be stricter on error handling.
-      o = (opts || {}).merge({
-        on_error: :return_nil  # if auth fails, bubble a nil so caller can skip the write
-      })
-      call(:request_headers_auth, connection, correlation_id, user_project, request_params, o)
-    end,
-
     # Unified auth+header builder.
-    # Backward-compatible signature; final arg `opts` is optional:
-    #   opts = {
-    #     scopes:        Array|String (default: cloud-platform),
-    #     force_remint:  true|false   (default: false),
-    #     cache_salt:    String       (optional logical namespace for token cache)
-    #   }
     request_headers_auth: lambda do |connection, correlation_id, user_project=nil, request_params=nil, opts=nil|
+      # Backward-compatible signature; final arg `opts` is optional:
+      #   opts = {
+      #     scopes:        Array|String (default: cloud-platform),
+      #     force_remint:  true|false   (default: false),
+      #     cache_salt:    String       (optional logical namespace for token cache)
+      #   }
       opts ||= {}
       begin
         # Resolve scopes and whether to bypass cache for this call
@@ -2937,14 +2559,7 @@ require 'securerandom'
           'Accept'           => 'application/json' }
       end
     end,
-    request_headers: lambda do |correlation_id, extra=nil|
-      base = {
-        'X-Correlation-Id' => correlation_id.to_s,
-        'Content-Type'     => 'application/json',
-        'Accept'           => 'application/json'
-      }
-      extra.is_a?(Hash) ? base.merge(extra) : base
-    end,
+
     # --- URL and resource building ----------------------------------------
     # Map a Vertex "region" (e.g., us-central1, europe-west1) to AI-Apps multi-region (global|us|eu)
     region_to_aiapps_loc: lambda do |raw|
@@ -2957,7 +2572,6 @@ require 'securerandom'
       # Safe fallback: prefer global (Ranking supports global/us/eu only)
       'global'
     end,
-
     # Resolve AI-Apps (Discovery/Ranking) location with optional override
     aiapps_loc_resolve: lambda do |connection, override=nil|
       o = override.to_s.strip.downcase
@@ -2970,28 +2584,6 @@ require 'securerandom'
     end,
     aipl_v1_url: lambda do |connection, loc, path|
       "https://#{call(:aipl_service_host, connection, loc)}/v1/#{path}"
-    end,
-    aipl_v1alpha_url: lambda do |connection, loc, path|
-      "https://#{call(:aipl_service_host, connection, loc)}/v1alpha/#{path}"
-    end,
-    endpoint_predict_url: lambda do |connection, endpoint|
-      ep = call(:normalize_endpoint_identifier, endpoint).to_s
-      # Allow fully-qualified dedicated endpoint URLs.
-      return (ep.include?(':predict') ? ep : "#{ep}:predict") if ep.start_with?('http')
-
-      # Prefer region from the resource name; fallback to connection.
-      m   = ep.match(%r{^projects/[^/]+/locations/([^/]+)/endpoints/})
-      loc = (m && m[1]) || (connection['location'] || '').to_s.downcase
-      error("This action requires a regional location. Current location is '#{loc}'.") if loc.blank? || loc == 'global'
-
-      host = call(:aipl_service_host, connection, loc)
-      "https://#{host}/v1/#{call(:build_endpoint_path, connection, ep)}:predict"
-    end,
-    build_endpoint_path: lambda do |connection, endpoint|
-      ep = call(:normalize_endpoint_identifier, endpoint)
-      ep = ep.sub(%r{^/v1/}, '') # defensive
-      ep.start_with?('projects/') ? ep :
-        "projects/#{connection['project_id']}/locations/#{connection['location']}/endpoints/#{ep}"
     end,
     build_model_path_with_global_preview: lambda do |connection, model|
       # Enforce project location (inference from connection)
@@ -3042,29 +2634,6 @@ require 'securerandom'
       else
         "projects/#{connection['project_id']}/locations/#{loc}/publishers/google/models/#{m}"
       end
-    end,
-    build_rag_corpus_path: lambda do |connection, corpus|
-      v = corpus.to_s.strip
-      return '' if v.empty?
-      return v.sub(%r{^/v1/}, '') if v.start_with?('projects/')
-      call(:ensure_project_id!, connection)
-      loc = (connection['location'] || '').to_s.downcase
-      error("RAG corpus requires regional location; got '#{loc}'") if loc.blank? || loc == 'global'
-      "projects/#{connection['project_id']}/locations/#{loc}/ragCorpora/#{v}"
-    end,
-    build_rag_file_path: lambda do |connection, rag_file|
-      v = rag_file.to_s.strip
-      return '' if v.empty?
-      return v.sub(%r{^/v1/}, '') if v.start_with?('projects/')
-      # allow short form: {corpus_id}/ragFiles/{file_id}
-      if v.start_with?('ragCorpora/')
-        call(:ensure_project_id!, connection)
-        loc = (connection['location'] || '').to_s.downcase
-        error("RAG file requires regional location; got '#{loc}'") if loc.blank? || loc == 'global'
-        return "projects/#{connection['project_id']}/locations/#{loc}/#{v}"
-      end
-      # otherwise expect full name
-      error('rag_file must be a full resource name like projects/{p}/locations/{l}/ragCorpora/{c}/ragFiles/{id}')
     end,
     discovery_host: lambda do |connection, loc=nil|
       # Accept regional input and normalize to multi-region for host selection
@@ -3177,14 +2746,7 @@ require 'securerandom'
       arr = arr['contexts'] if arr.is_a?(Hash) && arr.key?('contexts')
       Array(arr)
     end,
-    normalize_index_endpoint_identifier: lambda do |raw|
-      return '' if raw.nil? || raw == false
-      raw.to_s.strip
-    end,
-    normalize_index_identifier: lambda do |raw|
-      return '' if raw.nil? || raw == false
-      raw.to_s.strip
-    end,
+
     guard_threshold_union!: lambda do |dist, sim|
       return true if dist.nil? || dist.to_s == ''
       return true if sim.nil?  || sim.to_s  == ''
@@ -3257,61 +2819,6 @@ require 'securerandom'
 
         }
       end
-    end,
-    build_rag_import_payload!: lambda do |input|
-      # Validates XOR and constructs { importRagFilesConfig: { ... } }
-      has_gcs   = call(:safe_array, input['gcs_uris']).present?
-      has_drive = input['drive_folder_id'].present? || call(:safe_array, input['drive_file_ids']).present?
-      error('Provide exactly one source family: GCS or Drive') if (has_gcs && has_drive) || (!has_gcs && !has_drive)
-
-      cfg = {}
-      if has_gcs
-        uris = call(:safe_array, input['gcs_uris']).map(&:to_s)
-        bad  = uris.find { |u| u.include?('*') }
-        error("gcs_uris does not support wildcards; got: #{bad}") if bad
-        cfg['gcsSource'] = { 'uris' => uris }
-      else
-        res_ids = []
-        if input['drive_folder_id'].present?
-          folder_id = call(:normalize_drive_folder_id, input['drive_folder_id'])
-          error('drive_folder_id is not a valid Drive ID') if folder_id.blank?
-          res_ids << { 'resourceId' => folder_id, 'resourceType' => 'RESOURCE_TYPE_FOLDER' }
-        end
-        drive_ids = call(:sanitize_drive_ids, input['drive_file_ids'], allow_empty: true, label: 'drive_file_ids')
-        drive_ids.each do |fid|
-          res_ids << { 'resourceId' => fid, 'resourceType' => 'RESOURCE_TYPE_FILE' }
-        end
-        error('Provide drive_folder_id or non-empty drive_file_ids (share with the Vertex RAG Data Service Agent)') if res_ids.empty?
-        cfg['googleDriveSource'] = { 'resourceIds' => res_ids }
-      end
-
-      # Optional knobs
-      if input.key?('maxEmbeddingRequestsPerMin')
-        cfg['maxEmbeddingRequestsPerMin'] = call(:safe_integer, input['maxEmbeddingRequestsPerMin'])
-      end
-      cfg['rebuildAnnIndex'] = true if input['rebuildAnnIndex'] == true
-      sink = input['importResultGcsSink']
-      if sink.is_a?(Hash) && sink['outputUriPrefix'].present?
-        cfg['importResultGcsSink'] = { 'outputUriPrefix' => sink['outputUriPrefix'].to_s }
-      end
-
-      { 'importRagFilesConfig' => cfg }
-    end,
-    build_index_path: lambda do |connection, index|
-      id = call(:normalize_index_identifier, index)
-      return id.sub(%r{^/v1/}, '') if id.start_with?('projects/')
-      call(:ensure_project_id!, connection)
-      loc = (connection['location'] || '').to_s.downcase
-      error("Index requires regional location; got '#{loc}'") if loc.blank? || loc == 'global'
-      "projects/#{connection['project_id']}/locations/#{loc}/indexes/#{id}"
-    end,
-    build_index_endpoint_path: lambda do |connection, ep|
-      v = call(:normalize_index_endpoint_identifier, ep)
-      return v.sub(%r{^/v1/}, '') if v.start_with?('projects/')
-      call(:ensure_project_id!, connection)
-      loc = (connection['location'] || '').to_s.downcase
-      error("IndexEndpoint requires regional location; got '#{loc}'") if loc.blank? || loc == 'global'
-      "projects/#{connection['project_id']}/locations/#{loc}/indexEndpoints/#{v}"
     end,
 
     # --- Sanitizers and conversion ----------------------------------------
@@ -3593,10 +3100,6 @@ require 'securerandom'
       parts << "Body:\n#{b}"    if b.present?
       parts.join("\n\n")
     end,
-    safe_map: lambda do |v|
-      # Like Array#map but safe against nil/false/non-arrays.
-      call(:safe_array, v).map { |x| yield(x) }
-    end,
     json_compact: lambda do |obj|
       # Compact a JSON-able Hash/Array without mutating the caller:
       # - Removes nil
@@ -3640,22 +3143,7 @@ require 'securerandom'
       arr = call(:safe_array, v)
       arr.map { |x| call(:sanitize_hash, x) }.compact
     end,
-    sanitize_tools!: lambda do |raw|
-      a = call(:safe_array_of_hashes, raw)
-      return nil if a.empty?
 
-      allowed_keys = %w[googleSearch retrieval codeExecution functionDeclarations]
-      cleaned = a.map do |t|
-        keep = {}
-        allowed_keys.each do |k|
-          v = t[k]
-          keep[k] = v if v.is_a?(Hash) || v.is_a?(Array) || v == {}
-        end
-        keep.empty? ? nil : keep
-      end.compact
-
-      cleaned.empty? ? nil : cleaned
-    end,
     extract_candidate_text: lambda do |resp|
       # Returns [text, meta] where meta carries finishReason/safety/promptFeedback
       cands = call(:safe_array, resp['candidates'])
