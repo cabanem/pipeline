@@ -1177,14 +1177,17 @@ require 'securerandom'
           (out['telemetry'] ||= {})['rank'] = { 'mode' => 'llm', 'model' => opts['llmRankerModel'] }
         end
 
-        facets = call(:compute_facets_for!, 'rag_retrieve_contexts', out)
-        call(:tail_log_emit!, connection, :rag_retrieve_contexts, started_at, t0, out, nil, facets)
+        #facets = call(:compute_facets_for!, 'rag_retrieve_contexts', out)
+        #call(:tail_log_emit!, connection, :rag_retrieve_contexts, started_at, t0, out, nil, facets)
+        call(:tail_log_emit_min!, connection, :rag_retrieve_contexts, started_at, t0, out, nil)
+
         out
       rescue => e
         g = call(:extract_google_error, e)
         msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
         env = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
-        call(:tail_log_emit!, connection, :rag_retrieve_contexts, started_at, t0, nil, e, nil)
+        #call(:tail_log_emit!, connection, :rag_retrieve_contexts, started_at, t0, nil, e, nil)
+        call(:tail_log_emit_min!, connection, :rag_retrieve_contexts, started_at, t0, nil, e)
         env
 
       end,
@@ -2121,7 +2124,63 @@ require 'securerandom'
       mapped = mapped[0, 64]
       canonical.include?(mapped) ? mapped : "#{prefix}#{mapped}"
     end,
+    tail_log_emit_min!: lambda do |connection, action_sym, started_at, t0, result, error|
+      begin
+        # 1) Resolve project (fast-fail if missing)
+        project = (connection['project_id'] || connection['gcp_project_id']).to_s.strip
+        return nil if project.empty? || connection['disable_tail_logging'] == true
 
+        # 2) Get a token (use cached if present; otherwise mint once)
+        token = connection['access_token'].to_s
+        if token.empty?
+          set  = call(:const_default_scopes)
+          tokh = call(:auth_issue_token!, connection, set)
+          token = tokh['access_token'].to_s
+          connection['access_token'] = token
+        end
+        return nil if token.to_s.empty?
+
+        # 3) Build a tiny entry (no facets, no bloat)
+        now   = Time.now
+        began = (started_at || now.utc.iso8601)
+        durms = (((t0 || now).to_f - now.to_f) * -1000).round  # if t0 given, compute; else 0
+        env   = (connection['environment'] || 'prod').to_s
+        corr  = (result && result.dig('telemetry','correlation_id')) || connection['correlation_id'] || SecureRandom.uuid
+        log_id = 'workato_vertex_rag'
+        entry = {
+          logName: "projects/#{project}/logs/#{log_id}",
+          resource: { type: 'global', labels: { project_id: project } },
+          severity: (error ? 'ERROR' : 'INFO'),
+          labels: {
+            connector: 'vertex_rag_engine',
+            action: action_sym.to_s,
+            correlation_id: corr,
+            env: env
+          },
+          jsonPayload: {
+            status: (error ? 'error' : 'ok'),
+            started_at: began,
+            ended_at: now.utc.iso8601,
+            latency_ms: (t0 ? ((now.to_f - t0.to_f) * 1000).round : durms),
+            result_meta: (result.is_a?(Hash) ? { summary: 'present' } : nil),
+            error: (error ? { class: error.class.to_s, message: error.message.to_s[0,512] } : nil)
+          }
+        }
+
+        # 4) POST directly to Logging
+        post("https://logging.googleapis.com/v2/entries:write")
+          .headers({
+            'Authorization'   => "Bearer #{token}",
+            'Content-Type'    => 'application/json',
+            'Accept'          => 'application/json'
+          })
+          .payload({ entries: [entry] })
+          .request_format_json
+      rescue
+        # Never raise from the logger
+        nil
+      end
+    end,
     # -- Facets plumbing ----------------------------------------------------
     _facets_enabled?: lambda do |connection|
       # default true; explicit false disables
