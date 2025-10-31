@@ -2088,11 +2088,12 @@ require 'securerandom'
       # Use the standard auth header builder so 401s trigger refresh_on
       corr = connection['correlation_id'] || SecureRandom.uuid
       hdrs = call(:headers_logging, connection, corr, req_params)
-      # Fire the write using the same pipeline as other Google calls (no error swallow here;
-      # tail_log_emit! already rescues so this remains fire-and-forget while allowing token refresh)
+      # Fire the write using JSON (required by Cloud Logging). Do NOT swallow here;
+      # tail_log_emit! already rescues around this call.
+      body = { 'entries' => entries }
       post("https://logging.googleapis.com/v2/entries:write")
         .headers(hdrs)
-        .payload(entries: entries)
+        .payload(call(:json_compact, body))
         .request_format_json
       nil
     end,
@@ -2337,18 +2338,7 @@ require 'securerandom'
     json_parse_safe: lambda do |body|
       call(:safe_json, body) || {}
     end,
-    request_headers_auth: lambda do |_connection, correlation_id, user_project=nil, request_params=nil|
-      h = {
-        'X-Correlation-Id' => correlation_id.to_s,
-        'Content-Type'     => 'application/json',
-        'Accept'           => 'application/json'
-      }
-      up = user_project.to_s.strip
-      h['x-goog-user-project']   = up unless up.empty?
-      rp = request_params.to_s.strip
-      h['x-goog-request-params'] = rp unless rp.empty?
-      h
-    end,
+
 
     # --- HTTP -------------------------------------------------------------
     http_call!: lambda do |verb, url|
@@ -2694,6 +2684,29 @@ require 'securerandom'
     headers_logging: lambda do |connection, correlation_id, request_params=nil|
       # Logging calls: include x-goog-user-project when configured
       call(:request_headers_auth, connection, correlation_id, connection['user_project'], request_params)
+    end,
+    request_headers_auth: lambda do |connection, correlation_id, user_project=nil, request_params=nil|
+      # Always include Authorization explicitly to avoid relying solely on `authorization.apply`
+      auth = connection['access_token'].to_s
+      h = {
+        'X-Correlation-Id' => correlation_id.to_s,
+        'Content-Type'     => 'application/json',
+        'Accept'           => 'application/json'
+      }
+      h['Authorization'] = "Bearer #{auth}" unless auth.empty?
+      up = user_project.to_s.strip
+      h['x-goog-user-project']   = up unless up.empty?
+      rp = request_params.to_s.strip
+      h['x-goog-request-params'] = rp unless rp.empty?
+      h
+    end,
+    request_headers: lambda do |correlation_id, extra=nil|
+      base = {
+        'X-Correlation-Id' => correlation_id.to_s,
+        'Content-Type'     => 'application/json',
+        'Accept'           => 'application/json'
+      }
+      extra.is_a?(Hash) ? base.merge(extra) : base
     end,
     # --- URL and resource building ----------------------------------------
     # Map a Vertex "region" (e.g., us-central1, europe-west1) to AI-Apps multi-region (global|us|eu)
@@ -3346,14 +3359,6 @@ require 'securerandom'
     safe_map: lambda do |v|
       # Like Array#map but safe against nil/false/non-arrays.
       call(:safe_array, v).map { |x| yield(x) }
-    end,
-    request_headers: lambda do |correlation_id, extra=nil|
-      base = {
-        'X-Correlation-Id' => correlation_id.to_s,
-        'Content-Type'     => 'application/json',
-        'Accept'           => 'application/json'
-      }
-      extra.is_a?(Hash) ? base.merge(extra) : base
     end,
     json_compact: lambda do |obj|
       # Compact a JSON-able Hash/Array without mutating the caller:
