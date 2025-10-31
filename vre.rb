@@ -476,6 +476,16 @@ require 'securerandom'
               { name: 'category' }, { name: 'score', type: 'number' }, { name: 'cosine', type: 'number' }
             ]
           },
+          # Pre-filter outcome (hard exclude or soft signals triage). Optional.
+          { name: 'pre_filter', type: 'object', properties: [
+              { name: 'hit', type: 'boolean' },
+              { name: 'action' },
+              { name: 'reason' },
+              { name: 'score', type: 'number' },
+              { name: 'matched_signals', type: 'array', of: 'string' },
+              { name: 'decision' }
+            ]
+          },
           { name: 'referee', type: 'object', properties: [
               { name: 'category' }, { name: 'confidence', type: 'number' }, { name: 'reasoning' },
               { name: 'distribution', type: 'array', of: 'object', properties: [
@@ -531,7 +541,7 @@ require 'securerandom'
             hard_pack = rules['hard_exclude'].is_a?(Hash) ? rules['hard_exclude'] : {}
             soft_pack = rules['soft_signals'].is_a?(Array) ? rules['soft_signals'] : []
 
-            hf = call(:hr_eval_hard_exclude?, {
+            hf = call(:hr_eval_hard?, {
               'subject' => subj, 'body' => body,
               'from' => input['from'], 'headers' => input['headers'],
               'attachments' => input['attachments'], 'auth' => input['auth']
