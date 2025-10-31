@@ -571,7 +571,6 @@ require 'securerandom'
 
           # Build and emit to Google Cloud
           facets = call(:compute_facets_for!, 'gen_categorize_email', result)
-          call(:tail_log_emit!, connection, :gen_categorize_email, started_at, t0, result, nil, facets)
 
           result
         rescue => e
@@ -581,9 +580,6 @@ require 'securerandom'
 
           # Construct telmetry envelope
           env = call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg)
-
-          # Emit logging to Google Cloud
-          call(:tail_log_emit!, connection, :gen_categorize_email, started_at, t0, nil, e, nil)
 
           # Construct and emit debug attachment, as applicable
           if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
@@ -795,13 +791,11 @@ require 'securerandom'
 
           # Compute facets (tokens_total, etc.) and emit
           facets = call(:compute_facets_for!, 'email_extract_salient_span', out)
-          call(:tail_log_emit!, connection, :email_extract_salient_span, started_at, t0, out, nil, facets)
           out
         rescue => e
           g   = call(:extract_google_error, e)
           msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
           out = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
-          call(:tail_log_emit!, connection, :email_extract_salient_span, started_at, t0, nil, e, nil)
           unless call(:normalize_boolean, connection['prod_mode'])
             out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
           end
@@ -864,10 +858,8 @@ require 'securerandom'
         begin
           result = call(:gen_generate_core!, connection, input)
           facets = call(:compute_facets_for!, 'gen_generate', result)
-          call(:tail_log_emit!, connection, :gen_generate, started_at, t0, result, nil, facets)
           result
         rescue => e
-          call(:tail_log_emit!, connection, :gen_generate, started_at, t0, nil, e, nil)
           raise
         end
       end,
@@ -1029,13 +1021,11 @@ require 'securerandom'
           'rank_mode'  => out.dig('telemetry','ranking','api') ? 'rank_service' : nil,
           'rank_model' => out.dig('telemetry','ranking','model')
         }.delete_if { |_k,v| v.nil? }
-        call(:tail_log_emit!, connection, :rank_texts_with_ranking_api, started_at, t0, out, nil, rank_facets)
         out
       rescue => e
         g   = call(:extract_google_error, e)
         msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
         env = call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg)
-        call(:tail_log_emit!, connection, :rank_texts_with_ranking_api, started_at, t0, nil, e, nil)
         # Optional debug attachment in non-prod:
         if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
           env['debug'] = call(:debug_pack, true, url, req_body, g)
@@ -1176,20 +1166,21 @@ require 'securerandom'
         elsif opts['llmRankerModel']
           (out['telemetry'] ||= {})['rank'] = { 'mode' => 'llm', 'model' => opts['llmRankerModel'] }
         end
-
-        #facets = call(:compute_facets_for!, 'rag_retrieve_contexts', out)
-        #call(:tail_log_emit!, connection, :rag_retrieve_contexts, started_at, t0, out, nil, facets)
-        call(:tail_log_emit_min!, connection, :rag_retrieve_contexts, started_at, t0, out, nil)
-
+        call(:local_log_attach!,
+             out,
+             call(:local_log_entry, :rag_retrieve_contexts, started_at, t0, out, nil, {
+               'retrieval_top_k' => out.dig('telemetry','retrieval','top_k'),
+               'contexts_returned' => Array(out['contexts']).length
+             }))
         out
       rescue => e
         g = call(:extract_google_error, e)
         msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
         env = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg))
-        #call(:tail_log_emit!, connection, :rag_retrieve_contexts, started_at, t0, nil, e, nil)
-        call(:tail_log_emit_min!, connection, :rag_retrieve_contexts, started_at, t0, nil, e)
+        call(:local_log_attach!,
+             env,
+             call(:local_log_entry, :rag_retrieve_contexts, started_at, t0, nil, e, { 'google_error' => g }))
         env
-
       end,
       sample_output: lambda do
         {
@@ -1441,7 +1432,6 @@ require 'securerandom'
         end
 
         facets = call(:compute_facets_for!, 'rag_answer', out)
-        call(:tail_log_emit!, connection, :rag_answer, started_at, t0, out, nil, facets)
         out
       rescue => e
         g   = call(:extract_google_error, e)
@@ -1546,7 +1536,6 @@ require 'securerandom'
 
           result = call(:predict_embeddings, connection, model_path, instances, params, corr)
           result = result.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
-          call(:tail_log_emit!, connection, :embed_text, started_at, t0, result, nil)
           result
         rescue => e
           g   = call(:extract_google_error, e)
@@ -1556,7 +1545,6 @@ require 'securerandom'
           if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
             env['debug'] = call(:debug_pack, true, url, req_body, g)
           end
-          call(:tail_log_emit!, connection, :embed_text, started_at, t0, nil, e)
           error(env)   # <-- raise so Workato marks step failed and retries if applicable
         end
       end,
@@ -1631,7 +1619,6 @@ require 'securerandom'
                     .payload(req_body)
           code = call(:telemetry_success_code, resp)
           result = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-          call(:tail_log_emit!, connection, :count_tokens, started_at, t0, result, nil)
           result
         rescue => e
           g   = call(:extract_google_error, e)
@@ -1641,7 +1628,6 @@ require 'securerandom'
           if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
             env['debug'] = call(:debug_pack, true, url, req_body, g)
           end
-          call(:tail_log_emit!, connection, :count_tokens, started_at, t0, nil, e)
           error(env)   # <-- raise so Workato marks step failed and retries if applicable
         end
       end,
@@ -1697,11 +1683,9 @@ require 'securerandom'
           resp = get(url).headers(call(:request_headers_auth, connection, corr, connection['user_project'], nil))
           code = call(:telemetry_success_code, resp)
           result = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-          call(:tail_log_emit!, connection, :operations_get, started_at, t0, result, nil)
           result
         rescue => e
           env = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
-          call(:tail_log_emit!, connection, :operations_get, started_at, t0, nil, e)
           env
         end
       end,
@@ -1710,90 +1694,9 @@ require 'securerandom'
         { 'name' => 'projects/p/locations/us-central1/operations/123', 'done' => false,
           'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 8, 'correlation_id' => 'sample' } }
       end
-    },
-    logs_write: {
-      title: 'Logs: write (Cloud Logging)',
-      subtitle: 'Send structured logs to GCP',
-      help: lambda do |_| 
-        { 
-          body: 'Write structured logs to Google Cloud Logging. Canonical severities accepted by GCP logging facets include: '\
-                'DEFAULT, DEBUG, INFO, NOTICE, WARNING, ERROR, CRITICAL, ALERT, EMERGENCY. '
-        }
-      end,
-      input_fields: lambda do |object_definitions, connection|
-        [
-          { name: 'project_id', optional: false },
-          { name: 'log_id', label: 'Log ID', optional: false, hint: 'e.g., workato_vertex_rag' },
-          { name: 'entries', type: 'array', of: 'object', optional: false, properties: [
-            {
-              name: 'severity',
-              label: 'Severity',
-              control_type: 'select',
-              pick_list: 'logging_severities',
-              optional: true,
-              default: 'INFO',
-              toggle_hint: 'Or enter a custom severity',
-              toggle_field: {
-                name: 'severity_custom',
-                label: 'Custom severity (text)',
-                type: 'string',
-                hint: 'E.g., INFO, WARNING, ERROR — or your own label'
-              }
-            },
-            { name: 'labels', type: 'object', properties: [] },
-            { name: 'jsonPayload', type: 'object', properties: [] }
-          ]}
-        ]
-      end,
-      output_fields: lambda do |_object_definitions, _connection|
-        [{ name: 'status' }, { name: 'http_status' }]
-      end,
-      execute: lambda do |connection, input|
-        # Canonical severities for Cloud Logging facets:
-        # DEFAULT, DEBUG, INFO, NOTICE, WARNING, ERROR, CRITICAL, ALERT, EMERGENCY
-        started_at = Time.now.utc.iso8601
-        t0 = Time.now
-        corr = call(:build_correlation_id)
-        project = input['project_id'].to_s
-        log_id  = input['log_id'].to_s
-        error('project_id is required') if project.empty?
-        error('log_id is required')     if log_id.empty?
-
-        nonstandard_prefix = 'NONSTANDARD/'
-        entries = Array(input['entries']).map do |e|
-          # Prefer custom severity (toggle), then dropdown, then default; normalize afterwards
-          sev_raw = begin
-            sc = e['severity_custom'].to_s.strip
-            sd = e['severity'].to_s.strip
-            sc.empty? ? (sd.empty? ? 'INFO' : sd) : sc
-          end
-          sev = call(:normalize_severity, sev_raw, nonstandard_prefix)
-          {
-            logName:   "projects/#{project}/logs/#{log_id}",
-            resource:  { type: 'global', labels: { project_id: project } },
-            severity:  sev,
-            labels:    (e['labels'].is_a?(Hash) ? e['labels'] : nil),
-            jsonPayload: (e['jsonPayload'].is_a?(Hash) ? e['jsonPayload'] : {})
-          }.compact
-        end
-
-        begin
-          # Route through the same posting path as the tail logger to guarantee identical headers/behavior.
-          call(:_tl_post_logs, connection, entries)
-          out = { 'status' => 'ok', 'http_status' => 200 }
-          call(:tail_log_emit!, connection, :logs_write, started_at, t0, out, nil)
-          out
-        rescue => e
-          call(:tail_log_emit!, connection, :logs_write, started_at, t0, nil, e)
-          code = call(:telemetry_parse_error_code, e)
-          code = 500 if code.to_i == 0
-          error({ 'status' => 'error', 'message' => e.to_s, 'code' => code })
-        end
-      end
     }
   },
   
-
   # --------- PICK LISTS ---------------------------------------------------
   pick_lists: {
     # What to emit from rerank for ergonomics/BC:
@@ -2259,6 +2162,35 @@ require 'securerandom'
       # Final compaction: drop nils/empties
       h.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
       h
+    end,
+    local_log_entry: lambda do |action_id, started_at, t0, result=nil, err=nil, extras=nil|
+      now  = Time.now
+      beg  = started_at || now.utc.iso8601
+      dur  = (t0 ? ((now.to_f - t0.to_f) * 1000).round : nil)
+      {
+        'ts'           => now.utc.iso8601,
+        'action'       => action_id.to_s,
+        'started_at'   => beg,
+        'ended_at'     => now.utc.iso8601,
+        'latency_ms'   => dur,
+        'status'       => err ? 'error' : 'ok',
+        'correlation'  => (result && result.dig('telemetry','correlation_id')),
+        'http_status'  => (result && result.dig('telemetry','http_status')),
+        'message'      => (result && result.dig('telemetry','message')),
+        'error_class'  => (err && err.class.to_s),
+        'error_msg'    => (err && err.message.to_s[0,512]),
+        'extras'       => (extras.is_a?(Hash) ? extras : nil)
+      }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
+    end,
+    local_log_attach!: lambda do |container, entry|
+      begin
+        tel = (container['telemetry'] ||= {})
+        arr = (tel['local_logs'] ||= [])
+        arr << entry if entry.is_a?(Hash) && !entry.empty?
+      rescue
+        # don’t raise from logging
+      end
+      container
     end,
 
     gen_generate_core!: lambda do |connection, input|
