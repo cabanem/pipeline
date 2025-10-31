@@ -317,7 +317,9 @@ require 'securerandom'
             { name: 'http_status', type: 'integer' },
             { name: 'message', type: 'string' },
             { name: 'duration_ms', type: 'integer' },
-            { name: 'correlation_id', type: 'string' }
+            { name: 'correlation_id', type: 'string' },
+            { name: 'facets', type: 'object' },
+            { name: 'local_logs', type: 'array', of: 'object' }
           ] }
         ]
       end
@@ -571,6 +573,7 @@ require 'securerandom'
 
           # Facets (compact metrics block) + local log
           facets = call(:compute_facets_for!, 'gen_categorize_email', result)
+          (result['telemetry'] ||= {})['facets'] = facets
           call(:local_log_attach!, result,
             call(:local_log_entry, :gen_categorize_email, started_at, t0, result, nil, {
               'category'   => result['chosen'],
@@ -621,7 +624,12 @@ require 'securerandom'
             ]
           },
           'ok' => true,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr' }
+          'telemetry' => {
+            'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr',
+            'facets' => {
+              'confidence' => 0.91
+            }
+          }
         }
       end
     },
@@ -878,6 +886,7 @@ require 'securerandom'
         begin
           result = call(:gen_generate_core!, connection, input)
           facets = call(:compute_facets_for!, 'gen_generate', result)
+          (result['telemetry'] ||= {})['facets'] = facets
           call(:local_log_attach!, result,
             call(:local_log_entry, :gen_generate, started_at, t0, result, nil, {
               'model'         => input['model'],
@@ -895,13 +904,23 @@ require 'securerandom'
         end
       end,
       sample_output: lambda do
-        { 'responseId'=>'resp-x',
-          'candidates'=>[{'content'=>{'parts'=>[{'text'=>'...'}]}}],
-          'confidence'=>0.84,
-          'parsed'=>{'answer'=>'...','citations'=>[{'chunk_id'=>'doc-1#c2','score'=>0.88}]} ,
-          'ok'=>true,
-          'telemetry'=>{ 'http_status'=>200, 'message'=>'OK', 'duration_ms'=>12, 'correlation_id'=>'sample',
-                         'confidence'=>{'basis'=>'citations_topk_avg','k'=>3,'n'=>1} } }
+        {
+          'responseId' => 'resp-x',
+          'candidates' => [ { 'content' => { 'parts' => [ { 'text' => '...' } ] } } ],
+          'confidence' => 0.84,
+          'parsed'     => { 'answer' => '...', 'citations' => [ { 'chunk_id' => 'doc-1#c2', 'score' => 0.88 } ] },
+          'ok' => true,
+          'telemetry' => {
+            'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample',
+            'confidence' => { 'basis' => 'citations_topk_avg', 'k' => 3, 'n' => 1 },
+            'facets' => {
+              'tokens_total' => 271,
+              'gen_finish_reason' => 'STOP',
+              'confidence' => 0.84
+            }
+          }
+        }
+
       end
     },
     rank_texts_with_ranking_api: {
@@ -1147,6 +1166,7 @@ require 'securerandom'
             { name: 'correlation_id' },
             { name: 'retrieval', type: 'object' },
             { name: 'rank', type: 'object' }
+            {}
           ]}
         ]
       end,
@@ -1211,6 +1231,7 @@ require 'securerandom'
           (out['telemetry'] ||= {})['rank'] = { 'mode' => 'llm', 'model' => opts['llmRankerModel'] }
         end
         facets = call(:compute_facets_for!, 'rag_retrieve_contexts', out)
+        (out['telemetry'] ||= {})['facets'] = facets
         call(:local_log_attach!, out,
           call(:local_log_entry, :rag_retrieve_contexts, started_at, t0, out, nil, {
             'retrieval_top_k'    => out.dig('telemetry','retrieval','top_k'),
@@ -1241,7 +1262,13 @@ require 'securerandom'
           'telemetry' => {
             'http_status' => 200, 'message' => 'OK', 'duration_ms' => 22, 'correlation_id' => 'sample',
             'retrieval' => { 'top_k' => 20, 'filter' => { 'type' => 'distance', 'value' => 0.35 } },
-            'rank' => { 'mode': 'rank_service', 'model': 'semantic-ranker-512@latest' }
+            'rank' => { 'mode': 'rank_service', 'model': 'semantic-ranker-512@latest' },
+            'facets' => {
+              'retrieval_top_k' => 20,
+              'retrieval_filter' => 'distance',
+              'retrieval_filter_val' => 0.35,
+              'contexts_returned' => 1
+            }
           }
         }
       end
@@ -1476,6 +1503,7 @@ require 'securerandom'
           end
         end
         facets = call(:compute_facets_for!, 'rag_answer', out)
+        (out['telemetry'] ||= {})['facets'] = facets
         call(:local_log_attach!, out,
           call(:local_log_entry, :rag_answer, started_at, t0, out, nil, {
             'confidence'   => (out['confidence'] rescue nil),
@@ -1514,7 +1542,15 @@ require 'securerandom'
           'telemetry' => {
             'http_status' => 200, 'message' => 'OK', 'duration_ms' => 44, 'correlation_id' => 'sample',
             'retrieval' => { 'top_k' => 12, 'filter' => { 'type' => 'similarity', 'value' => 0.8 } },
-            'rank' => { 'mode': 'llm', 'model': 'gemini-2.0-flash' }
+            'rank' => { 'mode': 'llm', 'model': 'gemini-2.0-flash' },
+            'facets' => {
+              'retrieval_top_k' => 12,
+              'retrieval_filter' => 'similarity',
+              'retrieval_filter_val' => 0.8,
+              'contexts_returned' => 1,
+              'tokens_total' => 454,
+              'confidence' => 0.91
+            }
           }
         }
       end
@@ -1596,6 +1632,7 @@ require 'securerandom'
             'model'   => input['model']
           }
           facets = call(:compute_facets_for!, 'embed_text', result, extras_for_facets)
+          (result['telemetry'] ||= {})['facets'] = facets
           call(:local_log_attach!, result,
             call(:local_log_entry, :embed_text, started_at, t0, result, nil, {
               'n_texts'        => Array(input['texts']).length,
@@ -1619,7 +1656,6 @@ require 'securerandom'
           error(env)
         end
       end,
-
       sample_output: lambda do
         {
           'predictions' => [
@@ -1630,7 +1666,14 @@ require 'securerandom'
           ],
           'metadata' => { 'billableCharacterCount' => 230 },
           'ok' => true,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr' }
+          'telemetry' => {
+            'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr',
+            'facets' => {
+              'model' => 'text-embedding-005',
+              'n_texts' => 2,
+              'task' => 'RETRIEVAL_QUERY'
+            }
+          }
         }
       end
     },
@@ -1698,6 +1741,7 @@ require 'securerandom'
             'billable_chars' => result['totalBillableCharacters']
           }
           facets = call(:compute_facets_for!, 'count_tokens', result, extras_for_facets)
+          (result['telemetry'] ||= {})['facets'] = facets
           call(:local_log_attach!, result,
             call(:local_log_entry, :count_tokens, started_at, t0, result, nil, {
               'model'            => input['model'],
@@ -1721,10 +1765,20 @@ require 'securerandom'
         end
       end,
       sample_output: lambda do
-        { 'totalTokens' => 31, 'totalBillableCharacters' => 96,
+        {
+          'totalTokens' => 31,
+          'totalBillableCharacters' => 96,
           'promptTokensDetails' => [ { 'modality' => 'TEXT', 'tokenCount' => 31 } ],
           'ok' => true,
-          'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr' } }
+          'telemetry' => {
+            'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr',
+            'facets' => {
+              'model' => 'gemini-2.0-flash',
+              'tokens_total' => 31,
+              'billable_chars' => 96
+            }
+          }
+        }
       end
     },
     operations_get: {
@@ -1779,6 +1833,8 @@ require 'securerandom'
             'done'      => result['done']
           }
           facets = call(:compute_facets_for!, 'operations_get', result, extras_for_facets)
+          (result['telemetry'] ||= {})['facets'] = facets
+
           call(:local_log_attach!, result,
             call(:local_log_entry, :operations_get, started_at, t0, result, nil, {
               'operation' => (result['name'] || input['operation']),
@@ -1795,10 +1851,19 @@ require 'securerandom'
           env
         end
       end,
-
       sample_output: lambda do
-        { 'name' => 'projects/p/locations/us-central1/operations/123', 'done' => false,
-          'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 8, 'correlation_id' => 'sample' } }
+        {
+          'name' => 'projects/p/locations/us-central1/operations/123',
+          'done' => false,
+          'ok' => true,
+          'telemetry' => {
+            'http_status' => 200, 'message' => 'OK', 'duration_ms' => 8, 'correlation_id' => 'sample',
+            'facets' => {
+              'operation' => 'projects/p/locations/us-central1/operations/123',
+              'done' => false
+            }
+          }
+        }
       end
     }
   },
