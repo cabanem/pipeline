@@ -2088,13 +2088,13 @@ require 'securerandom'
       # Use the standard auth header builder so 401s trigger refresh_on
       corr = connection['correlation_id'] || SecureRandom.uuid
       hdrs = call(:headers_logging, connection, corr, req_params)
-      # Fire the write using JSON (required by Cloud Logging). Do NOT swallow here;
-      # tail_log_emit! already rescues around this call.
+      # Cloud Logging requires JSON body; keep it compact.
       body = { 'entries' => entries }
       post("https://logging.googleapis.com/v2/entries:write")
         .headers(hdrs)
         .payload(call(:json_compact, body))
         .request_format_json
+
       nil
     end,
     normalize_severity: lambda do |s, prefix = 'NONSTANDARD/'|
