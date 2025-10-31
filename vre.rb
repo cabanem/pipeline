@@ -93,7 +93,26 @@ require 'securerandom'
 
   # --------- OBJECT DEFINITIONS -------------------------------------------
   object_definitions: {
-
+    # Matches the hash produced by methods.local_log_entry
+    log_entry: {
+      fields: lambda do |_connection, _config_fields|
+        [
+          { name: 'ts' },
+          { name: 'action' },
+          { name: 'started_at' },
+          { name: 'ended_at' },
+          { name: 'latency_ms', type: 'integer' },
+          { name: 'status' },
+          { name: 'correlation' },
+          { name: 'http_status', type: 'integer' },
+          { name: 'message' },
+          { name: 'error_class' },
+          { name: 'error_msg' },
+          # extras is where you already stash compact, action-specific metrics
+          { name: 'extras', type: 'object' }
+        ]
+      end
+    },
     content_part: {
       fields: lambda do |connection, config_fields|
         [
@@ -1882,7 +1901,9 @@ require 'securerandom'
       display_priority: 4,
       input_fields: lambda do |_od, _c, _cf|
         [
-          { name: 'logs', type: 'array', of: 'object', optional: true,
+          { name: 'logs',
+            type: 'array', of: 'object', optional: true,
+            properties: od['log_entry'],
             hint: 'Preferred: pass an array of log objects (e.g., telemetry.local_logs).' },
           { name: 'logs_json', control_type: 'text-area', optional: true,
             hint: 'Alternative: paste JSON array or NDJSON.' },
