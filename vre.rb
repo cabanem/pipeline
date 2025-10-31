@@ -1789,6 +1789,7 @@ require 'securerandom'
       end
     }
   },
+  
 
   # --------- PICK LISTS ---------------------------------------------------
   pick_lists: {
@@ -2041,7 +2042,7 @@ require 'securerandom'
         entry[:jsonPayload][:facets] = fac if fac.any?
       end
       call(:_tl_post_logs, connection, [entry])
-    rescue
+    rescue => e
       unless call(:normalize_boolean, connection['prod_mode'])
         connection['__last_tail_log_error'] = {
           timestamp: Time.now.utc.iso8601,
@@ -2079,17 +2080,27 @@ require 'securerandom'
       # Build routing hint: x-goog-request-params requires log_name
       project = (connection['project_id'] || connection['gcp_project_id']).to_s.strip
       log_id  = begin
-        # entries[0][:logName] = "projects/<p>/logs/<log_id>"
         ln = entries.first && (entries.first[:logName] || entries.first['logName']).to_s
-        ln.split('/').last
+        # Expect "projects/<p>/logs/<id>"; be robust if callers pass full logName.
+        m = ln.match(%r{^projects/[^/]+/logs/(.+)$})
+        m ? m[1] : (ln.split('/').last)
       rescue
         nil
       end
       req_params = (project.empty? || log_id.to_s.empty?) ? nil : "log_name=projects/#{project}/logs/#{log_id}"
-      # Use the standard auth header builder so 401s trigger refresh_on
+
+      # Correlation id for the write itself
       corr = connection['correlation_id'] || SecureRandom.uuid
-      # Force a fresh token specifically for logging to avoid stale Authorization bleed.
-      hdrs = call(:headers_logging, connection, corr, req_params, { force_remint: true, cache_salt: 'logging' })
+
+      # Allow force remint to be toggled (default: false). Avoid unconditional remint.
+      force_remint = call(:normalize_boolean, connection['logging_force_remint'])
+      hdrs = call(:headers_logging, connection, corr, req_params, {
+        force_remint: force_remint,
+        cache_salt:   'logging',
+        on_error:     :return_nil
+      })
+      # If auth failed, skip silently (logger must never raise)
+      return nil if hdrs.nil?
       # Cloud Logging requires JSON body; keep it compact.
       body = { 'entries' => entries }
       resp = post("https://logging.googleapis.com/v2/entries:write")
@@ -2683,9 +2694,18 @@ require 'securerandom'
       call(:request_headers_auth, connection, correlation_id, nil, request_params)
     end,
     headers_logging: lambda do |connection, correlation_id, request_params=nil, opts=nil|
-      # Logging calls: include x-goog-user-project when configured.
-      # Allow callers to force a fresh token or pass a cache salt specific to logging.
-      call(:request_headers_auth, connection, correlation_id, connection['user_project'], request_params, opts)
+      # Logging calls: x-goog-user-project is *opt-in* and must be sane.
+      # Enable only when explicitly requested AND non-blank.
+      use_up = call(:normalize_boolean, connection['use_user_project_for_logging'])
+      up_val = connection['user_project'].to_s.strip
+      user_project = (use_up && !up_val.empty?) ? up_val : nil
+
+      # Allow callers to force a fresh token (rare). Default is cached token.
+      # Also let logging be stricter on error handling.
+      o = (opts || {}).merge({
+        on_error: :return_nil  # if auth fails, bubble a nil so caller can skip the write
+      })
+      call(:request_headers_auth, connection, correlation_id, user_project, request_params, o)
     end,
 
     # Unified auth+header builder.
@@ -2702,6 +2722,7 @@ require 'securerandom'
         scopes = opts.key?(:scopes) ? call(:auth_normalize_scopes, opts[:scopes]) : call(:const_default_scopes)
         force  = (opts[:force_remint] == true)
         salt   = opts[:cache_salt].to_s.strip
+        on_error = opts[:on_error]
 
         token =
           if force
@@ -2734,14 +2755,24 @@ require 'securerandom'
         h['x-goog-request-params'] = rp unless rp.empty?
 
         h
-      rescue
-        # On any unexpected auth/format issue, return minimal headers;
-        # caller paths already log and surface errors appropriately.
-        {
-          'X-Correlation-Id' => correlation_id.to_s,
+      rescue => e
+        # Harden behavior: optionally return nil so callers (e.g., logger) can skip the call.
+        # Also drop a breadcrumb for debugging (non-prod).
+        begin
+          unless call(:normalize_boolean, connection['prod_mode'])
+            connection['__last_tail_log_error'] = {
+              timestamp: Time.now.utc.iso8601,
+              method: 'request_headers_auth',
+              message: e.message.to_s[0,512],
+              class: e.class.to_s
+            }
+          end
+        rescue; end
+        return nil if on_error == :return_nil
+        # Fallback: minimal headers (legacy behavior)
+        { 'X-Correlation-Id' => correlation_id.to_s,
           'Content-Type'     => 'application/json',
-          'Accept'           => 'application/json'
-        }
+          'Accept'           => 'application/json' }
       end
     end,
     request_headers: lambda do |correlation_id, extra=nil|
