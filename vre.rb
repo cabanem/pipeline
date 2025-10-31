@@ -448,26 +448,16 @@ require 'securerandom'
             hint: 'Override the built-in strict JSON classifier preamble.' },
 
           # === (D) Salience (optional) ------------------------------------
-          { name: 'use_salience', label: 'Use salience extraction',
-            type: 'boolean', control_type: 'checkbox', optional: true, default: true,
-            hint: 'Extract a short span before classification.' },
-          { name: 'salience_model', label: 'Salience model', control_type: 'text',
-            optional: true, default: 'gemini-2.0-flash',
-            ngIf: 'input.use_salience == true && input.show_advanced == true',
-            hint: 'Model to extract salient span.' },
-          { name: 'salience_max_span_chars', label: 'Max salience chars',
-            type: 'integer', optional: true, default: 500,
-            ngIf: 'input.use_salience == true && input.show_advanced == true' },
-          { name: 'salience_temperature', label: 'Salience temperature',
-            type: 'number', optional: true, ngIf: 'input.use_salience == true && input.show_advanced == true',
-            hint: 'Default 0.' },
-          { name: 'salience_system_preamble', label: 'Salience system preamble',
-            optional: true, ngIf: 'input.use_salience == true && input.show_advanced == true',
-            hint: 'Override default extractor instruction.' },
-          { name: 'confidence_blend', label: 'Confidence blend',
-            type: 'number', optional: true, default: 0.15,
-            ngIf: 'input.use_salience == true && input.show_advanced == true',
-            hint: 'Blend salience importance into final score (0–0.5).' },
+          # Caller-supplied salience only (no in-action extraction)
+          { name: 'salient_span', label: 'Pre-extracted salient span',
+            optional: true,
+            hint: 'If provided, classification uses this span instead of full email.' },
+          { name: 'salience_importance', label: 'Salience importance (0–1)',
+            type: 'number', optional: true,
+            hint: 'Optional; used for confidence blending.' },
+          { name: 'salience_reason', label: 'Salience reason',
+            optional: true,
+            hint: 'Optional note describing why this span was chosen.' },
 
           # === (E) Rules (optional) ---------------------------------------
           { name: 'rules_mode', label: 'Rules mode',
@@ -564,23 +554,23 @@ require 'securerandom'
           body = (input['body']    || '').to_s.strip
           error('Provide subject and/or body') if subj.empty? && body.empty?
 
-          use_sal = call(:normalize_boolean, input['use_salience'])
+          # Salience: accept caller-provided span; no in-action extraction
           preproc = nil
-          if use_sal
-            preproc = call(:extract_salient_span!, connection, subj, body,
-                          (input['salience_model'].presence || 'gemini-2.0-flash'),
-                          (input['salience_max_span_chars'].presence || 500).to_i,
-                          (input['salience_temperature'].presence || 0),
-                          cid,
-                          (input['salience_system_preamble'].presence || nil))
+          if input['salient_span'].to_s.strip.length > 0
+            preproc = {
+              'salient_span' => input['salient_span'].to_s,
+              'reason'       => (input['salience_reason'].presence || nil),
+              'importance'   => (input['salience_importance'].nil? ? nil : input['salience_importance'].to_f)
+            }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
           end
 
           email_text =
-            if use_sal && preproc && preproc['salient_span'].to_s.strip.length > 0
+            if preproc && preproc['salient_span'].to_s.strip.length > 0
               preproc['salient_span'].to_s
             else
               call(:build_email_text, subj, body)
             end
+
           # 2a. Optional pre-filter using compiled rules (short-circuit irrelevant)
           if rules.is_a?(Hash)
             hard_pack = rules['hard_exclude'].is_a?(Hash) ? rules['hard_exclude'] : {}
