@@ -1746,16 +1746,18 @@ require 'securerandom'
         [{ name: 'status' }, { name: 'http_status' }]
       end,
       execute: lambda do |connection, input|
-        # Canonical severities accepted by Cloud Logging facets:
+        # Canonical severities for Cloud Logging facets:
         # DEFAULT, DEBUG, INFO, NOTICE, WARNING, ERROR, CRITICAL, ALERT, EMERGENCY
         started_at = Time.now.utc.iso8601
         t0 = Time.now
         corr = call(:build_correlation_id)
-        project = input['project_id']
-        log_id  = input['log_id']
-        nonstandard_prefix = 'NONSTANDARD/' # backend-only tag for abnormal values
-        body = {
-          entries: (input['entries'] || []).map do |e|
+        project = input['project_id'].to_s
+        log_id  = input['log_id'].to_s
+        error('project_id is required') if project.empty?
+        error('log_id is required')     if log_id.empty?
+
+        nonstandard_prefix = 'NONSTANDARD/'
+        entries = Array(input['entries']).map do |e|
           # Prefer custom severity (toggle), then dropdown, then default; normalize afterwards
           sev_raw = begin
             sc = e['severity_custom'].to_s.strip
@@ -1763,37 +1765,26 @@ require 'securerandom'
             sc.empty? ? (sd.empty? ? 'INFO' : sd) : sc
           end
           sev = call(:normalize_severity, sev_raw, nonstandard_prefix)
-            {
-              logName: "projects/#{project}/logs/#{log_id}",
-              resource: { type: 'global', labels: { project_id: project } },
-              severity: sev,
-              labels: e['labels'],
-              jsonPayload: e['jsonPayload']
-            }.compact
-          end
-        }
+          {
+            logName:   "projects/#{project}/logs/#{log_id}",
+            resource:  { type: 'global', labels: { project_id: project } },
+            severity:  sev,
+            labels:    (e['labels'].is_a?(Hash) ? e['labels'] : nil),
+            jsonPayload: (e['jsonPayload'].is_a?(Hash) ? e['jsonPayload'] : {})
+          }.compact
+        end
+
         begin
-          # Reuse standard header builder (adds auth, optional x-goog-user-project, x-goog-request-params)
-          req_headers = call(:headers_logging, connection, corr, nil)
-          resp = post("https://logging.googleapis.com/v2/entries:write")
-                    .headers(req_headers)
-                    .payload(call(:json_compact, body))
-                    .request_format_json
-          # Shape the return to match output_fields
-          http_status = (resp['status'] || resp['status_code'] || 200).to_i
-          out = { 'status' => 'ok', 'http_status' => http_status }
+          # Route through the same posting path as the tail logger to guarantee identical headers/behavior.
+          call(:_tl_post_logs, connection, entries)
+          out = { 'status' => 'ok', 'http_status' => 200 }
           call(:tail_log_emit!, connection, :logs_write, started_at, t0, out, nil)
           out
         rescue => e
           call(:tail_log_emit!, connection, :logs_write, started_at, t0, nil, e)
-          # Re-raise normalized so Workato retry/metrics apply; include code when we can parse it
           code = call(:telemetry_parse_error_code, e)
           code = 500 if code.to_i == 0
-          error({
-            'status'  => 'error',
-            'message' => e.to_s,
-            'code'    => code
-          })
+          error({ 'status' => 'error', 'message' => e.to_s, 'code' => code })
         end
       end
     }
@@ -2087,7 +2078,8 @@ require 'securerandom'
       req_params = (project.empty? || log_id.to_s.empty?) ? nil : "log_name=projects/#{project}/logs/#{log_id}"
       # Use the standard auth header builder so 401s trigger refresh_on
       corr = connection['correlation_id'] || SecureRandom.uuid
-      hdrs = call(:headers_logging, connection, corr, req_params)
+      # Force a fresh token specifically for logging to avoid stale Authorization bleed.
+      hdrs = call(:headers_logging, connection, corr, req_params, { force_remint: true, cache_salt: 'logging' })
       # Cloud Logging requires JSON body; keep it compact.
       body = { 'entries' => entries }
       post("https://logging.googleapis.com/v2/entries:write")
@@ -2681,10 +2673,12 @@ require 'securerandom'
       # Retrieval calls: NEVER send x-goog-user-project
       call(:request_headers_auth, connection, correlation_id, nil, request_params)
     end,
-    headers_logging: lambda do |connection, correlation_id, request_params=nil|
-      # Logging calls: include x-goog-user-project when configured
-      call(:request_headers_auth, connection, correlation_id, connection['user_project'], request_params)
+    headers_logging: lambda do |connection, correlation_id, request_params=nil, opts=nil|
+      # Logging calls: include x-goog-user-project when configured.
+      # Allow callers to force a fresh token or pass a cache salt specific to logging.
+      call(:request_headers_auth, connection, correlation_id, connection['user_project'], request_params, opts)
     end,
+
     # Unified auth+header builder.
     # Backward-compatible signature; final arg `opts` is optional:
     #   opts = {
