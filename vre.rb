@@ -1501,7 +1501,7 @@ require 'securerandom'
             hint: 'Optional dimensionality reduction (see model docs).' }
         ]
       end,
-      output_fields: lambda do |_object_definitions, _connection|
+      output_fields: lambda do |object_definitions, _connection|
         Array(object_definitions['embed_output']) + Array(object_definitions['envelope_fields'])
       end,
       execute: lambda do |connection, input|
@@ -2685,30 +2685,61 @@ require 'securerandom'
       # Logging calls: include x-goog-user-project when configured
       call(:request_headers_auth, connection, correlation_id, connection['user_project'], request_params)
     end,
-    request_headers_auth: lambda do |connection, correlation_id, user_project=nil, request_params=nil|
-      # Ensure we always carry a valid Bearer token (don’t rely solely on authorization.apply)
-      token = connection['access_token'].to_s
-      if token.empty?
-        begin
-          scopes = call(:const_default_scopes)
-          token  = call(:auth_build_access_token!, connection, scopes: scopes)
-          connection['access_token'] = token
-        rescue
-          # If token minting fails, still build headers; caller will raise and be logged as error.
-          token = ''
-        end
+    # Unified auth+header builder.
+    # Backward-compatible signature; final arg `opts` is optional:
+    #   opts = {
+    #     scopes:        Array|String (default: cloud-platform),
+    #     force_remint:  true|false   (default: false),
+    #     cache_salt:    String       (optional logical namespace for token cache)
+    #   }
+    request_headers_auth: lambda do |connection, correlation_id, user_project=nil, request_params=nil, opts=nil|
+      opts ||= {}
+      begin
+        # Resolve scopes and whether to bypass cache for this call
+        scopes = opts.key?(:scopes) ? call(:auth_normalize_scopes, opts[:scopes]) : call(:const_default_scopes)
+        force  = (opts[:force_remint] == true)
+        salt   = opts[:cache_salt].to_s.strip
+
+        token =
+          if force
+            # Explicit per-call remint (does NOT raise here; callers handle errors)
+            fresh = call(:auth_issue_token!, connection, scopes)
+            connection['access_token'] = fresh['access_token'].to_s
+            fresh['access_token'].to_s
+          else
+            # Normal path: reuse cached token or mint if missing/expired
+            t = connection['access_token'].to_s
+            if t.empty?
+              t = call(:auth_build_access_token!, connection, scopes: scopes)
+              connection['access_token'] = t
+            end
+            t.to_s
+          end
+
+        h = {
+          'X-Correlation-Id' => correlation_id.to_s,
+          'Content-Type'     => 'application/json',
+          'Accept'           => 'application/json'
+        }
+        # FIX: use the actual token variable; only set when non-empty.
+        h['Authorization'] = "Bearer #{token}" unless token.to_s.empty?
+
+        up = user_project.to_s.strip
+        h['x-goog-user-project']   = up unless up.empty?
+
+        rp = request_params.to_s.strip
+        h['x-goog-request-params'] = rp unless rp.empty?
+
+        h
+      rescue
+        # On any unexpected auth/format issue, return minimal headers;
+        # caller paths already log and surface errors appropriately.
+        {
+          'X-Correlation-Id' => correlation_id.to_s,
+          'Content-Type'     => 'application/json',
+          'Accept'           => 'application/json'
+        }
       end
-      h = {
-        'X-Correlation-Id' => correlation_id.to_s,
-        'Content-Type'     => 'application/json',
-        'Accept'           => 'application/json'
-      }
-      h['Authorization'] = "Bearer #{auth}" unless auth.empty?
-      up = user_project.to_s.strip
-      h['x-goog-user-project']   = up unless up.empty?
-      rp = request_params.to_s.strip
-      h['x-goog-request-params'] = rp unless rp.empty?
-      h
     end,
     request_headers: lambda do |correlation_id, extra=nil|
       base = {
