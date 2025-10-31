@@ -1147,9 +1147,11 @@ require 'securerandom'
 
         retr_url  = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
         retr_req_body = call(:json_compact, payload)
+        # Retrieval must not depend on user-project billing; align with rag_answer
         resp = post(retr_url)
-                .headers(call(:request_headers_auth, connection, corr, connection['user_project'], req_par))
-                .payload(retr_req_body)
+                 .headers(call(:headers_rag, connection, corr, req_par))
+                 .payload(retr_req_body)
+
 
         raw   = call(:normalize_retrieve_contexts!, resp)
         maxn  = call(:clamp_int, (input['max_contexts'] || 20), 1, 200)
@@ -1772,7 +1774,7 @@ require 'securerandom'
         }
         begin
           # Reuse standard header builder (adds auth, optional x-goog-user-project, x-goog-request-params)
-          req_headers = call(:request_headers_auth, connection, corr, connection['user_project'], nil)
+          req_headers = call(:headers_logging, connection, corr, nil)
           resp = post("https://logging.googleapis.com/v2/entries:write")
                     .headers(req_headers)
                     .payload(call(:json_compact, body))
@@ -2085,7 +2087,7 @@ require 'securerandom'
       req_params = (project.empty? || log_id.to_s.empty?) ? nil : "log_name=projects/#{project}/logs/#{log_id}"
       # Use the standard auth header builder so 401s trigger refresh_on
       corr = connection['correlation_id'] || SecureRandom.uuid
-      hdrs = call(:request_headers_auth, connection, corr, connection['user_project'], req_params)
+      hdrs = call(:headers_logging, connection, corr, req_params)
       # Fire the write using the same pipeline as other Google calls (no error swallow here;
       # tail_log_emit! already rescues so this remains fire-and-forget while allowing token refresh)
       post("https://logging.googleapis.com/v2/entries:write")
@@ -2684,7 +2686,15 @@ require 'securerandom'
       fresh = call(:auth_issue_token!, connection, set)
       call(:auth_token_cache_put, connection, scope_key, fresh)['access_token']
     end,
-
+    # --- Purpose-specific header helpers ---------------------------------
+    headers_rag: lambda do |connection, correlation_id, request_params=nil|
+      # Retrieval calls: NEVER send x-goog-user-project
+      call(:request_headers_auth, connection, correlation_id, nil, request_params)
+    end,
+    headers_logging: lambda do |connection, correlation_id, request_params=nil|
+      # Logging calls: include x-goog-user-project when configured
+      call(:request_headers_auth, connection, correlation_id, connection['user_project'], request_params)
+    end,
     # --- URL and resource building ----------------------------------------
     # Map a Vertex "region" (e.g., us-central1, europe-west1) to AI-Apps multi-region (global|us|eu)
     region_to_aiapps_loc: lambda do |raw|
