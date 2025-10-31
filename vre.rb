@@ -2686,8 +2686,18 @@ require 'securerandom'
       call(:request_headers_auth, connection, correlation_id, connection['user_project'], request_params)
     end,
     request_headers_auth: lambda do |connection, correlation_id, user_project=nil, request_params=nil|
-      # Always include Authorization explicitly to avoid relying solely on `authorization.apply`
-      auth = connection['access_token'].to_s
+      # Ensure we always carry a valid Bearer token (don’t rely solely on authorization.apply)
+      token = connection['access_token'].to_s
+      if token.empty?
+        begin
+          scopes = call(:const_default_scopes)
+          token  = call(:auth_build_access_token!, connection, scopes: scopes)
+          connection['access_token'] = token
+        rescue
+          # If token minting fails, still build headers; caller will raise and be logged as error.
+          token = ''
+        end
+      end
       h = {
         'X-Correlation-Id' => correlation_id.to_s,
         'Content-Type'     => 'application/json',
