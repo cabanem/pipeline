@@ -569,8 +569,14 @@ require 'securerandom'
           # Attach telemetry envelope
           result = result.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
 
-          # Build and emit to Google Cloud
+          # Facets (compact metrics block) + local log
           facets = call(:compute_facets_for!, 'gen_categorize_email', result)
+          call(:local_log_attach!, result,
+            call(:local_log_entry, :gen_categorize_email, started_at, t0, result, nil, {
+              'category'   => result['chosen'],
+              'confidence' => result['confidence'],
+              'facets'     => facets
+            }))
 
           result
         rescue => e
@@ -585,6 +591,12 @@ require 'securerandom'
           if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
             env['debug'] = call(:debug_pack, true, url, req_body, g)
           end
+
+          call(:local_log_attach!, env,
+              call(:local_log_entry, :gen_categorize_email, started_at, t0, nil, e, {
+                'google_error' => g
+              }))
+
           error(env)   # <-- raise so Workato marks step failed and retries if applicable
         end
       end,
@@ -789,8 +801,13 @@ require 'securerandom'
             out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
           end
 
-          # Compute facets (tokens_total, etc.) and emit
+          # Compute facets (tokens_total, etc.) and attach a local log entry
           facets = call(:compute_facets_for!, 'email_extract_salient_span', out)
+          call(:local_log_attach!, out,
+            call(:local_log_entry, :email_extract_salient_span, started_at, t0, out, nil, {
+              'importance' => out['importance'],
+              'facets'     => facets
+            }))
           out
         rescue => e
           g   = call(:extract_google_error, e)
@@ -799,6 +816,9 @@ require 'securerandom'
           unless call(:normalize_boolean, connection['prod_mode'])
             out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
           end
+          # Log the error path locally too
+          call(:local_log_attach!, out,
+            call(:local_log_entry, :email_extract_salient_span, started_at, t0, nil, e, { 'google_error' => g }))
           out
         end
       end,
@@ -858,8 +878,19 @@ require 'securerandom'
         begin
           result = call(:gen_generate_core!, connection, input)
           facets = call(:compute_facets_for!, 'gen_generate', result)
+          call(:local_log_attach!, result,
+            call(:local_log_entry, :gen_generate, started_at, t0, result, nil, {
+              'model'         => input['model'],
+              'finish_reason' => (call(:_facet_finish_reason, result) rescue result.dig('candidates', 0, 'finishReason')),
+              'facets'        => facets
+            }))
           result
         rescue => e
+          g   = call(:extract_google_error, e)
+          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
+          env = call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg)
+          call(:local_log_attach!, env,
+            call(:local_log_entry, :gen_generate, started_at, t0, nil, e, { 'google_error' => g }))
           raise
         end
       end,
@@ -1021,6 +1052,15 @@ require 'securerandom'
           'rank_mode'  => out.dig('telemetry','ranking','api') ? 'rank_service' : nil,
           'rank_model' => out.dig('telemetry','ranking','model')
         }.delete_if { |_k,v| v.nil? }
+
+        # Facets + local logging
+        facets = call(:compute_facets_for!, 'rank_texts_with_ranking_api', out, rank_facets)
+        call(:local_log_attach!, out,
+          call(:local_log_entry, :rank_texts_with_ranking_api, started_at, t0, out, nil, {
+            'rank_model' => (out.dig('telemetry','ranking','model') || input['rank_model']),
+            'n'          => Array(out['records']).length,
+            'facets'     => facets
+          }))
         out
       rescue => e
         g   = call(:extract_google_error, e)
@@ -1030,7 +1070,11 @@ require 'securerandom'
         if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
           env['debug'] = call(:debug_pack, true, url, req_body, g)
         end
-        error(env)   # <-- raise so Workato marks step failed and retries if applicable
+
+        call(:local_log_attach!, env,
+          call(:local_log_entry, :rank_texts_with_ranking_api, started_at, t0, nil, e, { 'google_error' => g }))
+
+        error(env)
       end
       end,
       sample_output: lambda do |_connection, _input|
@@ -1166,12 +1210,13 @@ require 'securerandom'
         elsif opts['llmRankerModel']
           (out['telemetry'] ||= {})['rank'] = { 'mode' => 'llm', 'model' => opts['llmRankerModel'] }
         end
-        call(:local_log_attach!,
-             out,
-             call(:local_log_entry, :rag_retrieve_contexts, started_at, t0, out, nil, {
-               'retrieval_top_k' => out.dig('telemetry','retrieval','top_k'),
-               'contexts_returned' => Array(out['contexts']).length
-             }))
+        facets = call(:compute_facets_for!, 'rag_retrieve_contexts', out)
+        call(:local_log_attach!, out,
+          call(:local_log_entry, :rag_retrieve_contexts, started_at, t0, out, nil, {
+            'retrieval_top_k'    => out.dig('telemetry','retrieval','top_k'),
+            'contexts_returned'  => Array(out['contexts']).length,
+            'facets'             => facets
+          }))
         out
       rescue => e
         g = call(:extract_google_error, e)
@@ -1430,8 +1475,13 @@ require 'securerandom'
                                 gen_req_body))
           end
         end
-
         facets = call(:compute_facets_for!, 'rag_answer', out)
+        call(:local_log_attach!, out,
+          call(:local_log_entry, :rag_answer, started_at, t0, out, nil, {
+            'confidence'   => (out['confidence'] rescue nil),
+            'tokens_total' => out.dig('usage','totalTokenCount') || out.dig('usageMetadata','totalTokenCount'),
+            'facets'       => facets
+          }))
         out
       rescue => e
         g   = call(:extract_google_error, e)
@@ -1440,10 +1490,12 @@ require 'securerandom'
         if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
           env['debug'] = call(:debug_pack, true, gen_url || retr_url, (gen_req_body || retr_req_body), g)
         end
-        call(:tail_log_emit!, connection, :rag_answer, started_at, t0, nil, e, nil)
+        # Local logging object
+        call(:local_log_attach!, env,
+            call(:local_log_entry, :rag_answer, started_at, t0, nil, e, { 'google_error' => g }))
+        # Error for retry
         error(env)
       end,
-
       sample_output: lambda do
         {
           'answer' => 'Employees may carry over up to 40 hours of PTO.',
@@ -1536,6 +1588,22 @@ require 'securerandom'
 
           result = call(:predict_embeddings, connection, model_path, instances, params, corr)
           result = result.merge(call(:telemetry_envelope, t0, corr, true, 200, 'OK'))
+
+          # Facets + local log
+          extras_for_facets = {
+            'n_texts' => Array(input['texts']).length,
+            'task'    => (task || nil),
+            'model'   => input['model']
+          }
+          facets = call(:compute_facets_for!, 'embed_text', result, extras_for_facets)
+          call(:local_log_attach!, result,
+            call(:local_log_entry, :embed_text, started_at, t0, result, nil, {
+              'n_texts'        => Array(input['texts']).length,
+              'task'           => (task || nil),
+              'model'          => input['model'],
+              'billable_chars' => result.dig('metadata','billableCharacterCount'),
+              'facets'         => facets
+            }))
           result
         rescue => e
           g   = call(:extract_google_error, e)
@@ -1545,7 +1613,10 @@ require 'securerandom'
           if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
             env['debug'] = call(:debug_pack, true, url, req_body, g)
           end
-          error(env)   # <-- raise so Workato marks step failed and retries if applicable
+          # Local log (error path)
+          call(:local_log_attach!, env,
+            call(:local_log_entry, :embed_text, started_at, t0, nil, e, { 'google_error' => g }))
+          error(env)
         end
       end,
 
@@ -1619,6 +1690,21 @@ require 'securerandom'
                     .payload(req_body)
           code = call(:telemetry_success_code, resp)
           result = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+
+          # Facets + local log
+          extras_for_facets = {
+            'model'          => input['model'],
+            'tokens_total'   => result['totalTokens'],
+            'billable_chars' => result['totalBillableCharacters']
+          }
+          facets = call(:compute_facets_for!, 'count_tokens', result, extras_for_facets)
+          call(:local_log_attach!, result,
+            call(:local_log_entry, :count_tokens, started_at, t0, result, nil, {
+              'model'            => input['model'],
+              'tokens_total'     => result['totalTokens'],
+              'billable_chars'   => result['totalBillableCharacters'],
+              'facets'           => facets
+            }))
           result
         rescue => e
           g   = call(:extract_google_error, e)
@@ -1628,7 +1714,10 @@ require 'securerandom'
           if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
             env['debug'] = call(:debug_pack, true, url, req_body, g)
           end
-          error(env)   # <-- raise so Workato marks step failed and retries if applicable
+          # Local log (error path)
+          call(:local_log_attach!, env,
+            call(:local_log_entry, :count_tokens, started_at, t0, nil, e, { 'google_error' => g }))
+          error(env) 
         end
       end,
       sample_output: lambda do
@@ -1683,9 +1772,26 @@ require 'securerandom'
           resp = get(url).headers(call(:request_headers_auth, connection, corr, connection['user_project'], nil))
           code = call(:telemetry_success_code, resp)
           result = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+
+          # Facets + local log
+          extras_for_facets = {
+            'operation' => (result['name'] || input['operation']),
+            'done'      => result['done']
+          }
+          facets = call(:compute_facets_for!, 'operations_get', result, extras_for_facets)
+          call(:local_log_attach!, result,
+            call(:local_log_entry, :operations_get, started_at, t0, result, nil, {
+              'operation' => (result['name'] || input['operation']),
+              'done'      => result['done'],
+              'facets'    => facets
+            }))
           result
         rescue => e
+          g   = call(:extract_google_error, e)
           env = {}.merge(call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), e.to_s))
+          # Local log (error path)
+          call(:local_log_attach!, env,
+            call(:local_log_entry, :operations_get, started_at, t0, nil, e, { 'google_error' => g, 'operation' => input['operation'] }))
           env
         end
       end,
