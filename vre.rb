@@ -413,7 +413,30 @@ require 'securerandom'
           { name: 'mode', control_type: 'select', pick_list: 'modes_classification', optional: false, default: 'embedding',
             hint: 'embedding (deterministic), generative (LLM-only), or hybrid (embeddings + LLM referee).' },
           { name: 'correlation_id', label: 'Correlation ID', optional: true, hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
+          # --- Policy table (Workato-native) ---
+          { name: 'rules_rows', label: 'Rules (single-table rows)', optional: true,
+            hint: 'Bind a Lookup Table row list here, or enter rows manually.',
+            type: 'array', of: 'object', properties: [
+              { name: 'rule_id' }, { name: 'family' }, { name: 'field' }, { name: 'operator' },
+              { name: 'pattern' }, { name: 'weight' }, { name: 'action' }, { name: 'cap_per_email' },
+              { name: 'category' }, { name: 'flag_a' }, { name: 'flag_b' },
+              { name: 'enabled' }, { name: 'priority' }, { name: 'notes' }
+            ]},
+          { name: 'rules_json', label: 'Rules (compiled JSON, optional)', optional: true,
+            hint: 'If present, overrides rules_rows.' },
+          # Optional email metadata used by pre-filter (map from upstream step)
+          { name: 'from',    optional: true, hint: 'Sender email (used by hard/soft rules).' },
+          { name: 'headers', type: 'object', optional: true, hint: 'Hash of headers (e.g., Content-Type, List-Unsubscribe).' },
+          { name: 'attachments', type: 'array', of: 'object', optional: true, properties: [
+              { name: 'filename' }, { name: 'mimeType' }, { name: 'size' }
+            ], hint: 'Attachment list used by ext_in rules.'
+          },
+          { name: 'auth', type: 'object', optional: true, hint: 'Auth checks (e.g., spf_dkim_dmarc_fail: true).' },
 
+          { name: 'referee_system_preamble', optional: true,
+            hint: 'Optional system prompt for the LLM referee (overrides the built-in strict classifier preamble).' },
+          { name: 'salience_system_preamble', optional: true,
+            hint: 'Optional system prompt used when extracting the salient span.' },
           { name: 'subject', optional: true },
           { name: 'body',    optional: true },
 
@@ -472,6 +495,15 @@ require 'securerandom'
         cid = call(:ensure_correlation_id!, input)
         url = nil; req_body = nil
         begin
+          # 1a. Compile rulepack from Workato-native table (if provided)
+          rules =
+            if input['rules_json'].present?
+              call(:safe_json, input['rules_json'])
+            elsif Array(input['rules_rows']).any?
+              call(:hr_compile_rulepack_from_rows!, input['rules_rows'])
+            else
+              nil
+            end
           # 2. Build the request
           subj = (input['subject'] || '').to_s.strip
           body = (input['body']    || '').to_s.strip
@@ -483,7 +515,9 @@ require 'securerandom'
             preproc = call(:extract_salient_span!, connection, subj, body,
                           (input['salience_model'].presence || 'gemini-2.0-flash'),
                           (input['salience_max_span_chars'].presence || 500).to_i,
-                          (input['salience_temperature'].presence || 0))
+                          (input['salience_temperature'].presence || 0),
+                          cid,
+                          (input['salience_system_preamble'].presence || nil))
           end
 
           email_text =
@@ -492,7 +526,48 @@ require 'securerandom'
             else
               call(:build_email_text, subj, body)
             end
+          # 2a. Optional pre-filter using compiled rules (short-circuit irrelevant)
+          if rules.is_a?(Hash)
+            hard_pack = rules['hard_exclude'].is_a?(Hash) ? rules['hard_exclude'] : {}
+            soft_pack = rules['soft_signals'].is_a?(Array) ? rules['soft_signals'] : []
 
+            hf = call(:hr_eval_hard_exclude?, {
+              'subject' => subj, 'body' => body,
+              'from' => input['from'], 'headers' => input['headers'],
+              'attachments' => input['attachments'], 'auth' => input['auth']
+            }, hard_pack)
+            if hf[:hit]
+              out = {
+                'mode' => (input['mode'] || 'embedding'),
+                'chosen' => (input['fallback_category'].presence || 'Irrelevant'),
+                'confidence' => 0.0,
+                'pre_filter' => hf
+              }.merge(call(:telemetry_envelope, t0, cid, true, 200, 'OK'))
+              facets = call(:compute_facets_for!, 'gen_categorize_email', out, { 'decision' => 'IRRELEVANT' })
+              (out['telemetry'] ||= {})['facets'] = facets
+              return call(:local_log_attach!, out,
+                call(:local_log_entry, :gen_categorize_email, started_at, t0, out, nil, { 'pre_filter' => hf, 'facets' => facets }))
+            end
+
+            ss = call(:hr_eval_soft, {
+              'subject' => subj, 'body' => body,
+              'from' => input['from'], 'headers' => input['headers'], 'attachments' => input['attachments']
+            }, soft_pack)
+            decision = call(:hr_eval_decide, ss[:score], (rules['thresholds'].is_a?(Hash) ? rules['thresholds'] : {}))
+            if decision == 'IRRELEVANT'
+              out = {
+                'mode' => (input['mode'] || 'embedding'),
+                'chosen' => (input['fallback_category'].presence || 'Irrelevant'),
+                'confidence' => 0.0,
+                'pre_filter' => { 'score' => ss[:score], 'matched_signals' => ss[:matched], 'decision' => decision }
+              }.merge(call(:telemetry_envelope, t0, cid, true, 200, 'OK'))
+              facets = call(:compute_facets_for!, 'gen_categorize_email', out, { 'decision' => 'IRRELEVANT' })
+              (out['telemetry'] ||= {})['facets'] = facets
+              return call(:local_log_attach!, out,
+                call(:local_log_entry, :gen_categorize_email, started_at, t0, out, nil, { 'pre_filter' => out['pre_filter'], 'facets' => facets }))
+            end
+            # REVIEW path: continue to normal classification; you already expose chosen/confidence downstream
+          end
           # Normalize categories
           raw_cats = input['categories']
           cats = call(:safe_array, raw_cats).map { |c|
@@ -548,7 +623,7 @@ require 'securerandom'
             if (mode == 'hybrid' || input['return_explanation']) && input['generative_model'].present?
               top_k     = [[(input['top_k'] || 3).to_i, 1].max, cats.length].min
               shortlist = scores.first(top_k).map { |h| h['category'] }
-              referee   = call(:llm_referee, connection, input['generative_model'], email_text, shortlist, cats, input['fallback_category'], cid)
+              referee   = call(:llm_referee, connection, input['generative_model'], email_text, shortlist, cats, input['fallback_category'], cid, (input['referee_system_preamble'].presence || nil))
               result['referee'] = referee
 
               if referee['category'].present? && shortlist.include?(referee['category'])
@@ -562,7 +637,7 @@ require 'securerandom'
 
           elsif mode == 'generative'
             error('generative_model is required when mode=generative') if input['generative_model'].blank?
-            referee = call(:llm_referee, connection, input['generative_model'], email_text, cats.map { |c| c['name'] }, cats, input['fallback_category'], cid)
+            referee = call(:llm_referee, connection, input['generative_model'], email_text, cats.map { |c| c['name'] }, cats, input['fallback_category'], cid, (input['referee_system_preamble'].presence || nil))
             chosen =
               if referee['confidence'].to_f < min_conf && input['fallback_category'].present?
                 input['fallback_category']
@@ -608,7 +683,7 @@ require 'securerandom'
           msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
 
           # Construct telmetry envelope
-          env = call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg)
+          env = call(:telemetry_envelope, t0, cid, false, call(:telemetry_parse_error_code, e), msg)
 
           # Construct and emit debug attachment, as applicable
           if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
@@ -620,7 +695,7 @@ require 'securerandom'
                 'google_error' => g
               }))
 
-          error(env)   # <-- raise so Workato marks step failed and retries if applicable
+          error(env)
         end
       end,
       sample_output: lambda do
@@ -731,6 +806,7 @@ require 'securerandom'
           max_span = call(:clamp_int, (input['max_span_chars'] || 500), 80, 2000)
           want_entities = call(:normalize_boolean, input['include_entities'])
 
+          # System Prompt #
           system_text = "You extract the single most important sentence or short paragraph from an email. " \
                         "Rules: (1) Return VALID JSON only. (2) Do NOT output greetings, signatures, legal footers, " \
                         "auto-replies, or vague pleasantries (e.g., 'Hello', 'Thanks', 'Please see below'). " \
@@ -1439,8 +1515,9 @@ require 'securerandom'
         }
 
         want_rat = call(:normalize_boolean, input['return_rationale'])
+        # System Prompt
         sys_text = (input['system_preamble'].presence ||
-          "Answer using ONLY the retrieved context chunks. If the context is insufficient, reply with “I don’t know.” "\
+          "Answer using ONLY the retrieved context chunks. If the context is insufficient, reply with “IDK” "\
           "Keep answers concise and include citations with chunk_id, source, uri, and score."\
           "#{want_rat ? ' Also include a brief rationale (1–2 sentences) explaining which chunks support the answer.' : ''}")
         sys_inst = { 'role' => 'system', 'parts' => [ { 'text' => sys_text } ] }
@@ -1899,7 +1976,7 @@ require 'securerandom'
         }
       end,
       display_priority: 4,
-      input_fields: lambda do |_od, _c, _cf|
+      input_fields: lambda do |od, _c, _cf|
         [
           { name: 'logs',
             type: 'array', of: 'object', optional: true,
@@ -2131,6 +2208,187 @@ require 'securerandom'
   
   # --------- METHODS ------------------------------------------------------
   methods: {
+    # Compile Workato-native "single-table" rows into the rulepack JSON
+    hr_compile_rulepack_from_rows!: lambda do |rows|
+      arr = call(:safe_array, rows)
+      # normalize columns -> strings
+      rows_n = arr.map { |r| (r || {}).to_h.transform_keys(&:to_s) }
+      on = lambda { |r| (r['enabled'].to_s.strip.downcase != 'false') }
+      parse_list = lambda do |s|
+        str = s.to_s
+        if str.include?('|')
+          str.split('|').map { |x| x.strip }.reject(&:empty?)
+        elsif str.include?(',')
+          str.split(',').map { |x| x.strip }.reject(&:empty?)
+        else
+          str
+        end
+      end
+      sortd = rows_n.select(&on).sort_by { |r| (r['priority'].to_i rescue 999) }
+      hard = sortd.select { |r| r['family'] == 'HARD' }
+      soft = sortd.select { |r| r['family'] == 'SOFT' }
+      thr  = sortd.select { |r| r['family'] == 'THRESHOLD' }
+      grd  = sortd.select { |r| r['family'] == 'GUARD' }
+
+      hard_pack = {}
+      hard.each do |r|
+        fld = r['field'].to_s
+        (hard_pack[fld] ||= []) << {
+          'operator' => r['operator'],
+          'pattern'  => r['pattern'],
+          'value'    => parse_list.call(r['pattern']),
+          'action'   => r['action']
+        }
+      end
+
+      soft_pack = soft.map do |r|
+        {
+          'name'          => (r['rule_id'] || r['notes'] || 'signal'),
+          'field'         => r['field'],
+          'pattern_type'  => r['operator'],
+          'pattern_value' => r['pattern'],
+          'weight'        => (r['weight'].to_i rescue 0),
+          'cap_per_email' => (r['cap_per_email'].to_s == '' ? nil : r['cap_per_email'].to_i)
+        }
+      end
+
+      thr_pack = {}
+      thr.each do |r|
+        key = r['pattern'].to_s # keep | triage_min | triage_max
+        val = (r['weight'].to_i rescue 0)
+        thr_pack[key] = val if key != ''
+      end
+
+      guards = {}
+      grd.each do |r|
+        cat = r['category'].to_s; next if cat == ''
+        g = (guards[cat] ||= { 'required' => [], 'forbidden' => [], 'flags' => {} })
+        case r['operator']
+        when 'required'  then g['required']  << r['pattern']
+        when 'forbidden' then g['forbidden'] << r['pattern']
+        when 'value'     then g['flags'][(r['pattern'] || '').to_s] = (r['flag_a'] || r['flag_b'] || true)
+        when 'is_true'   then g['flags'][(r['pattern'] || '').to_s] = true
+        end
+      end
+
+      {
+        'hard_exclude' => hard_pack,
+        'soft_signals' => soft_pack,
+        'thresholds'   => thr_pack,
+        'guards'       => guards
+      }
+    end,
+    hr_rx:        lambda { |s| Regexp.new(s) rescue nil },
+    hr_list:      lambda { |s| s.to_s.split(/[|,]/).map { |x| x.strip.downcase }.reject(&:empty?) },
+    hr_pick:      lambda { |email|
+      {
+        'subject'     => email['subject'].to_s,
+        'body'        => email['body'].to_s,
+        'from'        => email['from'].to_s,
+        'headers'     => (email['headers'] || {}),
+        'attachments' => Array(email['attachments']).map { |a| a['filename'].to_s.downcase },
+        'auth'        => (email['auth'] || {})
+      }
+    },
+    hr_eval_hard?: lambda do |email, hard_pack|
+      f = call(:hr_pick, email)
+
+      # generic helper
+      match = lambda do |field, rule|
+        case rule['operator']
+        when 'equals'
+          k, v = rule['pattern'].to_s.split(':', 2)
+          val = (field == 'headers' ? f['headers'][k.to_s] : f[field]).to_s.downcase
+          return val.start_with?((v || '').downcase)
+        when 'contains'
+          f[field].to_s.downcase.include?(rule['pattern'].to_s.downcase)
+        when 'regex'
+          (rx = call(:hr_rx, rule['pattern'])) && f[field].to_s =~ rx
+        when 'header_present'
+          f['headers'].key?(rule['pattern'].to_s)
+        when 'ext_in'
+          exts = call(:hr_list, rule['pattern'])
+          f['attachments'].any? { |fn| exts.any? { |e| fn.end_with?(".#{e}") || fn =~ /\.(#{e})$/ } }
+        when 'is_true'
+          # security flags carried on email['auth']
+          f['auth'][rule['pattern'].to_s] == true
+        else false
+        end
+      end
+
+      hard_pack.each do |field, rules|
+        Array(rules).each do |r|
+          if match.call(field, r)
+            return { hit: true, action: r['action'] || 'exclude', reason: "#{field}:#{r['operator']}" }
+          end
+        end
+      end
+
+      { hit: false }
+    end,
+    hr_eval_soft: lambda do |email, signals|
+      f = call(:hr_pick, email)
+      score = 0; hits = []
+
+      signals.each do |s|
+        field = (s['field'] || 'any')
+        text_sources =
+          case field
+          when 'subject' then [f['subject']]
+          when 'body'    then [f['body']]
+          when 'from'    then [f['from']]
+          when 'headers' then [f['headers'].to_json]
+          when 'attachments' then [f['attachments'].join(' ')]
+          else [f['subject'], f['body']]
+          end
+
+        matched =
+          case s['pattern_type']
+          when 'regex'
+            (rx = call(:hr_rx, s['pattern_value'])) && text_sources.any? { |t| t =~ rx }
+          when 'contains'
+            needles = call(:hr_list, s['pattern_value'])
+            text_sources.any? { |t| nt = t.to_s.downcase; needles.any? { |n| nt.include?(n) } }
+          when 'ext_in'
+            exts = call(:hr_list, s['pattern_value'])
+            f['attachments'].any? { |fn| exts.any? { |e| fn.end_with?(".#{e}") || fn =~ /\.(#{e})$/ } }
+          when 'header_present'
+            f['headers'].key?(s['pattern_value'].to_s)
+          else false
+          end
+
+        if matched
+          score += s['weight'].to_i
+          hits << (s['name'] || 'signal')
+        end
+      end
+
+      { score: score, matched: hits }
+    end,
+    hr_eval_decide: lambda do |score, thr|
+      keep = (thr['keep'] || 6).to_i
+      lo   = (thr['triage_min'] || 4).to_i
+      hi   = (thr['triage_max'] || 5).to_i
+      if score >= keep then 'HR-REQUEST'
+      elsif score >= lo && score <= hi then 'REVIEW'
+      else 'IRRELEVANT'
+      end
+    end,
+    hr_eval_guards_ok?: lambda do |category, email, guards|
+      g = guards[category] || {}
+      f = {
+        'subject' => email['subject'].to_s,
+        'body'    => email['body'].to_s
+      }
+
+      Array(g['required']).each do |rxs|
+        rx = call(:hr_rx, rxs); return false unless rx && (f['subject'] =~ rx || f['body'] =~ rx)
+      end
+      Array(g['forbidden']).each do |rxs|
+        rx = call(:hr_rx, rxs); return false if rx && (f['subject'] =~ rx || f['body'] =~ rx)
+      end
+      true
+    end,
     ensure_correlation_id!: lambda do |input|
       cid = input['correlation_id']
       (cid.is_a?(String) && cid.strip != '') ? cid.strip : SecureRandom.uuid
@@ -3176,7 +3434,7 @@ require 'securerandom'
     safe_parse_json: lambda do |s|
       JSON.parse(s) rescue { 'answer' => s }
     end,
-    llm_referee: lambda do |connection, model, email_text, shortlist_names, all_cats, fallback_category = nil, corr=nil|
+    llm_referee: lambda do |connection, model, email_text, shortlist_names, all_cats, fallback_category = nil, corr=nil, system_preamble=nil|
       # Minimal, schema-constrained JSON referee using Gemini
       model_path = call(:build_model_path_with_global_preview, connection, model)
       req_params = "model=#{model_path}"
@@ -3187,8 +3445,8 @@ require 'securerandom'
                    else
                      cats_norm.map { |c| c['name'] }
                    end
-
-      system_text = <<~SYS
+      # System Prompt (overrideable per-run)
+      system_text = system_preamble.presence || <<~SYS
         You are a strict email classifier. Choose exactly one category from the allowed list.
         Output MUST be valid JSON only (no prose).
         Confidence is a calibrated estimate in [0,1]. Keep reasoning crisp (<= 2 sentences).
@@ -3413,13 +3671,16 @@ require 'securerandom'
       # Keep head of the message if extremely long
       t.length > max_chars ? t[0, max_chars] : t
     end,
-    extract_salient_span!: lambda do |connection, subject, body, model='gemini-2.0-flash', max_span=500, temperature=0, corr=nil|
+    extract_salient_span!: lambda do |connection, subject, body, model='gemini-2.0-flash', max_span=500, temperature=0, corr=nil, system_preamble=nil|
       plain = call(:email_minify, subject, body)
       focus = call(:email_focus_trim, plain, 8000)
 
-      system_text = "Extract the single most important sentence or short paragraph from an email. " \
-                    "Return valid JSON only. Keep the extracted span under #{max_span} characters. " \
-                    "importance is a calibrated score in [0,1]."
+      # System Prompt (overrideable per-run)
+      system_text = system_preamble.presence || (
+        "Extract the single most important sentence or short paragraph from an email. " \
+        "Return valid JSON only. Keep the extracted span under #{max_span} characters. " \
+        "importance is a calibrated score in [0,1]."
+      )
 
       gen_cfg = {
         'temperature'      => temperature.to_f,
