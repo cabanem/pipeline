@@ -859,7 +859,7 @@ require 'securerandom'
       end,
       execute: lambda do |connection, raw_input|
         started_at = Time.now.utc.iso8601
-        t0 = t0 = Time.now
+        t0 = Time.now
         input = call(:normalize_input_keys, raw_input)
         begin
           result = call(:gen_generate_core!, connection, input)
@@ -1983,7 +1983,12 @@ require 'securerandom'
       h
     end,
     tail_log_emit!: lambda do |connection, action_id, started_at, t0, result, error, facets=nil|
-      # Fast-exit if no project or disabled
+      # Resolve project (guard) and respect feature flag
+      begin
+        call(:ensure_project_id!, connection)
+      rescue
+        # If ensure fails we still fast-exit; never raise from logger
+      end
       project = (connection['project_id'] || connection['gcp_project_id']).to_s.strip
       return nil if project.empty? || connection['disable_tail_logging'] == true
 
@@ -1996,7 +2001,14 @@ require 'securerandom'
       # Envelope
       env  = connection['environment'] || 'prod'
       app  = 'vertex_rag_engine'
-      corr = (connection['correlation_id'] || SecureRandom.uuid)
+      # Prefer action-scoped correlation id from the result envelope; fallback to connection or fresh UUID
+      corr = begin
+        (result && result['telemetry'] && result['telemetry']['correlation_id']) ||
+        connection['correlation_id'] ||
+        SecureRandom.uuid
+      rescue
+        SecureRandom.uuid
+      end
       log_id = 'workato_vertex_rag'
       # Normalize severity (maps WARN->WARNING, etc.; prefixes NONSTANDARD/ for unknowns)
       severity = call(:normalize_severity, (error ? 'ERROR' : 'INFO'))
@@ -2009,7 +2021,10 @@ require 'securerandom'
           connector: app,
           action: action_id.to_s,
           correlation_id: corr,
-          env: env
+          env: env,
+          # Duplicate a couple of request IDs into labels for faster filtering
+          recipe_id: connection['__recipe_id'],
+          job_id:    connection['__job_id']
         },
         jsonPayload: {
           status: (error ? 'error' : 'ok'),
@@ -2058,12 +2073,25 @@ require 'securerandom'
     end,
     _tl_post_logs: lambda do |connection, entries|
       return nil if entries.nil? || entries.empty?
+      # Build routing hint: x-goog-request-params requires log_name
+      project = (connection['project_id'] || connection['gcp_project_id']).to_s.strip
+      log_id  = begin
+        # entries[0][:logName] = "projects/<p>/logs/<log_id>"
+        ln = entries.first && (entries.first[:logName] || entries.first['logName']).to_s
+        ln.split('/').last
+      rescue
+        nil
+      end
+      req_params = (project.empty? || log_id.to_s.empty?) ? nil : "log_name=projects/#{project}/logs/#{log_id}"
+      # Use the standard auth header builder so 401s trigger refresh_on
+      corr = connection['correlation_id'] || SecureRandom.uuid
+      hdrs = call(:request_headers_auth, connection, corr, connection['user_project'], req_params)
+      # Fire the write using the same pipeline as other Google calls (no error swallow here;
+      # tail_log_emit! already rescues so this remains fire-and-forget while allowing token refresh)
       post("https://logging.googleapis.com/v2/entries:write")
-        .headers('Authorization' => "Bearer #{connection['access_token']}",
-                'Content-Type' => 'application/json')
+        .headers(hdrs)
         .payload(entries: entries)
         .request_format_json
-        .after_error_response(400..599) { |_| nil }
       nil
     end,
     normalize_severity: lambda do |s, prefix = 'NONSTANDARD/'|
