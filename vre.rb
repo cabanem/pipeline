@@ -2017,7 +2017,8 @@ require 'securerandom'
           env: env,
           # Duplicate a couple of request IDs into labels for faster filtering
           recipe_id: connection['__recipe_id'],
-          job_id:    connection['__job_id']
+          job_id:    connection['__job_id'],
+          special: 'workato'
         },
         jsonPayload: {
           status: (error ? 'error' : 'ok'),
@@ -2027,7 +2028,8 @@ require 'securerandom'
           request_meta: {
             recipe_id: connection['__recipe_id'],
             job_id: connection['__job_id'],
-            region: connection['location'] || connection['region']
+            region: connection['location'] || connection['region'],
+            special: 'workato'
           },
           result_meta: call(:_tl_shrink_meta, result),
           error: call(:_tl_norm_error, error)
@@ -2040,6 +2042,14 @@ require 'securerandom'
       end
       call(:_tl_post_logs, connection, [entry])
     rescue
+      unless call(:normalize_boolean, connection['prod_mode'])
+        connection['__last_tail_log_error'] = {
+          timestamp: Time.now.utc.iso8601,
+          method: '_tl_post_logs',
+          message: e.message,
+          class: e.class.to_s
+        }
+      end
       nil
     end,
     _tl_norm_error: lambda do |e|
@@ -2082,12 +2092,11 @@ require 'securerandom'
       hdrs = call(:headers_logging, connection, corr, req_params, { force_remint: true, cache_salt: 'logging' })
       # Cloud Logging requires JSON body; keep it compact.
       body = { 'entries' => entries }
-      post("https://logging.googleapis.com/v2/entries:write")
+      resp = post("https://logging.googleapis.com/v2/entries:write")
         .headers(hdrs)
         .payload(call(:json_compact, body))
         .request_format_json
-
-      nil
+      resp
     end,
     normalize_severity: lambda do |s, prefix = 'NONSTANDARD/'|
       raw = s.to_s.upcase.strip
