@@ -410,61 +410,106 @@ require 'securerandom'
 
       input_fields: lambda do |object_definitions, connection, config_fields|
         [
-          { name: 'mode', control_type: 'select', pick_list: 'modes_classification', optional: false, default: 'embedding',
-            hint: 'embedding (deterministic), generative (LLM-only), or hybrid (embeddings + LLM referee).' },
-          { name: 'correlation_id', label: 'Correlation ID', optional: true, hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
-          # --- Policy table (Workato-native) ---
-          { name: 'rules_rows', label: 'Rules (single-table rows)', optional: true,
-            hint: 'Bind a Lookup Table row list here, or enter rows manually.',
+          { name: 'show_advanced', label: 'Show advanced options',
+            type: 'boolean', control_type: 'checkbox', optional: true, default: false },
+
+          # === (A) Message -------------------------------------------------
+          { name: 'subject', label: 'Email subject', optional: true },
+          { name: 'body',    label: 'Email body (text/HTML ok)', optional: true },
+          # Advanced: email metadata for rules/pre-filter
+          { name: 'from',    optional: true, ngIf: 'input.show_advanced == true',
+            hint: 'Sender email; used by rules and heuristics.' },
+          { name: 'headers', type: 'object', optional: true, ngIf: 'input.show_advanced == true',
+            hint: 'Key→value map. Ex: Content-Type, List-Unsubscribe.' },
+          { name: 'attachments', type: 'array', of: 'object', optional: true, ngIf: 'input.show_advanced == true',
+            properties: [{ name: 'filename' }, { name: 'mimeType' }, { name: 'size' }],
+            hint: 'Attachment list used by ext_in rules.' },
+          { name: 'auth', type: 'object', optional: true, ngIf: 'input.show_advanced == true',
+            hint: 'Auth flags, e.g., spf_dkim_dmarc_fail: true.' },
+
+          # === (B) Categories ---------------------------------------------
+          { name: 'categories', label: 'Categories', optional: false, type: 'array', of: 'object',
+            properties: [{ name: 'name', optional: false }, { name: 'description' },
+                         { name: 'examples', type: 'array', of: 'string' }],
+            hint: 'Provide ≥2. Strings allowed (names only).' },
+
+          # === (C) Mode & Models ------------------------------------------
+          { name: 'mode', control_type: 'select', pick_list: 'modes_classification',
+            optional: false, default: 'embedding',
+            hint: 'embedding (deterministic), generative, or hybrid.' },
+          { name: 'embedding_model', label: 'Embedding model', control_type: 'text',
+            optional: true, default: 'text-embedding-005',
+            ngIf: 'input.mode != "generative"' },
+          { name: 'generative_model', label: 'Generative model', control_type: 'text',
+            optional: true, ngIf: 'input.mode != "embedding"',
+            hint: 'Gemini model for referee or pure generative mode.' },
+          { name: 'referee_system_preamble', label: 'Referee system preamble',
+            optional: true, ngIf: 'input.show_advanced == true && input.mode != "embedding"',
+            hint: 'Override the built-in strict JSON classifier preamble.' },
+
+          # === (D) Salience (optional) ------------------------------------
+          { name: 'use_salience', label: 'Use salience extraction',
+            type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+            hint: 'Extract a short span before classification.' },
+          { name: 'salience_model', label: 'Salience model', control_type: 'text',
+            optional: true, default: 'gemini-2.0-flash',
+            ngIf: 'input.use_salience == true && input.show_advanced == true',
+            hint: 'Model to extract salient span.' },
+          { name: 'salience_max_span_chars', label: 'Max salience chars',
+            type: 'integer', optional: true, default: 500,
+            ngIf: 'input.use_salience == true && input.show_advanced == true' },
+          { name: 'salience_temperature', label: 'Salience temperature',
+            type: 'number', optional: true, ngIf: 'input.use_salience == true && input.show_advanced == true',
+            hint: 'Default 0.' },
+          { name: 'salience_system_preamble', label: 'Salience system preamble',
+            optional: true, ngIf: 'input.use_salience == true && input.show_advanced == true',
+            hint: 'Override default extractor instruction.' },
+          { name: 'confidence_blend', label: 'Confidence blend',
+            type: 'number', optional: true, default: 0.15,
+            ngIf: 'input.use_salience == true && input.show_advanced == true',
+            hint: 'Blend salience importance into final score (0–0.5).' },
+
+          # === (E) Rules (optional) ---------------------------------------
+          { name: 'rules_mode', label: 'Rules mode',
+            control_type: 'select', optional: true, default: 'none',
+            pick_list: 'rules_modes', # stub below
+            hint: 'Choose none / single-table rows / compiled JSON.' },
+          { name: 'rules_rows', label: 'Rules (single-table rows)',
+            optional: true, ngIf: 'input.rules_mode == "rows"',
+            hint: 'Bind Lookup Table rows or enter rows manually.',
             type: 'array', of: 'object', properties: [
               { name: 'rule_id' }, { name: 'family' }, { name: 'field' }, { name: 'operator' },
               { name: 'pattern' }, { name: 'weight' }, { name: 'action' }, { name: 'cap_per_email' },
               { name: 'category' }, { name: 'flag_a' }, { name: 'flag_b' },
               { name: 'enabled' }, { name: 'priority' }, { name: 'notes' }
             ]},
-          { name: 'rules_json', label: 'Rules (compiled JSON, optional)', optional: true,
-            hint: 'If present, overrides rules_rows.' },
-          # Optional email metadata used by pre-filter (map from upstream step)
-          { name: 'from',    optional: true, hint: 'Sender email (used by hard/soft rules).' },
-          { name: 'headers', type: 'object', optional: true, hint: 'Hash of headers (e.g., Content-Type, List-Unsubscribe).' },
-          { name: 'attachments', type: 'array', of: 'object', optional: true, properties: [
-              { name: 'filename' }, { name: 'mimeType' }, { name: 'size' }
-            ], hint: 'Attachment list used by ext_in rules.'
-          },
-          { name: 'auth', type: 'object', optional: true, hint: 'Auth checks (e.g., spf_dkim_dmarc_fail: true).' },
+          { name: 'rules_json', label: 'Rules (compiled JSON)',
+            optional: true, ngIf: 'input.rules_mode == "json"',
+            hint: 'If present, overrides rows.' },
 
-          { name: 'referee_system_preamble', optional: true,
-            hint: 'Optional system prompt for the LLM referee (overrides the built-in strict classifier preamble).' },
-          { name: 'salience_system_preamble', optional: true,
-            hint: 'Optional system prompt used when extracting the salient span.' },
-          { name: 'subject', optional: true },
-          { name: 'body',    optional: true },
+          # === (F) Decision & Fallbacks -----------------------------------
+          { name: 'min_confidence', label: 'Minimum confidence',
+            type: 'number', optional: true, default: 0.25,
+            hint: '0–1. Below this, fallback is used.' },
+          { name: 'fallback_category', label: 'Fallback category',
+            optional: true, default: 'Other' },
+          { name: 'top_k', label: 'Referee shortlist (top-K)',
+            type: 'integer', optional: true, default: 3,
+            ngIf: 'input.mode == "hybrid" || (input.mode != "embedding" && input.show_advanced == true)',
+            hint: 'How many candidates to pass to LLM referee.' },
+          { name: 'return_explanation', label: 'Return explanation',
+            type: 'boolean', control_type: 'checkbox', optional: true, default: false,
+            ngIf: 'input.mode != "embedding"',
+            hint: 'If true and a generative model is set, return reasoning.' },
 
-          { name: 'categories', optional: false, type: 'array', of: 'object', properties: [
-              { name: 'name',      optional: false },
-              { name: 'description' },
-              { name: 'examples',  type: 'array', of: 'string' }
-            ],
-            hint: 'At least 2. You can also pass simple strings (names only).' },
-          { name: 'embedding_model', label: 'Embedding model', control_type: 'text', optional: true,
-            default: 'text-embedding-005', },
-          { name: 'generative_model', label: 'Generative model', control_type: 'text', optional: true },
-          { name: 'min_confidence', type: 'number', optional: true, default: 0.25,
-            hint: '0–1. If top score falls below this, fallback is used.' },
-          { name: 'fallback_category', optional: true, default: 'Other' },
-          { name: 'top_k', type: 'integer', optional: true, default: 3,
-            hint: 'In hybrid mode, pass top-K candidates to the LLM referee.' },
-          { name: 'return_explanation', type: 'boolean', optional: true, default: false,
-            hint: 'If true and a generative model is provided, returns a short reasoning + distribution.' },
-          # Salience fields
-          { name: 'use_salience', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
-            hint: 'If enabled, classify based on a short salient span (better signal on long threads).' },
-          { name: 'salience_model', control_type: 'text', optional: true, default: 'gemini-2.0-flash',
-            hint: 'Model used to extract the salient span.' },
-          { name: 'salience_max_span_chars', type: 'integer', optional: true, default: 500 },
-          { name: 'salience_temperature', type: 'number', optional: true, hint: 'Default 0' },
-          { name: 'confidence_blend', type: 'number', optional: true, default: 0.15,
-            hint: 'How much to blend salience importance into the final confidence (0–0.5 typical).' },
+          # === (G) Observability ------------------------------------------
+          { name: 'correlation_id', label: 'Correlation ID',
+            optional: true, sticky: true,
+            hint: 'Use a sticky ID to stitch logs/metrics.' },
+          { name: 'debug', label: 'Debug (non-prod only)',
+            type: 'boolean', control_type: 'checkbox', optional: true,
+            ngIf: 'input.show_advanced == true',
+            hint: 'Adds request/response preview to output when not in prod.' }
         ]
       end,
       output_fields: lambda do |object_definitions, connection|
@@ -713,6 +758,11 @@ require 'securerandom'
           'mode' => 'embedding',
           'chosen' => 'Billing',
           'confidence' => 0.91,
+          'pre_filter' => {
+            'score' => 5,
+            'matched_signals' => ['mentions_invoice', 'payment_terms'],
+            'decision' => 'REVIEW'
+          },
           'scores' => [
             { 'category' => 'Billing', 'score' => 0.91, 'cosine' => 0.82 },
             { 'category' => 'Tech Support', 'score' => 0.47, 'cosine' => -0.06 },
@@ -2133,11 +2183,20 @@ require 'securerandom'
   
   # --------- PICK LISTS ---------------------------------------------------
   pick_lists: {
-    # What to emit from rerank for ergonomics/BC:
-    # - records_only:     [{id, score, rank}]
-    # - enriched_records: [{id, score, rank, content, metadata}]
-    # - context_chunks:   enriched records + generator-ready context_chunks
+    modes_classification: lambda do |_connection|
+      [ ['Embedding (deterministic)', 'embedding'],
+        ['Generative (LLM only)',     'generative'],
+        ['Hybrid (embed + referee)',  'hybrid'] ]
+    end,
+    # rules
+    rules_modes: lambda do |_connection|
+      [ ['None', 'none'], ['Rows (Lookup Table)', 'rows'], ['Compiled JSON', 'json'] ]
+    end,
     rerank_emit_shapes: lambda do |_connection|
+      # What to emit from rerank for ergonomics/BC:
+      # - records_only:     [{id, score, rank}]
+      # - enriched_records: [{id, score, rank, content, metadata}]
+      # - context_chunks:   enriched records + generator-ready context_chunks
       [
         ['Records only (id, score, rank)','records_only'],
         ['Enriched records (adds content/metadata)','enriched_records'],
