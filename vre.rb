@@ -2665,31 +2665,12 @@ require 'securerandom'
         { body: 'Runs hard/soft rules and infers coarse intent from headers/auth/keywords.' }
       end,
 
-      config_fields: [
-          { name: 'show_advanced', label: 'Show advanced options',
-            type: 'boolean', control_type: 'checkbox',
-            default: false, sticky: true, extends_schema: true }
-      ],
+      config_fields: lambda do |_connection|
+        [ call(:ui_show_advanced_toggle, false) ]
+      end,
       input_fields: lambda do |object_definitions, connection, config_fields|
-        adv = (config_fields['show_advanced'] == true)
-        base = [
-          { name: 'show_advanced', type: 'boolean', control_type: 'checkbox',
-            default: false, extends_schema: true, sticky: true },
-
-          # A) Message
-          { name: 'email', label: 'Email', type: 'object',
-            properties: Array(object_definitions['email_envelope']), optional: false },
-
-          # B) Rules (optional)
-          { name: 'rules_mode', control_type: 'select', default: 'none', pick_list: 'rules_modes' },
-          { name: 'rules_rows', ngIf: 'input.rules_mode == "rows"',
-            type: 'array', of: 'object', properties: Array(object_definitions['rule_rows_table']), optional: true },
-          { name: 'rules_json', ngIf: 'input.rules_mode == "json"', optional: true },
-
-          # C) Fallbacks
-          { name: 'fallback_category', optional: true, default: 'Other' }
-        ]
-        base + Array(object_definitions['observability_input_fields'])
+        call(:ui_df_inputs, object_definitions, config_fields) +
+          Array(object_definitions['observability_input_fields'])
       end,
       output_fields: lambda do |object_definitions, connection|
         [
@@ -2786,29 +2767,12 @@ require 'securerandom'
         { body: 'Constrained LLM decides IRRELEVANT/REVIEW/KEEP. Short-circuits only if confident.' }
       end,
 
-      config_fields: [
-          { name: 'show_advanced', label: 'Show advanced options',
-            type: 'boolean', control_type: 'checkbox',
-            default: false, sticky: true, extends_schema: true }
-      ],
+      config_fields: lambda do |_connection|
+        [ call(:ui_show_advanced_toggle, false) ]
+      end,
       input_fields: lambda do |object_definitions, connection, config_fields|
-        adv = (config_fields['show_advanced'] == true)
-        base = [
-          # A) Message
-          { name: 'email_text', optional: false }
-        ]
-        if adv
-          base += [
-            # B) Policy knobs (advanced)
-            { name: 'model', label: 'Generative model', control_type: 'text', optional: true, default: 'gemini-2.0-flash' },
-            { name: 'confidence_short_circuit', type: 'number', optional: true, default: 0.8,
-              hint: 'Short-circuit only when decision=IRRELEVANT and confidence ≥ this value.' }
-          ]
-        else
-          base << { name: 'confidence_short_circuit', type: 'number', optional: true, default: 0.8,
-                    hint: 'Short-circuit only when decision=IRRELEVANT and confidence ≥ this value.' }
-        end
-        base + Array(object_definitions['observability_input_fields'])
+        call(:ui_policy_inputs, object_definitions, config_fields) +
+          Array(object_definitions['observability_input_fields'])
       end,
       output_fields: lambda do |object_definitions, connection|
         [
@@ -2878,29 +2842,12 @@ require 'securerandom'
         { body: 'Embeds email and categories, returns similarity scores and a top-K shortlist.' }
       end,
 
-      config_fields: [
-          { name: 'show_advanced', label: 'Show advanced options',
-            type: 'boolean', control_type: 'checkbox',
-            default: false, sticky: true, extends_schema: true }
-      ],
+      config_fields: lambda do |_connection|
+        [ call(:ui_show_advanced_toggle, false) ]
+      end,
       input_fields: lambda do |object_definitions, connection, config_fields|
-        adv = (config_fields['show_advanced'] == true)
-        base = [
-          # A) Message
-          { name: 'email_text', optional: false },
-          # B) Categories
-          { name: 'categories', type: 'array', of: 'object', optional: false,
-            properties: Array(object_definitions['category_def']) }
-        ]
-        if adv
-          base += [
-            # C) Models & knobs (advanced)
-            { name: 'embedding_model', control_type: 'text', optional: true, default: 'text-embedding-005' },
-            { name: 'shortlist_k', type: 'integer', optional: true, default: 3 }
-          ]
-        end
-        base + Array(object_definitions['observability_input_fields'])
-
+        call(:ui_embed_inputs, object_definitions, config_fields) +
+          Array(object_definitions['observability_input_fields'])
       end,
       output_fields: lambda do |object_definitions, _conn|
         [
@@ -2961,31 +2908,12 @@ require 'securerandom'
         { body: 'Uses LLM to produce a probability distribution over the shortlist and re-orders it.' }
       end,
 
-      config_fields: [
-        { name: 'show_advanced', label: 'Show advanced options',
-            type: 'boolean', control_type: 'checkbox',
-            default: false, sticky: true, extends_schema: true }
-      ],      
+      config_fields: lambda do |_connection|
+        [ call(:ui_show_advanced_toggle, false) ]
+      end,    
       input_fields: lambda do |object_definitions, connection, config_fields|
-        adv = (config_fields['show_advanced'] == true)
-        base = [
-          # A) Message
-          { name: 'email_text', optional: false },
-
-          # B) Categories & shortlist
-          { name: 'categories', type: 'array', of: 'object', optional: false,
-            properties: Array(object_definitions['category_def']) },
-          { name: 'shortlist', type: 'array', of: 'string', optional: false },
-
-          # C) Mode
-          { name: 'mode', control_type: 'select', optional: false, default: 'none',
-            options: [['None','none'], ['LLM','llm']] }
-        ]
-        if adv
-          base << { name: 'generative_model', control_type: 'text', optional: true, default: 'gemini-2.0-flash',
-                    ngIf: 'input.mode == "llm"' }
-        end
-        base + Array(object_definitions['observability_input_fields'])
+        call(:ui_rerank_inputs, object_definitions, config_fields) +
+          Array(object_definitions['observability_input_fields'])
       end,
       output_fields: lambda do |object_definitions, connection|
         [
@@ -3039,34 +2967,12 @@ require 'securerandom'
       help: lambda do |_|
         { body: 'Chooses final category using shortlist + category metadata; can append ranked contexts to the email text.' }
       end,
-
-      config_fields: [
-          { name: 'show_advanced', label: 'Show advanced options',
-            type: 'boolean', control_type: 'checkbox',
-            default: false, sticky: true, extends_schema: true }
-      ],      
+      config_fields: lambda do |_connection|
+        [ call(:ui_show_advanced_toggle, false) ]
+      end,   
       input_fields: lambda do |object_definitions, connection, config_fields|
-        adv = (config_fields['show_advanced'] == true)
-        base = [
-          # A) Message
-          { name: 'email_text', optional: false },
-
-          # B) Categories & shortlist
-          { name: 'categories', type: 'array', of: 'object', optional: false,
-            properties: Array(object_definitions['category_def']) },
-          { name: 'shortlist', type: 'array', of: 'string', optional: true,
-            hint: 'If omitted, all categories are allowed.' },
-
-          # D) Models & thresholds
-          { name: 'generative_model', control_type: 'text', optional: true, default: 'gemini-2.0-flash' },
-          { name: 'min_confidence', type: 'number', optional: true, default: 0.25 },
-          { name: 'fallback_category', optional: true, default: 'Other' }
-        ]
-        if adv
-          base << { name: 'contexts', label: 'Ranked contexts', type: 'array', of: 'object', optional: true,
-                    properties: Array(object_definitions['contexts_ranked']) }
-        end
-        base + Array(object_definitions['observability_input_fields'])
+        call(:ui_ref_inputs, object_definitions, config_fields) +
+          Array(object_definitions['observability_input_fields'])
       end,
       output_fields: lambda do |object_definitions, connection|
         [
@@ -3123,39 +3029,12 @@ require 'securerandom'
       help: lambda do |_|
         { body: 'Retrieves ranked contexts for a query (email text). Accepts thresholds and ranker knobs; no in-action salience.' }
       end,
-      config_fields:[
-          { name: 'show_advanced', label: 'Show advanced options',
-            type: 'boolean', control_type: 'checkbox',
-            default: false, sticky: true, extends_schema: true }
-        ],
+      config_fields: lambda do |_connection|
+        [ call(:ui_show_advanced_toggle, false) ]
+      end,
       input_fields: lambda do |object_definitions, connection, config_fields|
-        adv = (config_fields['show_advanced'] == true)
-        base = [
-          { name: 'show_advanced', type: 'boolean', control_type: 'checkbox',
-            default: false, extends_schema: true, sticky: true },
-          # A) Query
-          { name: 'email_text', optional: false, hint: 'Free text query (use norm_email_envelope upstream if you have subject/body).' },
-          # B) Corpus
-          { name: 'rag_corpus', label: 'RAG corpus ID', optional: false, hint: 'Vertex RAG corpus name/id.' }
-        ]
-        if adv
-          # C) Retrieval config (advanced, composed, with guards)
-          base << {
-            name: 'rag_retrieval_config', label: 'Retrieval config', type: 'object', optional: true,
-            properties: [
-              { name: 'top_k', type: 'integer', hint: 'Max contexts to return (default 6).' },
-              { name: 'filter', type: 'object', properties: [
-                  { name: 'vector_distance_threshold', type: 'number' },
-                  { name: 'vector_similarity_threshold', type: 'number' }
-              ]},
-              { name: 'ranking', type: 'object', properties: [
-                  { name: 'rank_service_model', hint: 'e.g., text-multilingual-document-reranker@001' },
-                  { name: 'llm_ranker_model', hint: 'e.g., gemini-2.0-flash' }
-              ]}
-            ]
-          }
-        end
-        base + Array(object_definitions['observability_input_fields'])
+        call(:ui_retrieve_inputs, object_definitions, config_fields) +
+          Array(object_definitions['observability_input_fields'])
       end,
       output_fields: lambda do |object_definitions, _connection|
         [
@@ -3293,6 +3172,114 @@ require 'securerandom'
   
   # --------- METHODS ------------------------------------------------------
   methods: {
+    # ---------- UI assembly helpers (schema-by-config) --------------------------
+    ui_show_advanced_toggle: lambda do |default=false|
+      { name: 'show_advanced', label: 'Show advanced options',
+        type: 'boolean', control_type: 'checkbox',
+        default: default, sticky: true, extends_schema: true,
+        hint: 'Toggle to reveal advanced parameters.' }
+    end,
+    ui_truthy: lambda do |v|
+      (v == true) || (v.to_s.downcase == 'true') || (v.to_s == '1')
+    end,
+    ui_df_inputs: lambda do |object_definitions, cfg|
+      [
+        { name: 'email', label: 'Email', type: 'object',
+          properties: Array(object_definitions['email_envelope']), optional: false },
+        { name: 'rules_mode', control_type: 'select', default: 'none', pick_list: 'rules_modes' },
+        { name: 'rules_rows', ngIf: 'input.rules_mode == "rows"',
+          type: 'array', of: 'object', properties: Array(object_definitions['rule_rows_table']), optional: true },
+        { name: 'rules_json', ngIf: 'input.rules_mode == "json"', optional: true },
+        { name: 'fallback_category', optional: true, default: 'Other' }
+      ]
+    end,
+    ui_policy_inputs: lambda do |object_definitions, cfg|
+      adv = call(:ui_truthy, cfg['show_advanced'])
+      base = [
+        { name: 'email_text', optional: false }
+      ]
+      base << { name: 'model', label: 'Generative model', control_type: 'text',
+                optional: true, default: 'gemini-2.0-flash' } if adv
+      base << { name: 'confidence_short_circuit', type: 'number', optional: true, default: 0.8,
+                hint: 'Short-circuit only when decision=IRRELEVANT and confidence ≥ this value.' }
+      base
+    end,
+    ui_embed_inputs: lambda do |object_definitions, cfg|
+      adv = call(:ui_truthy, cfg['show_advanced'])
+      base = [
+        { name: 'email_text', optional: false },
+        { name: 'categories', type: 'array', of: 'object', optional: false,
+          properties: Array(object_definitions['category_def']) }
+      ]
+      if adv
+        base += [
+          { name: 'embedding_model', control_type: 'text', optional: true, default: 'text-embedding-005' },
+          { name: 'shortlist_k', type: 'integer', optional: true, default: 3 }
+        ]
+      end
+      base
+    end,
+    ui_rerank_inputs: lambda do |object_definitions, cfg|
+      adv = call(:ui_truthy, cfg['show_advanced'])
+      base = [
+        { name: 'email_text', optional: false },
+        { name: 'categories', type: 'array', of: 'object', optional: false,
+          properties: Array(object_definitions['category_def']) },
+        { name: 'shortlist', type: 'array', of: 'string', optional: false },
+        { name: 'mode', control_type: 'select', optional: false, default: 'none',
+          options: [['None','none'], ['LLM','llm']] }
+      ]
+      if adv
+        base << { name: 'generative_model', control_type: 'text', optional: true, default: 'gemini-2.0-flash',
+                  ngIf: 'input.mode == "llm"' }
+      end
+      base
+    end,
+    ui_ref_inputs: lambda do |object_definitions, cfg|
+      adv = call(:ui_truthy, cfg['show_advanced'])
+      base = [
+        { name: 'email_text', optional: false },
+        { name: 'categories', type: 'array', of: 'object', optional: false,
+          properties: Array(object_definitions['category_def']) },
+        { name: 'shortlist', type: 'array', of: 'string', optional: true,
+          hint: 'If omitted, all categories are allowed.' },
+        { name: 'generative_model', control_type: 'text', optional: true, default: 'gemini-2.0-flash' },
+        { name: 'min_confidence', type: 'number', optional: true, default: 0.25 },
+        { name: 'fallback_category', optional: true, default: 'Other' }
+      ]
+      if adv
+        base << { name: 'contexts', label: 'Ranked contexts', type: 'array', of: 'object', optional: true,
+                  properties: Array(object_definitions['contexts_ranked']) }
+      end
+      base
+    end,
+    ui_retrieve_inputs: lambda do |object_definitions, cfg|
+      adv = call(:ui_truthy, cfg['show_advanced'])
+      base = [
+        { name: 'email_text', optional: false, hint: 'Free text query (use norm_email_envelope upstream if you have subject/body).' },
+        { name: 'rag_corpus', label: 'RAG corpus ID', optional: false, hint: 'Vertex RAG corpus name/id.' }
+      ]
+      if adv
+        props = Array(object_definitions['rag_retrieval_config'])
+        if props.empty?
+          props = [
+            { name: 'top_k', type: 'integer', hint: 'Max contexts to return (default 6).' },
+            { name: 'filter', type: 'object', properties: [
+                { name: 'vector_distance_threshold', type: 'number' },
+                { name: 'vector_similarity_threshold', type: 'number' }
+            ]},
+            { name: 'ranking', type: 'object', properties: [
+                { name: 'rank_service_model' },
+                { name: 'llm_ranker_model' }
+            ]}
+          ]
+        end
+        base << { name: 'rag_retrieval_config', label: 'Retrieval config', type: 'object', optional: true,
+                  properties: props }
+      end
+      base
+    end,
+
     step_begin!: lambda do |action_id, input|
       { 'action'=>action_id.to_s, 'started_at'=>Time.now.utc.iso8601,
         't0'=>Time.now, 'cid'=>call(:ensure_correlation_id!, input) }
