@@ -359,6 +359,7 @@ require 'securerandom'
         ]
       end
     },
+    # -- NEW ---
     # Shared envelope for all action outputs (ok, telemetry, optional debug)
     envelope_fields: {
       fields: lambda do |_connection, _config_fields|
@@ -2665,9 +2666,13 @@ require 'securerandom'
         { body: 'Runs hard/soft rules and infers coarse intent from headers/auth/keywords.' }
       end,
 
-      config_fields: lambda do |_connection|
-        [ call(:ui_show_advanced_toggle, false) ]
-      end,
+      # Static array only — no lambdas or method calls allowed here.
+      config_fields: [
+        { name: 'show_advanced', label: 'Show advanced options',
+          type: 'boolean', control_type: 'checkbox',
+          default: false, sticky: true, extends_schema: true,
+          hint: 'Toggle to reveal advanced parameters.' }
+      ],
       input_fields: lambda do |object_definitions, connection, config_fields|
         call(:ui_df_inputs, object_definitions, config_fields) +
           Array(object_definitions['observability_input_fields'])
@@ -2704,7 +2709,7 @@ require 'securerandom'
             nil
           end
 
-        pre = { hit => false }
+        pre = { 'hit' => false }
         if rules.is_a?(Hash)
           hard = call(:hr_eval_hard?, {
             'subject'=>subj, 'body'=>body, 'from'=>env['from'],
@@ -2767,9 +2772,12 @@ require 'securerandom'
         { body: 'Constrained LLM decides IRRELEVANT/REVIEW/KEEP. Short-circuits only if confident.' }
       end,
 
-      config_fields: lambda do |_connection|
-        [ call(:ui_show_advanced_toggle, false) ]
-      end,
+      config_fields: [
+        { name: 'show_advanced', label: 'Show advanced options',
+          type: 'boolean', control_type: 'checkbox',
+          default: false, sticky: true, extends_schema: true,
+          hint: 'Toggle to reveal advanced parameters.' }
+      ],
       input_fields: lambda do |object_definitions, connection, config_fields|
         call(:ui_policy_inputs, object_definitions, config_fields) +
           Array(object_definitions['observability_input_fields'])
@@ -2815,7 +2823,7 @@ require 'securerandom'
         resp = post(url).headers(call(:request_headers_auth, connection, ctx['cid'], connection['user_project'], req_params))
                         .payload(call(:json_compact, payload))
         text = resp.dig('candidates',0,'content','parts',0,'text').to_s
-        policy = call(:safe_parse_json, text)
+        policy = call(:safe_json, text)
 
         short_circuit = (policy['decision'] == 'IRRELEVANT' && policy['confidence'].to_f >= (input['confidence_short_circuit'] || 0.8).to_f)
 
@@ -2842,9 +2850,12 @@ require 'securerandom'
         { body: 'Embeds email and categories, returns similarity scores and a top-K shortlist.' }
       end,
 
-      config_fields: lambda do |_connection|
-        [ call(:ui_show_advanced_toggle, false) ]
-      end,
+      config_fields: [
+        { name: 'show_advanced', label: 'Show advanced options',
+          type: 'boolean', control_type: 'checkbox',
+          default: false, sticky: true, extends_schema: true,
+          hint: 'Toggle to reveal advanced parameters.' }
+      ],
       input_fields: lambda do |object_definitions, connection, config_fields|
         call(:ui_embed_inputs, object_definitions, config_fields) +
           Array(object_definitions['observability_input_fields'])
@@ -2908,9 +2919,12 @@ require 'securerandom'
         { body: 'Uses LLM to produce a probability distribution over the shortlist and re-orders it.' }
       end,
 
-      config_fields: lambda do |_connection|
-        [ call(:ui_show_advanced_toggle, false) ]
-      end,    
+      config_fields: [
+        { name: 'show_advanced', label: 'Show advanced options',
+          type: 'boolean', control_type: 'checkbox',
+          default: false, sticky: true, extends_schema: true,
+          hint: 'Toggle to reveal advanced parameters.' }
+      ],  
       input_fields: lambda do |object_definitions, connection, config_fields|
         call(:ui_rerank_inputs, object_definitions, config_fields) +
           Array(object_definitions['observability_input_fields'])
@@ -2967,9 +2981,12 @@ require 'securerandom'
       help: lambda do |_|
         { body: 'Chooses final category using shortlist + category metadata; can append ranked contexts to the email text.' }
       end,
-      config_fields: lambda do |_connection|
-        [ call(:ui_show_advanced_toggle, false) ]
-      end,   
+      config_fields: [
+        { name: 'show_advanced', label: 'Show advanced options',
+          type: 'boolean', control_type: 'checkbox',
+          default: false, sticky: true, extends_schema: true,
+          hint: 'Toggle to reveal advanced parameters.' }
+      ], 
       input_fields: lambda do |object_definitions, connection, config_fields|
         call(:ui_ref_inputs, object_definitions, config_fields) +
           Array(object_definitions['observability_input_fields'])
@@ -3029,9 +3046,12 @@ require 'securerandom'
       help: lambda do |_|
         { body: 'Retrieves ranked contexts for a query (email text). Accepts thresholds and ranker knobs; no in-action salience.' }
       end,
-      config_fields: lambda do |_connection|
-        [ call(:ui_show_advanced_toggle, false) ]
-      end,
+      config_fields: [
+        { name: 'show_advanced', label: 'Show advanced options',
+          type: 'boolean', control_type: 'checkbox',
+          default: false, sticky: true, extends_schema: true,
+          hint: 'Toggle to reveal advanced parameters.' }
+      ],
       input_fields: lambda do |object_definitions, connection, config_fields|
         call(:ui_retrieve_inputs, object_definitions, config_fields) +
           Array(object_definitions['observability_input_fields'])
