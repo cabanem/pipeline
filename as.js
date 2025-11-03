@@ -1,345 +1,222 @@
-/***** CONFIG *****************************************************************/
-const CFG = {
-  // REQUIRED: set to your target Drive folder ID where builds will be stored
-  RELEASE_ROOT_FOLDER_ID: 'PUT_RELEASE_FOLDER_ID_HERE',
-  // OPTIONAL: webhook for build summaries (Google Chat or Slack-compatible)
-  CHAT_WEBHOOK_URL: 'PUT_WEBHOOK_URL_OR_EMPTY',
-  // Map audiences to Docs template IDs
-  TEMPLATES: {
-    exec: 'DOC_TEMPLATE_ID_EXEC',
-    qa: 'DOC_TEMPLATE_ID_QA'
-    // compliance: 'DOC_TEMPLATE_ID_COMPLIANCE'
-  }
+/** Workato — Send Full Table (single call) + Run Log
+ *  - Menu: Initialize Config & Log / Send Table to Workato
+ *  - Reads contiguous headers from HEADER_ROW_INDEX to define the table
+ *  - Includes values from formula/array-formula columns
+ *  - Sends one POST to Workato; logs outcome to SendLog
+ */
+
+const CFG_DEFAULTS = {
+  WEBHOOK_URL: '',
+  DATA_SHEET: 'Table',          // name of sheet with the 4-column table
+  HEADER_ROW_INDEX: '1',        // row number where headers live
+  USE_DISPLAY_VALUES: 'FALSE',  // TRUE to send formatted text; FALSE to send typed values
+  LOG_SHEET: 'SendLog',
+  CORRELATION_HEADER: 'x-correlation-id',
+  HEADERS_JSON: '{}',           // extra headers if needed: {"x-team":"ops"}
+  QUERY_JSON: '{}'              // optional query params to append: {"env":"prod"}
 };
-/******************************************************************************/
 
-// Convenience getters
-function SS() { return SpreadsheetApp.getActive(); }
-function sh(name) { return SS().getSheetByName(name); }
-
-// Menu
+// ===== Menu =====
 function onOpen() {
-  SS().addMenu('TestPlan', [
-    {name: 'Validate SSOT', functionName: 'validate_ssot'},
-    {name: 'Render All Audiences', functionName: 'render_all_audiences'},
-    {name: 'Nightly Truth Build (Run Now)', functionName: 'truth_build'},
-    {name: 'Cut Baseline', functionName: 'cut_baseline'}
-  ]);
+  SpreadsheetApp.getUi()
+    .createMenu('Workato')
+    .addItem('Initialize Config & Log', 'initConfigAndLog_')
+    .addSeparator()
+    .addItem('Send Table to Workato', 'sendTableToWorkato')
+    .addToUi();
 }
 
-// --- Core: Validation --------------------------------------------------------
-function validate_ssot() {
-  const problems = [];
-  const reqs = readTable('requirements');
-  const tcs  = readTable('test_cases');
-  const risks= readTable('risks');
+// ===== Public action =====
+function sendTableToWorkato() {
+  const cfg = readConfig_();
+  const sheet = getSheetByNameOrThrow_(cfg.DATA_SHEET);
 
-  // ID uniqueness + regex
-  problems.push(...checkIds(reqs, /^REQ-[A-Z]+-\d{3}$/, 'requirements'));
-  problems.push(...checkIds(tcs,  /^TC-[A-Z]+-\d{3}$/,  'test_cases'));
-  problems.push(...checkIds(risks, /^RISK-[A-Z]+-\d{3}$/,'risks'));
+  const headerRow = Number(cfg.HEADER_ROW_INDEX || '1');
+  const headers = readContiguousHeaders_(sheet, headerRow);
+  if (headers.length === 0) throw new Error('No headers found on header row.');
 
-  // Enums
-  problems.push(...checkEnum(reqs, 'priority', ['P0','P1','P2','P3']));
-  problems.push(...checkEnum(reqs, 'status',   ['draft','proposed','approved','deprecated']));
-  problems.push(...checkEnum(tcs,  'env',      ['dev','staging','prod-sim']));
-  problems.push(...checkEnum(tcs,  'status',   ['draft','ready','blocked','deprecated']));
-  problems.push(...checkEnum(risks,'type',     ['security','privacy','operational','quality','compliance','other']));
-  problems.push(...checkEnum(risks,'severity', ['low','medium','high','critical']));
-  problems.push(...checkEnum(risks,'status',   ['open','mitigated','accepted','retired']));
+  const values = readDataValues_(sheet, headerRow, headers.length, toBool_(cfg.USE_DISPLAY_VALUES));
+  const trimmed = trimTrailingBlankRows_(values);
+  const rows = trimmed
+    .map(r => rowArrayToObject_(headers, r))
+    .filter(obj => !isAllEmptyObject_(obj)); // skip all-blank rows
 
-  // Traceability (REQ has ≥1 TC; TC maps to existing REQ)
-  const reqIds = new Set(reqs.map(r => r.id));
-  const tcReqLinks = flattenCsv(tcs, 'requirement_ids');
-  const orphanTCs = tcs.filter(t => !splitCsv(t.requirement_ids).every(id => reqIds.has(id)));
-  const reqCoverageMap = coverageCounts(reqs, tcs);
-  const orphanReqs = reqs.filter(r => (reqCoverageMap[r.id] || 0) === 0);
-
-  // Risks mapped?
-  const riskIds = new Set(risks.map(r => r.id));
-  const reqRiskLinks = flattenCsv(reqs, 'risk_ids').filter(id => id);
-  const unknownRiskRefs = reqRiskLinks.filter(id => !riskIds.has(id));
-
-  if (orphanTCs.length) problems.push(`Orphan test_cases (bad or missing requirement_ids): ${orphanTCs.map(t=>t.id).join(', ')}`);
-  if (orphanReqs.length) problems.push(`Uncovered requirements (0 test cases): ${orphanReqs.map(r=>r.id).join(', ')}`);
-  if (unknownRiskRefs.length) problems.push(`Unknown risks referenced by requirements: ${[...new Set(unknownRiskRefs)].join(', ')}`);
-
-  // Deprecated rules
-  reqs.filter(r => r.status === 'deprecated' && !r.version_deprecated)
-      .forEach(r => problems.push(`Requirement ${r.id} deprecated without version_deprecated`));
-  tcs.filter(t => t.status === 'deprecated' && !t.version_deprecated)
-     .forEach(t => problems.push(`Test case ${t.id} deprecated without version_deprecated`));
-
-  // Write summary
-  if (problems.length) {
-    SpreadsheetApp.getUi().alert(`Validation FAILED:\n- ${problems.join('\n- ')}`);
-  } else {
-    SpreadsheetApp.getUi().alert('Validation OK ✅');
-  }
-  return {problems, reqs, tcs, risks, orphanReqs, orphanTCs};
-}
-
-function checkIds(rows, regex, tab) {
-  const seen = new Set();
-  const problems = [];
-  rows.forEach(r => {
-    if (!regex.test(r.id || '')) problems.push(`${tab}: ${r.id} fails regex`);
-    if (seen.has(r.id)) problems.push(`${tab}: duplicate id ${r.id}`);
-    seen.add(r.id);
-  });
-  return problems;
-}
-
-function checkEnum(rows, field, allowed) {
-  const probs = [];
-  rows.forEach(r => {
-    if (r[field] && !allowed.includes(String(r[field]).trim()))
-      probs.push(`Enum violation: ${r.id}.${field}='${r[field]}' not in [${allowed.join(', ')}]`);
-  });
-  return probs;
-}
-
-// --- Core: Build & Render ----------------------------------------------------
-function render_all_audiences() {
-  const audiences = Object.keys(CFG.TEMPLATES);
-  const baseline = getBaseline();
-  audiences.forEach(a => render_audience(a, baseline));
-}
-
-function truth_build() {
-  const baseline = getBaseline();
-  const audiences = Object.keys(CFG.TEMPLATES);
-  const val = validate_ssot();
-  const ssotHash = hashSSOT();
-  audiences.forEach(aud => {
-    const {docId, docHash, metrics, ok} = render_audience(aud, baseline, ssotHash);
-    write_build_ledger({
-      audience: aud,
-      baseline,
-      ssot_hash: ssotHash,
-      doc_file_id: docId,
-      doc_hash: docHash,
-      coverage_pct: metrics.coverage_pct,
-      risks_high_open: metrics.risks_high_open,
-      orphans_req: metrics.orphans_req,
-      orphans_tc: metrics.orphans_tc,
-      invariants_ok: ok
-    });
-    notify_build(aud, baseline, ok, docId, metrics);
-  });
-}
-
-function render_audience(audience, baseline, ssotHashOpt) {
-  const templateId = CFG.TEMPLATES[audience];
-  if (!templateId) throw new Error(`No template configured for audience: ${audience}`);
-
-  const {reqs, tcs, risks} = {
-    reqs: readTable('requirements'),
-    tcs:  readTable('test_cases'),
-    risks:readTable('risks')
+  const correlationId = buildCorrelationId_(sheet.getName());
+  const payload = {
+    table: { sheet: sheet.getName(), headers, rows },
+    correlation_id: correlationId
   };
 
-  const metrics = compute_metrics(reqs, tcs, risks);
-  const ssotHash = ssotHashOpt || hashSSOT();
+  const url = buildUrlWithQuery_(cfg.WEBHOOK_URL, parseJsonSafe_(cfg.QUERY_JSON));
+  const headersOut = buildHeaders_(cfg, correlationId);
 
-  // Copy template
-  const dstName = `${baseline} - ${audience} - ${Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyyMMdd-HHmmss')}`;
-  const dstId = DriveApp.getFileById(templateId).makeCopy(dstName, DriveApp.getFolderById(CFG.RELEASE_ROOT_FOLDER_ID)).getId();
-  const doc = DocumentApp.openById(dstId);
-  const body = doc.getBody();
+  let status = 'SUCCESS', httpCode = '', err = '', respSnippet = '', bytes = 0, latency = 0;
 
-  // Simple placeholder replacement
-  replaceAll(body, '{{BASELINE}}', baseline);
-  replaceAll(body, '{{DATE}}', new Date().toISOString().slice(0,10));
-  replaceAll(body, '{{COVERAGE_PCT}}', String(metrics.coverage_pct));
-  replaceAll(body, '{{RISKS_HIGH_OPEN}}', String(metrics.risks_high_open));
-  replaceAll(body, '{{ORPHANS_REQ}}', String(metrics.orphans_req));
-  replaceAll(body, '{{ORPHANS_TC}}', String(metrics.orphans_tc));
-
-  // Insert QA tables for QA audience (example)
-  if (audience === 'qa') {
-    // We’ll append a table of TC → REQ mappings
-    body.appendParagraph('\nTest Cases & Requirement Mapping').setHeading(DocumentApp.ParagraphHeading.HEADING2);
-    const tableData = [['TC ID','Objective','Env','Status','Requirements']];
-    tcs.forEach(tc => {
-      tableData.push([tc.id, tc.objective || '', tc.env || '', tc.status || '', (tc.requirement_ids || '')]);
+  try {
+    const body = JSON.stringify(payload);
+    bytes = Utilities.newBlob(body).getBytes().length;
+    const t0 = Date.now();
+    const resp = UrlFetchApp.fetch(url, {
+      method: 'post',
+      contentType: 'application/json',
+      payload: body,
+      headers: headersOut,
+      muteHttpExceptions: true
     });
-    body.appendTable(tableData);
+    latency = Date.now() - t0;
+    httpCode = String(resp.getResponseCode());
+    if (httpCode[0] !== '2') {
+      status = 'FAILED';
+      respSnippet = safeSnippet_(resp.getContentText());
+      err = `Non-2xx response`;
+    }
+  } catch (e) {
+    status = 'FAILED';
+    err = String(e && e.message ? e.message : e);
   }
 
-  // Exec overlay example (optional)
-  if (audience === 'exec') {
-    const overlay = readSingle('overlays_exec');
-    replaceAll(body, '{{EXEC_KPIS}}', overlay.baseline_kpis_summary || '');
-    replaceAll(body, '{{KEY_CHANGES}}', overlay.key_changes_summary || '');
-    replaceAll(body, '{{RELEASE_SCOPE}}', overlay.release_scope_summary || '');
+  logRun_({
+    sheet: sheet.getName(),
+    rows_sent: rows.length,
+    bytes_sent: bytes,
+    http_code: httpCode,
+    status,
+    correlation_id: correlationId,
+    error: err || '',
+    response_snippet: respSnippet || '',
+    latency_ms: latency
+  });
+
+  SpreadsheetApp.getActive().toast(
+    `${status}: sent ${rows.length} row(s), http=${httpCode || 'n/a'}, bytes=${bytes}`
+  );
+}
+
+// ===== Config & Log setup =====
+function initConfigAndLog_() {
+  const ss = SpreadsheetApp.getActive();
+  // Config
+  let cfg = ss.getSheetByName('Config') || ss.insertSheet('Config');
+  if (cfg.getLastRow() <= 1) {
+    cfg.clear();
+    cfg.getRange(1,1,1,2).setValues([['key','value']]).setFontWeight('bold');
+    const rows = Object.entries(CFG_DEFAULTS);
+    cfg.getRange(2,1,rows.length,2).setValues(rows);
   }
-
-  // Invariant: no unreplaced placeholders
-  const unreplaced = body.getText().match(/{{[^}]+}}/g) || [];
-  doc.saveAndClose();
-
-  const ok = unreplaced.length === 0;
-  const docHash = hashDoc(dstId);
-
-  return {docId: dstId, docHash, metrics, ok, unreplaced};
+  // Log
+  let log = ss.getSheetByName(CFG_DEFAULTS.LOG_SHEET) || ss.insertSheet(CFG_DEFAULTS.LOG_SHEET);
+  if (log.getLastRow() === 0) {
+    log.getRange(1,1,1,10).setValues([[
+      'timestamp_utc','sheet','rows_sent','bytes_sent','http_code',
+      'status','latency_ms','correlation_id','error','response_snippet'
+    ]]).setFontWeight('bold');
+  }
+  SpreadsheetApp.getActive().toast('Config & Log ready. Set WEBHOOK_URL in Config.');
 }
 
-// --- Metrics & helpers -------------------------------------------------------
-function compute_metrics(reqs, tcs, risks) {
-  const cov = coverageCounts(reqs, tcs);
-  const covered = Object.values(cov).filter(n => n > 0).length;
-  const coverage_pct = reqs.length ? Math.round((covered / reqs.length) * 100) : 100;
-
-  const risks_high_open = risks.filter(r => (r.severity === 'high' || r.severity === 'critical') && r.status !== 'mitigated' && r.status !== 'retired').length;
-
-  const orphans_req = reqs.filter(r => (cov[r.id] || 0) === 0).length;
-  const reqIds = new Set(reqs.map(r => r.id));
-  const orphans_tc = tcs.filter(t => !splitCsv(t.requirement_ids).every(id => reqIds.has(id))).length;
-
-  return {coverage_pct, risks_high_open, orphans_req, orphans_tc};
+// ===== Data reading helpers =====
+function readContiguousHeaders_(sheet, headerRow) {
+  const lastCol = sheet.getLastColumn();
+  const headerVals = sheet.getRange(headerRow, 1, 1, Math.max(1, lastCol)).getValues()[0];
+  const headers = [];
+  for (let i=0;i<headerVals.length;i++) {
+    const h = String(headerVals[i] || '').trim();
+    if (i === 0 && h === '') break;         // nothing at A?
+    if (h === '') break;                    // stop at first blank -> contiguous block
+    headers.push(h);
+  }
+  return headers;
 }
 
-function coverageCounts(reqs, tcs) {
-  const counts = {};
-  reqs.forEach(r => counts[r.id] = 0);
-  tcs.forEach(tc => splitCsv(tc.requirement_ids).forEach(rid => { if (counts[rid] != null) counts[rid]++; }));
-  return counts;
+function readDataValues_(sheet, headerRow, colCount, useDisplay) {
+  const startRow = headerRow + 1;
+  const lastRow = sheet.getLastRow();
+  const numRows = Math.max(0, lastRow - headerRow);
+  if (numRows === 0) return [];
+  const range = sheet.getRange(startRow, 1, numRows, colCount);
+  return useDisplay ? range.getDisplayValues() : range.getValues();
 }
 
-function replaceAll(body, needle, val) {
-  body.replaceText(escapeRegExp(needle), val == null ? '' : String(val));
-}
-function escapeRegExp(s) {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-// --- Hashing -----------------------------------------------------------------
-function hashSSOT() {
-  const tabs = ['requirements','test_cases','risks'];
-  const chunks = tabs.map(t => JSON.stringify(readTable(t))).join('|');
-  const h = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, chunks);
-  return Utilities.base64Encode(h);
-}
-function hashDoc(fileId) {
-  const blob = DriveApp.getFileById(fileId).getBlob();
-  const h = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, blob.getBytes());
-  return Utilities.base64Encode(h);
+function trimTrailingBlankRows_(rows) {
+  let last = rows.length - 1;
+  for (; last >= 0; last--) {
+    const r = rows[last];
+    if (r.some(v => String(v ?? '').trim() !== '')) break;
+  }
+  return rows.slice(0, last + 1);
 }
 
-// --- Ledger & Notifications --------------------------------------------------
-function write_build_ledger(entry) {
-  const s = sh('builds');
-  const buildId = `BUILD-${Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyyMMdd-HHmmss')}`;
-  const who = Session.getActiveUser().getEmail() || 'script';
-  const link = `https://docs.google.com/document/d/${entry.doc_file_id}/edit`;
-  s.appendRow([
-    buildId,
-    entry.baseline,
-    entry.audience,
-    entry.invariants_ok ? 'PASS' : 'FAIL',
-    entry.ssot_hash,
-    entry.doc_file_id,
-    entry.doc_hash,
-    entry.coverage_pct,
-    entry.risks_high_open,
-    entry.orphans_req,
-    entry.orphans_tc,
-    entry.invariants_ok,
-    who,
-    new Date(),
-    link
-  ]);
+function rowArrayToObject_(headers, arr) {
+  const obj = {};
+  for (let i=0;i<headers.length;i++) obj[headers[i]] = arr[i];
+  return obj;
 }
 
-function notify_build(audience, baseline, ok, docId, metrics) {
-  if (!CFG.CHAT_WEBHOOK_URL) return;
-  const text = [
-    `*${ok ? 'PASS ✅' : 'FAIL ❌'}* ${baseline} → ${audience}`,
-    `Doc: https://docs.google.com/document/d/${docId}/edit`,
-    `Coverage: ${metrics.coverage_pct}% | High/Crit Risks Open: ${metrics.risks_high_open} | Orphans: REQ=${metrics.orphans_req}, TC=${metrics.orphans_tc}`
-  ].join('\n');
-  UrlFetchApp.fetch(CFG.CHAT_WEBHOOK_URL, {
-    method: 'post',
-    contentType: 'application/json',
-    payload: JSON.stringify({text})
+function isAllEmptyObject_(obj) {
+  return Object.keys(obj).every(k => {
+    const v = obj[k];
+    return v === null || v === undefined || String(v).trim() === '';
   });
 }
 
-// --- Baseline management -----------------------------------------------------
-function getBaseline() {
-  // Read from a named cell in any tab; fall back to default
-  const range = sh('requirements').getRange('J1'); // e.g., put current baseline in J1
-  const v = (range.getValue() || '').toString().trim();
-  return v || 'TESTPLAN 0.1.0';
+// ===== HTTP & logging helpers =====
+function buildHeaders_(cfg, correlationId) {
+  const out = Object.assign({}, parseJsonSafe_(cfg.HEADERS_JSON));
+  out['Content-Type'] = 'application/json';
+  if (cfg.CORRELATION_HEADER) out[cfg.CORRELATION_HEADER] = correlationId;
+  return out;
 }
 
-function cut_baseline() {
-  // Minimal: stamp a new baseline semver (manual edit in cell J1), then run a truth build
-  const ui = SpreadsheetApp.getUi();
-  const resp = ui.prompt('Cut Baseline', 'Enter new baseline (e.g., TESTPLAN 1.3.0):', ui.ButtonSet.OK_CANCEL);
-  if (resp.getSelectedButton() !== ui.Button.OK) return;
-  const baseline = resp.getResponseText().trim();
-  sh('requirements').getRange('J1').setValue(baseline);
-  truth_build();
+function buildUrlWithQuery_(base, params) {
+  if (!base) throw new Error('Config.WEBHOOK_URL is required.');
+  const keys = Object.keys(params || {});
+  if (!keys.length) return base;
+  const q = keys.map(k => encodeURIComponent(k) + '=' + encodeURIComponent(params[k])).join('&');
+  return base + (base.includes('?') ? '&' : '?') + q;
 }
 
-// --- Data access -------------------------------------------------------------
-function readTable(tab) {
-  const s = sh(tab);
-  const values = s.getDataRange().getValues();
-  const header = values.shift().map(h => String(h).trim().toLowerCase());
-  return values.filter(r => r.some(c => c !== '' && c != null))
-               .map(row => Object.fromEntries(header.map((h,i) => [h, row[i]])));
+function logRun_(evt) {
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(CFG_DEFAULTS.LOG_SHEET) || ss.insertSheet(CFG_DEFAULTS.LOG_SHEET);
+  sh.appendRow([
+    new Date().toISOString(),
+    evt.sheet || '',
+    evt.rows_sent || 0,
+    evt.bytes_sent || 0,
+    evt.http_code || '',
+    evt.status || '',
+    evt.latency_ms || 0,
+    evt.correlation_id || '',
+    evt.error || '',
+    safeSnippet_(evt.response_snippet || '')
+  ]);
 }
 
-function readSingle(tab) {
-  const rows = readTable(tab);
-  return rows[0] || {};
+function buildCorrelationId_(sheetName) {
+  const rnd = Utilities.getUuid().slice(0,8);
+  return `gsheets/${sheetName}/${Date.now()}/${rnd}`;
 }
 
-function splitCsv(s) {
-  if (!s) return [];
-  return String(s).split(',').map(x => x.trim()).filter(Boolean);
-}
-
-function flattenCsv(rows, field) {
-  return rows.flatMap(r => splitCsv(r[field]));
-}
-
-// --- On-edit guardrails (IDs, enums, changelog) ------------------------------
-function onEdit(e) {
-  try {
-    if (!e || !e.range || !e.range.getSheet()) return;
-    const sheetName = e.range.getSheet().getName();
-    const edited = (e.value || '').toString().trim();
-    const row = e.range.getRow();
-    const col = e.range.getColumn();
-    const header = e.range.getSheet().getRange(1, 1, 1, e.range.getSheet().getLastColumn()).getValues()[0]
-      .map(h => String(h).trim().toLowerCase());
-    const field = header[col-1];
-
-    // ID regex enforcement
-    if (field === 'id') {
-      let ok = true;
-      if (sheetName === 'requirements') ok = /^REQ-[A-Z]+-\d{3}$/.test(edited);
-      if (sheetName === 'test_cases')   ok = /^TC-[A-Z]+-\d{3}$/.test(edited);
-      if (sheetName === 'risks')        ok = /^RISK-[A-Z]+-\d{3}$/.test(edited);
-      if (!ok) {
-        e.range.setBackground('#ffcccc');
-        SpreadsheetApp.getUi().alert(`Invalid ID format on ${sheetName}!`);
-      } else {
-        e.range.setBackground(null);
-      }
-    }
-
-    // Write changelog for significant tabs (skip header row)
-    if (row > 1 && ['requirements','test_cases','risks'].includes(sheetName)) {
-      const idCell = e.range.getSheet().getRange(row, header.indexOf('id')+1).getValue();
-      sh('changelog').appendRow([new Date(), Session.getActiveUser().getEmail(), sheetName, idCell, field, e.oldValue || '', e.value || '']);
-    }
-  } catch (err) {
-    // don’t block edits on errors
-    console.error(err);
+// ===== Utils =====
+function readConfig_() {
+  const ss = SpreadsheetApp.getActive();
+  const cfgSheet = ss.getSheetByName('Config');
+  const cfg = Object.assign({}, CFG_DEFAULTS);
+  if (cfgSheet && cfgSheet.getLastRow() >= 2) {
+    const rows = cfgSheet.getRange(2,1,cfgSheet.getLastRow()-1,2).getValues();
+    rows.forEach(([k,v]) => { if (k) cfg[String(k)] = String(v); });
   }
+  // Script Properties override (optional for secrets)
+  const props = PropertiesService.getScriptProperties().getProperties();
+  Object.keys(props || {}).forEach(k => { if (props[k] != null) cfg[k] = props[k]; });
+  return cfg;
+}
+
+function parseJsonSafe_(s) { try { return s ? JSON.parse(s) : {}; } catch (_){ return {}; } }
+function toBool_(v) { const s = String(v).trim().toLowerCase(); return s==='true'||s==='1'||s==='yes'||s==='y'; }
+function safeSnippet_(txt, max=600) { return txt ? String(txt).slice(0, max) : ''; }
+function getSheetByNameOrThrow_(name) {
+  const sh = SpreadsheetApp.getActive().getSheetByName(name);
+  if (!sh) throw new Error(`Missing sheet: ${name}`);
+  return sh;
 }
