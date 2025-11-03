@@ -2665,6 +2665,13 @@ require 'securerandom'
         { body: 'Runs hard/soft rules and infers coarse intent from headers/auth/keywords.' }
       end,
 
+      config_fields: lambda do |connection|
+        [
+          { name: 'show_advanced', label: 'Show advanced options',
+            type: 'boolean', control_type: 'checkbox',
+            default: false, sticky: true, extends_schema: true }
+        ]
+      end,
       input_fields: lambda do |object_definitions, connection, config_fields|
         adv = (config_fields['show_advanced'] == true)
         base = [
@@ -2781,12 +2788,16 @@ require 'securerandom'
         { body: 'Constrained LLM decides IRRELEVANT/REVIEW/KEEP. Short-circuits only if confident.' }
       end,
 
+      config_fields: lambda do |connection|
+        [
+          { name: 'show_advanced', label: 'Show advanced options',
+            type: 'boolean', control_type: 'checkbox',
+            default: false, sticky: true, extends_schema: true }
+        ]
+      end,
       input_fields: lambda do |object_definitions, connection, config_fields|
         adv = (config_fields['show_advanced'] == true)
         base = [
-          { name: 'show_advanced', type: 'boolean', control_type: 'checkbox',
-            default: false, extends_schema: true, sticky: true },
-
           # A) Message
           { name: 'email_text', optional: false }
         ]
@@ -2798,7 +2809,6 @@ require 'securerandom'
               hint: 'Short-circuit only when decision=IRRELEVANT and confidence ≥ this value.' }
           ]
         else
-          # Keep the safety knob visible by default (optional—remove if you prefer fully minimal base)
           base << { name: 'confidence_short_circuit', type: 'number', optional: true, default: 0.8,
                     hint: 'Short-circuit only when decision=IRRELEVANT and confidence ≥ this value.' }
         end
@@ -2872,15 +2882,18 @@ require 'securerandom'
         { body: 'Embeds email and categories, returns similarity scores and a top-K shortlist.' }
       end,
 
+      config_fields: lambda do |connection|
+        [
+          { name: 'show_advanced', label: 'Show advanced options',
+            type: 'boolean', control_type: 'checkbox',
+            default: false, sticky: true, extends_schema: true }
+        ]
+      end,
       input_fields: lambda do |object_definitions, connection, config_fields|
         adv = (config_fields['show_advanced'] == true)
         base = [
-          { name: 'show_advanced', type: 'boolean', control_type: 'checkbox',
-            default: false, extends_schema: true, sticky: true },
-
           # A) Message
           { name: 'email_text', optional: false },
-
           # B) Categories
           { name: 'categories', type: 'array', of: 'object', optional: false,
             properties: Array(object_definitions['category_def']) }
@@ -2893,6 +2906,7 @@ require 'securerandom'
           ]
         end
         base + Array(object_definitions['observability_input_fields'])
+
       end,
       output_fields: lambda do |object_definitions, _conn|
         [
@@ -2953,12 +2967,16 @@ require 'securerandom'
         { body: 'Uses LLM to produce a probability distribution over the shortlist and re-orders it.' }
       end,
 
+      config_fields: lambda do |connection|
+        [
+          { name: 'show_advanced', label: 'Show advanced options',
+            type: 'boolean', control_type: 'checkbox',
+            default: false, sticky: true, extends_schema: true }
+        ]
+      end,      
       input_fields: lambda do |object_definitions, connection, config_fields|
         adv = (config_fields['show_advanced'] == true)
         base = [
-          { name: 'show_advanced', type: 'boolean', control_type: 'checkbox',
-            default: false, extends_schema: true, sticky: true },
-
           # A) Message
           { name: 'email_text', optional: false },
 
@@ -3030,12 +3048,16 @@ require 'securerandom'
         { body: 'Chooses final category using shortlist + category metadata; can append ranked contexts to the email text.' }
       end,
 
+      config_fields: lambda do |connection|
+        [
+          { name: 'show_advanced', label: 'Show advanced options',
+            type: 'boolean', control_type: 'checkbox',
+            default: false, sticky: true, extends_schema: true }
+        ]
+      end,      
       input_fields: lambda do |object_definitions, connection, config_fields|
         adv = (config_fields['show_advanced'] == true)
         base = [
-          { name: 'show_advanced', type: 'boolean', control_type: 'checkbox',
-            default: false, extends_schema: true, sticky: true },
-
           # A) Message
           { name: 'email_text', optional: false },
 
@@ -3110,6 +3132,13 @@ require 'securerandom'
       display_priority: 500,
       help: lambda do |_|
         { body: 'Retrieves ranked contexts for a query (email text). Accepts thresholds and ranker knobs; no in-action salience.' }
+      end,
+      config_fields: lambda do |connection|
+        [
+          { name: 'show_advanced', label: 'Show advanced options',
+            type: 'boolean', control_type: 'checkbox',
+            default: false, sticky: true, extends_schema: true }
+        ]
       end,
       input_fields: lambda do |object_definitions, connection, config_fields|
         adv = (config_fields['show_advanced'] == true)
