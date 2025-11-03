@@ -1,0 +1,72 @@
+{
+  "hard_exclude": {
+    "headers": [
+      { "operator": "header_present", "pattern": "Auto-Submitted", "action": "exclude" },
+      { "operator": "header_present", "pattern": "List-Unsubscribe", "action": "exclude" },
+      { "operator": "equals", "pattern": "Precedence:bulk", "action": "exclude" },
+      { "operator": "equals", "pattern": "Precedence:list", "action": "exclude" }
+    ],
+    "attachments": [
+      { "operator": "ext_in", "pattern": "ics|vcs", "action": "exclude" }
+    ],
+    "from": [
+      { "operator": "regex", "pattern": "(?i)\\b(no[-_]?reply|do[-_]?not[-_]?reply)@", "action": "exclude" }
+    ],
+    "auth": [
+      { "operator": "is_true", "pattern": "spf_dkim_dmarc_fail", "action": "exclude" }
+    ]
+  },
+
+  "soft_signals": [
+    { "name": "internal_domain", "field": "from", "pattern_type": "contains",
+      "pattern_value": "@company.com|@subsidiary.com", "weight": 3, "cap_per_email": 1 },
+
+    { "name": "help_words_subject", "field": "subject", "pattern_type": "contains",
+      "pattern_value": "help|assist|support|issue|error|problem|request|access|locked out|password|vpn",
+      "weight": 3, "cap_per_email": 2 },
+
+    { "name": "help_words_body", "field": "body", "pattern_type": "contains",
+      "pattern_value": "can you help|please assist|unable to|cannot|can't|locked out|password reset|forgot password|access|vpn|wifi|printer|laptop|bug|error|exception|crash|not working|troubleshoot",
+      "weight": 2, "cap_per_email": 3 },
+
+    { "name": "ticket_id", "field": "body", "pattern_type": "regex",
+      "pattern_value": "(?i)\\b(ticket|case|inc|incident)[ -]?#?\\d{3,8}\\b",
+      "weight": 2, "cap_per_email": 1 },
+
+    { "name": "service_words", "field": "body", "pattern_type": "contains",
+      "pattern_value": "service desk|helpdesk|it support|open a ticket",
+      "weight": 2, "cap_per_email": 1 },
+
+    { "name": "screenshots", "field": "attachments", "pattern_type": "ext_in",
+      "pattern_value": "png|jpg|jpeg|gif", "weight": 2, "cap_per_email": 2 },
+
+    { "name": "logs", "field": "attachments", "pattern_type": "ext_in",
+      "pattern_value": "txt|log|zip|har|pcap", "weight": 2, "cap_per_email": 2 },
+
+    { "name": "internal_systems", "field": "body", "pattern_type": "contains",
+      "pattern_value": "okta|sso|vpn|jira|confluence|slack|outlook|google workspace|drive|printer|wifi",
+      "weight": 1, "cap_per_email": 2 },
+
+    { "name": "time_pressure", "field": "body", "pattern_type": "contains",
+      "pattern_value": "urgently|asap|blocked|cannot proceed|production down|sev",
+      "weight": 1, "cap_per_email": 1 },
+
+    { "name": "anti_marketing_header", "field": "headers", "pattern_type": "header_present",
+      "pattern_value": "List-Id", "weight": -2, "cap_per_email": 1 }
+  ],
+
+  "thresholds": { "keep": 6, "triage_min": 4, "triage_max": 5 },
+
+  "guards": {
+    "HR-Request": {
+      "required": [ "(?i)(onboarding|benefits|pto|leave|payroll|badge|equipment|manager approval|expense)" ],
+      "forbidden": [ "(?i)(invoice|quote|pricing|order|refund|subscription)" ],
+      "flags": { "employee": true }
+    },
+    "Tech Support": {
+      "required": [ "(?i)(error|issue|bug|crash|exception|not\\s*working|unable|cannot|locked\\s*out|password|login|vpn|network|printer|wifi)" ],
+      "forbidden": [ "(?i)(invoice|quote|pricing|refund|marketing|unsubscribe)" ],
+      "flags": {}
+    }
+  }
+}
