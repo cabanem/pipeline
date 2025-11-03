@@ -328,7 +328,7 @@ require 'securerandom'
         ]
       end
     },
-    envelope_fields: {
+    envelope_fields_1: {
       fields: lambda do |_connection, _config_fields|
         [
           { name: 'ok', type: 'boolean' },
@@ -356,6 +356,107 @@ require 'securerandom'
         [
           { name: 'key' },
           { name: 'value' }
+        ]
+      end
+    },
+    # Shared envelope for all action outputs (ok, telemetry, optional debug)
+    envelope_fields: {
+      fields: lambda do |_connection, _config_fields|
+        [
+          { name: 'ok', type: 'boolean' },
+          { name: 'telemetry', type: 'object', properties: [
+              { name: 'http_status',  type: 'integer' },
+              { name: 'message' },
+              { name: 'duration_ms',  type: 'integer' },
+              { name: 'correlation_id' },
+              { name: 'facets',       type: 'object' }
+            ]
+          },
+          { name: 'debug', type: 'object', optional: true }
+        ]
+      end
+    },
+    # Tiny reusable input group for observability
+    observability_input_fields: {
+      fields: lambda do |_connection, _config_fields|
+        [
+          { name: 'correlation_id', label: 'Correlation ID', sticky: true, optional: true,
+            hint: 'Sticky ID for stitching logs/metrics across steps.' },
+          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true,
+            hint: 'Adds request/response preview to output in non-prod connections.' }
+        ]
+      end
+    }, 
+    email_envelope: {
+      fields: lambda do |_connection, _config_fields|
+        [
+          { name: 'subject' }, { name: 'body' }, { name: 'from' },
+          { name: 'headers', type: 'object' },
+          { name: 'attachments', type: 'array', of: 'object', properties: [
+              { name: 'filename' }, { name: 'mimeType' }, { name: 'size' }
+          ]},
+          { name: 'auth', type: 'object' }
+        ]
+      end
+    },
+    category_def: {
+      fields: lambda do |_connection, _config_fields|
+        [
+          { name: 'name', optional: false },
+          { name: 'description' },
+          { name: 'examples', type: 'array', of: 'string' }
+        ]
+      end
+    },
+    rule_rows_table: {
+      fields: lambda do |_connection, _config_fields|
+        [
+          { name: 'rule_id' }, { name: 'family' }, { name: 'field' }, { name: 'operator' },
+          { name: 'pattern' }, { name: 'weight' }, { name: 'action' }, { name: 'cap_per_email' },
+          { name: 'category' }, { name: 'flag_a' }, { name: 'flag_b' },
+          { name: 'enabled' }, { name: 'priority' }, { name: 'notes' }
+        ]
+      end
+    },
+    rulepack_compiled: {
+      fields: lambda do |_connection, _config_fields|
+        [
+          { name: 'hard_exclude', type: 'object' },
+          { name: 'soft_signals', type: 'array', of: 'object' },
+          { name: 'thresholds',   type: 'object' },
+          { name: 'guards',       type: 'object' }
+        ]
+      end
+    },
+    contexts_ranked: {
+      fields: lambda do |_connection, _config_fields|
+        [
+          { name: 'id' }, { name: 'text' }, { name: 'score', type: 'number' },
+          { name: 'source' }, { name: 'uri' }, { name: 'metadata', type: 'object' }
+        ]
+      end
+    },
+    intent_out: {
+      fields: lambda do |_connection, _config_fields|
+        [ { name: 'label' }, { name: 'confidence', type: 'number' }, { name: 'basis' } ]
+      end
+    },
+    policy_out: {
+      fields: lambda do |_connection, _config_fields|
+        [
+          { name: 'decision' }, { name: 'confidence', type: 'number' },
+          { name: 'matched_signals', type: 'array', of: 'string' },
+          { name: 'reasons', type: 'array', of: 'string' }
+        ]
+      end
+    },
+    referee_out: {
+      fields: lambda do |_connection, _config_fields|
+        [
+          { name: 'category' }, { name: 'confidence', type: 'number' }, { name: 'reasoning' },
+          { name: 'distribution', type: 'array', of: 'object', properties: [
+              { name: 'category' }, { name: 'prob', type: 'number' }
+          ]}
         ]
       end
     },
@@ -391,8 +492,6 @@ require 'securerandom'
 
   # --------- ACTIONS ------------------------------------------------------
   actions: {
-
-    # 1) Email categorization
     gen_categorize_email: {
       title: 'Email: Categorize email',
       subtitle: 'Classify an email into a category',
@@ -410,7 +509,7 @@ require 'securerandom'
 
       input_fields: lambda do |object_definitions, connection, config_fields|
         [
-          { name: 'show_advanced', label: 'Show advanced options',
+          { name: 'show_advanced', label: 'Show advanced options', extends_schema: true,
             type: 'boolean', control_type: 'checkbox', optional: true, default: false },
 
           # === (A) Message -------------------------------------------------
@@ -531,7 +630,394 @@ require 'securerandom'
               { name: 'salient_span' },
               { name: 'reason' },
               { name: 'importance', type: 'number' }]},
-        ] + Array(object_definitions['envelope_fields'])
+        ] + Array(object_definitions['envelope_fields_1'])
+      end,
+      execute: lambda do |connection, input|
+        # 1. Invariants
+        started_at = Time.now.utc.iso8601 # for logging
+        t0   = Time.now
+        cid = call(:ensure_correlation_id!, input)
+        
+        url = nil; req_body = nil
+        begin
+          # 1a. Compile rulepack from Workato-native table (if provided)
+          rules =
+            if input['rules_json'].present?
+              call(:safe_json, input['rules_json'])
+            elsif Array(input['rules_rows']).any?
+              call(:hr_compile_rulepack_from_rows!, input['rules_rows'])
+            else
+              nil
+            end
+          # 2. Build the request
+          subj = (input['subject'] || '').to_s.strip
+          body = (input['body']    || '').to_s.strip
+          error('Provide subject and/or body') if subj.empty? && body.empty?
+
+          # Salience: accept caller-provided span; no in-action extraction
+          preproc = nil
+          if input['salient_span'].to_s.strip.length > 0
+            preproc = {
+              'salient_span' => input['salient_span'].to_s,
+              'reason'       => (input['salience_reason'].presence || nil),
+              'importance'   => (input['salience_importance'].nil? ? nil : input['salience_importance'].to_f)
+            }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
+          end
+
+          email_text =
+            if preproc && preproc['salient_span'].to_s.strip.length > 0
+              preproc['salient_span'].to_s
+            else
+              call(:build_email_text, subj, body)
+            end
+
+          # 2a. Optional pre-filter using compiled rules (short-circuit irrelevant)
+          if rules.is_a?(Hash)
+            hard_pack = rules['hard_exclude'].is_a?(Hash) ? rules['hard_exclude'] : {}
+            soft_pack = rules['soft_signals'].is_a?(Array) ? rules['soft_signals'] : []
+
+            hf = call(:hr_eval_hard?, {
+              'subject' => subj, 'body' => body,
+              'from' => input['from'], 'headers' => input['headers'],
+              'attachments' => input['attachments'], 'auth' => input['auth']
+            }, hard_pack)
+            if hf[:hit]
+              out = {
+                'mode' => (input['mode'] || 'embedding'),
+                'chosen' => (input['fallback_category'].presence || 'Irrelevant'),
+                'confidence' => 0.0,
+                'pre_filter' => hf
+              }.merge(call(:telemetry_envelope, t0, cid, true, 200, 'OK'))
+              facets = call(:compute_facets_for!, 'gen_categorize_email', out, { 'decision' => 'IRRELEVANT' })
+              (out['telemetry'] ||= {})['facets'] = facets
+              return call(:local_log_attach!, out,
+                call(:local_log_entry, :gen_categorize_email, started_at, t0, out, nil, { 'pre_filter' => hf, 'facets' => facets }))
+            end
+
+            ss = call(:hr_eval_soft, {
+              'subject' => subj, 'body' => body,
+              'from' => input['from'], 'headers' => input['headers'], 'attachments' => input['attachments']
+            }, soft_pack)
+            decision = call(:hr_eval_decide, ss[:score], (rules['thresholds'].is_a?(Hash) ? rules['thresholds'] : {}))
+            if decision == 'IRRELEVANT'
+              out = {
+                'mode' => (input['mode'] || 'embedding'),
+                'chosen' => (input['fallback_category'].presence || 'Irrelevant'),
+                'confidence' => 0.0,
+                'pre_filter' => { 'score' => ss[:score], 'matched_signals' => ss[:matched], 'decision' => decision }
+              }.merge(call(:telemetry_envelope, t0, cid, true, 200, 'OK'))
+              facets = call(:compute_facets_for!, 'gen_categorize_email', out, { 'decision' => 'IRRELEVANT' })
+              (out['telemetry'] ||= {})['facets'] = facets
+              return call(:local_log_attach!, out,
+                call(:local_log_entry, :gen_categorize_email, started_at, t0, out, nil, { 'pre_filter' => out['pre_filter'], 'facets' => facets }))
+            end
+            # REVIEW path: continue to normal classification; you already expose chosen/confidence downstream
+          end
+          # Normalize categories
+          raw_cats = input['categories']
+          cats = call(:safe_array, raw_cats).map { |c|
+            if c.is_a?(String)
+              { 'name' => c, 'description' => nil, 'examples' => [] }
+            else
+              { 'name' => c['name'] || c[:name],
+                'description' => c['description'] || c[:description],
+                'examples' => call(:safe_array, (c['examples'] || c[:examples])) }
+            end
+          }.select { |c| c['name'].present? }
+          error('At least 2 categories are required') if cats.length < 2
+
+          mode      = (input['mode'] || 'embedding').to_s.downcase
+          min_conf  = (input['min_confidence'].presence || 0.25).to_f
+
+          result = nil
+
+          if %w[embedding hybrid].include?(mode)
+            emb_model      = (input['embedding_model'].presence || 'text-embedding-005')
+            emb_model_path = call(:build_embedding_model_path, connection, emb_model)
+
+            email_inst = { 'content' => email_text, 'task_type' => 'RETRIEVAL_QUERY' }
+            cat_insts  = cats.map do |c|
+              txt = [c['name'], c['description'], *(c['examples'] || [])].compact.join("\n")
+              { 'content' => txt, 'task_type' => 'RETRIEVAL_DOCUMENT' }
+            end
+
+            emb_resp = call(:predict_embeddings, connection, emb_model_path, [email_inst] + cat_insts, {}, cid)
+            preds    = call(:safe_array, emb_resp && emb_resp['predictions'])
+            error('Embedding model returned no predictions') if preds.empty?
+
+            email_vec = call(:extract_embedding_vector, preds.first)
+            cat_vecs  = preds.drop(1).map { |p| call(:extract_embedding_vector, p) }
+
+            sims = cat_vecs.each_with_index.map { |v, i| [i, call(:vector_cosine_similarity, email_vec, v)] }
+            sims.sort_by! { |(_i, s)| -s }
+
+            scores     = sims.map { |(i, s)| { 'category' => cats[i]['name'], 'score' => (((s + 1.0) / 2.0).round(6)), 'cosine' => s.round(6) } }
+            top        = scores.first
+            chosen     = top['category']
+            confidence = top['score']
+
+            chosen = input['fallback_category'] if confidence < min_conf && input['fallback_category'].present?
+
+            result = {
+              'mode'       => mode,
+              'chosen'     => chosen,
+              'confidence' => confidence.round(4),
+              'scores'     => scores
+            }
+
+            if (mode == 'hybrid' || input['return_explanation']) && input['generative_model'].present?
+              top_k     = [[(input['top_k'] || 3).to_i, 1].max, cats.length].min
+              shortlist = scores.first(top_k).map { |h| h['category'] }
+              referee   = call(:llm_referee, connection, input['generative_model'], email_text, shortlist, cats, input['fallback_category'], cid, (input['referee_system_preamble'].presence || nil))
+              result['referee'] = referee
+
+              if referee['category'].present? && shortlist.include?(referee['category'])
+                result['chosen']     = referee['category']
+                result['confidence'] = [result['confidence'], referee['confidence']].compact.max
+              end
+              if result['confidence'].to_f < min_conf && input['fallback_category'].present?
+                result['chosen'] = input['fallback_category']
+              end
+            end
+
+          elsif mode == 'generative'
+            error('generative_model is required when mode=generative') if input['generative_model'].blank?
+            referee = call(:llm_referee, connection, input['generative_model'], email_text, cats.map { |c| c['name'] }, cats, input['fallback_category'], cid, (input['referee_system_preamble'].presence || nil))
+            chosen =
+              if referee['confidence'].to_f < min_conf && input['fallback_category'].present?
+                input['fallback_category']
+              else
+                referee['category']
+              end
+
+            result = {
+              'mode'       => mode,
+              'chosen'     => chosen,
+              'confidence' => referee['confidence'],
+              'referee'    => referee
+            }
+
+          else
+            error("Unknown mode: #{mode}")
+          end
+
+          # Post-processing / salience blend & attachments
+          if preproc && preproc['importance']
+            blend = [[(input['confidence_blend'] || 0.15).to_f, 0.0].max, 0.5].min
+            result['confidence'] = [[result['confidence'].to_f + blend * (preproc['importance'].to_f - 0.5), 0.0].max, 1.0].min
+          end
+          result['preproc'] = preproc if preproc
+          
+          # Attach telemetry envelope
+          result = result.merge(call(:telemetry_envelope, t0, cid, true, 200, 'OK'))
+
+          # Facets (compact metrics block) + local log
+          facets = call(:compute_facets_for!, 'gen_categorize_email', result)
+          (result['telemetry'] ||= {})['facets'] = facets
+          call(:local_log_attach!, result,
+            call(:local_log_entry, :gen_categorize_email, started_at, t0, result, nil, {
+              'category'   => result['chosen'],
+              'confidence' => result['confidence'],
+              'facets'     => facets
+            }))
+
+          result
+        rescue => e
+          # Extract Google error
+          g   = call(:extract_google_error, e)
+          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
+
+          # Construct telmetry envelope
+          env = call(:telemetry_envelope, t0, cid, false, call(:telemetry_parse_error_code, e), msg)
+
+          # Construct and emit debug attachment, as applicable
+          if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
+            env['debug'] = call(:debug_pack, true, url, req_body, g)
+          end
+
+          call(:local_log_attach!, env,
+              call(:local_log_entry, :gen_categorize_email, started_at, t0, nil, e, {
+                'google_error' => g
+              }))
+
+          error(env)
+        end
+      end,
+      sample_output: lambda do
+        {
+          'mode' => 'embedding',
+          'chosen' => 'Billing',
+          'confidence' => 0.91,
+          'pre_filter' => {
+            'score' => 5,
+            'matched_signals' => ['mentions_invoice', 'payment_terms'],
+            'decision' => 'REVIEW'
+          },
+          'scores' => [
+            { 'category' => 'Billing', 'score' => 0.91, 'cosine' => 0.82 },
+            { 'category' => 'Tech Support', 'score' => 0.47, 'cosine' => -0.06 },
+            { 'category' => 'Sales', 'score' => 0.41, 'cosine' => -0.18 }
+          ],
+          'referee' => {
+            'category' => 'Billing',
+            'confidence' => 0.86,
+            'reasoning' => 'Mentions invoice #4411, past‑due payment, and refund request.',
+            'distribution' => [
+              { 'category' => 'Billing', 'prob' => 0.86 },
+              { 'category' => 'Tech Support', 'prob' => 0.10 },
+              { 'category' => 'Sales', 'prob' => 0.04 }
+            ]
+          },
+          'ok' => true,
+          'telemetry' => {
+            'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr',
+            'facets' => {
+              'confidence' => 0.91
+            }
+          }
+        }
+      end
+    },
+    # 1) Email categorization
+    gen_categorize_email: {
+      title: 'Email: Categorize email',
+      subtitle: 'Classify an email into a category',
+      help: lambda do |input, picklist_label|
+        {
+          body: 'Classify an email into one of the provided categories using embeddings (default) or a generative referee.',
+          learn_more_url: 'https://ai.google.dev/gemini-api/docs/models',
+          learn_more_text: 'Find a current list of available Gemini models'
+        }
+      end,
+      display_priority: 100,
+      retry_on_request: ['GET', 'HEAD'],
+      retry_on_response: [408, 429, 500, 502, 503, 504],
+      max_retries: 3,
+
+      input_fields: lambda do |object_definitions, connection, config_fields|
+        [
+          { name: 'show_advanced', label: 'Show advanced options', extends_schema: true,
+            type: 'boolean', control_type: 'checkbox', optional: true, default: false },
+
+          # === (A) Message -------------------------------------------------
+          { name: 'subject', label: 'Email subject', optional: true },
+          { name: 'body',    label: 'Email body (text/HTML ok)', optional: true },
+          # Advanced: email metadata for rules/pre-filter
+          { name: 'from',    optional: true, ngIf: 'input.show_advanced == true',
+            hint: 'Sender email; used by rules and heuristics.' },
+          { name: 'headers', type: 'object', optional: true, ngIf: 'input.show_advanced == true',
+            hint: 'Key→value map. Ex: Content-Type, List-Unsubscribe.' },
+          { name: 'attachments', type: 'array', of: 'object', optional: true, ngIf: 'input.show_advanced == true',
+            properties: [{ name: 'filename' }, { name: 'mimeType' }, { name: 'size' }],
+            hint: 'Attachment list used by ext_in rules.' },
+          { name: 'auth', type: 'object', optional: true, ngIf: 'input.show_advanced == true',
+            hint: 'Auth flags, e.g., spf_dkim_dmarc_fail: true.' },
+
+          # === (B) Categories ---------------------------------------------
+          { name: 'categories', label: 'Categories', optional: false, type: 'array', of: 'object',
+            properties: [{ name: 'name', optional: false }, { name: 'description' },
+                         { name: 'examples', type: 'array', of: 'string' }],
+            hint: 'Provide ≥2. Strings allowed (names only).' },
+
+          # === (C) Mode & Models ------------------------------------------
+          { name: 'mode', control_type: 'select', pick_list: 'modes_classification',
+            optional: false, default: 'embedding',
+            hint: 'embedding (deterministic), generative, or hybrid.' },
+          { name: 'embedding_model', label: 'Embedding model', control_type: 'text',
+            optional: true, default: 'text-embedding-005',
+            ngIf: 'input.mode != "generative"' },
+          { name: 'generative_model', label: 'Generative model', control_type: 'text',
+            optional: true, ngIf: 'input.mode != "embedding"',
+            hint: 'Gemini model for referee or pure generative mode.' },
+          { name: 'referee_system_preamble', label: 'Referee system preamble',
+            optional: true, ngIf: 'input.show_advanced == true && input.mode != "embedding"',
+            hint: 'Override the built-in strict JSON classifier preamble.' },
+
+          # === (D) Salience (optional) ------------------------------------
+          # Caller-supplied salience only (no in-action extraction)
+          { name: 'salient_span', label: 'Pre-extracted salient span',
+            optional: true,
+            hint: 'If provided, classification uses this span instead of full email.' },
+          { name: 'salience_importance', label: 'Salience importance (0–1)',
+            type: 'number', optional: true,
+            hint: 'Optional; used for confidence blending.' },
+          { name: 'salience_reason', label: 'Salience reason',
+            optional: true,
+            hint: 'Optional note describing why this span was chosen.' },
+
+          # === (E) Rules (optional) ---------------------------------------
+          { name: 'rules_mode', label: 'Rules mode',
+            control_type: 'select', optional: true, default: 'none',
+            pick_list: 'rules_modes', # stub below
+            hint: 'Choose none / single-table rows / compiled JSON.' },
+          { name: 'rules_rows', label: 'Rules (single-table rows)',
+            optional: true, ngIf: 'input.rules_mode == "rows"',
+            hint: 'Bind Lookup Table rows or enter rows manually.',
+            type: 'array', of: 'object', properties: [
+              { name: 'rule_id' }, { name: 'family' }, { name: 'field' }, { name: 'operator' },
+              { name: 'pattern' }, { name: 'weight' }, { name: 'action' }, { name: 'cap_per_email' },
+              { name: 'category' }, { name: 'flag_a' }, { name: 'flag_b' },
+              { name: 'enabled' }, { name: 'priority' }, { name: 'notes' }
+            ]},
+          { name: 'rules_json', label: 'Rules (compiled JSON)',
+            optional: true, ngIf: 'input.rules_mode == "json"',
+            hint: 'If present, overrides rows.' },
+
+          # === (F) Decision & Fallbacks -----------------------------------
+          { name: 'min_confidence', label: 'Minimum confidence',
+            type: 'number', optional: true, default: 0.25,
+            hint: '0–1. Below this, fallback is used.' },
+          { name: 'fallback_category', label: 'Fallback category',
+            optional: true, default: 'Other' },
+          { name: 'top_k', label: 'Referee shortlist (top-K)',
+            type: 'integer', optional: true, default: 3,
+            ngIf: 'input.mode == "hybrid" || (input.mode != "embedding" && input.show_advanced == true)',
+            hint: 'How many candidates to pass to LLM referee.' },
+          { name: 'return_explanation', label: 'Return explanation',
+            type: 'boolean', control_type: 'checkbox', optional: true, default: false,
+            ngIf: 'input.mode != "embedding"',
+            hint: 'If true and a generative model is set, return reasoning.' },
+
+          # === (G) Observability ------------------------------------------
+          { name: 'correlation_id', label: 'Correlation ID',
+            optional: true, sticky: true,
+            hint: 'Use a sticky ID to stitch logs/metrics.' },
+          { name: 'debug', label: 'Debug (non-prod only)',
+            type: 'boolean', control_type: 'checkbox', optional: true,
+            ngIf: 'input.show_advanced == true',
+            hint: 'Adds request/response preview to output when not in prod.' }
+        ]
+      end,
+      output_fields: lambda do |object_definitions, connection|
+        [
+          { name: 'mode' },
+          { name: 'chosen' },
+          { name: 'confidence', type: 'number' },
+          { name: 'scores', type: 'array', of: 'object', properties: [
+              { name: 'category' }, { name: 'score', type: 'number' }, { name: 'cosine', type: 'number' }
+            ]
+          },
+          # Pre-filter outcome (hard exclude or soft signals triage). Optional.
+          { name: 'pre_filter', type: 'object', properties: [
+              { name: 'hit', type: 'boolean' },
+              { name: 'action' },
+              { name: 'reason' },
+              { name: 'score', type: 'number' },
+              { name: 'matched_signals', type: 'array', of: 'string' },
+              { name: 'decision' }
+            ]
+          },
+          { name: 'referee', type: 'object', properties: [
+              { name: 'category' }, { name: 'confidence', type: 'number' }, { name: 'reasoning' },
+              { name: 'distribution', type: 'array', of: 'object', properties: [
+                  { name: 'category' }, { name: 'prob', type: 'number' } ] }
+            ]},
+          { name: 'preproc', type: 'object', properties: [
+              { name: 'focus_preview' },
+              { name: 'salient_span' },
+              { name: 'reason' },
+              { name: 'importance', type: 'number' }]},
+        ] + Array(object_definitions['envelope_fields_1'])
       end,
       execute: lambda do |connection, input|
         # 1. Invariants
@@ -921,7 +1407,7 @@ require 'securerandom'
           url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
           req_params = "model=#{model_path}"
           req_body = call(:json_compact, payload)
-          resp = post(url).headers(call(:request_headers_auth, connection, cid, connection['user_project'], req_params)).payload(req_body)
+          resp = post(url).headers(call(:request_headers_auth_1, connection, cid, connection['user_project'], req_params)).payload(req_body)
 
           text   = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
           parsed = call(:safe_parse_json, text)
@@ -1023,7 +1509,7 @@ require 'securerandom'
                   { name: 'chunk_id' }, { name: 'source' }, { name: 'uri' }, { name: 'score', type: 'number' }
               ]}
           ]}
-        ] + Array(od['envelope_fields'])
+        ] + Array(od['envelope_fields_1'])
       end,
       execute: lambda do |connection, raw_input|
         started_at = Time.now.utc.iso8601
@@ -1125,7 +1611,7 @@ require 'securerandom'
               { name: 'metadata_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] },
               { name: 'metadata_json' }
             ] }
-        ] + Array(object_definitions['envelope_fields'])
+        ] + Array(object_definitions['envelope_fields_1'])
       end,
       execute: lambda do |connection, input|
         started_at = Time.now.utc.iso8601
@@ -1177,7 +1663,7 @@ require 'securerandom'
 
         begin
         resp = post(url)
-                 .headers(call(:request_headers_auth, connection, cid, connection['user_project'], req_params))
+                 .headers(call(:request_headers_auth_1, connection, cid, connection['user_project'], req_params))
                  .payload(req_body)
 
         code = call(:telemetry_success_code, resp)
@@ -1527,7 +2013,7 @@ require 'securerandom'
         retr_url      = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
         retr_req_body = call(:json_compact, retrieve_payload)
         retr_resp = post(retr_url)
-                      .headers(call(:request_headers_auth, connection, cid, nil, req_params_re))
+                      .headers(call(:request_headers_auth_1, connection, cid, nil, req_params_re))
                       .payload(retr_req_body)
         raw_ctxs = call(:normalize_retrieve_contexts!, retr_resp)
 
@@ -1589,7 +2075,7 @@ require 'securerandom'
         gen_req_body = call(:json_compact, gen_payload)
         req_params_g = "model=#{model_path}"
         gen_resp = post(gen_url)
-                    .headers(call(:request_headers_auth, connection, corr, connection['user_project'], req_params_g))
+                    .headers(call(:request_headers_auth_1, connection, corr, connection['user_project'], req_params_g))
                     .payload(gen_req_body)
         text   = gen_resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
         parsed = call(:safe_parse_json, text)
@@ -1645,7 +2131,7 @@ require 'securerandom'
         unless call(:normalize_boolean, connection['prod_mode'])
           if call(:normalize_boolean, input['debug'])
             out = out.merge(call(:request_preview_pack, gen_url, 'POST',
-                                call(:request_headers_auth, connection, cid, connection['user_project'], req_params_g),
+                                call(:request_headers_auth_1, connection, cid, connection['user_project'], req_params_g),
                                 gen_req_body))
           end
         end
@@ -1852,7 +2338,7 @@ require 'securerandom'
           { name: 'totalTokens', type: 'integer' },
           { name: 'totalBillableCharacters', type: 'integer' },
           { name: 'promptTokensDetails', type: 'array', of: 'object' }
-        ] + Array(object_definitions['envelope_fields'])
+        ] + Array(object_definitions['envelope_fields_1'])
       end,
       execute:  lambda do |connection, input|
         # Correlation id and duration for logs / analytics
@@ -1878,7 +2364,7 @@ require 'securerandom'
             'systemInstruction' => sys_inst
           })
           resp = post(url)
-                    .headers(call(:request_headers_auth, connection, cid, connection['user_project'], "model=#{model_path}"))
+                    .headers(call(:request_headers_auth_1, connection, cid, connection['user_project'], "model=#{model_path}"))
                     .payload(req_body)
           code = call(:telemetry_success_code, resp)
           result = resp.merge(call(:telemetry_envelope, t0, cid, true, code, 'OK'))
@@ -1973,7 +2459,7 @@ require 'securerandom'
           op = input['operation'].to_s.sub(%r{^/v1/}, '')
           loc = (connection['location'].presence || 'us-central1').to_s.downcase
           url = call(:aipl_v1_url, connection, loc, op.start_with?('projects/') ? op : "projects/#{connection['project_id']}/locations/#{loc}/operations/#{op}")
-          resp = get(url).headers(call(:request_headers_auth, connection, cid, connection['user_project'], nil))
+          resp = get(url).headers(call(:request_headers_auth_1, connection, cid, connection['user_project'], nil))
           code = call(:telemetry_success_code, resp)
           result = resp.merge(call(:telemetry_envelope, t0, cid, true, code, 'OK'))
 
@@ -2168,6 +2654,497 @@ require 'securerandom'
           'table'        => table
         }
       end
+    },
+
+    # NEW
+    deterministic_filter: {
+      title: 'Filter: Deterministic (with intent)',
+      subtitle: 'Hard/soft rules + lightweight intent inference',
+      display_priority: 500,
+      help: lambda do |_|
+        { body: 'Runs hard/soft rules and infers coarse intent from headers/auth/keywords.' }
+      end,
+
+      input_fields: lambda do |object_definitions, connection, config_fields|
+        [
+          { name: 'show_advanced', type: 'boolean', control_type: 'checkbox', default: false },
+
+          # A) Message
+          { name: 'email', label: 'Email', type: 'object',
+            properties: Array(object_definitions['email_envelope']), optional: false },
+
+          # B) Rules (optional)
+          { name: 'rules_mode', control_type: 'select', default: 'none', pick_list: 'rules_modes' },
+          { name: 'rules_rows', ngIf: 'input.rules_mode == "rows"',
+            type: 'array', of: 'object', properties: Array(object_definitions['rule_rows_table']), optional: true },
+          { name: 'rules_json', ngIf: 'input.rules_mode == "json"', optional: true },
+
+          # C) Fallbacks
+          { name: 'fallback_category', optional: true, default: 'Other' }
+        ] + Array(object_definitions['observability_input_fields'])
+      end,
+      output_fields: lambda do |object_definitions, connection|
+        [
+          { name: 'pre_filter', type: 'object', properties: [
+              { name: 'hit', type: 'boolean' }, { name: 'action' }, { name: 'reason' },
+              { name: 'score', type: 'integer' }, { name: 'matched_signals', type: 'array', of: 'string' },
+              { name: 'decision' }
+          ]},
+          { name: 'intent', type: 'object', properties: Array(object_definitions['intent_out']) },
+          { name: 'email_text' }
+        ] + Array(object_definitions['envelope_fields'])
+      end,
+
+      execute: lambda do |connection, input|
+        ctx = call(:step_begin!, :deterministic_filter, input)
+
+        env = call(:norm_email_envelope!, (input['email'] || input))
+        subj, body, email_text = env['subject'], env['body'], env['email_text']
+        #subj = (input['subject'] || '').to_s.strip
+        #body = (input['body']    || '').to_s.strip
+        #error('Provide subject and/or body') if subj.empty? && body.empty?
+        #email_text = call(:build_email_text, subj, body)
+
+        # Build/choose rulepack
+        rules =
+          if input['rules_mode'] == 'json' && input['rules_json'].present?
+            call(:safe_json, input['rules_json'])
+          elsif input['rules_mode'] == 'rows' && Array(input['rules_rows']).any?
+            call(:hr_compile_rulepack_from_rows!, input['rules_rows'])
+          else
+            nil
+          end
+
+        pre = { hit => false }
+        if rules.is_a?(Hash)
+          hard = call(:hr_eval_hard?, {
+            'subject'=>subj, 'body'=>body, 'from'=>env['from'],
+            'headers'=>env['headers'], 'attachments'=>env['attachments'], 'auth'=>env['auth']
+          }, (rules['hard_exclude'] || {}))
+
+          if hard[:hit]
+            out = {
+              'pre_filter' => hard.merge({ 'decision' => 'IRRELEVANT' }),
+              'intent'     => nil,
+              'email_text' => email_text
+            }
+            return call(:step_ok!, ctx, out, 200, 'OK', { 'decision'=>'HARD_EXIT' })
+          end
+
+          soft = call(:hr_eval_soft, {
+            'subject'=>subj, 'body'=>body, 'from'=>env['from'],
+            'headers'=>env['headers'], 'attachments'=>env['attachments']
+          }, (rules['soft_signals'] || []))
+          decision = call(:hr_eval_decide, soft[:score], (rules['thresholds'] || {}))
+          pre = { 'hit'=>false, 'score'=>soft[:score], 'matched_signals'=>soft[:matched], 'decision'=>decision }
+        end
+
+        # Lightweight intent (deterministic)
+        headers = (env['headers'] || {}).transform_keys(&:to_s)
+        s = "#{subj}\n\n#{body}".downcase
+        intent = { 'label' => 'unknown', 'confidence' => 0.0, 'basis' => 'deterministic' }
+        if headers['auto-submitted'].to_s.downcase != '' && headers['auto-submitted'].to_s.downcase != 'no'
+          intent = { 'label'=>'auto_reply','confidence'=>0.95,'basis'=>'header:auto-submitted' }
+        elsif headers.key?('x-autoreply') || s =~ /(out of office|auto.?reply|automatic reply)/
+          intent = { 'label'=>'auto_reply','confidence'=>0.9,'basis'=>'header/subject' }
+        elsif headers.key?('list-unsubscribe') || headers.key?('list-id') || headers['precedence'].to_s =~ /(bulk|list)/i
+          intent = { 'label'=>'marketing','confidence'=>0.8,'basis'=>'list-headers' }
+        elsif s =~ /(invoice|receipt|order\s?#|shipment|ticket\s?#)/i
+          intent = { 'label'=>'transactional','confidence'=>0.7,'basis'=>'keywords' }
+        end
+
+        out = {
+          'pre_filter' => pre,
+          'intent'     => intent,
+          'email_text' => email_text
+        }
+        call(:step_ok!, ctx, out, 200, 'OK', { 'intent'=>intent['label'] })
+
+      end,
+      sample_output: lambda do
+        {
+          'pre_filter' => { 'hit'=>false, 'score'=>3, 'matched_signals'=>['mentions_invoice'], 'decision'=>'REVIEW' },
+          'intent'     => { 'label'=>'transactional','confidence'=>0.7,'basis'=>'keywords' },
+          'email_text' => "Subject: ...\n\nBody:\n..."
+        }.merge({ 'ok'=>true, 'telemetry'=>{ 'http_status'=>200, 'message'=>'OK', 'duration_ms'=>12, 'correlation_id'=>'corr' } })
+      end
+    },
+    # --- AI policy filter (LLM, strict JSON) -----------------------------------
+    ai_policy_filter: {
+      title: 'Filter: AI policy (optional)',
+      subtitle: 'Fuzzy triage via LLM under a strict JSON schema',
+      display_priority: 500,
+      help: lambda do |_|
+        { body: 'Constrained LLM decides IRRELEVANT/REVIEW/KEEP. Short-circuits only if confident.' }
+      end,
+
+      input_fields: lambda do |object_definitions, connection, config_fields|
+        [
+          { name: 'show_advanced', type: 'boolean', control_type: 'checkbox', default: false },
+
+          # A) Message
+          { name: 'email_text', optional: false },
+
+          # B) Policy knobs
+          { name: 'model', label: 'Generative model', control_type: 'text', optional: true, default: 'gemini-2.0-flash' },
+          { name: 'confidence_short_circuit', type: 'number', optional: true, default: 0.8,
+            hint: 'Short-circuit only when decision=IRRELEVANT and confidence ≥ this value.' }
+        ] + Array(object_definitions['observability_input_fields'])
+      end,
+      output_fields: lambda do |object_definitions, connection|
+        [
+          { name: 'policy', type: 'object', properties: Array(object_definitions['policy_out']) },
+          { name: 'short_circuit', type: 'boolean' }
+        ] + Array(object_definitions['envelope_fields'])
+      end,
+
+      execute: lambda do |connection, input|
+        ctx = call(:step_begin!, :ai_policy_filter, input)
+        model_path = call(:build_model_path_with_global_preview, connection, (input['model'] || 'gemini-2.0-flash'))
+        loc  = (model_path[/\/locations\/([^\/]+)/,1] || (connection['location'].presence || 'global')).to_s.downcase
+        url  = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
+        req_params = "model=#{model_path}"
+
+
+        system_text = <<~SYS
+          You are a strict email policy triage. Output JSON only.
+          decision ∈ {IRRELEVANT, REVIEW, KEEP}. confidence ∈ [0,1].
+          matched_signals is a short list of strings; reasons ≤ 2 brief strings.
+        SYS
+        payload = {
+          'systemInstruction' => { 'role'=>'system','parts'=>[{'text'=>system_text}] },
+          'contents' => [ { 'role'=>'user', 'parts'=>[ { 'text'=> "Email:\n#{input['email_text']}" } ] } ],
+          'generationConfig' => {
+            'temperature'=>0, 'maxOutputTokens'=>256,
+            'responseMimeType'=>'application/json',
+            'responseSchema'=>{
+              'type'=>'object','additionalProperties'=>false,
+              'properties'=>{
+                'decision'=>{'type'=>'string'},
+                'confidence'=>{'type'=>'number'},
+                'matched_signals'=>{'type'=>'array','items'=>{'type'=>'string'}},
+                'reasons'=>{'type'=>'array','items'=>{'type'=>'string'}}
+              }, 'required'=>['decision']
+            }
+          }
+        }
+
+        resp = post(url).headers(call(:request_headers_auth, connection, ctx['cid'], connection['user_project'], req_params))
+                        .payload(call(:json_compact, payload))
+        text = resp.dig('candidates',0,'content','parts',0,'text').to_s
+        policy = call(:safe_parse_json, text)
+
+        short_circuit = (policy['decision'] == 'IRRELEVANT' && policy['confidence'].to_f >= (input['confidence_short_circuit'] || 0.8).to_f)
+
+        out = { 'policy'=>policy, 'short_circuit'=>short_circuit }
+        call(:step_ok!, ctx, out, call(:telemetry_success_code, resp), 'OK',
+          { 'decision'=>policy['decision'], 'conf'=>policy['confidence'] })
+      rescue => e
+        call(:step_err!, ctx, e)
+      end,
+      sample_output: lambda do
+        {
+          'policy'=>{ 'decision'=>'REVIEW','confidence'=>0.62,'matched_signals'=>['low_detail'],'reasons'=>['thin context'] },
+          'short_circuit'=>false, 'ok'=>true,
+          'telemetry'=>{ 'http_status'=>200,'message'=>'OK','duration_ms'=>20,'correlation_id'=>'corr' }
+        }
+      end
+    },
+    # --- Embedder: email vs categories ----------------------------------------
+    embed_text_against_categories: {
+      title: 'Embed: Email vs categories',
+      subtitle: 'Cosine similarity → scores + shortlist',
+      display_priority: 500,
+      help: lambda do |_|
+        { body: 'Embeds email and categories, returns similarity scores and a top-K shortlist.' }
+      end,
+
+      input_fields: lambda do |object_definitions, _conn, _cfg|
+        [
+          { name: 'show_advanced', type: 'boolean', control_type: 'checkbox', default: false },
+
+          # A) Message
+          { name: 'email_text', optional: false },
+
+          # B) Categories
+          { name: 'categories', type: 'array', of: 'object', optional: false,
+            properties: Array(object_definitions['category_def']) },
+
+          # C) Models & knobs
+          { name: 'embedding_model', control_type: 'text', optional: true, default: 'text-embedding-005' },
+          { name: 'shortlist_k', type: 'integer', optional: true, default: 3 }
+        ] + Array(object_definitions['observability_input_fields'])
+      end,
+      output_fields: lambda do |object_definitions, _conn|
+        [
+          { name: 'scores', type: 'array', of: 'object', properties: [
+              { name: 'category' }, { name: 'score', type: 'number' }, { name: 'cosine', type: 'number' }
+          ]},
+          { name: 'shortlist', type: 'array', of: 'string' }
+        ] + Array(object_definitions['envelope_fields'])
+      end,
+
+      execute: lambda do |connection, input|
+        ctx = call(:step_begin!, :embed_text_against_categories, input)
+        cats = call(:norm_categories!, input['categories'])
+
+        emb_model      = (input['embedding_model'].presence || 'text-embedding-005')
+        model_path     = call(:build_embedding_model_path, connection, emb_model)
+
+        email_inst = { 'content'=>input['email_text'].to_s, 'task_type'=>'RETRIEVAL_QUERY' }
+        cat_insts  = cats.map do |c|
+          { 'content'=>[c['name'], c['description'], *call(:safe_array,c['examples'])].compact.join("\n"),
+            'task_type'=>'RETRIEVAL_DOCUMENT' }
+        end
+
+        emb_resp = call(:predict_embeddings, connection, model_path, [email_inst] + cat_insts, {}, ctx['cid'])
+        preds    = call(:safe_array, emb_resp && emb_resp['predictions'])
+        error('Embedding model returned no predictions') if preds.empty?
+
+        email_vec = call(:extract_embedding_vector, preds.first)
+        cat_vecs  = preds.drop(1).map { |p| call(:extract_embedding_vector, p) }
+        sims = cat_vecs.each_with_index.map { |v, i| [i, call(:vector_cosine_similarity, email_vec, v)] }
+        sims.sort_by! { |(_i, s)| -s }
+
+        scores = sims.map { |(i,s)| { 'category'=>cats[i]['name'], 'score'=>(((s+1.0)/2.0).round(6)), 'cosine'=>s.round(6) } }
+        k = [[(input['shortlist_k'] || 3).to_i, 1].max, cats.length].min
+        shortlist = scores.first(k).map { |h| h['category'] }
+
+        out = { 'scores'=>scores, 'shortlist'=>shortlist }
+        call(:step_ok!, ctx, out, 200, 'OK', { 'k'=>k })
+
+      end,
+      sample_output: lambda do
+        {
+          'scores'=>[
+            { 'category'=>'Billing','score'=>0.91,'cosine'=>0.82 },
+            { 'category'=>'Support','score'=>0.47,'cosine'=>-0.06 }
+          ],
+          'shortlist'=>['Billing','Support'],
+          'ok'=>true, 'telemetry'=>{ 'http_status'=>200,'message'=>'OK','duration_ms'=>11,'correlation_id'=>'corr' }
+        }
+      end
+    },
+    # --- Re-ranker: shortlist (LLM distribution) -------------------------------
+    rerank_shortlist: {
+      title: 'Re-rank: Shortlist',
+      subtitle: 'Optional LLM listwise re-ordering of categories',
+      display_priority: 500,
+      help: lambda do |_|
+        { body: 'Uses LLM to produce a probability distribution over the shortlist and re-orders it.' }
+      end,
+
+      input_fields: lambda do |object_definitions, _conn, _cfg|
+        [
+          { name: 'show_advanced', type: 'boolean', control_type: 'checkbox', default: false },
+
+          # A) Message
+          { name: 'email_text', optional: false },
+
+          # B) Categories & shortlist
+          { name: 'categories', type: 'array', of: 'object', optional: false,
+            properties: Array(object_definitions['category_def']) },
+          { name: 'shortlist', type: 'array', of: 'string', optional: false },
+
+          # C) Mode & model
+          { name: 'mode', control_type: 'select', optional: false, default: 'none',
+            options: [['None','none'], ['LLM','llm']] },
+          { name: 'generative_model', control_type: 'text', optional: true, default: 'gemini-2.0-flash',
+            ngIf: 'input.mode == "llm"' }
+        ] + Array(object_definitions['observability_input_fields'])
+      end,
+      output_fields: lambda do |object_definitions, connection|
+        [
+          { name: 'ranking', type: 'array', of: 'object', properties: [
+              { name: 'category' }, { name: 'prob', type: 'number' }
+          ]},
+          { name: 'shortlist', type: 'array', of: 'string' }
+        ] + Array(object_definitions['envelope_fields'])
+      end,
+
+      execute: lambda do |connection, input|
+        ctx = call(:step_begin!, :rerank_shortlist, input)
+        mode = (input['mode'] || 'none').to_s
+
+        if mode == 'none'
+          sl = call(:safe_array, input['shortlist'])
+          ranking = sl.map { |c| { 'category'=>c, 'prob'=>nil } }
+          out = { 'ranking'=>ranking, 'shortlist'=>sl }
+          return call(:step_ok!, ctx, out, 200, 'OK', { 'mode'=>'none' })
+        end
+
+        # LLM listwise: reuse your referee to get distribution over shortlist
+        cats = call(:norm_categories!, input['categories'])
+        ref  = call(:llm_referee, connection, (input['generative_model'] || 'gemini-2.0-flash'),
+                    input['email_text'], call(:safe_array, input['shortlist']), cats, nil, ctx['cid'], nil)
+        dist = call(:safe_array, ref['distribution']).map { |d| { 'category'=>d['category'], 'prob'=>d['prob'].to_f } }
+        # Ensure all shortlist items present
+        missing = call(:safe_array, input['shortlist']) - dist.map { |d| d['category'] }
+        dist.concat(missing.map { |m| { 'category'=>m, 'prob'=>0.0 } })
+        ranking = dist.sort_by { |h| -h['prob'].to_f }
+        out = { 'ranking'=>ranking, 'shortlist'=>ranking.map { |r| r['category'] } }
+        call(:step_ok!, ctx, out, 200, 'OK', { 'mode'=>'llm' })
+      end,
+      sample_output: lambda do
+        {
+          'ranking'=>[
+            { 'category'=>'Billing','prob'=>0.86 },
+            { 'category'=>'Support','prob'=>0.10 },
+            { 'category'=>'Sales','prob'=>0.04 }
+          ],
+          'shortlist'=>['Billing','Support','Sales'],
+          'ok'=>true, 'telemetry'=>{ 'http_status'=>200,'message'=>'OK','duration_ms'=>18,'correlation_id'=>'corr' }
+        }
+      end
+    },
+    # --- LLM referee (can consume ranked contexts) -----------------------------
+    llm_referee_with_contexts: {
+      title: 'Referee: LLM (with optional contexts)',
+      subtitle: 'Adjudicate among shortlist; accepts ranked RAG chunks',
+      display_priority: 500,
+      help: lambda do |_|
+        { body: 'Chooses final category using shortlist + category metadata; can append ranked contexts to the email text.' }
+      end,
+
+      input_fields: lambda do |object_definitions, connection, cfg|
+        [
+          { name: 'show_advanced', type: 'boolean', control_type: 'checkbox', default: false },
+
+          # A) Message
+          { name: 'email_text', optional: false },
+
+          # B) Categories & shortlist
+          { name: 'categories', type: 'array', of: 'object', optional: false,
+            properties: Array(object_definitions['category_def']) },
+          { name: 'shortlist', type: 'array', of: 'string', optional: true,
+            hint: 'If omitted, all categories are allowed.' },
+
+          # C) Ranked contexts (optional)
+          { name: 'contexts', label: 'Ranked contexts', type: 'array', of: 'object', optional: true,
+            properties: Array(object_definitions['contexts_ranked']),
+            ngIf: 'input.show_advanced == true' },
+
+          # D) Models & thresholds
+          { name: 'generative_model', control_type: 'text', optional: true, default: 'gemini-2.0-flash' },
+          { name: 'min_confidence', type: 'number', optional: true, default: 0.25 },
+          { name: 'fallback_category', optional: true, default: 'Other' }
+        ] + Array(object_definitions['observability_input_fields'])
+      end,
+      output_fields: lambda do |object_definitions, connection|
+        [
+          { name: 'referee', type: 'object', properties: Array(object_definitions['referee_out']) },
+          { name: 'chosen' },
+          { name: 'confidence', type: 'number' }
+        ] + Array(object_definitions['envelope_fields'])
+      end,
+
+      execute: lambda do |connection, input|
+        ctx = call(:step_begin!, :llm_referee_with_contexts, input)
+        cats = call(:norm_categories!, input['categories'])
+
+        # Optionally append ranked contexts to the email text for better decisions
+        email_text = input['email_text'].to_s
+        if Array(input['contexts']).any?
+          blob = call(:format_context_chunks, input['contexts'])
+          email_text = "#{email_text}\n\nContext:\n#{blob}"
+        end
+
+        shortlist = call(:safe_array, input['shortlist'])
+        ref = call(:llm_referee, connection, (input['generative_model'] || 'gemini-2.0-flash'),
+                  email_text, (shortlist.any? ? shortlist : nil), cats, input['fallback_category'], ctx['cid'], nil)
+
+        min_conf = (input['min_confidence'].presence || 0.25).to_f
+        chosen =
+          if ref['confidence'].to_f < min_conf && input['fallback_category'].present?
+            input['fallback_category']
+          else
+            ref['category']
+          end
+
+        out = { 'referee'=>ref, 'chosen'=>chosen, 'confidence'=>[ref['confidence'], 0.0].compact.first.to_f }
+        call(:step_ok!, ctx, out, 200, 'OK', { 'chosen'=>chosen, 'conf'=>out['confidence'] })
+      end,
+      sample_output: lambda do
+        {
+          'referee'=>{
+            'category'=>'Billing','confidence'=>0.86,'reasoning'=>'Mentions invoice 4411.',
+            'distribution'=>[
+              { 'category'=>'Billing','prob'=>0.86 }, { 'category'=>'Support','prob'=>0.10 }, { 'category'=>'Sales','prob'=>0.04 }
+            ]
+          },
+          'chosen'=>'Billing','confidence'=>0.86,
+          'ok'=>true,'telemetry'=>{ 'http_status'=>200,'message'=>'OK','duration_ms'=>19,'correlation_id'=>'corr' }
+        }
+      end
+    },
+    # --- RAG retrieval: ranked contexts ----------------------------------------
+    rag_retrieve_contexts: {
+      title: 'RAG Engine: Fetch contexts',
+      subtitle: 'projects.locations:retrieveContexts (Vertex RAG Store)',
+      display_priority: 500,
+      help: lambda do |_|
+        { body: 'Retrieves ranked contexts for a query (email text). Accepts thresholds and ranker knobs; no in-action salience.' }
+      end,
+      input_fields: lambda do |object_definitions, connection, cfg|
+        [
+          { name: 'show_advanced', type: 'boolean', control_type: 'checkbox', default: false },
+          # A) Query
+          { name: 'email_text', optional: false, hint: 'Free text query (use norm_email_envelope upstream if you have subject/body).' },
+          # B) Corpus
+          { name: 'rag_corpus', label: 'RAG corpus ID', optional: false, hint: 'Vertex RAG corpus name/id.' },
+          # C) Retrieval config (composed, with guards)
+          { name: 'rag_retrieval_config', label: 'Retrieval config', type: 'object', optional: true, ngIf: 'input.show_advanced == true',
+            properties: [
+              { name: 'top_k', type: 'integer', hint: 'Max contexts to return (default 6).' },
+              { name: 'filter', type: 'object', properties: [
+                  { name: 'vector_distance_threshold', type: 'number' },
+                  { name: 'vector_similarity_threshold', type: 'number' }
+              ]},
+              { name: 'ranking', type: 'object', properties: [
+                  { name: 'rank_service_model', hint: 'e.g., text-multilingual-document-reranker@001' },
+                  { name: 'llm_ranker_model', hint: 'e.g., gemini-2.0-flash' }
+              ]}
+            ]},
+          # D) Observability
+        ] + Array(object_definitions['observability_input_fields'])
+      end,
+      output_fields: lambda do |object_definitions, _connection|
+        [
+          { name: 'contexts', type: 'array', of: 'object', properties: Array(object_definitions['contexts_ranked']) }
+        ] + Array(object_definitions['envelope_fields'])
+      end,
+      execute: lambda do |connection, input|
+        ctx = call(:step_begin!, :rag_retrieve_contexts, input)
+        proj = connection['project_id']
+        loc  = (connection['location'].presence || 'global').to_s.downcase
+        url  = call(:aipl_v1_url, connection, loc, "projects/#{proj}/locations/#{loc}:retrieveContexts")
+        opts = call(:build_retrieval_opts_from_input!, input)
+        payload = {
+          'query' => input['email_text'].to_s,
+          'ragCorpus' => input['rag_corpus'],
+          'retrievalConfig' => opts.compact
+        }
+        resp = post(url)
+                 .headers(call(:request_headers_auth, connection, ctx['cid'], connection['user_project'], nil))
+                 .payload(call(:json_compact, payload))
+        items = call(:safe_array, resp['contexts']).map do |c|
+          { 'id'=>c['id'] || c['documentId'], 'text'=>c['text'] || c['chunkText'],
+            'score'=>c['score'], 'source'=>c['source'], 'uri'=>c['uri'],
+            'metadata'=>c['metadata'] }
+        end
+        out = { 'contexts'=>items }
+        call(:step_ok!, ctx, out, 200, 'OK', { 'k'=>items.length })
+      rescue => e
+        call(:step_err!, ctx, e)
+      end,
+      sample_output: lambda do
+        {
+          'contexts'=>[
+            { 'id'=>'c1','text'=>'...','score'=>0.78,'source'=>'drive','uri'=>'gs://...','metadata'=>{'page'=>2} }
+          ],
+          'ok'=>true,'telemetry'=>{ 'http_status'=>200,'message'=>'OK','duration_ms'=>15,'correlation_id'=>'corr' }
+        }
+      end
     }
   },
   
@@ -2267,6 +3244,68 @@ require 'securerandom'
   
   # --------- METHODS ------------------------------------------------------
   methods: {
+    step_begin!: lambda do |action_id, input|
+      { 'action'=>action_id.to_s, 'started_at'=>Time.now.utc.iso8601,
+        't0'=>Time.now, 'cid'=>call(:ensure_correlation_id!, input) }
+    end,
+    step_ok!: lambda do |ctx, result, code=200, msg='OK', extras=nil|
+      env = call(:telemetry_envelope, ctx['t0'], ctx['cid'], true, code, msg)
+      out = (result || {}).merge(env)
+      call(:local_log_attach!, out,
+        call(:local_log_entry, ctx['action'], ctx['started_at'], ctx['t0'], out, nil, (extras||{})))
+    end,
+    step_err!: lambda do |ctx, err|
+      g   = call(:extract_google_error, err)
+      msg = [err.to_s, (g['message'] || nil)].compact.join(' | ')
+      env = call(:telemetry_envelope, ctx['t0'], ctx['cid'], false, call(:telemetry_parse_error_code, err), msg)
+      call(:local_log_attach!, env,
+        call(:local_log_entry, ctx['action'], ctx['started_at'], ctx['t0'], nil, err, { 'google_error'=>g }))
+      error(env)
+    end,
+
+    # --- Normalizers (single source of truth) --------------------------------
+    norm_email_envelope!: lambda do |h|
+      s = (h || {}).to_h
+      subj = (s['subject'] || s[:subject]).to_s
+      body = (s['body']    || s[:body]).to_s
+      error('Provide subject and/or body') if subj.strip.empty? && body.strip.empty?
+      {
+        'subject'=>subj, 'body'=>body, 'from'=>s['from'] || s[:from],
+        'headers'=> (s['headers'].is_a?(Hash) ? s['headers'] : {}),
+        'attachments'=> Array(s['attachments']),
+        'auth'=> (s['auth'].is_a?(Hash) ? s['auth'] : {}),
+        'email_text'=>call(:build_email_text, subj, body)
+      }
+    end,
+    norm_categories!: lambda do |raw|
+      cats = call(:safe_array, raw).map { |c|
+        c.is_a?(String) ? { 'name'=>c } :
+          { 'name'=>c['name'] || c[:name],
+            'description'=>c['description'] || c[:description],
+            'examples'=>call(:safe_array,(c['examples'] || c[:examples])) }
+      }.select { |c| c['name'].to_s.strip != '' }
+      error('At least 2 categories are required') if cats.length < 2
+      cats
+    end,
+    # --- Header helper (auth + routing) -----------------------------------------
+    request_headers_auth: lambda do |connection, correlation_id=nil, user_project=nil, req_params=nil|
+      h = {
+        'Authorization'      => "Bearer #{connection['access_token']}",
+        'Content-Type'       => 'application/json; charset=UTF-8',
+        'X-Client-Cid'       => (correlation_id.to_s if correlation_id.to_s != '')
+      }.compact
+      h['x-goog-user-project']  = user_project if user_project.to_s != ''
+      h['x-goog-request-params'] = req_params if req_params.to_s != ''
+      h
+    end,
+    # --- Salience blending (no extraction) --------------------------------------
+    maybe_append_salience: lambda do |email_text, salience, importance|
+      imp = (importance.to_f rescue 0.0)
+      return email_text if !salience.is_a?(Hash) && !salience.is_a?(Array)
+      return email_text if imp <= 0.0
+      block = salience.is_a?(Array) ? salience.compact.map(&:to_s).join(', ') : call(:json_compact, salience)
+      "#{email_text}\n\nSignals (weight=#{imp}):\n#{block}"
+    end,
     # Compile Workato-native "single-table" rows into the rulepack JSON
     hr_compile_rulepack_from_rows!: lambda do |rows|
       arr = call(:safe_array, rows)
@@ -2698,7 +3737,7 @@ require 'securerandom'
         'generationConfig'  => gen_cfg
       }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
 
-      resp = post(url).headers(call(:request_headers_auth, connection, corr, connection['user_project'], req_params))
+      resp = post(url).headers(call(:request_headers_auth_1, connection, corr, connection['user_project'], req_params))
                       .payload(call(:json_compact, payload))
       code = call(:telemetry_success_code, resp)
 
@@ -2886,32 +3925,26 @@ require 'securerandom'
       }
     end,
 
-    # Build canonical retrieval opts from either the object field
-    #   input['rag_retrieval_config'] OR legacy flat fields on the action.
-    # Returns a Hash suitable for build_rag_retrieve_payload.
     build_retrieval_opts_from_input!: lambda do |input|
-      cfg = (input['rag_retrieval_config'].is_a?(Hash) ? input['rag_retrieval_config'] : {})
+      cfg  = (input['rag_retrieval_config'].is_a?(Hash) ? input['rag_retrieval_config'] : {})
       filt = cfg['filter'].is_a?(Hash) ? cfg['filter'] : {}
       rank = cfg['ranking'].is_a?(Hash) ? cfg['ranking'] : {}
-
       topk = cfg['top_k'] || input['similarity_top_k']
       dist = filt['vector_distance_threshold']   || input['vector_distance_threshold']
       sim  = filt['vector_similarity_threshold'] || input['vector_similarity_threshold']
       rsm  = rank['rank_service_model']          || input['rank_service_model']
       llm  = rank['llm_ranker_model']            || input['llm_ranker_model']
-
-      # Validate oneof unions
       call(:guard_threshold_union!, dist, sim)
       call(:guard_ranker_union!, rsm, llm)
-
-      {
-        'topK'                         => topk,
-        'vectorDistanceThreshold'      => dist,
-        'vectorSimilarityThreshold'    => sim,
-        'rankServiceModel'             => rsm,
-        'llmRankerModel'               => llm
-      }.delete_if { |_k, v| v.nil? || v == '' }
+      {}.tap do |h|
+        h['topK'] = topk.to_i if topk
+        h['vectorDistanceThreshold']   = dist if dist
+        h['vectorSimilarityThreshold'] = sim  if sim
+        h['rankServiceModel'] = rsm if rsm
+        h['llmRankerModel']   = llm if llm
+      end
     end,
+
     # --- Auth (JWT → OAuth) -----------------------------------------------
     const_default_scopes: lambda { ['https://www.googleapis.com/auth/cloud-platform'].freeze },
     b64url: lambda do |bytes|
@@ -2996,10 +4029,10 @@ require 'securerandom'
     # --- Purpose-specific header helpers ---------------------------------
     headers_rag: lambda do |connection, correlation_id, request_params=nil|
       # Retrieval calls: NEVER send x-goog-user-project
-      call(:request_headers_auth, connection, correlation_id, nil, request_params)
+      call(:request_headers_auth_1, connection, correlation_id, nil, request_params)
     end,
     # Unified auth+header builder.
-    request_headers_auth: lambda do |connection, correlation_id, user_project=nil, request_params=nil, opts=nil|
+    request_headers_auth_1: lambda do |connection, correlation_id, user_project=nil, request_params=nil, opts=nil|
       # Backward-compatible signature; final arg `opts` is optional:
       #   opts = {
       #     scopes:        Array|String (default: cloud-platform),
@@ -3052,7 +4085,7 @@ require 'securerandom'
           unless call(:normalize_boolean, connection['prod_mode'])
             connection['__last_tail_log_error'] = {
               timestamp: Time.now.utc.iso8601,
-              method: 'request_headers_auth',
+              method: 'request_headers_auth_1',
               message: e.message.to_s[0,512],
               class: e.class.to_s
             }
@@ -3453,7 +4486,7 @@ require 'securerandom'
       (instances || []).each_slice(max) do |slice|
         url  = call(:aipl_v1_url, connection, loc, "#{model_path}:predict")
         resp = post(url)
-                .headers(call(:request_headers_auth, connection, (corr || call(:build_correlation_id)), connection['user_project'], req_params))
+                .headers(call(:request_headers_auth_1, connection, (corr || call(:build_correlation_id)), connection['user_project'], req_params))
                 .payload({
                   'instances'  => slice,
                   'parameters' => (params.presence || {})
@@ -3566,7 +4599,7 @@ require 'securerandom'
       loc  = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
       url  = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
       resp = post(url)
-               .headers(call(:request_headers_auth, connection, (corr || call(:build_correlation_id)), connection['user_project'], req_params))
+               .headers(call(:request_headers_auth_1, connection, (corr || call(:build_correlation_id)), connection['user_project'], req_params))
                .payload(call(:json_compact, payload))
 
       text   = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s.strip
@@ -3769,7 +4802,7 @@ require 'securerandom'
       loc = (connection['location'].presence || 'global').to_s.downcase
       url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
       resp = post(url)
-               .headers(call(:request_headers_auth, connection, (corr || call(:build_correlation_id)), nil, req_params))
+               .headers(call(:request_headers_auth_1, connection, (corr || call(:build_correlation_id)), nil, req_params))
                .payload({
                   'contents' => contents,
                   'systemInstruction' => { 'role' => 'system', 'parts' => [ { 'text' => system_text } ] },
@@ -3798,7 +4831,7 @@ require 'securerandom'
       }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
 
       begin
-        post(url).headers(call(:request_headers_auth, connection, (corr || call(:build_correlation_id)), connection['user_project'], req_params))
+        post(url).headers(call(:request_headers_auth_1, connection, (corr || call(:build_correlation_id)), connection['user_project'], req_params))
                  .payload(call(:json_compact, payload))
 
       rescue
