@@ -491,13 +491,11 @@ require 'securerandom'
         { name: 'emit_mode', control_type: 'select', default: 'records', sticky: true,
           options: [['Array as records[]','records'], ['Inferred','inferred'], ['Raw only','raw']] }
       ],
-
       input_fields: lambda do |_od, _connection, _cfg|
         [
           { name: 'query_text', optional: false, label: 'Query text' }
         ]
       end,
-
       output_fields: lambda do |od, connection, cfg|
         if cfg['infer_schema'] == true
           call(:probe_retrieve_contexts_output_fields, connection, cfg)
@@ -515,38 +513,38 @@ require 'securerandom'
           ]
         end
       end,
-
       execute: lambda do |connection, input|
         url, parent = call(:aipl_v1_url_retrieve_contexts, connection)
 
-        headers = { 'Content-Type' => 'application/json' }
-        if input['x_goog_user_project'].present?
-          headers['x-goog-user-project'] = input['x_goog_user_project']
-        end
-        # Optional but nice: helps Google route requests
-        headers['x-goog-request-params'] = "parent=#{parent}"
+        # Build headers
+        req_headers = { 'Content-Type' => 'application/json' }
+        req_headers['x-goog-user-project']   = input['x_goog_user_project'] if input['x_goog_user_project'].present?
+        req_headers['x-goog-request-params'] = "parent=#{parent}"
 
-        # Build the request body
-        body = {
-          'query' => { 'text' => input['query_text'].to_s }
-        }.merge(
+        # Build body (JSON) — nothing but Vertex fields in here
+        req_body = {
+          'query'      => { 'text' => input['query_text'].to_s },
           'dataSource' => call(:build_rag_resources, input['rag_corpora'])
-        )
+        }
 
         tk = input['top_k'].to_i
-        body['topK'] = tk if tk > 0
+        req_body['topK'] = tk if tk > 0
 
         if input['vector_similarity_threshold'].present? && input['vector_distance_threshold'].present?
           error('Use EITHER vector_similarity_threshold OR vector_distance_threshold, not both')
         end
         if input['vector_similarity_threshold'].present?
-          body['vectorSimilarityThreshold'] = input['vector_similarity_threshold'].to_f
+          req_body['vectorSimilarityThreshold'] = input['vector_similarity_threshold'].to_f
         elsif input['vector_distance_threshold'].present?
-          body['vectorDistanceThreshold'] = input['vector_distance_threshold'].to_f
+          req_body['vectorDistanceThreshold'] = input['vector_distance_threshold'].to_f
         end
 
-        # POST correctly (named args) — avoids the classic "wrong number of arguments" bug
-        resp = post(url, headers: headers, payload: body)
+        # Guardrail: catch accidental nesting before the call
+        forbidden = (req_body.keys & %w[headers payload])
+        error("Invalid request body: contains #{forbidden.join(', ')}. Do not nest headers/payload into the JSON body.") if forbidden.any?
+
+        # POST — named args only (this is the critical line)
+        resp = post(url, headers: req_headers, payload: req_body)
 
         # Normalize response
         payload = call(:dig_path, resp, 'contexts.contexts')
@@ -558,7 +556,7 @@ require 'securerandom'
             { 'raw' => (resp.respond_to?(:to_json) ? resp.to_json : resp.to_s) }
           when 'inferred'
             payload.is_a?(Hash) ? payload : { 'value' => payload }
-          else # 'records'
+          else
             { 'records' => (payload.is_a?(Array) ? payload : Array(payload)) }
           end
 
@@ -568,6 +566,12 @@ require 'securerandom'
           extras = payload.reject { |k, _| known.include?(k) }
           data['extras'] = extras if extras.any?
         end
+
+        data['debug'] = {
+          request_url: url,
+          request_headers_sample: req_headers.slice('x-goog-request-params', 'x-goog-user-project', 'Content-Type'),
+          request_body_top_keys: req_body.keys
+        }
 
         data['raw'] ||= (resp.respond_to?(:to_json) ? resp.to_json : resp.to_s)
         data
