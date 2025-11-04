@@ -1515,6 +1515,8 @@ require 'securerandom'
         location = (input['location'].presence || connection['location']).to_s
         error('Project is required (connection or input).')  if project.blank?
         error('Location is required (connection or input).') if location.blank?
+        # retrieveContexts is REGIONAL-ONLY; fail fast on 'global'
+        call(:ensure_regional_location!, { 'location' => location })
         parent = "projects/#{project}/locations/#{location}"
 
         # ---- Expand optional short corpus ID -------------------------------------------
@@ -1537,8 +1539,10 @@ require 'securerandom'
         if Array(input['rag_file_ids']).present?
           rag_resources['ragFileIds'] = Array(input['rag_file_ids'])
         end
-        # Optional early guard if you don't rely on project-level defaults:
-        # error('Provide rag_corpus and/or rag_file_ids to set vertexRagStore.ragResources[]') if rag_resources.empty?
+        # v1 requires ragResources; be explicit and fail early
+        if rag_resources.empty?
+          error('Provide rag_corpus and/or rag_file_ids (vertexRagStore.ragResources is required).')
+        end
 
         # ---- Retrieval config (v1) -----------------------------------------------------
         retrieval_cfg = {}
@@ -1563,7 +1567,7 @@ require 'securerandom'
         # ---- Request body (union: vertexRagStore) --------------------------------------
         body = { 'query' => { 'text' => input['query_text'] } }
         body['query']['ragRetrievalConfig'] = retrieval_cfg unless retrieval_cfg.empty?
-        body['vertexRagStore'] = (rag_resources.empty? ? {} : { 'ragResources' => [rag_resources] })
+        body['vertexRagStore'] = { 'ragResources' => [rag_resources] }
 
         # ---- Endpoint + headers (Authorization + routing) ------------------------------
         host = "#{location}-aiplatform.googleapis.com"
