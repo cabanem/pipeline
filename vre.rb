@@ -437,6 +437,19 @@ require 'securerandom'
         ]
       end
     },
+    context_chunk: {
+      fields: lambda do |connection, config_fields|
+        [
+          { name: 'id' },
+          { name: 'uri', optional: true },
+          { name: 'content', control_type: 'text-area' },
+          { name: 'score', type: :number, optional: true },
+          { name: 'metadata', type: :object, optional: true }
+        ]
+      end,
+      sample_output: { id: 'c1', uri: 'gs://bucket/a.txt', content: '...', score: 0.83 },
+      additional_properties: false
+    },
     intent_out: {
       fields: lambda do |_connection, _config_fields|
         [ { name: 'label' }, { name: 'confidence', type: 'number' }, { name: 'basis' } ]
