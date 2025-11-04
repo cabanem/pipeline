@@ -1476,6 +1476,7 @@ require 'securerandom'
         context_props = [
           { name: 'sourceUri' }, { name: 'sourceDisplayName' },
           { name: 'text' }, { name: 'score', type: 'number' },
+          { name: 'similarity', type: 'number' },
           { name: 'chunk', type: 'object', properties: [
               { name: 'text' },
               { name: 'pageSpan', type: 'object', properties: [
@@ -1491,6 +1492,9 @@ require 'securerandom'
           ] },
           { name: 'contexts_flat', label: 'contexts (flat)', type: 'array', of: 'object', properties: context_props },
           { name: 'count', type: 'integer' },
+          { name: 'debug_shape', type: 'object', properties: [
+              { name: 'resp_class' }, { name: 'top_keys', type: 'array', of: 'string' }, { name: 'count', type: 'integer' }
+          ]},
 
           # Telemetry (from step_ok!)
           { name: 'ok', type: 'boolean' },
@@ -1598,6 +1602,7 @@ require 'securerandom'
                 'sourceDisplayName' => 'handbook.pdf',
                 'text'              => 'All expense reports must be submitted within 30 days…',
                 'score'             => 0.18,
+                'similarity'        => 0.82,
                 'chunk'             => {
                   'text'     => 'All expense reports must be submitted within 30 days…',
                   'pageSpan' => { 'firstPage' => 3, 'lastPage' => 3 }
@@ -1610,12 +1615,18 @@ require 'securerandom'
               'sourceUri'         => 'gs://docs/team/handbook.pdf',
               'sourceDisplayName' => 'handbook.pdf',
               'text'              => 'All expense reports must be submitted within 30 days…',
-                  'score'       => 0.18,
+                'score'             => 0.18,
+                'similarity'        => 0.82,
               'chunk' => { 'text' => 'All expense reports must be submitted within 30 days…',
                           'pageSpan' => { 'firstPage' => 3, 'lastPage' => 3 } }
             }
           ],
           'count' => 1,
+          'debug_shape' => {
+            'resp_class' => 'Hash',
+            'top_keys'   => ['contexts'],
+            'count'      => 1
+          },
           'ok' => true,
           'telemetry' => {
             'http_status'    => 200,
