@@ -1,72 +1,169 @@
+
+// DETERMINISTIC FILTER JSON
 {
   "hard_exclude": {
-    "headers": [
-      { "operator": "header_present", "pattern": "Auto-Submitted", "action": "exclude" },
-      { "operator": "header_present", "pattern": "List-Unsubscribe", "action": "exclude" },
-      { "operator": "equals", "pattern": "Precedence:bulk", "action": "exclude" },
-      { "operator": "equals", "pattern": "Precedence:list", "action": "exclude" }
+    "auto_reply": [
+      { "field": "headers.auto-submitted", "operator": "not_equals", "value": "no" },
+      { "field": "subject", "operator": "matches", "pattern": "(?i)(out of office|auto.?reply|automatic reply|vacation responder)" }
     ],
-    "attachments": [
-      { "operator": "ext_in", "pattern": "ics|vcs", "action": "exclude" }
+    "mailing_list": [
+      { "field": "headers.list-unsubscribe", "operator": "exists" },
+      { "field": "headers.list-id", "operator": "exists" },
+      { "field": "headers.precedence", "operator": "matches", "pattern": "(?i)(bulk|list)" },
+      { "field": "body", "operator": "matches", "pattern": "(?i)unsubscribe" }
     ],
-    "from": [
-      { "operator": "regex", "pattern": "(?i)\\b(no[-_]?reply|do[-_]?not[-_]?reply)@", "action": "exclude" }
-    ],
-    "auth": [
-      { "operator": "is_true", "pattern": "spf_dkim_dmarc_fail", "action": "exclude" }
+    "bounce": [
+      { "field": "from", "operator": "matches", "pattern": "(?i)(mailer-daemon|postmaster)" },
+      { "field": "subject", "operator": "matches", "pattern": "(?i)(delivery status notification|undeliverable|mail failure|returned mail)" }
     ]
   },
-
   "soft_signals": [
-    { "name": "internal_domain", "field": "from", "pattern_type": "contains",
-      "pattern_value": "@company.com|@subsidiary.com", "weight": 3, "cap_per_email": 1 },
+    { "id": "emp_domain_from", "family": "employee", "field": "from", "operator": "matches", "pattern": "@company\\.com$", "weight": 2, "cap_per_email": 1, "enabled": true },
+    { "id": "emp_signature", "family": "employee", "field": "body", "operator": "matches", "pattern": "@company\\.com", "weight": 2, "cap_per_email": 1, "enabled": true },
+    { "id": "emp_manager", "family": "employee", "field": "body", "operator": "matches", "pattern": "(?i)(my manager|approved by|people manager)", "weight": 1, "cap_per_email": 1, "enabled": true },
+    { "id": "emp_tools", "family": "employee", "field": "body", "operator": "matches", "pattern": "(?i)(Workday|ADP|UKG|Rippling|HR portal)", "weight": 1, "cap_per_email": 2, "enabled": true },
 
-    { "name": "help_words_subject", "field": "subject", "pattern_type": "contains",
-      "pattern_value": "help|assist|support|issue|error|problem|request|access|locked out|password|vpn",
-      "weight": 3, "cap_per_email": 2 },
+    { "id": "topic_pto", "family": "hr_topics", "field": "body", "operator": "matches", "pattern": "(?i)\\b(PTO|paid time off|vacation|holiday|sick (day|leave))\\b", "weight": 2, "cap_per_email": 2, "enabled": true },
+    { "id": "topic_w2", "family": "hr_topics", "field": "body", "operator": "matches", "pattern": "(?i)\\b(W-?2|tax (form|paperwork|document))\\b", "weight": 2, "cap_per_email": 2, "enabled": true },
+    { "id": "topic_payroll", "family": "hr_topics", "field": "body", "operator": "matches", "pattern": "(?i)\\b(payroll|paycheck|direct deposit|timesheet|timecard|didn'?t submit time)\\b", "weight": 2, "cap_per_email": 2, "enabled": true },
 
-    { "name": "help_words_body", "field": "body", "pattern_type": "contains",
-      "pattern_value": "can you help|please assist|unable to|cannot|can't|locked out|password reset|forgot password|access|vpn|wifi|printer|laptop|bug|error|exception|crash|not working|troubleshoot",
-      "weight": 2, "cap_per_email": 3 },
+    { "id": "nonemp_marketing", "family": "non_employee", "field": "body", "operator": "matches", "pattern": "(?i)(free trial|demo|pricing|quote(?: request)?|our services|newsletter)", "weight": -3, "cap_per_email": 1, "enabled": true },
+    { "id": "nonemp_unsub", "family": "non_employee", "field": "body", "operator": "matches", "pattern": "(?i)unsubscribe", "weight": -3, "cap_per_email": 1, "enabled": true },
 
-    { "name": "ticket_id", "field": "body", "pattern_type": "regex",
-      "pattern_value": "(?i)\\b(ticket|case|inc|incident)[ -]?#?\\d{3,8}\\b",
-      "weight": 2, "cap_per_email": 1 },
+    { "id": "soft_auto_reply_text", "family": "auto_reply", "field": "body", "operator": "matches", "pattern": "(?i)(out of office|automatic reply)", "weight": -3, "cap_per_email": 1, "enabled": true },
 
-    { "name": "service_words", "field": "body", "pattern_type": "contains",
-      "pattern_value": "service desk|helpdesk|it support|open a ticket",
-      "weight": 2, "cap_per_email": 1 },
-
-    { "name": "screenshots", "field": "attachments", "pattern_type": "ext_in",
-      "pattern_value": "png|jpg|jpeg|gif", "weight": 2, "cap_per_email": 2 },
-
-    { "name": "logs", "field": "attachments", "pattern_type": "ext_in",
-      "pattern_value": "txt|log|zip|har|pcap", "weight": 2, "cap_per_email": 2 },
-
-    { "name": "internal_systems", "field": "body", "pattern_type": "contains",
-      "pattern_value": "okta|sso|vpn|jira|confluence|slack|outlook|google workspace|drive|printer|wifi",
-      "weight": 1, "cap_per_email": 2 },
-
-    { "name": "time_pressure", "field": "body", "pattern_type": "contains",
-      "pattern_value": "urgently|asap|blocked|cannot proceed|production down|sev",
-      "weight": 1, "cap_per_email": 1 },
-
-    { "name": "anti_marketing_header", "field": "headers", "pattern_type": "header_present",
-      "pattern_value": "List-Id", "weight": -2, "cap_per_email": 1 }
+    { "id": "pii_ssn", "family": "pii", "field": "body", "operator": "matches", "pattern": "\\b\\d{3}-\\d{2}-\\d{4}\\b", "weight": -4, "cap_per_email": 1, "enabled": true },
+    { "id": "pii_bank", "family": "pii", "field": "body", "operator": "matches", "pattern": "(?i)(routing number|account number|direct deposit form)", "weight": -3, "cap_per_email": 1, "enabled": true }
   ],
-
-  "thresholds": { "keep": 6, "triage_min": 4, "triage_max": 5 },
-
+  "thresholds": {
+    "keep_min": 4,
+    "review_min": 2,
+    "floor": -6,
+    "cap_total": 10
+  },
   "guards": {
-    "HR-Request": {
-      "required": [ "(?i)(onboarding|benefits|pto|leave|payroll|badge|equipment|manager approval|expense)" ],
-      "forbidden": [ "(?i)(invoice|quote|pricing|order|refund|subscription)" ],
-      "flags": { "employee": true }
-    },
-    "Tech Support": {
-      "required": [ "(?i)(error|issue|bug|crash|exception|not\\s*working|unable|cannot|locked\\s*out|password|login|vpn|network|printer|wifi)" ],
-      "forbidden": [ "(?i)(invoice|quote|pricing|refund|marketing|unsubscribe)" ],
-      "flags": {}
-    }
+    "cap_per_family": { "employee": 3, "hr_topics": 3, "non_employee": 2, "pii": 2 },
+    "notes": "Headers may be absent; rely on subject/body patterns and signatures. Hard excludes cover auto-replies, lists, and bounces."
   }
 }
+
+// POLICY
+{
+  "schema": {
+    "decision": ["IRRELEVANT", "REVIEW", "KEEP"],
+    "confidence_range": [0, 1]
+  },
+  "purpose": "Only evaluate/respond to emails likely sent by current employees to HR. Everything else should be ignored or flagged for review.",
+  "company": {
+    "domains": ["@company.com", "@subsidiary.com"],
+    "hr_topics": ["pto", "paid time off", "vacation", "holiday", "leave", "w-2", "w2", "tax", "payroll", "paycheck", "timesheet", "timecard", "direct deposit", "benefits", "address change"]
+  },
+  "signals": {
+    "employee_indicators": [
+      "signature contains @company.com",
+      "mentions manager/lead by name",
+      "employee id present",
+      "references internal tools (Workday, ADP, UKG, Rippling, internal HR portal)",
+      "internal slang or team names",
+      "first-person account of employment (\"my PTO\", \"my paycheck\", \"I was hired\")"
+    ],
+    "non_employee_indicators": [
+      "marketing boilerplate",
+      "unsubscribe footer",
+      "sales pitch / vendor outreach",
+      "job application / resume submission",
+      "press inquiry or external newsletter",
+      "recruiter outreach"
+    ],
+    "auto_reply_indicators": [
+      "auto-reply",
+      "out of office",
+      "autoreply",
+      "vacation responder"
+    ],
+    "pii_indicators": [
+      "full ssn pattern ###-##-####",
+      "bank routing/account numbers",
+      "images or scans of identity documents"
+    ]
+  },
+  "rules": {
+    "KEEP": {
+      "all_of": [
+        "message is about an HR topic (hr_topics)",
+        "not an auto-reply",
+        "no strong non-employee indicators"
+      ],
+      "any_of": [
+        "employee indicators present",
+        "email text strongly implies current employment (manager approval, timesheet, internal portal references)"
+      ]
+    },
+    "IRRELEVANT": {
+      "any_of": [
+        "strong non-employee indicators",
+        "explicit unsubscribe/newsletter content",
+        "sales/vendor pitch or invoice unrelated to payroll/W-2 for an employee",
+        "auto-reply"
+      ]
+    },
+    "REVIEW": {
+      "any_of": [
+        "PII indicators detected (e.g., SSN/bank info) — avoid auto response",
+        "ambiguous employment status",
+        "HR topic present but no clear employee indicators",
+        "conflicting signals (both employee and non-employee cues)"
+      ]
+    }
+  },
+  "confidence_guidance": {
+    "KEEP": "≥0.85 when HR topic + multiple employee indicators; 0.6–0.84 when topic is clear but employee status is somewhat inferred.",
+    "IRRELEVANT": "≥0.9 when strong external/marketing/auto-reply cues; 0.7–0.89 when topic is off-scope with mild external cues.",
+    "REVIEW": "0.5–0.8 when ambiguous or PII risk present."
+  },
+  "output_instructions": "Return ONLY JSON: {\"decision\": \"IRRELEVANT|REVIEW|KEEP\", \"confidence\": number 0..1, \"matched_signals\": [\"short tokens\"], \"reasons\": [\"≤2 brief strings\"]}. No extra text.",
+  "examples": [
+    {
+      "email": "Hi HR—I'd like to request PTO for 12/24–12/27. My manager, Jane Lee, approved in Workday.",
+      "expected": { "decision": "KEEP", "confidence": 0.92 },
+      "why": ["pto", "manager approval", "Workday reference"]
+    },
+    {
+      "email": "Automatic reply: I am out of office until Monday.",
+      "expected": { "decision": "IRRELEVANT", "confidence": 0.95 },
+      "why": ["auto-reply"]
+    },
+    {
+      "email": "Hello, I'm a vendor offering payroll services. Can we schedule a demo?",
+      "expected": { "decision": "IRRELEVANT", "confidence": 0.93 },
+      "why": ["sales pitch", "vendor outreach"]
+    },
+    {
+      "email": "My paycheck looks short this period—timesheet might not have synced. Can you check?",
+      "expected": { "decision": "KEEP", "confidence": 0.9 },
+      "why": ["payroll", "timesheet"]
+    },
+    {
+      "email": "Can you resend my W-2? I moved recently and need it for taxes.",
+      "expected": { "decision": "KEEP", "confidence": 0.9 },
+      "why": ["w-2", "tax"]
+    },
+    {
+      "email": "Please find my resume attached for the HR role.",
+      "expected": { "decision": "IRRELEVANT", "confidence": 0.9 },
+      "why": ["job application"]
+    },
+    {
+      "email": "Here is my new bank information for direct deposit: routing 021000021, account XXXXX6789.",
+      "expected": { "decision": "REVIEW", "confidence": 0.85 },
+      "why": ["bank details", "PII risk"]
+    },
+    {
+      "email": "Hi HR, I think I was supposed to get a holiday credit. Not sure if my manager submitted it.",
+      "expected": { "decision": "KEEP", "confidence": 0.82 },
+      "why": ["holiday/PTO", "manager reference"]
+    }
+  ],
+  "notes": "Temperature=0; respond JSON only. Prefer precision over recall for KEEP; bias to REVIEW when unsure or PII is present."
+}
+
