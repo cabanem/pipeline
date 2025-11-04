@@ -1507,22 +1507,23 @@ require 'securerandom'
         ]
       end,
       execute: lambda do |connection, input|
+        # Step start (captures correlation_id + timing)
         ctx = call(:step_begin!, :rag_retrieve_contexts, input)
 
-        # Resolve project/location and build parent
+        # ---- Resolve project/location and build parent ---------------------------------
         project  = (input['project'].presence  || connection['project_id']).to_s
         location = (input['location'].presence || connection['location']).to_s
         error('Project is required (connection or input).')  if project.blank?
         error('Location is required (connection or input).') if location.blank?
         parent = "projects/#{project}/locations/#{location}"
 
-        # Expand optional short corpus ID
+        # ---- Expand optional short corpus ID -------------------------------------------
         corpus = (input['rag_corpus'] || '').to_s.strip
         if corpus.present? && !corpus.start_with?('projects/')
           corpus = "#{parent}/ragCorpora/#{corpus}"
         end
 
-        # Union guards
+        # ---- Union guards (thresholds, rankers) ----------------------------------------
         if input['vector_distance_threshold'].present? && input['vector_similarity_threshold'].present?
           error('Set ONLY one of: vector_distance_threshold OR vector_similarity_threshold.')
         end
@@ -1530,14 +1531,16 @@ require 'securerandom'
           error('Choose ONE ranker: rank_service_model OR llm_ranker_model.')
         end
 
-        # Build ragResources
+        # ---- Build ragResources ---------------------------------------------------------
         rag_resources = {}
         rag_resources['ragCorpus']  = corpus if corpus.present?
         if Array(input['rag_file_ids']).present?
           rag_resources['ragFileIds'] = Array(input['rag_file_ids'])
         end
+        # Optional early guard if you don't rely on project-level defaults:
+        # error('Provide rag_corpus and/or rag_file_ids to set vertexRagStore.ragResources[]') if rag_resources.empty?
 
-        # Retrieval config
+        # ---- Retrieval config (v1) -----------------------------------------------------
         retrieval_cfg = {}
         retrieval_cfg['topK'] = input['top_k'] if input['top_k'].present?
 
@@ -1557,41 +1560,91 @@ require 'securerandom'
         end
         retrieval_cfg['ranking'] = ranking unless ranking.empty?
 
-        body = {
-          'query' => { 'text' => input['query_text'] }
-        }
+        # ---- Request body (union: vertexRagStore) --------------------------------------
+        body = { 'query' => { 'text' => input['query_text'] } }
         body['query']['ragRetrievalConfig'] = retrieval_cfg unless retrieval_cfg.empty?
         body['vertexRagStore'] = (rag_resources.empty? ? {} : { 'ragResources' => [rag_resources] })
 
-        # Endpoint + headers (with Authorization and routing)
+        # ---- Endpoint + headers (Authorization + routing) ------------------------------
         host = "#{location}-aiplatform.googleapis.com"
         url  = "https://#{host}/v1/#{parent}:retrieveContexts"
         cid  = (input['correlation_id'] || (ctx && ctx['cid']))
         headers = call(:headers_rag, connection, cid, "parent=#{parent}") || {
-          'Content-Type' => 'application/json', 'Accept' => 'application/json',
+          'Content-Type' => 'application/json',
+          'Accept'       => 'application/json',
           'x-goog-request-params' => "parent=#{parent}"
         }
 
-        resp = post(url)
+        if headers['Authorization'].to_s.strip.empty?
+          error('Missing Authorization header. Check service account / token minting.')
+        end
+        # ---- Call API -------------------------------------------------------------------
+        req = post(url)
                 .headers(headers)
+                .request_format_json 
                 .payload(body)
-                .after_error_response(/.*/) { |code, b, _h| error("Vertex retrieveContexts failed (HTTP #{code}): #{b}") }
-                .response_format_json
 
-        contexts_array = call(:coerce_contexts_array!, resp)
-        enriched = contexts_array.map { |h|
-          h = h.is_a?(Hash) ? h.dup : {}
-          h['similarity'] = (1.0 - h['score']).round(6) if h['score'].is_a?(Numeric)
-          h
-        }
+        resp = 
+          begin
+            req.response_format_json
+          rescue
+            raw = req.response_format_raw
+            (JSON.parse(raw['body']) rescue raw)
+          end
+
+        # ---- Strict JSON envelope handling ---------------------------------------------
+        doc =
+          if resp.is_a?(Hash) && resp.key?('body') && resp['body'].is_a?(String)
+            JSON.parse(resp['body']) rescue {}
+          elsif resp.is_a?(String)
+            JSON.parse(resp) rescue {}
+          elsif resp.is_a?(Hash) || resp.is_a?(Array)
+            resp
+          else
+            {}
+          end
+
+        arr =
+          if doc.is_a?(Hash) && doc.dig('contexts','contexts').is_a?(Array)
+            doc['contexts']['contexts']
+          elsif doc.is_a?(Hash) && doc['contexts'].is_a?(Array)
+            doc['contexts']
+          else
+            []
+          end
+
+        # Symbolized-keys fallback (if some layer turned keys into symbols)
+        if arr.empty? && doc.is_a?(Hash) && doc.key?(:contexts)
+          c = doc[:contexts]
+          if c.is_a?(Hash) && c.key?(:contexts) && c[:contexts].is_a?(Array)
+            arr = c[:contexts]
+          elsif c.is_a?(Array)
+            arr = c
+          end
+        end
+
+        enriched = Array(arr).map do |h|
+          item = h.is_a?(Hash) ? h.transform_keys(&:to_s) : {}
+          sc = item['score']
+          item['similarity'] = (1.0 - sc).round(6) if sc.is_a?(Numeric)
+          item
+        end
+
         out = {
-          'contexts'      => { 'contexts' => contexts_array },
+          'contexts'      => { 'contexts' => enriched },   # keep documented nesting
           'contexts_flat' => enriched,
-          'count'         => contexts_array.length,
-          'debug_shape'   => { 'resp_class' => resp.class.name, 'top_keys' => (resp.is_a?(Hash) ? resp.keys : []), 'count' => contexts_array.length }
+          'count'         => enriched.length,
+          'debug_shape'   => {
+            'resp_class'    => resp.class.name,
+            'has_body'      => (resp.is_a?(Hash) && resp.key?('body')),
+            'top_keys'      => (doc.is_a?(Hash) ? doc.keys : []),
+            'contexts_type' => (doc.is_a?(Hash) ? (doc['contexts'].class.name rescue 'nil') : doc.class.name),
+            'count'         => enriched.length
+          }
         }
 
-        call(:step_ok!, ctx, out, 200, 'OK', { 'count' => contexts_array.length })
+        call(:step_ok!, ctx, out, 200, 'OK', { 'count' => enriched.length })
+
       end,
       sample_output: lambda do
         {
@@ -4446,7 +4499,7 @@ require 'securerandom'
       filt = cfg['filter'].is_a?(Hash) ? cfg['filter'] : {}
       rank = cfg['ranking'].is_a?(Hash) ? cfg['ranking'] : {}
 
-      topk = cfg['top_k'] || input['similarity_top_k']
+      topk = cfg['top_k'] || input['top_k']
       dist = filt['vector_distance_threshold']   || input['vector_distance_threshold']
       sim  = filt['vector_similarity_threshold'] || input['vector_similarity_threshold']
       rsm  = rank['rank_service_model']          || input['rank_service_model']
@@ -4798,22 +4851,13 @@ require 'securerandom'
     normalize_drive_file_id:   lambda { |raw| call(:normalize_drive_resource_id, raw) },
     normalize_drive_folder_id: lambda { |raw| call(:normalize_drive_resource_id, raw) },
     normalize_retrieve_contexts!: lambda do |raw_resp|
-      # Accept:
-      #   1) { "contexts":[...] }
-      #   2) { "contexts":{"contexts":[...]} }
-      #   3) stringified JSON of either of the above
-      doc = raw_resp.is_a?(String) ? (call(:safe_json, raw_resp) || {}) : raw_resp
-      # Some runtimes embed the body as a string
-      if doc.is_a?(Hash) && doc['body'].is_a?(String)
-        parsed = call(:safe_json, doc['body'])
-        doc = parsed if parsed.is_a?(Hash)
-      end
-      arr = doc.is_a?(Hash) ? doc['contexts'] : doc
-      arr = (call(:safe_json, arr) || arr) if arr.is_a?(String)
+      # Accept both shapes:
+      #   { "contexts": [ {...}, {...} ] }
+      #   { "contexts": { "contexts": [ ... ] } }  # some beta responses
+      arr = raw_resp['contexts']
       arr = arr['contexts'] if arr.is_a?(Hash) && arr.key?('contexts')
       Array(arr)
     end,
-
     guard_threshold_union!: lambda do |dist, sim|
       return true if dist.nil? || dist.to_s == ''
       return true if sim.nil?  || sim.to_s  == ''
@@ -5580,6 +5624,9 @@ require 'securerandom'
 
 # ----------- VERTEX API NOTES ---------------------------------------------
 # ENDPOINTS
+  # Retrieve contexts
+    # - host=`https://aiplatform.googleapis.com/v1/{parent}:retreiveContexts`
+    # - parent=`projects/project/locations/location`
   # Embed
     # - host=`https://{LOCATION}-aiplatform.googleapis.com`
     # - path=`/v1/projects/{project}/locations/{location}/publishers/google/models/{embeddingModel}:predict`
@@ -5597,6 +5644,7 @@ require 'securerandom'
     # 1a. (https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/rag-api-v1)
     # 1b. (https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/rag-output-explained)
     # 1c. (https://cloud.google.com/vertex-ai/generative-ai/docs/reference/rest/v1/projects.locations/retrieveContexts)
+    # 1d. (https://docs.cloud.google.com/vertex-ai/generative-ai/docs/reference/rest/v1/projects.locations/retrieveContexts)
   # 2. Embedding (https://ai.google.dev/gemini-api/docs/embeddings)
   # 3. Ranking (https://docs.cloud.google.com/generative-ai-app-builder/docs/ranking)
   # 4. Count tokens
