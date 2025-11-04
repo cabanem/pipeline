@@ -1758,12 +1758,10 @@ require 'securerandom'
 
       # ---- Execute ----
       execute: lambda do |_connection, input|
-        # --- Build URL ---
         parent = (input['parent'] || '').to_s.strip
         error('Parent is required (projects/{project}/locations/{location}).') if parent.empty?
         url = "https://aiplatform.googleapis.com/v1/#{parent}:retrieveContexts"
 
-        # --- Build body per data contract ---
         query_text = (input['query_text'] || '').to_s
         error('query_text is required') if query_text.empty?
 
@@ -1776,9 +1774,8 @@ require 'securerandom'
         rc = (input['rag_corpus'] || '').to_s.strip
         rag_resource['ragCorpus'] = rc unless rc.empty?
 
-        rids = input['rag_file_ids']
-        if rids.is_a?(Array)
-          ids = rids.compact.map(&:to_s).reject(&:empty?)
+        if input['rag_file_ids'].is_a?(Array)
+          ids = input['rag_file_ids'].compact.map(&:to_s).reject(&:empty?)
           rag_resource['ragFileIds'] = ids unless ids.empty?
         end
 
@@ -1788,42 +1785,34 @@ require 'securerandom'
 
         body = {
           'query' => query_obj,
-          'data_source' => {
-            'vertexRagStore' => { 'ragResources' => rag_resources }
-          }
+          'data_source' => { 'vertexRagStore' => { 'ragResources' => rag_resources } }
         }
 
-        headers = { 'Content-Type' => 'application/json' }
+        headers = {
+          'Content-Type' => 'application/json',
+          'Accept' => 'application/json'
+        }
 
-        # --- Call API (make sure this is keyword args, not positional) ---
-        rsp = post(url, body: body, headers: headers)
+        # KEY CHANGE: use payload:, not body:. This ensures Workato executes and parses JSON.
+        rsp = post(url, payload: body, headers: headers)
 
-        # --- Normalize/parse response into a Hash ---
-        parsed = nil
-        case rsp
-        when Hash
-          parsed = rsp
-        when String
-          begin
-            parsed = JSON.parse(rsp)
-          rescue JSON::ParserError
-            parsed = { '_raw_string' => rsp }
+        parsed =
+          if rsp.is_a?(Hash)
+            rsp
+          elsif rsp.is_a?(String)
+            begin
+              JSON.parse(rsp)
+            rescue JSON::ParserError
+              { '_raw_string' => rsp }
+            end
+          else
+            { '_unexpected_class' => rsp.class.to_s }
           end
-        else
-          # If someone accidentally used positional args earlier in dev, Workato can hand back a Request-ish object.
-          # We surface a helpful debug breadcrumb while still emitting an empty contexts array.
-          parsed = { '_unexpected_class' => rsp.class.to_s }
-        end
 
-        # --- Extract contexts with shape tolerance ---
-        # Accept any of:
-        #   { "contexts": { "contexts": [ ... ] } }
-        #   { "contexts": [ ... ] }
-        #   { "ragContexts": [ ... ] }   (defensive future-proofing)
         raw_contexts =
-          (parsed.is_a?(Hash) && parsed.dig('contexts', 'contexts')) ||
-          (parsed.is_a?(Hash) && parsed['contexts']) ||
-          (parsed.is_a?(Hash) && parsed['ragContexts']) ||
+          (parsed.dig('contexts', 'contexts')) ||
+          parsed['contexts'] ||
+          parsed['ragContexts'] ||
           []
 
         contexts = Array(raw_contexts).map do |c|
@@ -1837,7 +1826,6 @@ require 'securerandom'
           }.delete_if { |_, v| v.nil? }
         end.compact
 
-        # --- Optional debug payload (auto-on if nothing was found) ---
         emit_debug = (input['emit_debug'] == true) || contexts.empty?
         debug = nil
         if emit_debug
@@ -1846,7 +1834,6 @@ require 'securerandom'
             'request_body' => body,
             'response_top_keys' => (parsed.is_a?(Hash) ? parsed.keys.map(&:to_s) : []),
             'response_class' => rsp.class.to_s,
-            'nested_keys_hint' => parsed.dig('contexts')&.class&.to_s,
             'raw_contexts_class' => raw_contexts.class.to_s,
             'raw_contexts_length' => Array(raw_contexts).length
           }
