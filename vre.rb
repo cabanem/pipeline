@@ -1758,30 +1758,32 @@ require 'securerandom'
 
       # ---- Execute ----
       execute: lambda do |_connection, input|
-        # 1) Build URL
-        parent = input['parent'].to_s.strip
+        # --- Build URL ---
+        parent = (input['parent'] || '').to_s.strip
         error('Parent is required (projects/{project}/locations/{location}).') if parent.empty?
         url = "https://aiplatform.googleapis.com/v1/#{parent}:retrieveContexts"
 
-        # 2) Prepare request body from data contract
-        #    {
-        #      "query": { "text": "...", "ragRetrievalConfig": {...} },
-        #      "data_source": { "vertexRagStore": { "ragResources": [ {ragCorpus, ragFileIds} ] } }
-        #    }
-        query_obj = { 'text' => input['query_text'].to_s }
+        # --- Build body per data contract ---
+        query_text = (input['query_text'] || '').to_s
+        error('query_text is required') if query_text.empty?
+
+        query_obj = { 'text' => query_text }
         if input['rag_retrieval_config'].is_a?(Hash) && !input['rag_retrieval_config'].empty?
           query_obj['ragRetrievalConfig'] = input['rag_retrieval_config']
         end
 
         rag_resource = {}
-        rag_resource['ragCorpus'] = input['rag_corpus'] if input['rag_corpus'].to_s.strip.present?
-        if input['rag_file_ids'].is_a?(Array) && input['rag_file_ids'].any?
-          rag_resource['ragFileIds'] = input['rag_file_ids'].compact
+        rc = (input['rag_corpus'] || '').to_s.strip
+        rag_resource['ragCorpus'] = rc unless rc.empty?
+
+        rids = input['rag_file_ids']
+        if rids.is_a?(Array)
+          ids = rids.compact.map(&:to_s).reject(&:empty?)
+          rag_resource['ragFileIds'] = ids unless ids.empty?
         end
 
         rag_resources = []
         rag_resources << rag_resource unless rag_resource.empty?
-
         error('Request must set RAG resources (rag_corpus and/or rag_file_ids).') if rag_resources.empty?
 
         body = {
@@ -1791,47 +1793,68 @@ require 'securerandom'
           }
         }
 
-        # 3) Headers (Workato OAuth2 usually injects Authorization automatically; keep minimal & explicit JSON)
-        headers = {
-          'Content-Type' => 'application/json'
-        }
+        headers = { 'Content-Type' => 'application/json' }
 
-        # 4) Call API (correct Workato signature: post(url, body: ..., headers: ...))
+        # --- Call API (make sure this is keyword args, not positional) ---
         rsp = post(url, body: body, headers: headers)
 
-        # 5) Normalize shape (be resilient to nested {"contexts":{"contexts":[...]}} or flat {"contexts":[...]})
-        #    Also tolerate alternative keys if the API evolves.
-        top = rsp.is_a?(Hash) ? rsp : {}
+        # --- Normalize/parse response into a Hash ---
+        parsed = nil
+        case rsp
+        when Hash
+          parsed = rsp
+        when String
+          begin
+            parsed = JSON.parse(rsp)
+          rescue JSON::ParserError
+            parsed = { '_raw_string' => rsp }
+          end
+        else
+          # If someone accidentally used positional args earlier in dev, Workato can hand back a Request-ish object.
+          # We surface a helpful debug breadcrumb while still emitting an empty contexts array.
+          parsed = { '_unexpected_class' => rsp.class.to_s }
+        end
+
+        # --- Extract contexts with shape tolerance ---
+        # Accept any of:
+        #   { "contexts": { "contexts": [ ... ] } }
+        #   { "contexts": [ ... ] }
+        #   { "ragContexts": [ ... ] }   (defensive future-proofing)
         raw_contexts =
-          top.dig('contexts', 'contexts') ||
-          top['contexts'] ||
-          top['ragContexts'] ||
+          (parsed.is_a?(Hash) && parsed.dig('contexts', 'contexts')) ||
+          (parsed.is_a?(Hash) && parsed['contexts']) ||
+          (parsed.is_a?(Hash) && parsed['ragContexts']) ||
           []
 
         contexts = Array(raw_contexts).map do |c|
-          # Keep only stable keys; pass chunk/pageSpan through as-is for downstream use
+          next unless c.is_a?(Hash)
           {
             'sourceUri' => c['sourceUri'],
             'sourceDisplayName' => c['sourceDisplayName'],
-            'text' => c['text'] || c.dig('chunk', 'text'),
+            'text' => c['text'] || (c['chunk'].is_a?(Hash) ? c['chunk']['text'] : nil),
             'score' => c['score'],
             'chunk' => (c['chunk'].is_a?(Hash) ? c['chunk'] : nil)
-          }.compact
-        end
+          }.delete_if { |_, v| v.nil? }
+        end.compact
 
-        # 6) Optional debug block
+        # --- Optional debug payload (auto-on if nothing was found) ---
+        emit_debug = (input['emit_debug'] == true) || contexts.empty?
         debug = nil
-        if input['emit_debug'] == true
+        if emit_debug
           debug = {
-            'http_status' => ( rsp.is_a?(Hash) && rsp['error'] ? rsp['error']['code'] : 200 ),
             'request_url' => url,
             'request_body' => body,
-            'raw_keys' => top.keys.map(&:to_s)
+            'response_top_keys' => (parsed.is_a?(Hash) ? parsed.keys.map(&:to_s) : []),
+            'response_class' => rsp.class.to_s,
+            'nested_keys_hint' => parsed.dig('contexts')&.class&.to_s,
+            'raw_contexts_class' => raw_contexts.class.to_s,
+            'raw_contexts_length' => Array(raw_contexts).length
           }
         end
 
-        { 'contexts' => contexts, 'debug' => debug }.compact
+        { 'contexts' => contexts, 'debug' => debug }.delete_if { |_, v| v.nil? }
       end
+
     },
 
     rag_answer: {
