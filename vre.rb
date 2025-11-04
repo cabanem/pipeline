@@ -1412,12 +1412,8 @@ require 'securerandom'
       title: 'RAG (Serving): Retrieve contexts',
       subtitle: 'projects.locations:retrieveContexts (Vertex RAG Engine, v1)',
       display_priority: 120,
-
-      # Retries (safe defaults)
-      retry_on_request: ['GET', 'HEAD'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
-
       help: lambda do |_|
         { body: 'Retrieve relevant contexts from a Vertex RAG corpus/store. Toggle advanced options to expose thresholds and rankers.' }
       end,
@@ -1429,7 +1425,6 @@ require 'securerandom'
           default: false, sticky: true, extends_schema: true,
           hint: 'Toggle to reveal threshold/ranker controls.' }
       ],
-
       input_fields: lambda do |od, connection, cfg|
         show_adv = (cfg['show_advanced'] == true)
 
@@ -1464,7 +1459,6 @@ require 'securerandom'
 
         base + (show_adv ? adv : []) + Array(od['observability_input_fields']) # includes cid, etc.
       end,
-
       output_fields: lambda do |_od, _connection|
         context_props = [
           { name: 'sourceUri' }, { name: 'sourceDisplayName' },
@@ -1495,7 +1489,6 @@ require 'securerandom'
           ] }
         ]
       end,
-
       execute: lambda do |connection, input|
         # Step begin: captures cid (if provided) and starts timing
         ctx = call(:step_begin!, :rag_retrieve_contexts, input)
@@ -1559,7 +1552,8 @@ require 'securerandom'
         cid = (input['cid'] || (ctx && ctx['cid']))
         headers = {
           'Content-Type' => 'application/json',
-          'x-goog-request-params' => "project=#{project}&location=#{location}"
+          'x-goog-request-params' => "project=#{project}&location=#{location}",
+          'Accept' => 'application/json'
         }
         headers['x-goog-user-project'] = connection['quota_project'] if connection['quota_project'].present?
         headers['x-correlation-id']    = cid if cid.present?
@@ -1573,16 +1567,50 @@ require 'securerandom'
                 end
                 .response_format_json
 
-        # Normalize/flatten
-        contexts_array = Array(resp.dig('contexts', 'contexts'))
+        # 6) Normalize/flatten (defensive against shape variants)
+        # Official v1 shape is: { "contexts": { "contexts": [ Context, ... ] } }
+        # Fallbacks handle accidental top-level arrays or `ragContexts` names.
+        root_ctx_obj = resp['contexts']
+        contexts_array =
+          if root_ctx_obj.is_a?(Hash) && root_ctx_obj['contexts'].is_a?(Array)
+            root_ctx_obj['contexts']
+          elsif resp['contexts'].is_a?(Array)
+            # Some proxies/tools flatten to an array at top-level "contexts"
+            resp['contexts']
+          elsif resp.dig('ragContexts', 'contexts').is_a?(Array)
+            # Older/alt naming seen in some examples
+            resp.dig('ragContexts', 'contexts')
+          else
+            []
+          end
+
+        # Canonicalize the object we return to match output_fields
+        canonical_contexts_obj =
+          if root_ctx_obj.is_a?(Hash)
+            # Keep as-is if it's already the documented object
+            root_ctx_obj
+          else
+            { 'contexts' => contexts_array }
+          end
+
+        # Minimal debug breadcrumb to help diagnose future shape changes
+        debug_shape = {
+          'resp_class'        => resp.class.name,
+          'top_keys'          => (resp.is_a?(Hash) ? resp.keys : []),
+          'contexts_is_hash'  => root_ctx_obj.is_a?(Hash),
+          'contexts_keys'     => (root_ctx_obj.is_a?(Hash) ? root_ctx_obj.keys : []),
+          'count'             => contexts_array.length
+        }
+
         out = {
-          'contexts'      => resp['contexts'],
+          'contexts'      => canonical_contexts_obj,
           'contexts_flat' => contexts_array,
-          'count'         => contexts_array.length
+          'count'         => contexts_array.length,
+          'debug_shape'   => debug_shape
         }
 
         # Success w/telemetry; label helps dashboards
-        call(:step_ok!, ctx, out, 200, 'OK', { 'count' => contexts_array.length })
+        call(:step_ok!, ctx, out, 200, 'OK', { 'count' => contexts_array.length, 'shape' => debug_shape })
       end,
 
       sample_output: lambda do
