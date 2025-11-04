@@ -1409,7 +1409,7 @@ require 'securerandom'
 
     # RAG store engine
     rag_retrieve_contexts: {
-      title: 'RAG Engine: Retrieve contexts',
+      title: 'RAG Engine: Fetch contexts',
       subtitle: 'projects.locations:retrieveContexts (Vertex RAG Store)',
       help: lambda do |_|
         {
@@ -1424,7 +1424,6 @@ require 'securerandom'
         }
       end,
       display_priority: 86,
-      retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
 
@@ -1434,24 +1433,12 @@ require 'securerandom'
           { name: 'rag_corpus', optional: false,
             hint: 'Accepts either full resource name (e.g., "projects/{project}/locations/{region}/ragCorpora/{corpus}") or the "corpus"' },
           { name: 'question', optional: false },
-          { name: 'category', optional: true, hint: 'Chosen category used to scope corpus and shape the question.' },
-          { name: 'category_hint_in_question', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
-            hint: 'Prepend "Category: <name>" to the question to improve retrieval focus.' },
           { name: 'restrict_to_file_ids', type: 'array', of: 'string', optional: true },
           { name: 'max_contexts', type: 'integer', optional: true, default: 20 },
-          { name: 'show_advanced', label: 'Show advanced options', type: 'boolean', control_type: 'checkbox',
-            default: false, sticky: true, extends_schema: true },
 
           { name: 'rag_retrieval_config', label: 'Retrieval config', type: 'object',
             properties: object_definitions['rag_retrieval_config'], optional: true,
-            hint: 'Set top_k, exactly one threshold (distance OR similarity), and exactly one ranker (semantic OR LLM).' },
-          { name: 'category_corpus_map_json', label: 'Category→Corpus (JSON)', control_type: 'text-area',
-            optional: true, ngIf: 'input.show_advanced',
-            hint: 'JSON object mapping category to corpus. Example: {"PTO":"projects/.../ragCorpora/pto"}' },
-          { name: 'filter_contexts_by_category', type: 'boolean', control_type: 'checkbox', optional: true, default: false,
-            ngIf: 'input.show_advanced', hint: 'After retrieval, drop contexts whose metadata does not match the category.' },
-          { name: 'metadata_category_key', optional: true, default: 'category', ngIf: 'input.show_advanced',
-            hint: 'Metadata key used for category matching (string or array).' }
+            hint: 'Set top_k, exactly one threshold (distance OR similarity), and exactly one ranker (semantic OR LLM).' }
         ]
       end,
       output_fields: lambda do |object_definitions, _connection|
@@ -1479,9 +1466,9 @@ require 'securerandom'
       execute: lambda do |connection, input|
         started_at = Time.now.utc.iso8601
         t0   = Time.now
-        cid  = call(:ensure_correlation_id!, input)
+        cid = call(:ensure_correlation_id!, input)
+        retr_url = nil; retr_req_body = nil
 
-        # --- Connection + resource guards --------------------------------------
         proj = connection['project_id']
         loc  = connection['location']
         raise 'Connection missing project_id' if proj.blank?
@@ -1490,51 +1477,39 @@ require 'securerandom'
         corpus = call(:normalize_rag_corpus, connection, input['rag_corpus'])
         error('rag_corpus is required') if corpus.blank?
 
-        loc_str = (connection['location'] || '').downcase
-        parent  = "projects/#{connection['project_id']}/locations/#{loc_str}"
+        loc     = (connection['location'] || '').downcase
+        parent  = "projects/#{connection['project_id']}/locations/#{loc}"
         req_par = "parent=#{parent}"
 
-        # --- Build request ------------------------------------------------------
+        # Merge + validate retrieval options from object/flat inputs
         opts = call(:build_retrieval_opts_from_input!, input)
+
         payload = call(
           :build_rag_retrieve_payload,
-          input['question'].to_s,
+          input['question'],
           corpus,
           input['restrict_to_file_ids'],
           opts
         )
 
-        url  = call(:aipl_v1_url, connection, loc_str, "#{parent}:retrieveContexts")
-        res  = call(:http_post_json!, url,
-                    call(:headers_rag, connection, cid, req_par),
-                    call(:json_compact, payload))
+        retr_url  = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
+        retr_req_body = call(:json_compact, payload)
+        # Retrieval must not depend on user-project billing; align with rag_answer
+        resp = post(retr_url)
+                 .headers(call(:headers_rag, connection, cid, req_par))
+                 .payload(retr_req_body)
 
-        resp_code = res['__http_code__'].to_i
-        resp_body = res['__body__']  # <- this is the real parsed JSON/Hash now
 
-        # Use resp_body from here on:
-        raw_contexts = call(:coerce_contexts_array!, resp_body)
-        maxn         = call(:clamp_int, (input['max_contexts'] || 20), 1, 200)
-        mapped       = call(:map_context_chunks, raw_contexts, maxn)
-
-        contexts_final =
-          if mapped.is_a?(String)
-            parsed = call(:safe_json, mapped)
-            if parsed.is_a?(Hash) && parsed['contexts'].is_a?(Array) then parsed['contexts']
-            elsif parsed.is_a?(Array) then parsed else [] end
-          elsif mapped.is_a?(Hash) && mapped['contexts'].is_a?(Array)
-            mapped['contexts']
-          else
-            mapped
-          end
+        raw   = call(:normalize_retrieve_contexts!, resp)
+        maxn  = call(:clamp_int, (input['max_contexts'] || 20), 1, 200)
+        mapped= call(:map_context_chunks, raw, maxn)
 
         out = {
-          'question' => input['question'].to_s,
-          'contexts' => contexts_final
-        }.merge(call(:telemetry_envelope, t0, cid, true, resp_code, 'OK'))
+          'question' => input['question'],
+          'contexts' => mapped
+        }.merge(call(:telemetry_envelope, t0, cid, true, call(:telemetry_success_code, resp), 'OK'))
 
-
-        # Telemetry knobs preview
+        # Telemetry preview from canonical opts:
         (out['telemetry'] ||= {})['retrieval'] = {}.tap do |h|
           h['top_k'] = opts['topK'].to_i if opts['topK']
           if opts['vectorDistanceThreshold']
@@ -1548,35 +1523,22 @@ require 'securerandom'
         elsif opts['llmRankerModel']
           (out['telemetry'] ||= {})['rank'] = { 'mode' => 'llm', 'model' => opts['llmRankerModel'] }
         end
-
-        # Debug probe (fix typos too)
-        unless call(:normalize_boolean, connection['prod_mode'])
-          (out['telemetry'] ||= {})['debug_shape'] = {
-            'resp_cls'       => resp_body.class.to_s,
-            'resp_keys'      => (resp_body.is_a?(Hash) ? resp_body.keys.take(8) : nil),
-            'contexts_cls'   => out['contexts'].class.to_s,
-            'contexts0_keys' => (Array(out['contexts']).first || {}).keys.take(8)
-          }
-        end
-
         facets = call(:compute_facets_for!, 'rag_retrieve_contexts', out)
         (out['telemetry'] ||= {})['facets'] = facets
-
         call(:local_log_attach!, out,
           call(:local_log_entry, :rag_retrieve_contexts, started_at, t0, out, nil, {
-            'retrieval_top_k'   => out.dig('telemetry','retrieval','top_k'),
-            'contexts_returned' => Array(out['contexts']).length,
-            'facets'            => facets
+            'retrieval_top_k'    => out.dig('telemetry','retrieval','top_k'),
+            'contexts_returned'  => Array(out['contexts']).length,
+            'facets'             => facets
           }))
-
         out
       rescue => e
-        g   = call(:extract_google_error, e)
+        g = call(:extract_google_error, e)
         msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
         env = {}.merge(call(:telemetry_envelope, t0, cid, false, call(:telemetry_parse_error_code, e), msg))
         call(:local_log_attach!,
-            env,
-            call(:local_log_entry, :rag_retrieve_contexts, started_at, t0, nil, e, { 'google_error' => g }))
+             env,
+             call(:local_log_entry, :rag_retrieve_contexts, started_at, t0, nil, e, { 'google_error' => g }))
         env
       end,
       sample_output: lambda do
@@ -3930,24 +3892,29 @@ require 'securerandom'
       }
     end,
 
+    # Reverted to old version //emc
     build_retrieval_opts_from_input!: lambda do |input|
-      cfg  = (input['rag_retrieval_config'].is_a?(Hash) ? input['rag_retrieval_config'] : {})
+      cfg = (input['rag_retrieval_config'].is_a?(Hash) ? input['rag_retrieval_config'] : {})
       filt = cfg['filter'].is_a?(Hash) ? cfg['filter'] : {}
       rank = cfg['ranking'].is_a?(Hash) ? cfg['ranking'] : {}
+
       topk = cfg['top_k'] || input['similarity_top_k']
       dist = filt['vector_distance_threshold']   || input['vector_distance_threshold']
       sim  = filt['vector_similarity_threshold'] || input['vector_similarity_threshold']
       rsm  = rank['rank_service_model']          || input['rank_service_model']
       llm  = rank['llm_ranker_model']            || input['llm_ranker_model']
+
+      # Validate oneof unions
       call(:guard_threshold_union!, dist, sim)
       call(:guard_ranker_union!, rsm, llm)
-      {}.tap do |h|
-        h['topK'] = topk.to_i if topk
-        h['vectorDistanceThreshold']   = dist if dist
-        h['vectorSimilarityThreshold'] = sim  if sim
-        h['rankServiceModel'] = rsm if rsm
-        h['llmRankerModel']   = llm if llm
-      end
+
+      {
+        'topK'                         => topk,
+        'vectorDistanceThreshold'      => dist,
+        'vectorSimilarityThreshold'    => sim,
+        'rankServiceModel'             => rsm,
+        'llmRankerModel'               => llm
+      }.delete_if { |_k, v| v.nil? || v == '' }
     end,
 
     # --- Auth (JWT → OAuth) -----------------------------------------------
