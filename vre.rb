@@ -1691,62 +1691,38 @@ require 'securerandom'
       end
     },
     rag_retrieve_contexts_new: {
-      title: 'RAG: Retrieve contexts (Vertex v1)',
-      subtitle: 'projects.locations:retrieveContexts',
-      display_priority: 120,
-      retry_on_response: [408, 429, 500, 502, 503, 504],
-      max_retries: 3,
-      help: lambda do |_|
-        { body: 'Retrieve relevant contexts from a Vertex RAG Store corpus. Pass request per the v1 data contract.' }
-      end,
+      title: 'RAG: Retrieve contexts (new)',
+      subtitle: 'Friendly inputs → contract → Vertex v1',
+      display_priority: 119,
 
-      # Config fields must be a literal array (no lambdas/methods)
       config_fields: [
         { name: 'show_advanced', label: 'Show advanced options',
-          type: 'boolean', control_type: 'checkbox',
-          default: false, sticky: true, extends_schema: true }
+          type: 'boolean', control_type: 'checkbox', default: false, sticky: true, extends_schema: true }
       ],
 
       input_fields: lambda do |_od, connection, cfg|
         adv = (cfg['show_advanced'] == true)
-
         [
-          # Path
-          { name: 'parent', label: 'Parent (projects/{project}/locations/{location})',
-            hint: 'If blank, uses connection project/location.',
-            sticky: true },
+          { name: 'parent', hint: 'projects/{project}/locations/{location}. If blank, uses connection.' },
+          { name: 'query_text', label: 'Query text', optional: false },
 
-          # Request body (strictly from the contract)
-          { name: 'query', type: 'object', optional: false, properties: [
-              { name: 'text', label: 'Query text' },
-              { name: 'ragRetrievalConfig', type: 'object', optional: true }
-            ],
-            hint: 'At minimum, provide text. ragRetrievalConfig is passthrough.' },
+          # Minimal source targeting
+          { name: 'rag_corpus', label: 'RAG corpus (full name)',
+            hint: 'projects/{proj}/locations/{loc}/ragCorpora/{corpus}', optional: false },
+          { name: 'rag_file_ids', label: 'RAG file IDs', type: 'array', of: 'string', optional: true },
 
-          { name: 'data_source', type: 'object', optional: false, properties: [
-              { name: 'vertexRagStore', type: 'object', properties: [
-                  { name: 'ragResources', type: 'array', of: 'object', properties: [
-                      { name: 'ragCorpus', hint: 'projects/{project}/locations/{location}/ragCorpora/{corpus}' },
-                      { name: 'ragFileIds', type: 'array', of: 'string' }
-                    ] },
-                  { name: 'vectorDistanceThreshold', type: 'number',
-                    hint: 'Deprecated by Google; keep empty unless you know you need it.' }
-                ] }
-            ] },
+          # Optional pass-through tuning (drops directly into ragRetrievalConfig)
+          (adv ? { name: 'rag_retrieval_config', label: 'ragRetrievalConfig (object)',
+                  type: 'object', optional: true } : nil),
 
-          # Optional headers / diagnostics
-          { name: 'x_goog_user_project', label: 'x-goog-user-project (billing)', sticky: true, optional: true },
-          { name: 'cid', label: 'Correlation ID (x-correlation-id)', sticky: true, optional: true, hint: 'For tracing/logs.' },
-
-          # Toggle to expose raw passthrough (entire request JSON)
-          (adv ? { name: 'raw_request_json', label: 'Raw request override (JSON)',
-                  control_type: 'text-area', sticky: true, optional: true,
-                  hint: 'If provided, this exact JSON is sent as the request body (query/data_source fields above are ignored).' } : nil)
+          # Optional headers/diag
+          { name: 'x_goog_user_project', optional: true, sticky: true },
+          { name: 'cid', label: 'Correlation ID', optional: true, sticky: true }
         ].compact
       end,
 
       execute: lambda do |connection, input|
-        # Build parent from connection if not provided
+        # Resolve parent
         parent = input['parent'].presence
         if parent.blank?
           proj = connection['project_id'].presence || connection['project'].presence
@@ -1755,44 +1731,41 @@ require 'securerandom'
           parent = "projects/#{proj}/locations/#{loc}"
         end
 
-        url = "https://aiplatform.googleapis.com/v1/#{parent}:retrieveContexts"
+        # Build the **contract** body from simple fields
+        body = {
+          'query' => {
+            'text' => input['query_text']
+          },
+          'data_source' => {
+            'vertexRagStore' => {
+              'ragResources' => [
+                {
+                  'ragCorpus' => input['rag_corpus'],
+                  # only include if provided
+                  'ragFileIds' => Array(input['rag_file_ids']).presence
+                }.compact
+              ]
+            }
+          }
+        }
 
-        # Headers (auth handled by connector framework)
+        # Optional tuning passthrough → ragRetrievalConfig
+        if input['rag_retrieval_config'].present?
+          body['query']['ragRetrievalConfig'] = input['rag_retrieval_config']
+        end
+
+        # Guardrails
+        error('query_text required') if body.dig('query', 'text').blank?
+        error('rag_corpus required') if body.dig('data_source', 'vertexRagStore', 'ragResources', 0, 'ragCorpus').blank?
+
+        url = "https://aiplatform.googleapis.com/v1/#{parent}:retrieveContexts"
         headers = { 'Content-Type' => 'application/json' }
         headers['x-goog-user-project'] = input['x_goog_user_project'] if input['x_goog_user_project'].present?
         headers['x-correlation-id']    = input['cid'] if input['cid'].present?
 
-        # Body: either raw override or structured per contract
-        body =
-          if input['raw_request_json'].present?
-            call(:parse_json, input['raw_request_json'])
-          else
-            req = {}
-            if input['query'].present?
-              # keep only known keys; pass ragRetrievalConfig through
-              q = {}
-              q['text'] = input['query']['text'] if input['query']['text'].present?
-              if input['query']['ragRetrievalConfig'].present?
-                q['ragRetrievalConfig'] = input['query']['ragRetrievalConfig']
-              end
-              req['query'] = q
-            end
-            if input['data_source'].present?
-              req['data_source'] = input['data_source']
-            end
-            req
-          end
-
-        # Guardrails
-        error('Missing query.text') unless body.dig('query', 'text').present?
-        error('Missing data_source.vertexRagStore') unless body.dig('data_source', 'vertexRagStore').present?
-
         rsp = post(url, body, headers)
 
-        # Normalize response shapes:
-        # A) { "contexts": { "contexts": [ ... ] } }
-        # B) { "contexts": [ ... ] }
-        # C) { "contexts": null }  → []
+        # Normalize "contexts" shape → flat array
         contexts =
           if rsp['contexts'].is_a?(Hash) && rsp['contexts']['contexts'].is_a?(Array)
             rsp['contexts']['contexts']
@@ -1802,11 +1775,7 @@ require 'securerandom'
             []
           end
 
-        # Emit a flat array; also pass through the raw for debugging
-        {
-          contexts: contexts,
-          _raw_response: rsp
-        }
+        { contexts: contexts, _raw_response: rsp, _request_body: body }
       end,
 
       output_fields: lambda do |_od, _connection|
@@ -1821,8 +1790,8 @@ require 'securerandom'
                 ] },
               { name: 'score', type: 'number' }
             ] },
-          # handy for debugging / recipes
-          { name: '_raw_response', type: 'object' }
+          { name: '_raw_response', type: 'object' },
+          { name: '_request_body', type: 'object' } # helpful for debugging what was sent
         ]
       end,
 
@@ -1832,15 +1801,17 @@ require 'securerandom'
             {
               'sourceUri' => 'gs://bucket/file.pdf',
               'sourceDisplayName' => 'file.pdf',
-              'text' => 'Example chunk text…',
-              'chunk' => { 'text' => 'Example chunk text…', 'pageSpan' => { 'start' => 2, 'end' => 2 } },
+              'text' => 'Example chunk…',
+              'chunk' => { 'text' => 'Example chunk…', 'pageSpan' => { 'start': 2, 'end': 2 } },
               'score' => 0.27
             }
           ],
-          '_raw_response' => { 'contexts' => { 'contexts' => [] } }
+          '_raw_response' => { 'contexts' => { 'contexts' => [] } },
+          '_request_body' => {}
         }
       end
     },
+
     rag_answer: {
       title: 'RAG Engine: Get grounded response (one-shot)',
       subtitle: 'Retrieve contexts from a corpus and generate a cited answer',
