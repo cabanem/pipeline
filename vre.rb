@@ -1575,20 +1575,24 @@ require 'securerandom'
           'x-goog-request-params' => "parent=#{parent}"
         }
 
-        # ---- Call API -------------------------------------------------------------------
-        resp = post(url)
-                .headers(headers)
-                .payload(body)
-                .after_error_response(/.*/) { |code, b, _h| error("Vertex retrieveContexts failed (HTTP #{code}): #{b}") }
-                .response_format_json
-
-        # ---- Robust, single-pass JSON normalization ------------------------------------
-        # If a layer ever returns a string with unquoted keys (Ruby/JS literal), fail loud:
-        if resp.is_a?(String) && resp =~ /[{,]\s*[A-Za-z_]\w*\s*:/
-          error('Received non-JSON object literal (unquoted keys). Ensure response_format_json is set, or parse body JSON once.')
+        if headers['Authorization'].to_s.strip.empty?
+          error('Missing Authorization header. Check service account / token minting.')
         end
+        # ---- Call API -------------------------------------------------------------------
+        req = post(url)
+                .headers(headers)
+                .request_format_json 
+                .payload(body)
 
-        # Workato wrappers or direct parsed JSON:
+        resp = 
+          begin
+            req.response_format_json
+          rescue
+            raw = req.response_format_raw
+            (JSON.parse(raw['body']) rescue raw)
+          end
+
+        # ---- Strict JSON envelope handling ---------------------------------------------
         doc =
           if resp.is_a?(Hash) && resp.key?('body') && resp['body'].is_a?(String)
             JSON.parse(resp['body']) rescue {}
@@ -1600,7 +1604,6 @@ require 'securerandom'
             {}
           end
 
-        # Accept only the documented v1 envelopes
         arr =
           if doc.is_a?(Hash) && doc.dig('contexts','contexts').is_a?(Array)
             doc['contexts']['contexts']
@@ -1610,7 +1613,7 @@ require 'securerandom'
             []
           end
 
-        # If upstream symbolized keys, coerce once
+        # Symbolized-keys fallback (if some layer turned keys into symbols)
         if arr.empty? && doc.is_a?(Hash) && doc.key?(:contexts)
           c = doc[:contexts]
           if c.is_a?(Hash) && c.key?(:contexts) && c[:contexts].is_a?(Array)
@@ -1620,7 +1623,6 @@ require 'securerandom'
           end
         end
 
-        # Normalize each item and add similarity helper when score is numeric.
         enriched = Array(arr).map do |h|
           item = h.is_a?(Hash) ? h.transform_keys(&:to_s) : {}
           sc = item['score']
@@ -1630,7 +1632,7 @@ require 'securerandom'
 
         out = {
           'contexts'      => { 'contexts' => enriched },   # keep documented nesting
-          'contexts_flat' => enriched,                     # easy pills
+          'contexts_flat' => enriched,
           'count'         => enriched.length,
           'debug_shape'   => {
             'resp_class'    => resp.class.name,
@@ -1641,8 +1643,8 @@ require 'securerandom'
           }
         }
 
-        # Success envelope with telemetry
         call(:step_ok!, ctx, out, 200, 'OK', { 'count' => enriched.length })
+
       end,
       sample_output: lambda do
         {
