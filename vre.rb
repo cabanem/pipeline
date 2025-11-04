@@ -1690,6 +1690,109 @@ require 'securerandom'
         }
       end
     },
+    rag_retrieve_contexts_simplified: {
+      title: 'RAG: Retrieve contexts (simplified)',
+      subtitle: '',
+      description: '',
+      display_priority: 86,
+      retry_on_request: ['GET','HEAD'],
+      retry_on_response: [408,429,500,502,503,504],
+      max_retries: 3,
+
+      input_fields: lambda do |_|
+        [
+          { name: 'rag_corpus', optional: true, hint: 'projects/{p}/locations/{l}/ragCorpora/{corpus}' },
+          { name: 'query', optional: false, hint: 'Plain-text query string.' },
+          { name: 'max_contexts', label: 'Top K', type: :integer, optional: true, default: 12, hint: 'Maps to query.ragRetrievalConfig.topK.' }
+        ]
+      end,
+      output_fields: lambda do |object_definitions|
+        [
+          { name: 'contexts', type: :array, of: :object, properties: object_definitions['context_chunk'] },
+          { name: '_meta', type: :object }
+        ]
+      end,
+      execute: lambda do |connection, input|
+        host = call(:aiplatform_host, connection)
+        path = call(:path_rag_retrieve_contexts, connection)
+        # Build the canonical parent for routing + header hints
+        parent = "projects/#{call(:ensure_project_id!, connection)}/locations/#{call(:ensure_location!, connection)}"
+
+        body = {
+          'query' => {
+            'text' => input['query'].to_s,
+            'ragRetrievalConfig' => {
+              'topK' => call(:coerce_integer, input['max_contexts'], 12)
+            }
+          }
+        }
+        rc = input['rag_corpus'].to_s.strip
+        unless rc.empty?
+          # 'data_source' is a union; include only the chosen member at top level.
+          body['vertexRagStore'] = {
+            'ragResources' => [{ 'ragCorpus' => rc }]
+          }
+        end
+
+        # Add Google's routing hint header
+        extra = { 'x-goog-request-params' => "parent=#{parent}" }
+        # Push requestor-pays/quota attribution if configured
+        up = connection['user_project'].to_s.strip
+        extra['x-goog-user-project'] = up unless up.empty?
+
+        result = post("https://#{host}#{path}")
+                .headers(call(:default_headers, connection).merge(extra))
+                .payload(body)
+                .after_error_response(/.*/) { |code, b, _h| error("Vertex retrieveContexts failed (HTTP #{code}): #{b}") }
+                .response_format_json
+
+        # Handle both REST shapes:
+        # (A) { "contexts": [ ... ] }
+        # (B) { "contexts": { "contexts": [ ... ] } }
+        arr =
+          if result.is_a?(Hash)
+            if result['contexts'].is_a?(Array)
+              result['contexts']
+            elsif result.dig('contexts', 'contexts').is_a?(Array)
+              result.dig('contexts', 'contexts')
+            else
+              []
+            end
+          else
+            []
+          end
+
+        mapped = arr.map do |c|
+          {
+            # ID is best-effort; not always present
+            'id' => c.dig('chunk', 'id') || c.dig('chunk', 'chunkId') || c.dig('chunk', 'chunk_id'),
+            'uri' => c['sourceUri'] || c['source_uri'],
+            'content' => c['text'],
+            'score' => c['score'],
+            'metadata' => {
+              'sourceDisplayName' => c['sourceDisplayName'] || c['source_display_name'],
+              'chunk' => c['chunk']
+            }.compact
+          }.compact
+        end
+
+        { 'contexts' => mapped, '_meta' => { 'raw_count' => mapped.length } }
+      end,
+      sample_output: lambda do
+        {
+          'contexts' => [
+            {
+              'id' => 'chunk-123',
+              'uri' => 'gs://bucket/doc.txt',
+              'content' => '...',
+              'score' => 0.83,
+              'metadata' => { 'sourceDisplayName' => 'doc.txt' }
+            }
+          ],
+          '_meta' => { 'raw_count' => 1 }
+        }
+      end
+    },
     rag_answer: {
       title: 'RAG Engine: Get grounded response (one-shot)',
       subtitle: 'Retrieve contexts from a corpus and generate a cited answer',
@@ -3371,10 +3474,10 @@ require 'securerandom'
         )
 
         src = (
-          h['sourceDisplayName'] || md['source'] || md['displayName'] || h['source']
+          h['sourceDisplayName'] || h['source_display_name'] || md['source'] || md['displayName'] || h['source']
         )
         uri = (
-          h['sourceUri'] || h['uri'] || md['uri'] || md['gcsUri'] || md['url']
+          h['sourceUri'] || h['source_uri'] || h['uri'] || md['uri'] || md['gcsUri'] || md['url']
         )
 
         # Normalize types
@@ -3514,7 +3617,8 @@ require 'securerandom'
       if v.is_a?(Array)
         return v if !v.empty? && v.first.is_a?(Hash) &&
                     (v.first.key?('text') || v.first.key?('chunkText') ||
-                    v.first.key?('sourceUri') || v.first.key?('chunkId'))
+                    v.first.key?('sourceUri') || v.first.key?('source_uri') ||
+                    v.first.key?('chunkId') || v.first.key?('chunk_id'))
         v.each do |e|
           r = call(:find_contexts_array_any!, e)
           return r if r
@@ -4823,10 +4927,10 @@ require 'securerandom'
                h.dig('context','text') ||
                h.dig('documentContext','text') ||
                ''
-        src = h['sourceDisplayName'] || md['source']
-        uri = h['sourceUri'] || md['uri'] || md['gcsUri'] || md['url']
+        src = h['sourceDisplayName'] || h['source_display_name'] || md['source']
+        uri = h['sourceUri'] || h['source_uri'] || md['uri'] || md['gcsUri'] || md['url']
         {
-          'id'            => (h['chunkId'] || h['id'] || "ctx-#{i+1}"),
+          'id'            => (h['chunkId'] || h['chunk_id'] || h['id'] || "ctx-#{i+1}"),
           'text'          => text.to_s,
           'score'         => (h['score'] || h['relevanceScore'] || 0.0).to_f,
           'source'        => src,
