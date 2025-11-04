@@ -1409,7 +1409,7 @@ require 'securerandom'
 
     # RAG store engine
     rag_retrieve_contexts: {
-      title: 'RAG Engine: Fetch contexts',
+      title: 'RAG (Serving): Retrieve contexts',
       subtitle: 'projects.locations:retrieveContexts (Vertex RAG Store)',
       help: lambda do |_|
         {
@@ -1424,23 +1424,27 @@ require 'securerandom'
         }
       end,
       display_priority: 86,
+      retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
 
       input_fields: lambda do |object_definitions, _connection, _config_fields|
         [
-          { name: 'correlation_id', label: 'Correlation ID', optional: true, hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
           { name: 'rag_corpus', optional: false,
             hint: 'Accepts either full resource name (e.g., "projects/{project}/locations/{region}/ragCorpora/{corpus}") or the "corpus"' },
           { name: 'question', optional: false },
           { name: 'restrict_to_file_ids', type: 'array', of: 'string', optional: true },
           { name: 'max_contexts', type: 'integer', optional: true, default: 20 },
 
+          # Preferred object (teams can use this)
           { name: 'rag_retrieval_config', label: 'Retrieval config', type: 'object',
             properties: object_definitions['rag_retrieval_config'], optional: true,
             hint: 'Set top_k, exactly one threshold (distance OR similarity), and exactly one ranker (semantic OR LLM).' }
+
+          # (If you kept legacy flat fields for BC, they can remain here; not required.)
         ]
       end,
+
       output_fields: lambda do |object_definitions, _connection|
         [
           { name: 'question' },
@@ -1463,18 +1467,17 @@ require 'securerandom'
           ]}
         ]
       end,
+
       execute: lambda do |connection, input|
-        started_at = Time.now.utc.iso8601
         t0   = Time.now
-        cid = call(:ensure_correlation_id!, input)
-        retr_url = nil; retr_req_body = nil
+        corr = call(:build_correlation_id_0)
 
         proj = connection['project_id']
         loc  = connection['location']
         raise 'Connection missing project_id' if proj.blank?
         raise 'Connection missing location'   if loc.blank?
 
-        corpus = call(:normalize_rag_corpus, connection, input['rag_corpus'])
+        corpus = call(:normalize_rag_corpus_0, connection, input['rag_corpus'])
         error('rag_corpus is required') if corpus.blank?
 
         loc     = (connection['location'] || '').downcase
@@ -1482,32 +1485,29 @@ require 'securerandom'
         req_par = "parent=#{parent}"
 
         # Merge + validate retrieval options from object/flat inputs
-        opts = call(:build_retrieval_opts_from_input!, input)
+        opts = call(:build_retrieval_opts_from_input_0!, input)
 
         payload = call(
-          :build_rag_retrieve_payload,
+          :build_rag_retrieve_payload_0,
           input['question'],
           corpus,
           input['restrict_to_file_ids'],
           opts
         )
 
-        retr_url  = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
-        retr_req_body = call(:json_compact, payload)
-        # Retrieval must not depend on user-project billing; align with rag_answer
-        resp = post(retr_url)
-                 .headers(call(:headers_rag, connection, cid, req_par))
-                 .payload(retr_req_body)
+        url  = call(:aipl_v1_url_0, connection, loc, "#{parent}:retrieveContexts")
+        resp = post(url)
+                .headers(call(:request_headers_auth_0, connection, corr, connection['user_project'], req_par))
+                .payload(call(:json_compact_0, payload))
 
-
-        raw   = call(:normalize_retrieve_contexts!, resp)
-        maxn  = call(:clamp_int, (input['max_contexts'] || 20), 1, 200)
-        mapped= call(:map_context_chunks, raw, maxn)
+        raw   = call(:normalize_retrieve_contexts_0!, resp)
+        maxn  = call(:clamp_int_0, (input['max_contexts'] || 20), 1, 200)
+        mapped= call(:map_context_chunks_0, raw, maxn)
 
         out = {
           'question' => input['question'],
           'contexts' => mapped
-        }.merge(call(:telemetry_envelope, t0, cid, true, call(:telemetry_success_code, resp), 'OK'))
+        }.merge(call(:telemetry_envelope_0, t0, corr, true, call(:telemetry_success_code_0, resp), 'OK'))
 
         # Telemetry preview from canonical opts:
         (out['telemetry'] ||= {})['retrieval'] = {}.tap do |h|
@@ -1523,24 +1523,14 @@ require 'securerandom'
         elsif opts['llmRankerModel']
           (out['telemetry'] ||= {})['rank'] = { 'mode' => 'llm', 'model' => opts['llmRankerModel'] }
         end
-        facets = call(:compute_facets_for!, 'rag_retrieve_contexts', out)
-        (out['telemetry'] ||= {})['facets'] = facets
-        call(:local_log_attach!, out,
-          call(:local_log_entry, :rag_retrieve_contexts, started_at, t0, out, nil, {
-            'retrieval_top_k'    => out.dig('telemetry','retrieval','top_k'),
-            'contexts_returned'  => Array(out['contexts']).length,
-            'facets'             => facets
-          }))
+
         out
       rescue => e
-        g = call(:extract_google_error, e)
+        g = call(:extract_google_error_0, e)
         msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-        env = {}.merge(call(:telemetry_envelope, t0, cid, false, call(:telemetry_parse_error_code, e), msg))
-        call(:local_log_attach!,
-             env,
-             call(:local_log_entry, :rag_retrieve_contexts, started_at, t0, nil, e, { 'google_error' => g }))
-        env
+        {}.merge(call(:telemetry_envelope_0, t0, corr, false, call(:telemetry_parse_error_code_0, e), msg))
       end,
+
       sample_output: lambda do
         {
           'question' => 'What is the PTO carryover policy?',
@@ -1555,13 +1545,7 @@ require 'securerandom'
           'telemetry' => {
             'http_status' => 200, 'message' => 'OK', 'duration_ms' => 22, 'correlation_id' => 'sample',
             'retrieval' => { 'top_k' => 20, 'filter' => { 'type' => 'distance', 'value' => 0.35 } },
-            'rank' => { 'mode': 'rank_service', 'model': 'semantic-ranker-512@latest' },
-            'facets' => {
-              'retrieval_top_k' => 20,
-              'retrieval_filter' => 'distance',
-              'retrieval_filter_val' => 0.35,
-              'contexts_returned' => 1
-            }
+            'rank' => { 'mode': 'rank_service', 'model': 'semantic-ranker-512@latest' }
           }
         }
       end
@@ -2983,6 +2967,293 @@ require 'securerandom'
   
   # --------- METHODS ------------------------------------------------------
   methods: {
+    build_retrieval_opts_from_input_0!: lambda do |input|
+      cfg  = (input['rag_retrieval_config'].is_a?(Hash) ? input['rag_retrieval_config'] : {})
+      filt = cfg['filter'].is_a?(Hash) ? cfg['filter'] : {}
+      rank = cfg['ranking'].is_a?(Hash) ? cfg['ranking'] : {}
+
+      topk = cfg['top_k'] || input['similarity_top_k']
+      dist = filt['vector_distance_threshold']   || input['vector_distance_threshold']
+      sim  = filt['vector_similarity_threshold'] || input['vector_similarity_threshold']
+      rsm  = rank['rank_service_model']          || input['rank_service_model']
+      llm  = rank['llm_ranker_model']            || input['llm_ranker_model']
+
+      # Validate oneof unions
+      call(:guard_threshold_union_0!, dist, sim)
+      call(:guard_ranker_union_0!, rsm, llm)
+
+      {
+        'topK'                      => topk,
+        'vectorDistanceThreshold'   => dist,
+        'vectorSimilarityThreshold' => sim,
+        'rankServiceModel'          => rsm,
+        'llmRankerModel'            => llm
+      }.delete_if { |_k, v| v.nil? || v == '' }
+    end,
+    request_headers_auth_0: lambda do |_connection, correlation_id, user_project=nil, request_params=nil|
+      h = {
+        'X-Correlation-Id' => correlation_id.to_s,
+        'Content-Type'     => 'application/json',
+        'Accept'           => 'application/json'
+      }
+      up = user_project.to_s.strip
+      h['x-goog-user-project']   = up unless up.empty?
+      rp = request_params.to_s.strip
+      h['x-goog-request-params'] = rp unless rp.empty?
+      h
+    end,
+    aipl_service_host_0: lambda do |connection, loc=nil|
+      l = (loc || connection['location']).to_s.downcase
+      (l.blank? || l == 'global') ? 'aiplatform.googleapis.com' : "#{l}-aiplatform.googleapis.com"
+    end,
+    aipl_v1_url_0: lambda do |connection, loc, path|
+      "https://#{call(:aipl_service_host_0, connection, loc)}/v1/#{path}"
+    end,
+    normalize_rag_corpus_0: lambda do |connection, raw|
+      v = raw.to_s.strip
+      return '' if v.blank?
+      return v if v.start_with?('projects/')
+      # Allow short form: just corpus id -> expand using connection project/region
+      call(:ensure_project_id_0!, connection)
+      loc = (connection['location'] || '').to_s.downcase
+      error("RAG corpus requires regional location; got '#{loc}'") if loc.blank? || loc == 'global'
+      "projects/#{connection['project_id']}/locations/#{loc}/ragCorpora/#{v}"
+    end,
+    ensure_project_id_0!: lambda do |connection|
+      # Method mutates caller-visible state, but this is a known and desired side effect.
+      pid = (connection['project_id'].presence ||
+              (JSON.parse(connection['service_account_key_json'].to_s)['project_id'] rescue nil)).to_s
+      error('Project ID is required (not found in connection or key)') if pid.blank?
+      connection['project_id'] = pid
+      pid
+    end,
+    build_rag_retrieve_payload_0: lambda do |question, rag_corpus, restrict_ids = [], opts = {}|
+      # Optional opts:
+      #   'topK', 'vectorDistanceThreshold', 'vectorSimilarityThreshold',
+      #   'rankServiceModel', 'llmRankerModel'
+
+      rag_res = { 'ragCorpus' => rag_corpus }
+      ids     = call(:sanitize_drive_ids_0, restrict_ids, allow_empty: true, label: 'restrict_to_file_ids')
+      rag_res['ragFileIds'] = ids if ids.present?
+
+      query = { 'text' => question.to_s }
+      rr_cfg = {}
+      if opts.is_a?(Hash)
+        if opts['topK']
+          rr_cfg['topK'] = call(:clamp_int_0, (opts['topK'] || 0), 1, 200)
+        end
+        # Filter union
+        dist = opts['vectorDistanceThreshold']
+        sim  = opts['vectorSimilarityThreshold']
+        call(:guard_threshold_union_0!, dist, sim)
+        filt = {}
+        filt['vectorDistanceThreshold']   = call(:safe_float_0, dist) if !dist.nil?
+        filt['vectorSimilarityThreshold'] = call(:safe_float_0, sim)  if !sim.nil?
+        rr_cfg['filter'] = filt unless filt.empty?
+
+        # Ranking union
+        rsm = (opts['rankServiceModel'].to_s.strip)
+        llm = (opts['llmRankerModel'].to_s.strip)
+        call(:guard_ranker_union_0!, rsm, llm)
+        if rsm != ''
+          rr_cfg['ranking'] = { 'rankService' => { 'modelName' => rsm } }
+        elsif llm != ''
+          rr_cfg['ranking'] = { 'llmRanker'   => { 'modelName' => llm } }
+        end
+      end
+      query['ragRetrievalConfig'] = rr_cfg unless rr_cfg.empty?
+
+      {
+        'query'          => query,
+        'vertexRagStore' => { 'ragResources'  => [rag_res] }
+      }
+    end,
+    sanitize_drive_ids_0: lambda do |raw_list, allow_empty: false, label: 'drive_file_ids'|
+      # 1) normalize → 2) drop empties → 3) de-dup
+      norm = call(:safe_array_0, raw_list)
+              .map { |x| call(:normalize_drive_file_id_0, x) }
+              .reject { |x| x.to_s.strip.empty? }
+              .uniq
+      return [] if norm.empty? && allow_empty
+      error("No valid Drive IDs found in #{label}. Remove empty entries or fix links.") if norm.empty?
+      bad = norm.find { |id| id !~ /\A[A-Za-z0-9_-]{8,}\z/ }
+      error("Invalid Drive ID in #{label}: #{bad}") if bad
+      norm
+    end,
+    safe_array_0: lambda do |v|
+      return [] if v.nil? || v == false
+      return v  if v.is_a?(Array)
+      [v]
+    end,
+    normalize_drive_file_id_0:   lambda { |raw| call(:normalize_drive_resource_id_0, raw) },
+    normalize_drive_resource_id_0: lambda do |raw|
+      # Accept strings, datapill Hashes, and common Drive URLs → bare ID
+      return '' if raw.nil? || raw == false
+      v =
+        if raw.is_a?(Hash)
+          raw['id'] || raw[:id] ||
+          raw['fileId'] || raw[:fileId] ||
+          raw['value'] || raw[:value] ||
+          raw['name'] || raw[:name] ||
+          raw['path'] || raw[:path] ||
+          raw.to_s
+        else
+          raw
+        end.to_s.strip
+      return '' if v.empty? || %w[null nil none undefined - (blank)].include?(v.downcase)
+
+      if v.start_with?('http://', 'https://')
+        if (m = v.match(%r{/file/d/([^/?#]+)}))      then v = m[1]
+        elsif (m = v.match(%r{/folders/([^/?#]+)}))  then v = m[1]
+        elsif (m = v.match(/[?&]id=([^&#]+)/))       then v = m[1]
+        end
+      end
+
+      if v.include?('=>') || v.include?('{') || v.include?('}')
+        begin
+          j = JSON.parse(v) rescue nil
+          if j.is_a?(Hash)
+            v = j['id'] || j['fileId'] || j['value'] || ''
+          end
+        rescue; end
+      end
+
+      prior = v.dup
+      v = v[/[A-Za-z0-9_-]+/].to_s
+      v = '' if v.length < 8 && prior.start_with?('http')
+      v
+    end,
+    clamp_int_0: lambda do |n, min, max|
+      [[n.to_i, min].max, max].min
+    end,
+    safe_float_0: lambda do |v|
+      return nil if v.nil?; Float(v) rescue v.to_f
+    end,
+    guard_threshold_union_0!: lambda do |dist, sim|
+      return true if dist.nil? || dist.to_s == ''
+      return true if sim.nil?  || sim.to_s  == ''
+      error('Provide only one of vector_distance_threshold OR vector_similarity_threshold')
+    end,
+    guard_ranker_union_0!: lambda do |rank_service_model, llm_ranker_model|
+      r = rank_service_model.to_s.strip
+      l = llm_ranker_model.to_s.strip
+      return true if r.empty? || l.empty?
+      error('Provide only one of rank_service_model OR llm_ranker_model')
+    end,
+    normalize_retrieve_contexts_0!: lambda do |raw_resp|
+      # Accept both shapes:
+      #   { "contexts": [ {...}, {...} ] }
+      #   { "contexts": { "contexts": [ ... ] } }  # some beta responses
+      arr = raw_resp['contexts']
+      arr = arr['contexts'] if arr.is_a?(Hash) && arr.key?('contexts')
+      Array(arr)
+    end,
+    map_context_chunks_0: lambda do |raw_contexts, maxn = 20|
+      call(:safe_array_0, raw_contexts).first(maxn).each_with_index.map do |c, i|
+        md = (c['metadata'] || {}).to_h
+        {
+          'id'           => (c['chunkId'] || "ctx-#{i+1}"),
+          'text'         => c['text'].to_s,
+          'score'        => (c['score'] || c['relevanceScore'] || 0.0).to_f,
+          'source'       => (c['sourceDisplayName'] || c.dig('metadata','source')),
+          'uri'          => (c['sourceUri']        || c.dig('metadata','uri')),
+          'metadata'     => md,
+          'metadata_kv'  => md.map { |k,v| { 'key' => k.to_s, 'value' => v } },
+          'metadata_json'=> (md.empty? ? nil : md.to_json)
+        }
+      end
+    end,
+    telemetry_envelope_0: lambda do |started_at, correlation_id, ok, code, message|
+      dur = ((Time.now - started_at) * 1000.0).to_i
+      {
+        'ok' => !!ok,
+        'telemetry' => {
+          'http_status'    => code.to_i,
+          'message'        => (message || (ok ? 'OK' : 'ERROR')).to_s,
+          'duration_ms'    => dur,
+          'correlation_id' => correlation_id
+        }
+      }
+    end,
+    telemetry_success_code_0: lambda do |resp|
+      (resp.is_a?(Hash) && (resp['status'] || resp['status_code'])) ? (resp['status'] || resp['status_code']).to_i : 200
+    end,
+    telemetry_parse_error_code_0: lambda do |err|
+      begin
+        if err.respond_to?(:[])
+          code = err['status'] || err.dig('response', 'status') ||
+                err.dig('response', 'status_code') || err.dig('error', 'code')
+          return code.to_i if code
+        end
+      rescue; end
+      begin
+        body = (err.respond_to?(:[]) && err.dig('response','body')).to_s
+        j = JSON.parse(body) rescue nil
+        c = j && j.dig('error','code')
+        return c.to_i if c
+      rescue; end
+      m = err.to_s.match(/\b(\d{3})\b/)
+      m ? m[1].to_i : 500
+    end,
+    extract_google_error_0: lambda do |err|
+      begin
+        body = (err.respond_to?(:[]) && err.dig('response','body')).to_s
+        json = JSON.parse(body) rescue nil
+        if json
+          if json['error']
+            det   = json['error']['details'] || []
+            bad   = det.find { |d| (d['@type'] || '').end_with?('google.rpc.BadRequest') } || {}
+            vlist = (bad['fieldViolations'] || bad['violations'] || []).map do |v|
+              {
+                'field'  => v['field'] || v['fieldPath'] || v['subject'],
+                'reason' => v['description'] || v['message'] || v['reason']
+              }.compact
+            end.reject(&:empty?)
+            return {
+              'code'       => json['error']['code'],
+              'message'    => json['error']['message'],
+              'details'    => json['error']['details'],
+              'violations' => vlist,
+              'raw'        => json
+            }
+          end
+          return { 'message' => json['message'], 'raw' => json } if json['message']
+        end
+      rescue
+      end
+      {}
+    end,
+    build_correlation_id_0: lambda do
+      SecureRandom.uuid
+    end,
+    json_compact_0: lambda do |obj|
+      case obj
+      when Hash
+        obj.each_with_object({}) do |(k, v), h|
+          next if v.nil?
+          cv = call(:json_compact_0, v)
+          keep =
+            case cv
+            when String then !cv.empty?
+            when Array  then !cv.empty?
+            when Hash   then !cv.empty?
+            else true
+            end
+          h[k] = cv if keep
+        end
+      when Array
+        obj.map { |e| call(:json_compact_0, e) }.reject do |cv|
+          case cv
+          when String then cv.empty?
+          when Array  then cv.empty?
+          when Hash   then cv.empty?
+          else false
+          end
+        end
+      else
+        obj
+      end
+    end,
     http_post_json!: lambda do |url, headers, body|
       post(url)
         .headers(headers || {})
