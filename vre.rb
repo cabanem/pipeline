@@ -1687,12 +1687,11 @@ require 'securerandom'
         up = connection['user_project'].to_s.strip
         extra['x-goog-user-project'] = up unless up.empty?
 
-        raw = post("https://#{host}#{path}")
+        result = post("https://#{host}#{path}")
                 .headers(call(:default_headers, connection).merge(extra))
                 .payload(body)
-
-        # Workato normally returns a hash, but parse to hash anyway
-        result = call(:safe_parse_json, raw)
+                .after_error_response(/.*/) { |code, b, _h| error("Vertex retrieveContexts failed (HTTP #{code}): #{b}") }
+                .response_format_json
 
         # Handle both REST shapes:
         # (A) { "contexts": [ ... ] }
@@ -1713,12 +1712,12 @@ require 'securerandom'
         mapped = arr.map do |c|
           {
             # ID is best-effort; not always present
-            'id' => c.dig('chunk', 'id') || c.dig('chunk', 'chunkId'),
-            'uri' => c['sourceUri'],
+            'id' => c.dig('chunk', 'id') || c.dig('chunk', 'chunkId') || c.dig('chunk', 'chunk_id'),
+            'uri' => c['sourceUri'] || c['source_uri'],
             'content' => c['text'],
             'score' => c['score'],
             'metadata' => {
-              'sourceDisplayName' => c['sourceDisplayName'],
+              'sourceDisplayName' => c['sourceDisplayName'] || c['source_display_name'],
               'chunk' => c['chunk']
             }.compact
           }.compact
@@ -3422,10 +3421,10 @@ require 'securerandom'
         )
 
         src = (
-          h['sourceDisplayName'] || md['source'] || md['displayName'] || h['source']
+          h['sourceDisplayName'] || h['source_display_name'] || md['source'] || md['displayName'] || h['source']
         )
         uri = (
-          h['sourceUri'] || h['uri'] || md['uri'] || md['gcsUri'] || md['url']
+          h['sourceUri'] || h['source_uri'] || h['uri'] || md['uri'] || md['gcsUri'] || md['url']
         )
 
         # Normalize types
@@ -3565,7 +3564,8 @@ require 'securerandom'
       if v.is_a?(Array)
         return v if !v.empty? && v.first.is_a?(Hash) &&
                     (v.first.key?('text') || v.first.key?('chunkText') ||
-                    v.first.key?('sourceUri') || v.first.key?('chunkId'))
+                    v.first.key?('sourceUri') || v.first.key?('source_uri') ||
+                    v.first.key?('chunkId') || v.first.key?('chunk_id'))
         v.each do |e|
           r = call(:find_contexts_array_any!, e)
           return r if r
@@ -4883,10 +4883,10 @@ require 'securerandom'
                h.dig('context','text') ||
                h.dig('documentContext','text') ||
                ''
-        src = h['sourceDisplayName'] || md['source']
-        uri = h['sourceUri'] || md['uri'] || md['gcsUri'] || md['url']
+        src = h['sourceDisplayName'] || h['source_display_name'] || md['source']
+        uri = h['sourceUri'] || h['source_uri'] || md['uri'] || md['gcsUri'] || md['url']
         {
-          'id'            => (h['chunkId'] || h['id'] || "ctx-#{i+1}"),
+          'id'            => (h['chunkId'] || h['chunk_id'] || h['id'] || "ctx-#{i+1}"),
           'text'          => text.to_s,
           'score'         => (h['score'] || h['relevanceScore'] || 0.0).to_f,
           'source'        => src,
