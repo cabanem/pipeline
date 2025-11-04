@@ -1887,7 +1887,162 @@ require 'securerandom'
       end
 
     },
+    rag_retrieve_contexts_debug: {
+      title: 'RAG: Retrieve contexts (plain)',
+      subtitle: 'projects.locations:retrieveContexts (Vertex RAG Engine, v1)',
+      display_priority: 120,
+      retry_on_response: [408, 429, 500, 502, 503, 504],
+      max_retries: 3,
+      help: lambda do |_|
+        { body: 'Retrieve relevant contexts from a Vertex RAG corpus/store. Toggle advanced options to expose thresholds and rankers.' }
+      end,
 
+      config_fields: [
+        { name: 'show_advanced', label: 'Show advanced options',
+          type: 'boolean', control_type: 'checkbox',
+          default: false, sticky: true, extends_schema: true,
+          hint: 'Toggle to reveal threshold/ranker controls.' }
+      ],
+      input_fields: lambda do |od, connection, cfg|
+        show_adv = (cfg['show_advanced'] == true)
+
+        base = [
+          { name: 'query_text', label: 'Query text', optional: false },
+          { name: 'rag_corpus', optional: true,
+            hint: 'Full or short ID. Example short ID: my-corpus. Will auto-expand using connection project/location.' },
+          { name: 'rag_file_ids', type: 'array', of: 'string', optional: true,
+            hint: 'Optional: limit to these file IDs (must belong to the same corpus).' },
+          { name: 'top_k', type: 'integer', optional: true, default: 20, hint: 'Max contexts to return.' },
+          { name: 'project', optional: true, hint: 'Defaults to connection project.' },
+          { name: 'location', optional: true, hint: 'Defaults to connection location (e.g., us-central1).' }
+        ]
+
+        adv = [
+          { name: 'vector_distance_threshold', type: 'number', optional: true,
+            hint: 'Return contexts with distance ≤ threshold. For COSINE, lower is better.' },
+          { name: 'vector_similarity_threshold', type: 'number', optional: true,
+            hint: 'Return contexts with similarity ≥ threshold. Do NOT set both thresholds.' },
+          { name: 'rank_service_model', optional: true,
+            hint: 'Vertex Ranking model, e.g. semantic-ranker-512@latest.' },
+          { name: 'llm_ranker_model', optional: true,
+            hint: 'LLM ranker, e.g. gemini-2.5-flash.' }
+        ]
+
+        base + (show_adv ? adv : []) + Array(od['observability_input_fields'])
+      end,
+      output_fields: lambda do |object_definitions, connection|
+        [
+          # Keep everything as generic objects/strings to see raw structure
+          { name: 'raw_response_body', type: 'string' },
+          { name: 'parsed_json', type: 'object' },
+          { name: 'contexts_raw', type: 'object' },
+          { name: 'http_status', type: 'integer' },
+          { name: 'debug_info', type: 'object' }
+        ]
+      end,
+      execute: lambda do |connection, input|
+        ctx = call(:step_begin!, :rag_retrieve_contexts, input)
+
+        # Build request (same as before)
+        project  = (input['project'].presence  || connection['project_id']).to_s
+        location = (input['location'].presence || connection['location']).to_s
+        error('Project is required (connection or input).')  if project.blank?
+        error('Location is required (connection or input).') if location.blank?
+        call(:ensure_regional_location!, { 'location' => location })
+        parent = "projects/#{project}/locations/#{location}"
+
+        corpus = (input['rag_corpus'] || '').to_s.strip
+        if corpus.present? && !corpus.start_with?('projects/')
+          corpus = "#{parent}/ragCorpora/#{corpus}"
+        end
+
+        if input['vector_distance_threshold'].present? && input['vector_similarity_threshold'].present?
+          error('Set ONLY one of: vector_distance_threshold OR vector_similarity_threshold.')
+        end
+        if input['rank_service_model'].present? && input['llm_ranker_model'].present?
+          error('Choose ONE ranker: rank_service_model OR llm_ranker_model.')
+        end
+
+        rag_resources = {}
+        rag_resources['ragCorpus']  = corpus if corpus.present?
+        file_ids = Array(input['rag_file_ids']).map { |v| v.to_s.strip }.reject(&:empty?)
+        rag_resources['ragFileIds'] = file_ids if file_ids.any?
+        if rag_resources.empty?
+          error('Provide rag_corpus and/or rag_file_ids (vertexRagStore.ragResources is required).')
+        end
+
+        retrieval_cfg = {}
+        retrieval_cfg['topK'] = (input['top_k'].presence || 50).to_i
+
+        filter = {}
+        if input['vector_distance_threshold'].present?
+          filter['vectorDistanceThreshold'] = input['vector_distance_threshold'].to_f
+        elsif input['vector_similarity_threshold'].present?
+          filter['vectorSimilarityThreshold'] = input['vector_similarity_threshold'].to_f
+        end
+        retrieval_cfg['filter'] = filter unless filter.empty?
+
+        ranking = {}
+        if input['rank_service_model'].present?
+          ranking['rankService'] = { 'modelName' => input['rank_service_model'] }
+        elsif input['llm_ranker_model'].present?
+          ranking['llmRanker'] = { 'modelName' => input['llm_ranker_model'] }
+        end
+        retrieval_cfg['ranking'] = ranking unless ranking.empty?
+
+        body = { 'query' => { 'text' => input['query_text'] } }
+        body['query']['ragRetrievalConfig'] = retrieval_cfg unless retrieval_cfg.empty?
+        body['vertexRagStore'] = { 'ragResources' => [rag_resources] }
+
+        host = "#{location}-aiplatform.googleapis.com"
+        url  = "https://#{host}/v1/#{parent}:retrieveContexts"
+        cid  = (input['correlation_id'] || (ctx && ctx['cid']))
+        headers = call(:headers_rag, connection, cid, "parent=#{parent}") || {
+          'Content-Type' => 'application/json',
+          'Accept'       => 'application/json',
+          'x-goog-request-params' => "parent=#{parent}"
+        }
+
+        # Make the API call
+        t_net = Time.now
+        wire = post(url)
+                .headers(headers)
+                .request_format_json
+                .payload(body)
+                .response_format_raw
+
+        net_ms = (((Time.now - t_net) * 1000.0).ceil rescue 0)
+        code = (wire['status'] || wire['status_code'] || 200).to_i
+        raw_body = (wire['body'].to_s rescue '')
+
+        # Try to parse JSON
+        parsed = nil
+        parse_error = nil
+        begin
+          parsed = JSON.parse(raw_body)
+        rescue => e
+          parse_error = e.message
+        end
+
+        # Return EVERYTHING raw for debugging
+        {
+          'raw_response_body' => raw_body[0..10000], # Truncate if huge
+          'parsed_json' => parsed,
+          'contexts_raw' => parsed.is_a?(Hash) ? parsed['contexts'] : nil,
+          'http_status' => code,
+          'debug_info' => {
+            'response_length' => raw_body.length,
+            'parse_error' => parse_error,
+            'wire_object_class' => wire.class.name,
+            'wire_keys' => wire.is_a?(Hash) ? wire.keys : [],
+            'parsed_type' => parsed.class.name,
+            'parsed_keys' => parsed.is_a?(Hash) ? parsed.keys : [],
+            'contexts_type' => (parsed.is_a?(Hash) && parsed['contexts']) ? parsed['contexts'].class.name : 'not_found',
+            'first_context' => (parsed.is_a?(Hash) && parsed['contexts'].is_a?(Array) && parsed['contexts'].first) ? parsed['contexts'].first : nil
+          }
+        }
+      end
+    },
     rag_answer: {
       title: 'RAG Engine: Get grounded response (one-shot)',
       subtitle: 'Retrieve contexts from a corpus and generate a cited answer',
