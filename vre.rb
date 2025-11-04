@@ -1600,30 +1600,49 @@ require 'securerandom'
                 .request_format_json
                 .payload(body)
                 .response_format_raw   # <- forces execution & returns {'status','headers','body'}
+        # --- Timing (ceil; clamp to 1 when we have a status) ---------------------
         net_ms = (((Time.now - t_net) * 1000.0).ceil rescue 0)
         net_ms = 1 if net_ms == 0 && wire.is_a?(Hash) && (wire['status'] || wire['status_code'])
 
         code = (wire['status'] || wire['status_code'] || 200).to_i
         text = (wire['body'].to_s rescue '')
-        # Tolerant parse; if not JSON, keep a 'raw' wrapper so we can try again
-        doc  = (JSON.parse(text) rescue (text == '' ? {} : { 'raw' => text }))
 
-        # ---- Unwrap contexts (tolerant) -----------------------------------------------
-        arr = call(:coerce_contexts_array!, doc)
+        # --- Hardened JSON parse -------------------------------------------------
+        # 1) Strip BOM and anti-XSSI prefixes
+        clean = text.encode('UTF-8', invalid: :replace, undef: :replace, replace: '')
+        clean = clean.sub(/\A\xEF\xBB\xBF/, '')           # UTF-8 BOM
+        clean = clean.sub(/\A\)\]\}'\s*\n?/, '')          # )]}'
+        # 2) Try strict parse
+        parsed = (JSON.parse(clean) rescue nil)
 
-        # Fallback A: server gave us a string body we wrapped as {raw: "..."} — try parsing that
-        if arr.empty? && doc.is_a?(Hash) && doc['raw'].is_a?(String)
+        # 3) If strict failed, try from the first '{' to last '}' slice
+        if parsed.nil? && clean.include?('{')
           begin
-            sdoc = JSON.parse(doc['raw'])
-            arr = call(:coerce_contexts_array!, sdoc)
-            # prefer parsed doc thereafter
-            doc = sdoc if arr.is_a?(Array)
-          rescue
-            # keep doc as-is
-          end
+            head = clean.index('{')
+            tail = clean.rindex('}')
+            if head && tail && tail > head
+              parsed = JSON.parse(clean[head..tail]) rescue nil
+            end
+          rescue; end
         end
 
-        # Fallback B: collect *all* arrays under any "contexts" key(s) and flatten
+        # 4) If still nil and it looks like NDJSON / noisy logs, parse lines
+        if parsed.nil?
+          begin
+            lines = clean.lines.map(&:strip).reject(&:empty?)
+            objs  = lines.map { |ln| JSON.parse(ln) rescue nil }.compact
+            parsed = (objs.length == 1 ? objs.first : { 'lines' => objs }) unless objs.empty?
+          rescue; end
+        end
+
+        # 5) Final fallback: keep raw
+        doc = parsed || (clean.empty? ? {} : { 'raw' => clean })
+
+        # --- Unwrap contexts: A) coercer, B) contexts arrays, C) deep contexty objs
+        arr = call(:coerce_contexts_array!, doc)
+
+        # B: collect *all* arrays under any "contexts" key(s) and flatten if empty
+        arrays_found = 0
         if arr.empty?
           collector = lambda do |obj, acc|
             case obj
@@ -1631,7 +1650,9 @@ require 'securerandom'
               obj.each do |k, v|
                 if k.to_s == 'contexts'
                   vv = v.is_a?(Hash) ? v['contexts'] : v
-                  acc << vv if vv.is_a?(Array)
+                  if vv.is_a?(Array)
+                    acc << vv
+                  end
                 end
                 collector.call(v, acc)
               end
@@ -1641,18 +1662,17 @@ require 'securerandom'
             acc
           end
           arrays = collector.call(doc, [])
-          # flatten and keep only contextish hashes
-          arr = arrays.flatten.select do |e|
-            e.is_a?(Hash) && (e['text'] || e['chunkText'] || e['sourceUri'] || e['chunkId'])
-          end
+          arrays_found = arrays.length
+          arr = arrays.flatten.select { |e| e.is_a?(Hash) }
         end
 
-        # Fallback C (robust): deep-collect ANY context-looking objects, even if not inside a 'contexts' array
+        # C: deep-collect any context-looking objects if still empty
+        deep_found = 0
         if arr.empty?
           looks_like_ctx = lambda do |h|
             return false unless h.is_a?(Hash)
             hh = h.transform_keys(&:to_s)
-            hh.key?('text') || hh.key?('chunkText') || hh.key?('sourceUri') || hh.key?('chunkId') || hh.dig('chunk','text')
+            hh.key?('text') || hh.key?('chunkText') || hh.key?('sourceUri') || hh.key?('chunkId') || (hh['chunk'].is_a?(Hash) && hh['chunk'].key?('text'))
           end
           deep_collect = lambda do |obj, acc|
             case obj
@@ -1665,9 +1685,10 @@ require 'securerandom'
             acc
           end
           arr = deep_collect.call(doc, []).select { |h| looks_like_ctx.call(h) }
+          deep_found = arr.length
         end
 
-        # Map/enrich (ok if empty; we won't hard-fail so you can inspect preview)
+        # Map/enrich (ok if empty; no hard fail during triage)
         enriched = Array(arr).map do |h|
           item = h.is_a?(Hash) ? h.transform_keys(&:to_s) : {}
           sc = item['score']
@@ -1676,7 +1697,7 @@ require 'securerandom'
         end
 
         out = {
-          'contexts'      => { 'contexts' => enriched },   # keep documented nesting
+          'contexts'      => { 'contexts' => enriched },
           'contexts_flat' => enriched,
           'count'         => enriched.length,
           'debug_shape'   => {
@@ -1686,28 +1707,25 @@ require 'securerandom'
             'top_keys'      => (doc.is_a?(Hash) ? doc.keys : []),
             'contexts_type' => (doc.is_a?(Hash) ? (doc['contexts'].class.name rescue 'nil') : doc.class.name),
             'count'         => enriched.length,
-            'net_ms'        => net_ms
+            'net_ms'        => net_ms,
+            # extra crumbs to prove the unwrappers’ work
+            'raw_length'    => text.length,
+            'parsed'        => parsed ? true : false,
+            'arrays_found'  => arrays_found,
+            'deep_found'    => deep_found
           }
         }
 
-        # Optional request/response preview in non-prod with debug=true
         if !call(:normalize_boolean, connection['prod_mode']) && input['debug']
-          out['request_preview'] = {
-            'url'     => url,
-            'headers' => call(:redact_json, headers),
-            'payload' => call(:redact_json, body),
-            'parent'  => parent,
-            'rag_corpus_expanded' => corpus
-          }
           out['response_preview'] = {
             'http_status'    => code,
-            'body_head'      => text[0, 300],
+            'body_head'      => clean[0, 300],
             'top_level_keys' => (doc.is_a?(Hash) ? doc.keys : []),
             'raw_count'      => Array(arr).length
           }
         end
 
-        # Don’t hard-fail on empty; keep telemetry and preview visible during triage
+        # Telemetry w/ real timing
         call(:step_ok!, ctx, out, code, "HTTP #{code} in #{net_ms} ms", { 'count' => enriched.length, 'net_ms' => net_ms })
       end,
       sample_output: lambda do
