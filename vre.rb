@@ -1581,50 +1581,17 @@ require 'securerandom'
         if headers['Authorization'].to_s.strip.empty?
           error('Missing Authorization header. Check service account / token minting.')
         end
-        # ---- Call API -------------------------------------------------------------------
-        req = post(url)
+        # ---- Call API (return parsed body) ----------------------------------------------
+        raw = post(url)
                 .headers(headers)
-                .request_format_json 
+                .request_format_json
                 .payload(body)
+        # Ultra-tolerant JSON extraction
+        doc = call(:http_body_json_0, raw)
+        # Tolerant contexts unwrapping (handles {contexts:[...]} and {contexts:{contexts:[...]}} and wrappers)
+        arr = call(:coerce_contexts_array!, doc)
 
-        resp = 
-          begin
-            req.response_format_json
-          rescue
-            raw = req.response_format_raw
-            (JSON.parse(raw['body']) rescue raw)
-          end
-
-        # ---- Strict JSON envelope handling ---------------------------------------------
-        doc =
-          if resp.is_a?(Hash) && resp.key?('body') && resp['body'].is_a?(String)
-            JSON.parse(resp['body']) rescue {}
-          elsif resp.is_a?(String)
-            JSON.parse(resp) rescue {}
-          elsif resp.is_a?(Hash) || resp.is_a?(Array)
-            resp
-          else
-            {}
-          end
-
-        arr =
-          if doc.is_a?(Hash) && doc.dig('contexts','contexts').is_a?(Array)
-            doc['contexts']['contexts']
-          elsif doc.is_a?(Hash) && doc['contexts'].is_a?(Array)
-            doc['contexts']
-          else
-            []
-          end
-
-        # Symbolized-keys fallback (if some layer turned keys into symbols)
-        if arr.empty? && doc.is_a?(Hash) && doc.key?(:contexts)
-          c = doc[:contexts]
-          if c.is_a?(Hash) && c.key?(:contexts) && c[:contexts].is_a?(Array)
-            arr = c[:contexts]
-          elsif c.is_a?(Array)
-            arr = c
-          end
-        end
+        # (Symbolized-key fallback no longer needed; coerce_contexts_array! already handles it)
 
         enriched = Array(arr).map do |h|
           item = h.is_a?(Hash) ? h.transform_keys(&:to_s) : {}
@@ -1638,8 +1605,8 @@ require 'securerandom'
           'contexts_flat' => enriched,
           'count'         => enriched.length,
           'debug_shape'   => {
-            'resp_class'    => resp.class.name,
-            'has_body'      => (resp.is_a?(Hash) && resp.key?('body')),
+            'resp_class'    => raw.class.name,
+            'has_body'      => (raw.is_a?(Hash) && raw.key?('body')),
             'top_keys'      => (doc.is_a?(Hash) ? doc.keys : []),
             'contexts_type' => (doc.is_a?(Hash) ? (doc['contexts'].class.name rescue 'nil') : doc.class.name),
             'count'         => enriched.length
