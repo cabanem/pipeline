@@ -1600,7 +1600,8 @@ require 'securerandom'
                 .request_format_json
                 .payload(body)
                 .response_format_raw   # <- forces execution & returns {'status','headers','body'}
-        net_ms = ((Time.now - t_net) * 1000).round
+        net_ms = (((Time.now - t_net) * 1000.0).ceil rescue 0)
+        net_ms = 1 if net_ms == 0 && wire.is_a?(Hash) && (wire['status'] || wire['status_code'])
 
         code = (wire['status'] || wire['status_code'] || 200).to_i
         text = (wire['body'].to_s rescue '')
@@ -1644,6 +1645,26 @@ require 'securerandom'
           arr = arrays.flatten.select do |e|
             e.is_a?(Hash) && (e['text'] || e['chunkText'] || e['sourceUri'] || e['chunkId'])
           end
+        end
+
+        # Fallback C (robust): deep-collect ANY context-looking objects, even if not inside a 'contexts' array
+        if arr.empty?
+          looks_like_ctx = lambda do |h|
+            return false unless h.is_a?(Hash)
+            hh = h.transform_keys(&:to_s)
+            hh.key?('text') || hh.key?('chunkText') || hh.key?('sourceUri') || hh.key?('chunkId') || hh.dig('chunk','text')
+          end
+          deep_collect = lambda do |obj, acc|
+            case obj
+            when Hash
+              acc << obj if looks_like_ctx.call(obj)
+              obj.each_value { |v| deep_collect.call(v, acc) }
+            when Array
+              obj.each { |e| deep_collect.call(e, acc) }
+            end
+            acc
+          end
+          arr = deep_collect.call(doc, []).select { |h| looks_like_ctx.call(h) }
         end
 
         # Map/enrich (ok if empty; we won't hard-fail so you can inspect preview)
