@@ -2666,13 +2666,9 @@ require 'securerandom'
         { body: 'Runs hard/soft rules and infers coarse intent from headers/auth/keywords.' }
       end,
 
-      # Static array only — no lambdas or method calls allowed here.
-      config_fields: [
-        { name: 'show_advanced', label: 'Show advanced options',
-          type: 'boolean', control_type: 'checkbox',
-          default: false, sticky: true, extends_schema: true,
-          hint: 'Toggle to reveal advanced parameters.' }
-      ],
+      config_fields: lambda do |_connection|
+        [ call(:ui_show_advanced_toggle, false) ]
+      end,
       input_fields: lambda do |object_definitions, connection, config_fields|
         call(:ui_df_inputs, object_definitions, config_fields) +
           Array(object_definitions['observability_input_fields'])
@@ -2709,7 +2705,7 @@ require 'securerandom'
             nil
           end
 
-        pre = { 'hit' => false }
+        pre = { hit => false }
         if rules.is_a?(Hash)
           hard = call(:hr_eval_hard?, {
             'subject'=>subj, 'body'=>body, 'from'=>env['from'],
@@ -2772,12 +2768,9 @@ require 'securerandom'
         { body: 'Constrained LLM decides IRRELEVANT/REVIEW/KEEP. Short-circuits only if confident.' }
       end,
 
-      config_fields: [
-        { name: 'show_advanced', label: 'Show advanced options',
-          type: 'boolean', control_type: 'checkbox',
-          default: false, sticky: true, extends_schema: true,
-          hint: 'Toggle to reveal advanced parameters.' }
-      ],
+      config_fields: lambda do |_connection|
+        [ call(:ui_show_advanced_toggle, false) ]
+      end,
       input_fields: lambda do |object_definitions, connection, config_fields|
         call(:ui_policy_inputs, object_definitions, config_fields) +
           Array(object_definitions['observability_input_fields'])
@@ -2796,12 +2789,24 @@ require 'securerandom'
         url  = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
         req_params = "model=#{model_path}"
 
+        # Optional policy spec via JSON (testing path)
+        policy_spec = nil
+        if input['policy_mode'].to_s == 'json' && input['policy_json'].present?
+          spec = call(:safe_json, input['policy_json'])
+          error('Invalid JSON for policy: expected object') unless spec.is_a?(Hash)
+          policy_spec = spec
+        end
 
         system_text = <<~SYS
           You are a strict email policy triage. Output JSON only.
           decision ∈ {IRRELEVANT, REVIEW, KEEP}. confidence ∈ [0,1].
           matched_signals is a short list of strings; reasons ≤ 2 brief strings.
         SYS
+
+        if policy_spec
+          system_text << "\n\nPolicy spec JSON:\n#{call(:json_compact, policy_spec)}"
+        end
+
         payload = {
           'systemInstruction' => { 'role'=>'system','parts'=>[{'text'=>system_text}] },
           'contents' => [ { 'role'=>'user', 'parts'=>[ { 'text'=> "Email:\n#{input['email_text']}" } ] } ],
@@ -2823,7 +2828,7 @@ require 'securerandom'
         resp = post(url).headers(call(:request_headers_auth, connection, ctx['cid'], connection['user_project'], req_params))
                         .payload(call(:json_compact, payload))
         text = resp.dig('candidates',0,'content','parts',0,'text').to_s
-        policy = call(:safe_json, text)
+        policy = call(:safe_parse_json, text)
 
         short_circuit = (policy['decision'] == 'IRRELEVANT' && policy['confidence'].to_f >= (input['confidence_short_circuit'] || 0.8).to_f)
 
@@ -2850,12 +2855,9 @@ require 'securerandom'
         { body: 'Embeds email and categories, returns similarity scores and a top-K shortlist.' }
       end,
 
-      config_fields: [
-        { name: 'show_advanced', label: 'Show advanced options',
-          type: 'boolean', control_type: 'checkbox',
-          default: false, sticky: true, extends_schema: true,
-          hint: 'Toggle to reveal advanced parameters.' }
-      ],
+      config_fields: lambda do |_connection|
+        [ call(:ui_show_advanced_toggle, false) ]
+      end,
       input_fields: lambda do |object_definitions, connection, config_fields|
         call(:ui_embed_inputs, object_definitions, config_fields) +
           Array(object_definitions['observability_input_fields'])
@@ -2871,7 +2873,16 @@ require 'securerandom'
 
       execute: lambda do |connection, input|
         ctx = call(:step_begin!, :embed_text_against_categories, input)
-        cats = call(:norm_categories!, input['categories'])
+        # Select categories source (array vs JSON)
+        cats_raw =
+          if input['categories_mode'].to_s == 'json' && input['categories_json'].present?
+            parsed = call(:safe_json, input['categories_json'])
+            error('Invalid JSON for categories: expected array') unless parsed.is_a?(Array)
+            parsed
+          else
+            input['categories']
+          end
+        cats = call(:norm_categories!, cats_raw)
 
         emb_model      = (input['embedding_model'].presence || 'text-embedding-005')
         model_path     = call(:build_embedding_model_path, connection, emb_model)
@@ -2919,12 +2930,9 @@ require 'securerandom'
         { body: 'Uses LLM to produce a probability distribution over the shortlist and re-orders it.' }
       end,
 
-      config_fields: [
-        { name: 'show_advanced', label: 'Show advanced options',
-          type: 'boolean', control_type: 'checkbox',
-          default: false, sticky: true, extends_schema: true,
-          hint: 'Toggle to reveal advanced parameters.' }
-      ],  
+      config_fields: lambda do |_connection|
+        [ call(:ui_show_advanced_toggle, false) ]
+      end,    
       input_fields: lambda do |object_definitions, connection, config_fields|
         call(:ui_rerank_inputs, object_definitions, config_fields) +
           Array(object_definitions['observability_input_fields'])
@@ -2950,7 +2958,15 @@ require 'securerandom'
         end
 
         # LLM listwise: reuse your referee to get distribution over shortlist
-        cats = call(:norm_categories!, input['categories'])
+        cats_raw =
+          if input['categories_mode'].to_s == 'json' && input['categories_json'].present?
+            parsed = call(:safe_json, input['categories_json'])
+            error('Invalid JSON for categories: expected array') unless parsed.is_a?(Array)
+            parsed
+          else
+            input['categories']
+          end
+        cats = call(:norm_categories!, cats_raw)
         ref  = call(:llm_referee, connection, (input['generative_model'] || 'gemini-2.0-flash'),
                     input['email_text'], call(:safe_array, input['shortlist']), cats, nil, ctx['cid'], nil)
         dist = call(:safe_array, ref['distribution']).map { |d| { 'category'=>d['category'], 'prob'=>d['prob'].to_f } }
@@ -2981,12 +2997,9 @@ require 'securerandom'
       help: lambda do |_|
         { body: 'Chooses final category using shortlist + category metadata; can append ranked contexts to the email text.' }
       end,
-      config_fields: [
-        { name: 'show_advanced', label: 'Show advanced options',
-          type: 'boolean', control_type: 'checkbox',
-          default: false, sticky: true, extends_schema: true,
-          hint: 'Toggle to reveal advanced parameters.' }
-      ], 
+      config_fields: lambda do |_connection|
+        [ call(:ui_show_advanced_toggle, false) ]
+      end,   
       input_fields: lambda do |object_definitions, connection, config_fields|
         call(:ui_ref_inputs, object_definitions, config_fields) +
           Array(object_definitions['observability_input_fields'])
@@ -3001,7 +3014,16 @@ require 'securerandom'
 
       execute: lambda do |connection, input|
         ctx = call(:step_begin!, :llm_referee_with_contexts, input)
-        cats = call(:norm_categories!, input['categories'])
+        # Select categories source (array vs JSON)
+        cats_raw =
+          if input['categories_mode'].to_s == 'json' && input['categories_json'].present?
+            parsed = call(:safe_json, input['categories_json'])
+            error('Invalid JSON for categories: expected array') unless parsed.is_a?(Array)
+            parsed
+          else
+            input['categories']
+          end
+        cats = call(:norm_categories!, cats_raw)
 
         # Optionally append ranked contexts to the email text for better decisions
         email_text = input['email_text'].to_s
@@ -3046,12 +3068,9 @@ require 'securerandom'
       help: lambda do |_|
         { body: 'Retrieves ranked contexts for a query (email text). Accepts thresholds and ranker knobs; no in-action salience.' }
       end,
-      config_fields: [
-        { name: 'show_advanced', label: 'Show advanced options',
-          type: 'boolean', control_type: 'checkbox',
-          default: false, sticky: true, extends_schema: true,
-          hint: 'Toggle to reveal advanced parameters.' }
-      ],
+      config_fields: lambda do |_connection|
+        [ call(:ui_show_advanced_toggle, false) ]
+      end,
       input_fields: lambda do |object_definitions, connection, config_fields|
         call(:ui_retrieve_inputs, object_definitions, config_fields) +
           Array(object_definitions['observability_input_fields'])
@@ -3216,10 +3235,16 @@ require 'securerandom'
     ui_policy_inputs: lambda do |object_definitions, cfg|
       adv = call(:ui_truthy, cfg['show_advanced'])
       base = [
-        { name: 'email_text', optional: false }
+        { name: 'email_text', optional: false },
+        { name: 'policy_mode', label: 'Policy input mode', control_type: 'select',
+          options: [['None','none'], ['JSON','json']], default: 'none', optional: false,
+          extends_schema: true, hint: 'Switch to use JSON policy for testing.' }
       ]
       base << { name: 'model', label: 'Generative model', control_type: 'text',
                 optional: true, default: 'gemini-2.0-flash' } if adv
+      base << { name: 'policy_json', label: 'Policy JSON',
+                ngIf: 'input.policy_mode == "json"', optional: true,
+                hint: 'Paste policy spec JSON for testing (overrides defaults this run).' } if adv
       base << { name: 'confidence_short_circuit', type: 'number', optional: true, default: 0.8,
                 hint: 'Short-circuit only when decision=IRRELEVANT and confidence ≥ this value.' }
       base
@@ -3228,13 +3253,20 @@ require 'securerandom'
       adv = call(:ui_truthy, cfg['show_advanced'])
       base = [
         { name: 'email_text', optional: false },
+        { name: 'categories_mode', label: 'Categories input mode', control_type: 'select',
+          options: [['Array (pills)','array'], ['JSON','json']], default: 'array',
+          optional: false, extends_schema: true, hint: 'Switch to paste categories as JSON.' },
         { name: 'categories', type: 'array', of: 'object', optional: false,
+          ngIf: 'input.categories_mode == "array"',
           properties: Array(object_definitions['category_def']) }
       ]
       if adv
         base += [
           { name: 'embedding_model', control_type: 'text', optional: true, default: 'text-embedding-005' },
-          { name: 'shortlist_k', type: 'integer', optional: true, default: 3 }
+          { name: 'shortlist_k', type: 'integer', optional: true, default: 3 },
+          { name: 'categories_json', label: 'Categories JSON',
+            ngIf: 'input.categories_mode == "json"', optional: true,
+            hint: 'Paste categories array JSON for testing (overrides pills this run).' }
         ]
       end
       base
@@ -3243,7 +3275,11 @@ require 'securerandom'
       adv = call(:ui_truthy, cfg['show_advanced'])
       base = [
         { name: 'email_text', optional: false },
+        { name: 'categories_mode', label: 'Categories input mode', control_type: 'select',
+          options: [['Array (pills)','array'], ['JSON','json']], default: 'array',
+          optional: false, extends_schema: true, hint: 'Switch to paste categories as JSON.' },
         { name: 'categories', type: 'array', of: 'object', optional: false,
+          ngIf: 'input.categories_mode == "array"',
           properties: Array(object_definitions['category_def']) },
         { name: 'shortlist', type: 'array', of: 'string', optional: false },
         { name: 'mode', control_type: 'select', optional: false, default: 'none',
@@ -3252,6 +3288,10 @@ require 'securerandom'
       if adv
         base << { name: 'generative_model', control_type: 'text', optional: true, default: 'gemini-2.0-flash',
                   ngIf: 'input.mode == "llm"' }
+        base << { name: 'categories_json', label: 'Categories JSON',
+                  ngIf: 'input.categories_mode == "json"', optional: true,
+                  hint: 'Paste categories array JSON for testing (overrides pills this run).' }
+
       end
       base
     end,
@@ -3259,7 +3299,11 @@ require 'securerandom'
       adv = call(:ui_truthy, cfg['show_advanced'])
       base = [
         { name: 'email_text', optional: false },
+        { name: 'categories_mode', label: 'Categories input mode', control_type: 'select',
+          options: [['Array (pills)','array'], ['JSON','json']], default: 'array',
+          optional: false, extends_schema: true, hint: 'Switch to paste categories as JSON.' },
         { name: 'categories', type: 'array', of: 'object', optional: false,
+          ngIf: 'input.categories_mode == "array"',
           properties: Array(object_definitions['category_def']) },
         { name: 'shortlist', type: 'array', of: 'string', optional: true,
           hint: 'If omitted, all categories are allowed.' },
@@ -3268,8 +3312,9 @@ require 'securerandom'
         { name: 'fallback_category', optional: true, default: 'Other' }
       ]
       if adv
-        base << { name: 'contexts', label: 'Ranked contexts', type: 'array', of: 'object', optional: true,
-                  properties: Array(object_definitions['contexts_ranked']) }
+        base << { name: 'categories_json', label: 'Categories JSON',
+                  ngIf: 'input.categories_mode == "json"', optional: true,
+                  hint: 'Paste categories array JSON for testing (overrides pills this run).' }
       end
       base
     end,
