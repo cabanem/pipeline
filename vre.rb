@@ -1503,21 +1503,22 @@ require 'securerandom'
         ]
       end,
       execute: lambda do |connection, input|
-        # Step begin: captures cid (if provided) and starts timing
         ctx = call(:step_begin!, :rag_retrieve_contexts, input)
-        # Resolve project/location
-        project  = (input['project_id'].presence || connection['project_id']).to_s
+
+        # Resolve project/location and build parent
+        project  = (input['project'].presence  || connection['project_id']).to_s
         location = (input['location'].presence || connection['location']).to_s
         error('Project is required (connection or input).')  if project.blank?
         error('Location is required (connection or input).') if location.blank?
+        parent = "projects/#{project}/locations/#{location}"
 
-        # Expand optional short corpus IDHi
+        # Expand optional short corpus ID
         corpus = (input['rag_corpus'] || '').to_s.strip
         if corpus.present? && !corpus.start_with?('projects/')
-          corpus = "projects/#{project}/locations/#{location}/ragCorpora/#{corpus}"
+          corpus = "#{parent}/ragCorpora/#{corpus}"
         end
 
-        # Mutually-exclusive checks
+        # Union guards
         if input['vector_distance_threshold'].present? && input['vector_similarity_threshold'].present?
           error('Set ONLY one of: vector_distance_threshold OR vector_similarity_threshold.')
         end
@@ -1525,13 +1526,14 @@ require 'securerandom'
           error('Choose ONE ranker: rank_service_model OR llm_ranker_model.')
         end
 
-        # Build body (REST v1 camelCase)
+        # Build ragResources
         rag_resources = {}
         rag_resources['ragCorpus']  = corpus if corpus.present?
         if Array(input['rag_file_ids']).present?
           rag_resources['ragFileIds'] = Array(input['rag_file_ids'])
         end
 
+        # Retrieval config
         retrieval_cfg = {}
         retrieval_cfg['topK'] = input['top_k'] if input['top_k'].present?
 
@@ -1552,79 +1554,41 @@ require 'securerandom'
         retrieval_cfg['ranking'] = ranking unless ranking.empty?
 
         body = {
-          'vertexRagStore' => rag_resources.empty? ? {} : { 'ragResources' => [rag_resources] },
           'query' => { 'text' => input['query_text'] }
         }
         body['query']['ragRetrievalConfig'] = retrieval_cfg unless retrieval_cfg.empty?
+        body['vertexRagStore'] = (rag_resources.empty? ? {} : { 'ragResources' => [rag_resources] })
 
-        # Endpoint + headers
+        # Endpoint + headers (with Authorization and routing)
         host = "#{location}-aiplatform.googleapis.com"
-        url  = "https://#{host}/v1/projects/#{project}/locations/#{location}:retrieveContexts"
-
-        cid = (input['cid'] || (ctx && ctx['cid']))
-        headers = {
-          'Content-Type' => 'application/json',
-          'x-goog-request-params' => "project=#{project}&location=#{location}",
-          'Accept' => 'application/json'
+        url  = "https://#{host}/v1/#{parent}:retrieveContexts"
+        cid  = (input['correlation_id'] || (ctx && ctx['cid']))
+        headers = call(:headers_rag, connection, cid, "parent=#{parent}") || {
+          'Content-Type' => 'application/json', 'Accept' => 'application/json',
+          'x-goog-request-params' => "parent=#{parent}"
         }
-        headers['x-goog-user-project'] = connection['quota_project'] if connection['quota_project'].present?
-        headers['x-correlation-id']    = cid if cid.present?
 
-        # Call API
         resp = post(url)
                 .headers(headers)
                 .payload(body)
-                .after_error_response(/.*/) do |code, b, _h|
-                  error("Vertex retrieveContexts failed (HTTP #{code}): #{b}")
-                end
+                .after_error_response(/.*/) { |code, b, _h| error("Vertex retrieveContexts failed (HTTP #{code}): #{b}") }
                 .response_format_json
 
-        # 6) Normalize/flatten (defensive against shape variants)
-        # Official v1 shape is: { "contexts": { "contexts": [ Context, ... ] } }
-        # Fallbacks handle accidental top-level arrays or `ragContexts` names.
-        root_ctx_obj = resp['contexts']
-        contexts_array =
-          if root_ctx_obj.is_a?(Hash) && root_ctx_obj['contexts'].is_a?(Array)
-            root_ctx_obj['contexts']
-          elsif resp['contexts'].is_a?(Array)
-            # Some proxies/tools flatten to an array at top-level "contexts"
-            resp['contexts']
-          elsif resp.dig('ragContexts', 'contexts').is_a?(Array)
-            # Older/alt naming seen in some examples
-            resp.dig('ragContexts', 'contexts')
-          else
-            []
-          end
-
-        # Canonicalize the object we return to match output_fields
-        canonical_contexts_obj =
-          if root_ctx_obj.is_a?(Hash)
-            # Keep as-is if it's already the documented object
-            root_ctx_obj
-          else
-            { 'contexts' => contexts_array }
-          end
-
-        # Minimal debug breadcrumb to help diagnose future shape changes
-        debug_shape = {
-          'resp_class'        => resp.class.name,
-          'top_keys'          => (resp.is_a?(Hash) ? resp.keys : []),
-          'contexts_is_hash'  => root_ctx_obj.is_a?(Hash),
-          'contexts_keys'     => (root_ctx_obj.is_a?(Hash) ? root_ctx_obj.keys : []),
-          'count'             => contexts_array.length
+        contexts_array = call(:coerce_contexts_array!, resp)
+        enriched = contexts_array.map { |h|
+          h = h.is_a?(Hash) ? h.dup : {}
+          h['similarity'] = (1.0 - h['score']).round(6) if h['score'].is_a?(Numeric)
+          h
         }
-
         out = {
-          'contexts'      => canonical_contexts_obj,
-          'contexts_flat' => contexts_array,
+          'contexts'      => { 'contexts' => contexts_array },
+          'contexts_flat' => enriched,
           'count'         => contexts_array.length,
-          'debug_shape'   => debug_shape
+          'debug_shape'   => { 'resp_class' => resp.class.name, 'top_keys' => (resp.is_a?(Hash) ? resp.keys : []), 'count' => contexts_array.length }
         }
 
-        # Success w/telemetry; label helps dashboards
-        call(:step_ok!, ctx, out, 200, 'OK', { 'count' => contexts_array.length, 'shape' => debug_shape })
+        call(:step_ok!, ctx, out, 200, 'OK', { 'count' => contexts_array.length })
       end,
-
       sample_output: lambda do
         {
           'contexts' => {
@@ -3183,6 +3147,9 @@ require 'securerandom'
   
   # --------- METHODS ------------------------------------------------------
   methods: {
+    coerce_integer: lambda do |v, fallback|
+      Integer(v) rescue fallback
+    end,
     path_rag_retrieve_contexts: lambda do |connection|
       "/v1/projects/#{call(:ensure_project_id!, connection)}/locations/#{call(:ensure_location!, connection)}:retrieveContexts"
     end,
