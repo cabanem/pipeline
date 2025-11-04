@@ -1533,7 +1533,7 @@ require 'securerandom'
           error('Choose ONE ranker: rank_service_model OR llm_ranker_model.')
         end
 
-        # ---- Build ragResources ---------------------------------------------------------
+        # ---- Build ragResources (scrub empty file IDs) ---------------------------------
         rag_resources = {}
         rag_resources['ragCorpus']  = corpus if corpus.present?
         file_ids = Array(input['rag_file_ids']).map { |v| v.to_s.strip }.reject(&:empty?)
@@ -1577,36 +1577,41 @@ require 'securerandom'
           'Accept'       => 'application/json',
           'x-goog-request-params' => "parent=#{parent}"
         }
-
         if headers['Authorization'].to_s.strip.empty?
           error('Missing Authorization header. Check service account / token minting.')
         end
-        # ---- Call API (force execution + parsed body) -----------------------------------
-        doc = post(url)
+
+        # ---- Optional environment probe (debug only) -----------------------------------
+        ping_ok = nil; ping_status = nil
+        if !call(:normalize_boolean, connection['prod_mode']) && input['debug']
+          begin
+            ping = get("https://www.googleapis.com/discovery/v1/apis").response_format_raw
+            ping_status = (ping['status'] || ping['status_code']).to_i
+            ping_ok     = (ping_status == 200 && ping['body'].to_s.length > 0)
+          rescue
+            ping_ok = false
+          end
+        end
+
+        # ---- Call API (force execution; get raw wire payload) --------------------------
+        t_net = Time.now
+        wire = post(url)
                 .headers(headers)
                 .request_format_json
                 .payload(body)
-                .after_error_response(400..599) do |code, body, headers, message|
-                  # Normalize error so step_err!/telemetry can read it
-                  error({
-                    'status'   => code,
-                    'response' => { 'body' => body, 'headers' => headers },
-                    'message'  => message
-                  })
-                end
-                .after_response do |code, body, headers|
-                  # Workato hands you parsed JSON Hash when content-type is JSON;
-                  # otherwise it's a String. Normalize gently.
-                  body.is_a?(String) ? (JSON.parse(body) rescue body) : body
-                end
+                .response_format_raw   # <- forces execution & returns {'status','headers','body'}
+        net_ms = ((Time.now - t_net) * 1000).round
 
-        # Robust contexts unwrapping (supports {contexts:[...]} and {contexts:{contexts:[...]}})
+        code = (wire['status'] || wire['status_code'] || 200).to_i
+        text = (wire['body'].to_s rescue '')
+        # Tolerant parse; if not JSON, return a small wrapper to aid debugging
+        doc  = (JSON.parse(text) rescue (text == '' ? {} : { 'raw' => text }))
+
+        # ---- Unwrap contexts defensively ----------------------------------------------
         arr = call(:coerce_contexts_array!, doc)
 
-        # Sanity check
+        # If you expect at least one, fail fast to avoid silent 0s in pipelines
         error('retrieveContexts returned no contexts (0). Check corpus/project/region or query/topK).') if arr.empty?
-
-        # (Symbolized-key fallback no longer needed; coerce_contexts_array! already handles it)
 
         enriched = Array(arr).map do |h|
           item = h.is_a?(Hash) ? h.transform_keys(&:to_s) : {}
@@ -1620,12 +1625,13 @@ require 'securerandom'
           'contexts_flat' => enriched,
           'count'         => enriched.length,
           'debug_shape'   => {
-            # Show what we actually parsed
-            'resp_class'    => doc.class.name,
-            'has_body'      => (doc.is_a?(Hash) && doc.key?('body')),  # true if Workato wrapped
+            'http_status'   => code,
+            'resp_class'    => wire.class.name,
+            'has_body'      => wire.is_a?(Hash) && wire.key?('body'),
             'top_keys'      => (doc.is_a?(Hash) ? doc.keys : []),
             'contexts_type' => (doc.is_a?(Hash) ? (doc['contexts'].class.name rescue 'nil') : doc.class.name),
-            'count'         => enriched.length
+            'count'         => enriched.length,
+            'net_ms'        => net_ms
           }
         }
 
@@ -1636,16 +1642,20 @@ require 'securerandom'
             'headers' => call(:redact_json, headers),
             'payload' => call(:redact_json, body),
             'parent'  => parent,
-            'rag_corpus_expanded' => corpus
+            'rag_corpus_expanded' => corpus,
+            'ping_ok' => ping_ok,
+            'ping_status' => ping_status
           }
           out['response_preview'] = {
-            'top_level_keys' => (doc.is_a?(Hash) ? doc.keys : []),
-            'raw_count'      => Array(arr).length
+            'http_status'   => code,
+            'body_head'     => text[0, 300],
+            'top_level_keys'=> (doc.is_a?(Hash) ? doc.keys : []),
+            'raw_count'     => Array(arr).length
           }
         end
 
-        call(:step_ok!, ctx, out, 200, 'OK', { 'count' => enriched.length })
-
+        # Promote real timing & status into telemetry message
+        call(:step_ok!, ctx, out, code, "HTTP #{code} in #{net_ms} ms", { 'count' => enriched.length, 'net_ms' => net_ms })
       end,
       sample_output: lambda do
         {
