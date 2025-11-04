@@ -1577,12 +1577,24 @@ require 'securerandom'
           { name: 'records', type: 'array', of: 'object', optional: false, properties: [
               { name: 'id', optional: false }, { name: 'content', optional: false }, { name: 'metadata', type: 'object' }
             ], hint: 'id + content required.' },
+          { name: 'category', optional: true, hint: 'Chosen category (e.g., PTO, W2, Payroll).' },
+          { name: 'category_hint_in_query', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+            hint: 'Prepend "Category: <name>" to query_text.' },
+          { name: 'show_advanced', label: 'Show advanced options', type: 'boolean', control_type: 'checkbox',
+            default: false, sticky: true, extends_schema: true },
+          { name: 'filter_records_by_category', type: 'boolean', control_type: 'checkbox', optional: true, default: false,
+            ngIf: 'input.show_advanced', hint: 'Drop records whose metadata does not match the category.' },
+          { name: 'record_category_key', optional: true, default: 'category',
+            ngIf: 'input.show_advanced', hint: 'Metadata key to match the category (string or array).' },
           { name: 'correlation_id', label: 'Correlation ID', optional: true, hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
           { name: 'rank_model', optional: true, hint: 'e.g., semantic-ranker-default@latest' },
           { name: 'top_n', type: 'integer', optional: true },
           { name: 'ignore_record_details_in_response', type: 'boolean', control_type: 'checkbox', optional: true,
             hint: 'If true, response returns only {id, score}. Useful when you only need scores.' },
           { name: 'ranking_config_name', optional: true, hint: 'Full name or simple id. Blank → default_ranking_config' },
+          { name: 'category_ranking_config_map_json', label: 'Category→RankingConfig (JSON)', control_type: 'text-area',
+            optional: true, ngIf: 'input.show_advanced',
+            hint: 'JSON object: {"PTO":"pto_rank","Payroll":"payroll_rank"}; overrides ranking_config_name when category is set.' },
           { name: 'emit_metrics', type: 'boolean', control_type: 'checkbox', optional: true, default: true },
           { name: 'metrics_namespace', optional: true },
           # --- New tidy knobs ---
@@ -1622,6 +1634,12 @@ require 'securerandom'
         # Normalize connection region → AI-Apps multi-region (global|us|eu), allow per-action override
         loc = call(:aiapps_loc_resolve, connection, input['ai_apps_location'])
 
+        # Category hint + optional config override
+        cat   = input['category'].to_s.strip
+        qtext = input['query_text'].to_s
+        if cat != '' && input['category_hint_in_query'] == true
+          qtext = "Category: #{cat}\n\n#{qtext}"
+        end
         # Resolve config id (not full resource) to avoid double-embedding path parts.
         config_id =
           if input['ranking_config_name'].to_s.strip.empty?
@@ -1629,7 +1647,15 @@ require 'securerandom'
           else
             input['ranking_config_name'].to_s.split('/').last
           end
-
+        # Optional category → rankingConfig override (JSON)
+        if cat != '' && input['category_ranking_config_map_json'].present?
+          rcmap = call(:safe_json, input['category_ranking_config_map_json'])
+          error('Invalid JSON for category→rankingConfig map: expected object') unless rcmap.is_a?(Hash)
+          mapped = (rcmap[cat] || rcmap[cat.downcase] || rcmap[cat.upcase])
+          if mapped.to_s.strip != ''
+            config_id = mapped.to_s.split('/').last
+          end
+        end
         req_params = "ranking_config=projects/#{connection['project_id']}/locations/#{loc}/rankingConfigs/#{config_id}"
 
         # Build absolute URL to Discovery Engine Ranking API (no base_uri usage)
@@ -1643,10 +1669,29 @@ require 'securerandom'
           ver
         )
 
+        # Optionally filter records by category metadata
+        records_in = call(:safe_array, input['records'])
+        records_used = records_in
+        if cat != '' && input['filter_records_by_category'] == true
+          key = (input['record_category_key'].presence || 'category').to_s
+          lc  = cat.downcase
+          records_used = records_in.select do |r|
+            md = (r['metadata'].is_a?(Hash) ? r['metadata'] : {})
+            val = md[key]
+            if val.is_a?(String)
+              val.to_s.downcase.include?(lc)
+            elsif val.is_a?(Array)
+              val.map { |x| x.to_s.downcase }.any? { |x| x == lc || x.include?(lc) }
+            else
+              false
+            end
+          end
+        end
         body = {
           # Ranking expects a scalar string for 'query'
-          'query'   => input['query_text'].to_s,
-          'records' => call(:safe_array, input['records']).map { |r|
+          'query'   => qtext,
+          'records' => records_used.map { |r|
+
             {
               'id'       => r['id'].to_s,
               'content'  => r['content'].to_s,
@@ -1698,7 +1743,8 @@ require 'securerandom'
           'config_id' => config_id,
           'model'     => (input['rank_model'].to_s.strip if input['rank_model'].present?)
         }.compact
-
+        (out['telemetry'] ||= {})['category'] = cat if cat != ''
+        out['telemetry']['ranking']['category_hint'] = true if (cat != '' && input['category_hint_in_query'] == true)
         # Facets: capture rank mode/model when present
         rank_facets = {
           'rank_mode'  => out.dig('telemetry','ranking','api') ? 'rank_service' : nil,
@@ -1711,7 +1757,10 @@ require 'securerandom'
           call(:local_log_entry, :rank_texts_with_ranking_api, started_at, t0, out, nil, {
             'rank_model' => (out.dig('telemetry','ranking','model') || input['rank_model']),
             'n'          => Array(out['records']).length,
-            'facets'     => facets
+            'facets'     => facets,
+            'category'   => (cat if cat != ''),
+            'filtered_in'=> records_used.length,
+            'filtered_out'=> (records_in.length - records_used.length)
           }))
         out
       rescue => e
@@ -1770,12 +1819,24 @@ require 'securerandom'
           { name: 'rag_corpus', optional: false,
             hint: 'Accepts either full resource name (e.g., "projects/{project}/locations/{region}/ragCorpora/{corpus}") or the "corpus"' },
           { name: 'question', optional: false },
+          { name: 'category', optional: true, hint: 'Chosen category used to scope corpus and shape the question.' },
+          { name: 'category_hint_in_question', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+            hint: 'Prepend "Category: <name>" to the question to improve retrieval focus.' },
           { name: 'restrict_to_file_ids', type: 'array', of: 'string', optional: true },
           { name: 'max_contexts', type: 'integer', optional: true, default: 20 },
+          { name: 'show_advanced', label: 'Show advanced options', type: 'boolean', control_type: 'checkbox',
+            default: false, sticky: true, extends_schema: true },
 
           { name: 'rag_retrieval_config', label: 'Retrieval config', type: 'object',
             properties: object_definitions['rag_retrieval_config'], optional: true,
-            hint: 'Set top_k, exactly one threshold (distance OR similarity), and exactly one ranker (semantic OR LLM).' }
+            hint: 'Set top_k, exactly one threshold (distance OR similarity), and exactly one ranker (semantic OR LLM).' },
+          { name: 'category_corpus_map_json', label: 'Category→Corpus (JSON)', control_type: 'text-area',
+            optional: true, ngIf: 'input.show_advanced',
+            hint: 'JSON object mapping category to corpus. Example: {"PTO":"projects/.../ragCorpora/pto"}' },
+          { name: 'filter_contexts_by_category', type: 'boolean', control_type: 'checkbox', optional: true, default: false,
+            ngIf: 'input.show_advanced', hint: 'After retrieval, drop contexts whose metadata does not match the category.' },
+          { name: 'metadata_category_key', optional: true, default: 'category', ngIf: 'input.show_advanced',
+            hint: 'Metadata key used for category matching (string or array).' }
         ]
       end,
       output_fields: lambda do |object_definitions, _connection|
@@ -1811,7 +1872,20 @@ require 'securerandom'
         raise 'Connection missing project_id' if proj.blank?
         raise 'Connection missing location'   if loc.blank?
 
-        corpus = call(:normalize_rag_corpus, connection, input['rag_corpus'])
+        # Category hint + optional corpus override
+        cat   = input['category'].to_s.strip
+        qtext = input['question'].to_s
+        if cat != '' && input['category_hint_in_question'] != false
+          qtext = "Category: #{cat}\n\n#{qtext}"
+        end
+        raw_corpus = input['rag_corpus']
+        if cat != '' && input['category_corpus_map_json'].present?
+          cmap = call(:safe_json, input['category_corpus_map_json'])
+          error('Invalid JSON for category→corpus map: expected object') unless cmap.is_a?(Hash)
+          mapped = (cmap[cat] || cmap[cat.downcase] || cmap[cat.upcase])
+          raw_corpus = mapped if mapped.to_s.strip != ''
+        end
+        corpus = call(:normalize_rag_corpus, connection, raw_corpus)
         error('rag_corpus is required') if corpus.blank?
 
         loc     = (connection['location'] || '').downcase
@@ -1823,7 +1897,7 @@ require 'securerandom'
 
         payload = call(
           :build_rag_retrieve_payload,
-          input['question'],
+          qtext,
           corpus,
           input['restrict_to_file_ids'],
           opts
@@ -1840,10 +1914,27 @@ require 'securerandom'
         raw   = call(:normalize_retrieve_contexts!, resp)
         maxn  = call(:clamp_int, (input['max_contexts'] || 20), 1, 200)
         mapped= call(:map_context_chunks, raw, maxn)
+        # Optional post-filter by metadata category
+        contexts_used = mapped
+        if cat != '' && input['filter_contexts_by_category'] == true
+          key = (input['metadata_category_key'].presence || 'category').to_s
+          lc  = cat.downcase
+          contexts_used = mapped.select do |c|
+            md = (c['metadata'].is_a?(Hash) ? c['metadata'] : {})
+            val = md[key]
+            if val.is_a?(String)
+              val.to_s.downcase.include?(lc)
+            elsif val.is_a?(Array)
+              val.map { |x| x.to_s.downcase }.any? { |x| x == lc || x.include?(lc) }
+            else
+              false
+            end
+          end
+        end
 
         out = {
-          'question' => input['question'],
-          'contexts' => mapped
+          'question' => qtext,
+          'contexts' => contexts_used
         }.merge(call(:telemetry_envelope, t0, cid, true, call(:telemetry_success_code, resp), 'OK'))
 
         # Telemetry preview from canonical opts:
@@ -1860,12 +1951,21 @@ require 'securerandom'
         elsif opts['llmRankerModel']
           (out['telemetry'] ||= {})['rank'] = { 'mode' => 'llm', 'model' => opts['llmRankerModel'] }
         end
+        (out['telemetry'] ||= {})['category'] = cat if cat != ''
+        (out['telemetry'] ||= {})['retrieval'] ||= {}
+        out['telemetry']['retrieval']['corpus_effective'] = corpus
+        out['telemetry']['retrieval']['category_hint'] = true if (cat != '' && input['category_hint_in_question'] != false)
+        if cat != '' && input['filter_contexts_by_category'] == true
+          out['telemetry']['retrieval']['contexts_before_filter'] = mapped.length
+          out['telemetry']['retrieval']['contexts_after_filter']  = contexts_used.length
+        end
         facets = call(:compute_facets_for!, 'rag_retrieve_contexts', out)
         (out['telemetry'] ||= {})['facets'] = facets
         call(:local_log_attach!, out,
           call(:local_log_entry, :rag_retrieve_contexts, started_at, t0, out, nil, {
             'retrieval_top_k'    => out.dig('telemetry','retrieval','top_k'),
             'contexts_returned'  => Array(out['contexts']).length,
+            'category'           => (cat if cat != ''),
             'facets'             => facets
           }))
         out
