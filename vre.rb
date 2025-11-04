@@ -2043,6 +2043,113 @@ require 'securerandom'
         }
       end
     },
+    rag_retrieve_contexts_simple_debug: {
+      title: 'RAG: Retrieve contexts (simple debug)',
+      subtitle: 'projects.locations:retrieveContexts (Vertex RAG Engine, v1)',
+      display_priority: 120,
+      retry_on_response: [408, 429, 500, 502, 503, 504],
+      max_retries: 3,
+      
+      config_fields: [
+        { name: 'show_advanced', label: 'Show advanced options',
+          type: 'boolean', control_type: 'checkbox',
+          default: false, sticky: true, extends_schema: true,
+          hint: 'Toggle to reveal threshold/ranker controls.' }
+      ],
+      
+      input_fields: lambda do |od, connection, cfg|
+        show_adv = (cfg['show_advanced'] == true)
+        base = [
+          { name: 'query_text', label: 'Query text', optional: false },
+          { name: 'rag_corpus', optional: true,
+            hint: 'Full or short ID. Example short ID: my-corpus.' },
+          { name: 'rag_file_ids', type: 'array', of: 'string', optional: true },
+          { name: 'top_k', type: 'integer', optional: true, default: 20 },
+          { name: 'project', optional: true },
+          { name: 'location', optional: true }
+        ]
+        adv = [
+          { name: 'vector_distance_threshold', type: 'number', optional: true },
+          { name: 'vector_similarity_threshold', type: 'number', optional: true },
+          { name: 'rank_service_model', optional: true },
+          { name: 'llm_ranker_model', optional: true }
+        ]
+        base + (show_adv ? adv : []) + Array(od['observability_input_fields'])
+      end,
+      
+      output_fields: lambda do |object_definitions, connection|
+        [
+          { name: 'raw_response', type: 'object' },
+          { name: 'response_type' },
+          { name: 'response_keys', type: 'array', of: 'string' },
+          { name: 'contexts_check', type: 'object' },
+          { name: 'debug_extraction', type: 'object' }
+        ]
+      end,
+      
+      execute: lambda do |connection, input|
+        # Setup (simplified for debugging)
+        project  = (input['project'].presence || connection['project_id']).to_s
+        location = (input['location'].presence || connection['location']).to_s
+        error('Project is required') if project.blank?
+        error('Location is required') if location.blank?
+        
+        parent = "projects/#{project}/locations/#{location}"
+        corpus = input['rag_corpus'].to_s.strip
+        if corpus.present? && !corpus.start_with?('projects/')
+          corpus = "#{parent}/ragCorpora/#{corpus}"
+        end
+        
+        # Build minimal request
+        rag_resources = {}
+        rag_resources['ragCorpus'] = corpus if corpus.present?
+        file_ids = Array(input['rag_file_ids']).map(&:strip).reject(&:empty?)
+        rag_resources['ragFileIds'] = file_ids if file_ids.any?
+        
+        body = {
+          'query' => { 
+            'text' => input['query_text'],
+            'ragRetrievalConfig' => { 'topK' => (input['top_k'] || 20).to_i }
+          },
+          'vertexRagStore' => { 'ragResources' => [rag_resources] }
+        }
+        
+        url = "https://#{location}-aiplatform.googleapis.com/v1/#{parent}:retrieveContexts"
+        headers = {
+          'Authorization' => "Bearer #{connection['access_token']}",
+          'Content-Type' => 'application/json',
+          'x-goog-request-params' => "parent=#{parent}"
+        }
+        
+        # Try normal Workato response handling (no .response_format_raw)
+        begin
+          resp = post(url).headers(headers).payload(body)
+          
+          # Debug what we actually got
+          {
+            'raw_response' => resp,
+            'response_type' => resp.class.name,
+            'response_keys' => resp.is_a?(Hash) ? resp.keys : [],
+            'contexts_check' => {
+              'has_contexts' => resp.is_a?(Hash) && resp.key?('contexts'),
+              'contexts_type' => resp.is_a?(Hash) && resp['contexts'] ? resp['contexts'].class.name : nil,
+              'contexts_count' => resp.is_a?(Hash) && resp['contexts'].is_a?(Array) ? resp['contexts'].length : 0,
+              'first_context_keys' => (resp.is_a?(Hash) && resp['contexts'].is_a?(Array) && resp['contexts'].first) ? resp['contexts'].first.keys : []
+            },
+            'debug_extraction' => {
+              'direct_contexts' => resp.is_a?(Hash) ? resp['contexts'] : nil,
+              'nested_contexts' => resp.is_a?(Hash) && resp['contexts'].is_a?(Hash) ? resp['contexts']['contexts'] : nil
+            }
+          }
+        rescue => e
+          {
+            'error' => e.message,
+            'error_class' => e.class.name,
+            'error_response' => e.respond_to?(:response) ? e.response : nil
+          }
+        end
+      end
+    },
     rag_answer: {
       title: 'RAG Engine: Get grounded response (one-shot)',
       subtitle: 'Retrieve contexts from a corpus and generate a cited answer',
