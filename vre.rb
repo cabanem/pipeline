@@ -1508,90 +1508,45 @@ require 'securerandom'
       end,
       execute: lambda do |connection, input|
         ctx = call(:step_begin!, :rag_retrieve_contexts, input)
+        begin
+          # 0) Guards
+          call(:ensure_project_id!, connection)
+          call(:ensure_regional_location!, connection)  # RAG requires regional location
+          cid   = ctx['cid']
+          q     = (input['question'] || '').to_s
+          error('question is required') if q.strip.empty?
 
-        # Resolve project/location and build parent
-        project  = (input['project'].presence  || connection['project_id']).to_s
-        location = (input['location'].presence || connection['location']).to_s
-        error('Project is required (connection or input).')  if project.blank?
-        error('Location is required (connection or input).') if location.blank?
-        parent = "projects/#{project}/locations/#{location}"
+          corpus = call(:normalize_rag_corpus, connection, input['rag_corpus'])
+          error('rag_corpus is required') if corpus.to_s.strip.empty?
 
-        # Expand optional short corpus ID
-        corpus = (input['rag_corpus'] || '').to_s.strip
-        if corpus.present? && !corpus.start_with?('projects/')
-          corpus = "#{parent}/ragCorpora/#{corpus}"
+          # Optional restrict-to-file IDs (accept empty)
+          restrict_ids = call(:sanitize_drive_ids, input['restrict_to_file_ids'], allow_empty: true, label: 'restrict_to_file_ids')
+
+          # Build canonical retrieval opts (handles unions + legacy fields)
+          opts    = call(:build_retrieval_opts_from_input!, input)
+          payload = call(:build_rag_retrieve_payload, q, corpus, restrict_ids, opts)
+
+          # URL + routing header
+          loc    = (connection['location'].to_s.downcase)
+          parent = "projects/#{connection['project_id']}/locations/#{loc}"
+          url    = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
+          resp   = post(url)
+                    .headers(call(:headers_rag, connection, cid, "parent=#{parent}"))
+                    .payload(call(:json_compact, payload))
+
+          # Normalize v1 / v1beta1 shape and map to your chunk shape
+          raw_contexts = call(:normalize_retrieve_contexts!, resp)
+          maxn         = call(:clamp_int, (input['max_chunks'] || 20), 1, 100)
+          contexts     = call(:map_context_chunks, raw_contexts, maxn)
+
+          out = { 'contexts' => contexts }
+                  .merge(call(:telemetry_envelope, ctx['t0'], cid, true,
+                              call(:telemetry_success_code, resp), 'OK'))
+          call(:step_ok!, ctx, out, call(:telemetry_success_code, resp), 'OK',
+              { 'retrieval_top_k' => opts['topK'] })
+        rescue => e
+          call(:step_err!, ctx, e)
         end
-
-        # Union guards
-        if input['vector_distance_threshold'].present? && input['vector_similarity_threshold'].present?
-          error('Set ONLY one of: vector_distance_threshold OR vector_similarity_threshold.')
-        end
-        if input['rank_service_model'].present? && input['llm_ranker_model'].present?
-          error('Choose ONE ranker: rank_service_model OR llm_ranker_model.')
-        end
-
-        # Build ragResources
-        rag_resources = {}
-        rag_resources['ragCorpus']  = corpus if corpus.present?
-        if Array(input['rag_file_ids']).present?
-          rag_resources['ragFileIds'] = Array(input['rag_file_ids'])
-        end
-
-        # Retrieval config
-        retrieval_cfg = {}
-        retrieval_cfg['topK'] = input['top_k'] if input['top_k'].present?
-
-        filter = {}
-        if input['vector_distance_threshold'].present?
-          filter['vectorDistanceThreshold'] = input['vector_distance_threshold'].to_f
-        elsif input['vector_similarity_threshold'].present?
-          filter['vectorSimilarityThreshold'] = input['vector_similarity_threshold'].to_f
-        end
-        retrieval_cfg['filter'] = filter unless filter.empty?
-
-        ranking = {}
-        if input['rank_service_model'].present?
-          ranking['rankService'] = { 'modelName' => input['rank_service_model'] }
-        elsif input['llm_ranker_model'].present?
-          ranking['llmRanker'] = { 'modelName' => input['llm_ranker_model'] }
-        end
-        retrieval_cfg['ranking'] = ranking unless ranking.empty?
-
-        body = {
-          'query' => { 'text' => input['query_text'] }
-        }
-        body['query']['ragRetrievalConfig'] = retrieval_cfg unless retrieval_cfg.empty?
-        body['vertexRagStore'] = (rag_resources.empty? ? {} : { 'ragResources' => [rag_resources] })
-
-        # Endpoint + headers (with Authorization and routing)
-        host = "#{location}-aiplatform.googleapis.com"
-        url  = "https://#{host}/v1/#{parent}:retrieveContexts"
-        cid  = (input['correlation_id'] || (ctx && ctx['cid']))
-        headers = call(:headers_rag, connection, cid, "parent=#{parent}") || {
-          'Content-Type' => 'application/json', 'Accept' => 'application/json',
-          'x-goog-request-params' => "parent=#{parent}"
-        }
-
-        resp = post(url)
-                .headers(headers)
-                .payload(body)
-                .after_error_response(/.*/) { |code, b, _h| error("Vertex retrieveContexts failed (HTTP #{code}): #{b}") }
-                .response_format_json
-
-        contexts_array = call(:coerce_contexts_array!, resp)
-        enriched = contexts_array.map { |h|
-          h = h.is_a?(Hash) ? h.dup : {}
-          h['similarity'] = (1.0 - h['score']).round(6) if h['score'].is_a?(Numeric)
-          h
-        }
-        out = {
-          'contexts'      => { 'contexts' => contexts_array },
-          'contexts_flat' => enriched,
-          'count'         => contexts_array.length,
-          'debug_shape'   => { 'resp_class' => resp.class.name, 'top_keys' => (resp.is_a?(Hash) ? resp.keys : []), 'count' => contexts_array.length }
-        }
-
-        call(:step_ok!, ctx, out, 200, 'OK', { 'count' => contexts_array.length })
       end,
       sample_output: lambda do
         {
@@ -5580,6 +5535,9 @@ require 'securerandom'
 
 # ----------- VERTEX API NOTES ---------------------------------------------
 # ENDPOINTS
+  # Retrieve contexts
+    # - host=`https://aiplatform.googleapis.com/v1/{parent}:retreiveContexts`
+    # - parent=`projects/project/locations/location`
   # Embed
     # - host=`https://{LOCATION}-aiplatform.googleapis.com`
     # - path=`/v1/projects/{project}/locations/{location}/publishers/google/models/{embeddingModel}:predict`
@@ -5597,6 +5555,7 @@ require 'securerandom'
     # 1a. (https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/rag-api-v1)
     # 1b. (https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/rag-output-explained)
     # 1c. (https://cloud.google.com/vertex-ai/generative-ai/docs/reference/rest/v1/projects.locations/retrieveContexts)
+    # 1d. (https://docs.cloud.google.com/vertex-ai/generative-ai/docs/reference/rest/v1/projects.locations/retrieveContexts)
   # 2. Embedding (https://ai.google.dev/gemini-api/docs/embeddings)
   # 3. Ranking (https://docs.cloud.google.com/generative-ai-app-builder/docs/ranking)
   # 4. Count tokens
