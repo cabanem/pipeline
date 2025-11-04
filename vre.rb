@@ -1581,15 +1581,30 @@ require 'securerandom'
         if headers['Authorization'].to_s.strip.empty?
           error('Missing Authorization header. Check service account / token minting.')
         end
-        # ---- Call API (return parsed body) ----------------------------------------------
-        raw = post(url)
+        # ---- Call API (force execution + parsed body) -----------------------------------
+        doc = post(url)
                 .headers(headers)
                 .request_format_json
                 .payload(body)
-        # Ultra-tolerant JSON extraction
-        doc = call(:http_body_json_0, raw)
-        # Tolerant contexts unwrapping (handles {contexts:[...]} and {contexts:{contexts:[...]}} and wrappers)
+                .after_error_response(400..599) do |code, body, headers, message|
+                  # Normalize error so step_err!/telemetry can read it
+                  error({
+                    'status'   => code,
+                    'response' => { 'body' => body, 'headers' => headers },
+                    'message'  => message
+                  })
+                end
+                .after_response do |code, body, headers|
+                  # Workato hands you parsed JSON Hash when content-type is JSON;
+                  # otherwise it's a String. Normalize gently.
+                  body.is_a?(String) ? (JSON.parse(body) rescue body) : body
+                end
+
+        # Robust contexts unwrapping (supports {contexts:[...]} and {contexts:{contexts:[...]}})
         arr = call(:coerce_contexts_array!, doc)
+
+        # Sanity check
+        error('retrieveContexts returned no contexts (0). Check corpus/project/region or query/topK).') if arr.empty?
 
         # (Symbolized-key fallback no longer needed; coerce_contexts_array! already handles it)
 
@@ -1605,8 +1620,9 @@ require 'securerandom'
           'contexts_flat' => enriched,
           'count'         => enriched.length,
           'debug_shape'   => {
-            'resp_class'    => raw.class.name,
-            'has_body'      => (raw.is_a?(Hash) && raw.key?('body')),
+            # Show what we actually parsed
+            'resp_class'    => doc.class.name,
+            'has_body'      => (doc.is_a?(Hash) && doc.key?('body')),  # true if Workato wrapped
             'top_keys'      => (doc.is_a?(Hash) ? doc.keys : []),
             'contexts_type' => (doc.is_a?(Hash) ? (doc['contexts'].class.name rescue 'nil') : doc.class.name),
             'count'         => enriched.length
