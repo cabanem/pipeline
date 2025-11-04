@@ -1410,141 +1410,214 @@ require 'securerandom'
     # RAG store engine
     rag_retrieve_contexts: {
       title: 'RAG (Serving): Retrieve contexts',
-      subtitle: 'projects.locations:retrieveContexts (Vertex RAG Store)',
-      help: lambda do |_|
-        {
-          body:
-            'Retrieves contexts from a Vertex RAG corpus. ' \
-            'Modifiers: top_k limits pre-ranking candidates; use EITHER vector_distance_threshold OR vector_similarity_threshold (not both). ' \
-            'Pick ONE ranker: rank_service_model (semantic ranker) OR llm_ranker_model (Gemini). ' \
-            'Guidance: if your index uses COSINE distance, distance≈1−similarity (so distance≤0.30 ≈ similarity≥0.70). ' \
-            'Start with top_k=20, then tighten by threshold; add a ranker only if you need stricter ordering.',
-          learn_more_url: 'https://docs.cloud.google.com/vertex-ai/generative-ai/docs/model-reference/rag-api-v1',
-          learn_more_text: 'Find out more about the RAG Engine API'
-        }
-      end,
-      display_priority: 86,
-      retry_on_request: ['GET','HEAD'],
-      retry_on_response: [408,429,500,502,503,504],
+      subtitle: 'projects.locations:retrieveContexts (Vertex RAG Engine, v1)',
+      display_priority: 120,
+
+      # Retries (safe defaults)
+      retry_on_request: ['GET', 'HEAD'],
+      retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
 
-      input_fields: lambda do |object_definitions, _connection, _config_fields|
-        [
-          { name: 'rag_corpus', optional: false,
-            hint: 'Accepts either full resource name (e.g., "projects/{project}/locations/{region}/ragCorpora/{corpus}") or the "corpus"' },
-          { name: 'question', optional: false },
-          { name: 'restrict_to_file_ids', type: 'array', of: 'string', optional: true },
-          { name: 'max_contexts', type: 'integer', optional: true, default: 20 },
-
-          # Preferred object (teams can use this)
-          { name: 'rag_retrieval_config', label: 'Retrieval config', type: 'object',
-            properties: object_definitions['rag_retrieval_config'], optional: true,
-            hint: 'Set top_k, exactly one threshold (distance OR similarity), and exactly one ranker (semantic OR LLM).' }
-
-          # (If you kept legacy flat fields for BC, they can remain here; not required.)
-        ]
+      help: lambda do |_|
+        { body: 'Retrieve relevant contexts from a Vertex RAG corpus/store. Toggle advanced options to expose thresholds and rankers.' }
       end,
-      output_fields: lambda do |object_definitions, _connection|
+
+      # Keep config_fields as a literal array (no lambdas), supports dynamic re-render.
+      config_fields: [
+        { name: 'show_advanced', label: 'Show advanced options',
+          type: 'boolean', control_type: 'checkbox',
+          default: false, sticky: true, extends_schema: true,
+          hint: 'Toggle to reveal threshold/ranker controls.' }
+      ],
+
+      input_fields: lambda do |od, connection, cfg|
+        show_adv = (cfg['show_advanced'] == true)
+
+        base = [
+          # Required
+          { name: 'query_text', label: 'Query text', optional: false },
+
+          # Scope (either corpus and/or file IDs)
+          { name: 'rag_corpus', optional: true,
+            hint: 'Full or short ID. Example short ID: my-corpus. Will auto-expand using connection project/location.' },
+          { name: 'rag_file_ids', type: 'array', of: 'string', optional: true,
+            hint: 'Optional: limit to these file IDs (must belong to the same corpus).' },
+
+          # Core knob
+          { name: 'top_k', type: 'integer', optional: true, default: 20, hint: 'Max contexts to return.' },
+
+          # Optional overrides
+          { name: 'project', optional: true, hint: 'Defaults to connection project.' },
+          { name: 'location', optional: true, hint: 'Defaults to connection location (e.g., us-central1).' }
+        ]
+
+        adv = [
+          { name: 'vector_distance_threshold', type: 'number', optional: true,
+            hint: 'Return contexts with distance ≤ threshold. For COSINE, lower is better.' },
+          { name: 'vector_similarity_threshold', type: 'number', optional: true,
+            hint: 'Return contexts with similarity ≥ threshold. Do NOT set both thresholds.' },
+          { name: 'rank_service_model', optional: true,
+            hint: 'Vertex Ranking model, e.g. semantic-ranker-512@latest.' },
+          { name: 'llm_ranker_model', optional: true,
+            hint: 'LLM ranker, e.g. gemini-2.5-flash.' }
+        ]
+
+        base + (show_adv ? adv : []) + Array(od['observability_input_fields']) # includes cid, etc.
+      end,
+
+      output_fields: lambda do |_od, _connection|
+        context_props = [
+          { name: 'sourceUri' }, { name: 'sourceDisplayName' },
+          { name: 'text' }, { name: 'score', type: 'number' },
+          { name: 'chunk', type: 'object', properties: [
+              { name: 'text' },
+              { name: 'pageSpan', type: 'object', properties: [
+                  { name: 'firstPage', type: 'integer' },
+                  { name: 'lastPage',  type: 'integer' }
+              ] }
+          ] }
+        ]
+
         [
-          { name: 'question' },
-          { name: 'contexts', type: 'array', of: 'object', properties: [
-              { name: 'id' }, { name: 'text' }, { name: 'score', type: 'number' },
-              { name: 'source' }, { name: 'uri' },
-              { name: 'metadata', type: 'object' },
-              { name: 'metadata_kv', label: 'metadata (KV)', type: 'array', of: 'object', properties: object_definitions['kv_pair'] },
-              { name: 'metadata_json', label: 'metadata (JSON)' }
-            ]
-          }
-        ] + [
+          { name: 'contexts', type: 'object', properties: [
+              { name: 'contexts', type: 'array', of: 'object', properties: context_props }
+          ] },
+          { name: 'contexts_flat', label: 'contexts (flat)', type: 'array', of: 'object', properties: context_props },
+          { name: 'count', type: 'integer' },
+
+          # Telemetry (from step_ok!)
           { name: 'ok', type: 'boolean' },
           { name: 'telemetry', type: 'object', properties: [
-            { name: 'http_status', type: 'integer' },
-            { name: 'message' }, { name: 'duration_ms', type: 'integer' },
-            { name: 'correlation_id' },
-            { name: 'retrieval', type: 'object' },
-            { name: 'rank', type: 'object' }
-          ]}
+              { name: 'http_status', type: 'integer' },
+              { name: 'message' },
+              { name: 'duration_ms', type: 'integer' },
+              { name: 'correlation_id' }
+          ] }
         ]
       end,
+
       execute: lambda do |connection, input|
-        t0   = Time.now
-        corr = call(:build_correlation_id_0)
+        # Step begin: captures cid (if provided) and starts timing
+        ctx = call(:step_begin!, :rag_retrieve_contexts, input)
 
-        proj = connection['project_id']
-        loc  = connection['location']
-        raise 'Connection missing project_id' if proj.blank?
-        raise 'Connection missing location'   if loc.blank?
+        # Resolve project/location
+        project  = (input['project'].presence || connection['project']).to_s
+        location = (input['location'].presence || connection['location']).to_s
+        error('Project is required (connection or input).')  if project.blank?
+        error('Location is required (connection or input).') if location.blank?
 
-        corpus = call(:normalize_rag_corpus_0, connection, input['rag_corpus'])
-        error('rag_corpus is required') if corpus.blank?
+        # Expand optional short corpus ID
+        corpus = (input['rag_corpus'] || '').to_s.strip
+        if corpus.present? && !corpus.start_with?('projects/')
+          corpus = "projects/#{project}/locations/#{location}/ragCorpora/#{corpus}"
+        end
 
-        loc     = (connection['location'] || '').downcase
-        parent  = "projects/#{connection['project_id']}/locations/#{loc}"
-        req_par = "parent=#{parent}"
+        # Mutually-exclusive checks
+        if input['vector_distance_threshold'].present? && input['vector_similarity_threshold'].present?
+          error('Set ONLY one of: vector_distance_threshold OR vector_similarity_threshold.')
+        end
+        if input['rank_service_model'].present? && input['llm_ranker_model'].present?
+          error('Choose ONE ranker: rank_service_model OR llm_ranker_model.')
+        end
 
-        # Merge + validate retrieval options from object/flat inputs
-        opts = call(:build_retrieval_opts_from_input_0!, input)
+        # Build body (REST v1 camelCase)
+        rag_resources = {}
+        rag_resources['ragCorpus']  = corpus if corpus.present?
+        if Array(input['rag_file_ids']).present?
+          rag_resources['ragFileIds'] = Array(input['rag_file_ids'])
+        end
 
-        payload = call(
-          :build_rag_retrieve_payload_0,
-          input['question'],
-          corpus,
-          input['restrict_to_file_ids'],
-          opts
-        )
+        retrieval_cfg = {}
+        retrieval_cfg['topK'] = input['top_k'] if input['top_k'].present?
 
-        url  = call(:aipl_v1_url_0, connection, loc, "#{parent}:retrieveContexts")
+        filter = {}
+        if input['vector_distance_threshold'].present?
+          filter['vectorDistanceThreshold'] = input['vector_distance_threshold'].to_f
+        elsif input['vector_similarity_threshold'].present?
+          filter['vectorSimilarityThreshold'] = input['vector_similarity_threshold'].to_f
+        end
+        retrieval_cfg['filter'] = filter unless filter.empty?
+
+        ranking = {}
+        if input['rank_service_model'].present?
+          ranking['rankService'] = { 'modelName' => input['rank_service_model'] }
+        elsif input['llm_ranker_model'].present?
+          ranking['llmRanker'] = { 'modelName' => input['llm_ranker_model'] }
+        end
+        retrieval_cfg['ranking'] = ranking unless ranking.empty?
+
+        body = {
+          'vertexRagStore' => rag_resources.empty? ? {} : { 'ragResources' => [rag_resources] },
+          'query' => { 'text' => input['query_text'] }
+        }
+        body['query']['ragRetrievalConfig'] = retrieval_cfg unless retrieval_cfg.empty?
+
+        # Endpoint + headers
+        host = "#{location}-aiplatform.googleapis.com"
+        url  = "https://#{host}/v1/projects/#{project}/locations/#{location}:retrieveContexts"
+
+        cid = (input['cid'] || (ctx && ctx['cid']))
+        headers = {
+          'Content-Type' => 'application/json',
+          'x-goog-request-params' => "project=#{project}&location=#{location}"
+        }
+        headers['x-goog-user-project'] = connection['quota_project'] if connection['quota_project'].present?
+        headers['x-correlation-id']    = cid if cid.present?
+
+        # Call API
         resp = post(url)
-                .headers(call(:request_headers_auth_0, connection, corr, connection['user_project'], req_par))
-                .payload(call(:json_compact_0, payload))
+                .headers(headers)
+                .payload(body)
+                .after_error_response(/.*/) do |code, b, _h|
+                  error("Vertex retrieveContexts failed (HTTP #{code}): #{b}")
+                end
+                .response_format_json
 
-        body  = call(:http_body_json_0, resp)
-        raw   = call(:normalize_retrieve_contexts_0!, body)
-        maxn  = call(:clamp_int_0, (input['max_contexts'] || 20), 1, 200)
-        mapped= call(:map_context_chunks_0, raw, maxn)
-
+        # Normalize/flatten
+        contexts_array = Array(resp.dig('contexts', 'contexts'))
         out = {
-          'question' => input['question'],
-          'contexts' => mapped
-        }.merge(call(:telemetry_envelope_0, t0, corr, true, call(:telemetry_success_code_0, resp), 'OK'))
+          'contexts'      => resp['contexts'],
+          'contexts_flat' => contexts_array,
+          'count'         => contexts_array.length
+        }
 
-        # Telemetry preview from canonical opts:
-        (out['telemetry'] ||= {})['retrieval'] = {}.tap do |h|
-          h['top_k'] = opts['topK'].to_i if opts['topK']
-          if opts['vectorDistanceThreshold']
-            h['filter'] = { 'type' => 'distance',  'value' => opts['vectorDistanceThreshold'].to_f }
-          elsif opts['vectorSimilarityThreshold']
-            h['filter'] = { 'type' => 'similarity','value' => opts['vectorSimilarityThreshold'].to_f }
-          end
-        end
-        if opts['rankServiceModel']
-          (out['telemetry'] ||= {})['rank'] = { 'mode' => 'rank_service', 'model' => opts['rankServiceModel'] }
-        elsif opts['llmRankerModel']
-          (out['telemetry'] ||= {})['rank'] = { 'mode' => 'llm', 'model' => opts['llmRankerModel'] }
-        end
-
-        out
-      rescue => e
-        g = call(:extract_google_error_0, e)
-        msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-        {}.merge(call(:telemetry_envelope_0, t0, corr, false, call(:telemetry_parse_error_code_0, e), msg))
+        # Success w/telemetry; label helps dashboards
+        call(:step_ok!, ctx, out, 200, 'OK', { 'count' => contexts_array.length })
       end,
 
       sample_output: lambda do
         {
-          'question' => 'What is the PTO carryover policy?',
-          'contexts' => [
-            { 'id' => 'doc-42#c3', 'text' => 'Employees may carry over up to 40 hours...', 'score' => 0.91,
-              'source' => 'handbook', 'uri' => 'https://drive.google.com/file/d/abc...',
-              'metadata' => { 'page' => 7 },
-              'metadata_kv' => [ { 'key' => 'page', 'value' => 7 } ],
-              'metadata_json' => '{"page":7}' }
+          'contexts' => {
+            'contexts' => [
+              {
+                'sourceUri'         => 'gs://docs/team/handbook.pdf',
+                'sourceDisplayName' => 'handbook.pdf',
+                'text'              => 'All expense reports must be submitted within 30 days…',
+                'score'             => 0.18,
+                'chunk'             => {
+                  'text'     => 'All expense reports must be submitted within 30 days…',
+                  'pageSpan' => { 'firstPage' => 3, 'lastPage' => 3 }
+                }
+              }
+            ]
+          },
+          'contexts_flat' => [
+            {
+              'sourceUri'         => 'gs://docs/team/handbook.pdf',
+              'sourceDisplayName' => 'handbook.pdf',
+              'text'              => 'All expense reports must be submitted within 30 days…',
+                  'score'       => 0.18,
+              'chunk' => { 'text' => 'All expense reports must be submitted within 30 days…',
+                          'pageSpan' => { 'firstPage' => 3, 'lastPage' => 3 } }
+            }
           ],
+          'count' => 1,
           'ok' => true,
           'telemetry' => {
-            'http_status' => 200, 'message' => 'OK', 'duration_ms' => 22, 'correlation_id' => 'sample',
-            'retrieval' => { 'top_k' => 20, 'filter' => { 'type' => 'distance', 'value' => 0.35 } },
-            'rank' => { 'mode': 'rank_service', 'model': 'semantic-ranker-512@latest' }
+            'http_status'    => 200,
+            'message'        => 'OK',
+            'duration_ms'    => 18,
+            'correlation_id' => 'corr-123'
           }
         }
       end
