@@ -2948,7 +2948,7 @@ require 'securerandom'
       end
     },
     embed_text_against_categories: {
-      title: 'Embed: Email vs categories',
+      title: 'Categorize: Embed email vs categories',
       subtitle: 'Cosine similarity → scores + shortlist',
       display_priority: 500,
       help: lambda do |_|
@@ -3023,7 +3023,7 @@ require 'securerandom'
       end
     },
     rerank_shortlist: {
-      title: 'Re-rank: Shortlist',
+      title: 'Categorize: Re-rank shortlist',
       subtitle: 'Optional LLM listwise re-ordering of categories',
       display_priority: 500,
       help: lambda do |_|
@@ -3091,8 +3091,8 @@ require 'securerandom'
       end
     },
     llm_referee_with_contexts: {
-      title: 'Referee: LLM (with optional contexts)',
-      subtitle: 'Adjudicate among shortlist; accepts ranked RAG chunks',
+      title: 'Categorize: LLM as referee',
+      subtitle: 'Adjudicate among shortlist; accepts ranked categories',
       display_priority: 500,
       help: lambda do |_|
         { body: 'Chooses final category using shortlist + category metadata; can append ranked contexts to the email text.' }
