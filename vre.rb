@@ -3183,6 +3183,29 @@ require 'securerandom'
   
   # --------- METHODS ------------------------------------------------------
   methods: {
+    path_rag_retrieve_contexts: lambda do |connection|
+      "/v1/projects/#{call(:ensure_project_id!, connection)}/locations/#{call(:ensure_location!, connection)}:retrieveContexts"
+    end,
+    safe_parse_json: lambda do |maybe_string|
+      return maybe_string unless maybe_string.is_a?(String)
+      begin
+        parse_json(maybe_string)
+      rescue
+        # If the server lied about content-type or returned pretty text,
+        # keep the original; the caller can handle/log.
+        maybe_string
+      end
+    end,
+    ensure_project_id!: lambda do |connection|
+      pid = connection['project'].to_s.strip
+      error('Project is required') if pid.empty?
+      pid
+    end,
+    ensure_location!: lambda do |connection|
+      loc = connection['location'].to_s.strip
+      error('Location is required') if loc.empty?
+      loc
+    end,
     default_headers: lambda do |connection|
       # Deliberately keep these minimal to avoid duplication of headers
       {
