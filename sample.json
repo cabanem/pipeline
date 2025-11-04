@@ -1,3 +1,66 @@
+// Categories
+[
+  {
+    "name": "PTO",
+    "description": "Paid time off requests and holiday scheduling.",
+    "examples": ["request PTO for 12/24-12/27", "holiday schedule question", "sick day request"]
+  },
+  {
+    "name": "W2",
+    "description": "W-2 and related tax document requests or issues.",
+    "examples": ["need my W-2", "lost tax paperwork", "update address for W2"]
+  },
+  {
+    "name": "Payroll",
+    "description": "Paychecks, time submission, withholdings, direct deposit.",
+    "examples": ["paycheck missing", "didn't submit time", "withholding seems wrong"]
+  },
+  {
+    "name": "Benefits & Enrollment",
+    "description": "Health, dental, vision, 401(k), HSA/FSA; enrollments and changes.",
+    "examples": ["add newborn to benefits", "FSA rollover question"]
+  },
+  {
+    "name": "Leaves & Accommodations",
+    "description": "FMLA, parental leave, medical leave, ADA accommodations.",
+    "examples": ["how to start parental leave", "doctor note for medical leave"]
+  },
+  {
+    "name": "Employee Data Changes",
+    "description": "Profile updates to address, name, dependents, marital status.",
+    "examples": ["legal name change", "new mailing address"]
+  },
+  {
+    "name": "HRIS/Portal Access",
+    "description": "Issues accessing HR systems (Workday/ADP/UKG/Rippling).",
+    "examples": ["can't log in to Workday", "2FA not working for ADP"]
+  },
+  {
+    "name": "Verification & Letters",
+    "description": "VOE and official letter requests.",
+    "examples": ["employment verification for mortgage", "letter confirming salary"]
+  },
+  {
+    "name": "Policy & Employee Relations",
+    "description": "HR policy questions and workplace concerns.",
+    "examples": ["clarify holiday policy", "concern about team conduct"]
+  },
+  {
+    "name": "Immigration/Work Authorization",
+    "description": "I-9, visa, sponsorship, work authorization updates.",
+    "examples": ["I-9 reverification", "visa renewal timing"]
+  },
+  {
+    "name": "Offboarding/Exit",
+    "description": "Resignation, final paycheck, benefits after departure (COBRA).",
+    "examples": ["two-week notice submitted", "when will final pay arrive?"]
+  },
+  {
+    "name": "Other",
+    "description": "General HR inquiries that do not fit the above.",
+    "examples": ["not sure which form to use"]
+  }
+]
 
 // DETERMINISTIC FILTER JSON
 {
