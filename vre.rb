@@ -463,7 +463,116 @@ require 'securerandom'
         data
       end
     },
+    rag_retrieve_contexts2: {
+      title: 'RAG: Retrieve contexts 2',
+      subtitle: 'projects.locations:retrieveContexts (Vertex RAG Store)',
+      display_priority: 120,
+      retry_on_request: ['GET','HEAD'],
+      retry_on_response: [408,429,500,502,503,504],
+      max_retries: 3,
 
+      # Keep these as plain arrays (no lambdas) so the UI renders reliably
+      config_fields: [
+        { name: 'infer_schema', label: 'Infer schema from live sample',
+          type: 'boolean', control_type: 'checkbox', default: false, sticky: true, extends_schema: true },
+
+        { name: 'rag_corpora', label: 'RAG corpora',
+          type: 'array', of: 'string', optional: false,
+          hint: 'Full resource names: projects/{project}/locations/{location}/ragCorpora/{corpusId}',
+          extends_schema: true },
+
+        { name: 'top_k', type: 'integer', optional: true, default: 20, extends_schema: true },
+        { name: 'vector_similarity_threshold', type: 'number', optional: true, extends_schema: true },
+        { name: 'vector_distance_threshold',   type: 'number', optional: true, extends_schema: true },
+
+        { name: 'x_goog_user_project', type: 'string', optional: true,
+          hint: 'Billing project (x-goog-user-project header)', extends_schema: true },
+
+        { name: 'emit_mode', control_type: 'select', default: 'records', sticky: true,
+          options: [['Array as records[]','records'], ['Inferred','inferred'], ['Raw only','raw']] }
+      ],
+
+      input_fields: lambda do |_od, _connection, _cfg|
+        [
+          { name: 'query_text', optional: false, label: 'Query text' }
+        ]
+      end,
+
+      output_fields: lambda do |od, connection, cfg|
+        if cfg['infer_schema'] == true
+          call(:probe_retrieve_contexts_output_fields, connection, cfg)
+        else
+          # Fixed superset that matches typical retrieveContexts shapes
+          [
+            { name: 'records', type: 'array', of: 'object', properties: [
+                { name: 'text' },
+                { name: 'sourceUri' },
+                { name: 'score', type: 'number', optional: true },
+                { name: 'metadata', type: 'object', optional: true }
+            ]},
+            { name: 'extras', type: 'object', optional: true },
+            { name: 'raw',    type: 'string',  optional: true }
+          ]
+        end
+      end,
+
+      execute: lambda do |connection, input|
+        url, parent = call(:aipl_v1_url_retrieve_contexts, connection)
+
+        headers = { 'Content-Type' => 'application/json' }
+        if input['x_goog_user_project'].present?
+          headers['x-goog-user-project'] = input['x_goog_user_project']
+        end
+        # Optional but nice: helps Google route requests
+        headers['x-goog-request-params'] = "parent=#{parent}"
+
+        # Build the request body
+        body = {
+          'query' => { 'text' => input['query_text'].to_s }
+        }.merge(
+          'dataSource' => call(:build_rag_resources, input['rag_corpora'])
+        )
+
+        tk = input['top_k'].to_i
+        body['topK'] = tk if tk > 0
+
+        if input['vector_similarity_threshold'].present? && input['vector_distance_threshold'].present?
+          error('Use EITHER vector_similarity_threshold OR vector_distance_threshold, not both')
+        end
+        if input['vector_similarity_threshold'].present?
+          body['vectorSimilarityThreshold'] = input['vector_similarity_threshold'].to_f
+        elsif input['vector_distance_threshold'].present?
+          body['vectorDistanceThreshold'] = input['vector_distance_threshold'].to_f
+        end
+
+        # POST correctly (named args) — avoids the classic "wrong number of arguments" bug
+        resp = post(url, headers: headers, payload: body)
+
+        # Normalize response
+        payload = call(:dig_path, resp, 'contexts.contexts')
+        payload ||= resp
+
+        data =
+          case (input['emit_mode'] || 'records')
+          when 'raw'
+            { 'raw' => (resp.respond_to?(:to_json) ? resp.to_json : resp.to_s) }
+          when 'inferred'
+            payload.is_a?(Hash) ? payload : { 'value' => payload }
+          else # 'records'
+            { 'records' => (payload.is_a?(Array) ? payload : Array(payload)) }
+          end
+
+        # Drift tolerance: stash unknown keys if payload was a Hash envelope
+        if payload.is_a?(Hash)
+          known = Array(data['records']).first.is_a?(Hash) ? data['records'].first.keys : data.keys
+          extras = payload.reject { |k, _| known.include?(k) }
+          data['extras'] = extras if extras.any?
+        end
+
+        data['raw'] ||= (resp.respond_to?(:to_json) ? resp.to_json : resp.to_s)
+        data
+      end
+    },
     gen_categorize_email: {
       title: 'Email: Categorize email',
       subtitle: 'Classify an email into a category',
@@ -2049,27 +2158,8 @@ require 'securerandom'
   # --------- METHODS ------------------------------------------------------
   methods: {
     # ---- SCHEMA DISCOVERY METHODS
-    http_sample: lambda do |connection, cfg|
-      url     = cfg['probe_url']
-      method  = (cfg['probe_method'] || 'GET').to_s.upcase
-      headers = (cfg['probe_headers'] || {})
-      params  = (cfg['probe_params']  || {})
-      body    = cfg['probe_body']
-
-      resp =
-        case method
-        when 'GET'    then get(url,    headers: headers, params: params)
-        when 'DELETE' then delete(url, headers: headers, params: params)
-        when 'POST'   then post(url,   headers: headers, params: params, payload: body)
-        when 'PUT'    then put(url,    headers: headers, params: params, payload: body)
-        when 'PATCH'  then patch(url,  headers: headers, params: params, payload: body)
-        else error("Unsupported method: #{method}")
-        end
-
-      resp
-    end,
     dig_path: lambda do |obj, path|
-      return obj if path.blank?
+      return obj if path.to_s.strip.empty?
       path.split('.').reduce(obj) do |acc, key|
         if acc.is_a?(Hash)        then acc[key]
         elsif acc.is_a?(Array) && key =~ /\A\d+\z/ then acc[key.to_i]
@@ -2083,12 +2173,11 @@ require 'securerandom'
       when Float                 then 'number'
       when Hash                  then 'object'
       when Array                 then 'array'
-      when NilClass              then 'string' # null → optional string
+      when NilClass              then 'string'
       else 'string'
       end
     end,
     json_schema_fields: lambda do |value|
-      # Returns an Array of Workato field hashes representing 'value'
       case value
       when Hash
         value.map do |k, v|
@@ -2115,6 +2204,73 @@ require 'securerandom'
         }]
       else
         [{ name: 'value', type: call(:infer_type, value) }]
+      end
+    end,
+    # --- Vertex URL + body builders (no external method deps) ---
+    aipl_v1_url_retrieve_contexts: lambda do |connection|
+      project  = connection['project'].presence || connection['project_id']
+      location = connection['location'].presence || 'us-east4'
+      error('Connection missing project')  if project.blank?
+      error('Connection missing location') if location.blank?
+      parent = "projects/#{project}/locations/#{location}"
+      ["https://aiplatform.googleapis.com/v1/#{parent}:retrieveContexts", parent]
+    end,
+    build_rag_resources: lambda do |rag_corpora|
+      arr = Array(rag_corpora).compact.map(&:to_s).reject(&:empty?)
+      error('At least one rag corpus is required') if arr.empty?
+      {
+        'vertexRagStore' => {
+          'ragResources' => arr.map { |c| { 'ragCorpus' => c } }
+        }
+      }
+    end,
+    # --- Probe the endpoint to infer output fields (optional) ---
+    probe_retrieve_contexts_output_fields: lambda do |connection, cfg|
+      begin
+        url, _parent = call(:aipl_v1_url_retrieve_contexts, connection)
+
+        headers = { 'Content-Type' => 'application/json' }
+        if cfg['x_goog_user_project'].present?
+          headers['x-goog-user-project'] = cfg['x_goog_user_project']
+        end
+
+        body = {
+          'query' => { 'text' => (cfg['probe_query_text'].presence || 'schema-probe') }
+        }.merge(
+          'dataSource' => call(:build_rag_resources, cfg['rag_corpora'])
+        )
+        body['topK'] = (cfg['top_k'].to_i) if cfg['top_k'].to_i > 0
+        if cfg['vector_similarity_threshold'].present? && cfg['vector_distance_threshold'].present?
+          error('Use EITHER vector_similarity_threshold OR vector_distance_threshold, not both')
+        end
+        if cfg['vector_similarity_threshold'].present?
+          body['vectorSimilarityThreshold'] = cfg['vector_similarity_threshold'].to_f
+        elsif cfg['vector_distance_threshold'].present?
+          body['vectorDistanceThreshold'] = cfg['vector_distance_threshold'].to_f
+        end
+
+        resp = post(url, headers: headers, payload: body)
+        sample = call(:dig_path, resp, 'contexts.contexts')
+        sample ||= resp
+        fields = call(:json_schema_fields, sample)
+        fields + [
+          { name: 'extras', type: 'object', optional: true },
+          { name: 'raw',    type: 'string', optional: true }
+        ]
+      rescue => e
+        # Fallback superset if probe fails (auth, quota, or no corpus yet)
+        [
+          { name: 'records', type: 'array', of: 'object', properties: [
+              { name: 'text' },
+              { name: 'sourceUri' },
+              { name: 'score', type: 'number', optional: true },
+              { name: 'metadata', type: 'object', optional: true }
+          ]},
+          { name: 'raw', type: 'string' },
+          { name: 'error', type: 'object', properties: [
+              { name: 'message' }, { name: 'class' }, { name: 'hint' }
+          ]}
+        ]
       end
     end,
     probe_output_fields: lambda do |connection, cfg|
