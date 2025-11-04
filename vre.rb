@@ -3183,6 +3183,16 @@ require 'securerandom'
   
   # --------- METHODS ------------------------------------------------------
   methods: {
+    default_headers: lambda do |connection|
+      # Deliberately keep these minimal to avoid duplication of headers
+      {
+      'Content-Type' => 'application/json; charset=utf-8',
+      'Accept' => 'application/json'
+      }
+    end,
+    aiplatform_host: lambda do |connection|
+      "#{call(:ensure_location!, connection)}-aiplatform.googleapis.com"
+    end,
     build_retrieval_opts_from_input_0!: lambda do |input|
       cfg  = (input['rag_retrieval_config'].is_a?(Hash) ? input['rag_retrieval_config'] : {})
       filt = cfg['filter'].is_a?(Hash) ? cfg['filter'] : {}
