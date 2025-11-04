@@ -1534,14 +1534,37 @@ require 'securerandom'
                     .headers(call(:headers_rag, connection, cid, "parent=#{parent}"))
                     .payload(call(:json_compact, payload))
 
-          # Normalize v1 / v1beta1 shape and map to your chunk shape
-          raw_contexts = call(:normalize_retrieve_contexts!, resp)
-          maxn         = call(:clamp_int, (input['top_k'] || 20), 1, 100)
-          contexts     = call(:map_context_chunks, raw_contexts, maxn)
+          # Process the API response - preserve the actual API structure
+          raw_resp = resp.is_a?(Hash) ? resp : {}
+          contexts_obj = raw_resp['contexts'] || {}
+          contexts_array = contexts_obj.is_a?(Hash) ? (contexts_obj['contexts'] || []) : []
 
-          out = { 'contexts' => contexts }
-                  .merge(call(:telemetry_envelope, ctx['t0'], cid, true,
-                              call(:telemetry_success_code, resp), 'OK'))
+          # Limit to top_k
+          maxn = call(:clamp_int, (input['top_k'] || 20), 1, 100)
+          contexts_array = contexts_array.first(maxn)
+
+          # Add similarity field to each context (assuming score is distance for COSINE)
+          contexts_with_similarity = contexts_array.map do |ctx_item|
+            score = (ctx_item['score'] || 0.0).to_f
+            ctx_item.merge({
+              'similarity' => (1.0 - score).round(4)
+            })
+          end
+
+          out = {
+            'contexts' => {
+              'contexts' => contexts_with_similarity
+            },
+            'contexts_flat' => contexts_with_similarity,
+            'count' => contexts_with_similarity.length,
+            'debug_shape' => {
+              'resp_class' => resp.class.to_s,
+              'top_keys' => (resp.is_a?(Hash) ? resp.keys : []),
+              'count' => contexts_with_similarity.length
+            }
+          }.merge(call(:telemetry_envelope, ctx['t0'], cid, true,
+                       call(:telemetry_success_code, resp), 'OK'))
+
           call(:step_ok!, ctx, out, call(:telemetry_success_code, resp), 'OK',
               { 'retrieval_top_k' => opts['topK'] })
         rescue => e
