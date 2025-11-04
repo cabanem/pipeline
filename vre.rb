@@ -1678,79 +1678,59 @@ require 'securerandom'
         end
 
         # Map using the existing helper method that properly formats contexts
-        mapped_contexts = call(:map_context_chunks, arr, 100) 
+        max_contexts = (input['top_k'].presence || 50).to_i
+        mapped_contexts = call(:map_context_chunks, arr, max_contexts)
 
         # Build the output
         out = {
-          'question'      => input['query_text'],
-          'contexts'      => mapped_contexts,
-          'count'         => mapped_contexts.length,
-          'debug_shape'   => {
-            'http_status'   => code,
-            'resp_class'    => wire.class.name,
-            'has_body'      => wire.is_a?(Hash) && wire.key?('body'),
-            'top_keys'      => (doc.is_a?(Hash) ? doc.keys : []),
-            'contexts_type' => (doc.is_a?(Hash) ? (doc['contexts'].class.name rescue 'nil') : doc.class.name),
-            'count'         => mapped_contexts.length,
-            'net_ms'        => net_ms,
-            'raw_length'    => text.length,
-            'parsed'        => parsed ? true : false,
-            'arrays_found'  => arrays_found,
-            'deep_found'    => deep_found
-          }
+          'question' => input['query_text'],
+          'contexts' => mapped_contexts
+        }
 
-
+        # Add debug information if not in production mode and debug is enabled
         if !call(:normalize_boolean, connection['prod_mode']) && input['debug']
-          out['response_preview'] = {
+          out['debug'] = {
             'http_status'    => code,
             'body_head'      => clean[0, 300],
             'top_level_keys' => (doc.is_a?(Hash) ? doc.keys : []),
-            'raw_count'      => Array(arr).length
+            'raw_count'      => Array(arr).length,
+            'mapped_count'   => mapped_contexts.length,
+            'arrays_found'   => arrays_found,
+            'deep_found'     => deep_found,
+            'net_ms'         => net_ms
           }
         end
 
-        # Telemetry w/ real timing
-        call(:step_ok!, ctx, out, code, "HTTP #{code} in #{net_ms} ms", { 'count' => enriched.length, 'net_ms' => net_ms })
+        # Add telemetry using the step helper
+        call(:step_ok!, ctx, out, code, "Retrieved #{mapped_contexts.length} contexts", 
+            { 'count' => mapped_contexts.length, 'net_ms' => net_ms })
       end,
       sample_output: lambda do
         {
-          'contexts' => {
-            'contexts' => [
-              {
-                'sourceUri'         => 'gs://docs/team/handbook.pdf',
-                'sourceDisplayName' => 'handbook.pdf',
-                'text'              => 'All expense reports must be submitted within 30 days…',
-                'score'             => 0.18,
-                'similarity'        => 0.82,
-                'chunk'             => {
-                  'text'     => 'All expense reports must be submitted within 30 days…',
-                  'pageSpan' => { 'firstPage' => 3, 'lastPage' => 3 }
-                }
-              }
-            ]
-          },
-          'contexts_flat' => [
+          'question' => 'What is the expense report policy?',
+          'contexts' => [
             {
-              'sourceUri'         => 'gs://docs/team/handbook.pdf',
-              'sourceDisplayName' => 'handbook.pdf',
-              'text'              => 'All expense reports must be submitted within 30 days…',
-                'score'             => 0.18,
-                'similarity'        => 0.82,
-              'chunk' => { 'text' => 'All expense reports must be submitted within 30 days…',
-                          'pageSpan' => { 'firstPage' => 3, 'lastPage' => 3 } }
+              'id'     => 'ctx-1',
+              'text'   => 'All expense reports must be submitted within 30 days…',
+              'score'  => 0.82,
+              'source' => 'handbook.pdf',
+              'uri'    => 'gs://docs/team/handbook.pdf',
+              'metadata' => {
+                'page' => 3,
+                'section' => 'Expense Policy'
+              },
+              'metadata_kv' => [
+                { 'key' => 'page', 'value' => 3 },
+                { 'key' => 'section', 'value' => 'Expense Policy' }
+              ],
+              'metadata_json' => '{"page":3,"section":"Expense Policy"}'
             }
           ],
-          'count' => 1,
-          'debug_shape' => {
-            'resp_class' => 'Hash',
-            'top_keys'   => ['contexts'],
-            'count'      => 1
-          },
           'ok' => true,
           'telemetry' => {
             'http_status'    => 200,
-            'message'        => 'OK',
-            'duration_ms'    => 18,
+            'message'        => 'Retrieved 1 contexts',
+            'duration_ms'    => 250,
             'correlation_id' => 'corr-123'
           }
         }
