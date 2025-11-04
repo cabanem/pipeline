@@ -1604,15 +1604,49 @@ require 'securerandom'
 
         code = (wire['status'] || wire['status_code'] || 200).to_i
         text = (wire['body'].to_s rescue '')
-        # Tolerant parse; if not JSON, return a small wrapper to aid debugging
+        # Tolerant parse; if not JSON, keep a 'raw' wrapper so we can try again
         doc  = (JSON.parse(text) rescue (text == '' ? {} : { 'raw' => text }))
 
-        # ---- Unwrap contexts defensively ----------------------------------------------
+        # ---- Unwrap contexts (tolerant) -----------------------------------------------
         arr = call(:coerce_contexts_array!, doc)
 
-        # If you expect at least one, fail fast to avoid silent 0s in pipelines
-        error('retrieveContexts returned no contexts (0). Check corpus/project/region or query/topK).') if arr.empty?
+        # Fallback A: server gave us a string body we wrapped as {raw: "..."} — try parsing that
+        if arr.empty? && doc.is_a?(Hash) && doc['raw'].is_a?(String)
+          begin
+            sdoc = JSON.parse(doc['raw'])
+            arr = call(:coerce_contexts_array!, sdoc)
+            # prefer parsed doc thereafter
+            doc = sdoc if arr.is_a?(Array)
+          rescue
+            # keep doc as-is
+          end
+        end
 
+        # Fallback B: collect *all* arrays under any "contexts" key(s) and flatten
+        if arr.empty?
+          collector = lambda do |obj, acc|
+            case obj
+            when Hash
+              obj.each do |k, v|
+                if k.to_s == 'contexts'
+                  vv = v.is_a?(Hash) ? v['contexts'] : v
+                  acc << vv if vv.is_a?(Array)
+                end
+                collector.call(v, acc)
+              end
+            when Array
+              obj.each { |e| collector.call(e, acc) }
+            end
+            acc
+          end
+          arrays = collector.call(doc, [])
+          # flatten and keep only contextish hashes
+          arr = arrays.flatten.select do |e|
+            e.is_a?(Hash) && (e['text'] || e['chunkText'] || e['sourceUri'] || e['chunkId'])
+          end
+        end
+
+        # Map/enrich (ok if empty; we won't hard-fail so you can inspect preview)
         enriched = Array(arr).map do |h|
           item = h.is_a?(Hash) ? h.transform_keys(&:to_s) : {}
           sc = item['score']
@@ -1642,19 +1676,17 @@ require 'securerandom'
             'headers' => call(:redact_json, headers),
             'payload' => call(:redact_json, body),
             'parent'  => parent,
-            'rag_corpus_expanded' => corpus,
-            'ping_ok' => ping_ok,
-            'ping_status' => ping_status
+            'rag_corpus_expanded' => corpus
           }
           out['response_preview'] = {
-            'http_status'   => code,
-            'body_head'     => text[0, 300],
-            'top_level_keys'=> (doc.is_a?(Hash) ? doc.keys : []),
-            'raw_count'     => Array(arr).length
+            'http_status'    => code,
+            'body_head'      => text[0, 300],
+            'top_level_keys' => (doc.is_a?(Hash) ? doc.keys : []),
+            'raw_count'      => Array(arr).length
           }
         end
 
-        # Promote real timing & status into telemetry message
+        # Don’t hard-fail on empty; keep telemetry and preview visible during triage
         call(:step_ok!, ctx, out, code, "HTTP #{code} in #{net_ms} ms", { 'count' => enriched.length, 'net_ms' => net_ms })
       end,
       sample_output: lambda do
