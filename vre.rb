@@ -1513,7 +1513,7 @@ require 'securerandom'
           call(:ensure_project_id!, connection)
           call(:ensure_regional_location!, connection)  # RAG requires regional location
           cid   = ctx['cid']
-          q     = (input['question'] || '').to_s
+          q     = (input['query_text'] || '').to_s
           error('question is required') if q.strip.empty?
 
           corpus = call(:normalize_rag_corpus, connection, input['rag_corpus'])
@@ -1589,110 +1589,6 @@ require 'securerandom'
             'duration_ms'    => 18,
             'correlation_id' => 'corr-123'
           }
-        }
-      end
-    },
-    rag_retrieve_contexts_simplified: {
-      title: 'RAG: Retrieve contexts (simplified)',
-      subtitle: '',
-      description: '',
-      display_priority: 86,
-      retry_on_request: ['GET','HEAD'],
-      retry_on_response: [408,429,500,502,503,504],
-      max_retries: 3,
-
-      input_fields: lambda do |_|
-        [
-          { name: 'rag_corpus', optional: true, hint: 'projects/{p}/locations/{l}/ragCorpora/{corpus}' },
-          { name: 'query', optional: false, hint: 'Plain-text query string.' },
-          { name: 'max_contexts', label: 'Top K', type: :integer, optional: true, default: 12, hint: 'Maps to query.ragRetrievalConfig.topK.' }
-        ]
-      end,
-      output_fields: lambda do |object_definitions|
-        [
-          { name: 'contexts', type: :array, of: :object, properties: object_definitions['context_chunk'] },
-          { name: '_meta', type: :object }
-        ]
-      end,
-      execute: lambda do |connection, input|
-        host = call(:aiplatform_host, connection)
-        path = call(:path_rag_retrieve_contexts, connection)
-        # Build the canonical parent for routing + header hints
-        parent = "projects/#{call(:ensure_project_id!, connection)}/locations/#{call(:ensure_location!, connection)}"
-
-        body = {
-          'query' => {
-            'text' => input['query'].to_s,
-            'ragRetrievalConfig' => {
-              'topK' => call(:coerce_integer, input['max_contexts'], 12)
-            }
-          }
-        }
-        rc = input['rag_corpus'].to_s.strip
-        unless rc.empty?
-          # 'data_source' is a union; include only the chosen member at top level.
-          body['vertexRagStore'] = {
-            'ragResources' => [{ 'ragCorpus' => rc }]
-          }
-        end
-
-        # Add Google's routing hint header
-        extra = { 'x-goog-request-params' => "parent=#{parent}" }
-        # Push requestor-pays/quota attribution if configured
-        up = connection['user_project'].to_s.strip
-        extra['x-goog-user-project'] = up unless up.empty?
-
-        raw = post("https://#{host}#{path}")
-                .headers(call(:default_headers, connection).merge(extra))
-                .payload(body)
-
-        # Workato normally returns a hash, but parse to hash anyway
-        result = call(:safe_parse_json, raw)
-
-        # Handle both REST shapes:
-        # (A) { "contexts": [ ... ] }
-        # (B) { "contexts": { "contexts": [ ... ] } }
-        arr =
-          if result.is_a?(Hash)
-            if result['contexts'].is_a?(Array)
-              result['contexts']
-            elsif result.dig('contexts', 'contexts').is_a?(Array)
-              result.dig('contexts', 'contexts')
-            else
-              []
-            end
-          else
-            []
-          end
-
-        mapped = arr.map do |c|
-          {
-            # ID is best-effort; not always present
-            'id' => c.dig('chunk', 'id') || c.dig('chunk', 'chunkId'),
-            'uri' => c['sourceUri'],
-            'content' => c['text'],
-            'score' => c['score'],
-            'metadata' => {
-              'sourceDisplayName' => c['sourceDisplayName'],
-              'chunk' => c['chunk']
-            }.compact
-          }.compact
-        end
-
-        { 'contexts' => mapped, '_meta' => { 'raw_count' => mapped.length } }
-      end,
-      sample_output: lambda do
-        {
-          'contexts' => [
-            {
-              'id' => 'chunk-123',
-              'uri' => 'gs://bucket/doc.txt',
-              'content' => '...',
-              'score' => 0.83,
-              'metadata' => { 'sourceDisplayName' => 'doc.txt' }
-            }
-          ],
-          '_meta' => { 'raw_count' => 1 }
         }
       end
     },
