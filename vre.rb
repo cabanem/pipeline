@@ -1690,125 +1690,147 @@ require 'securerandom'
         }
       end
     },
-    rag_retrieve_contexts_new: {
-      title: 'RAG: Retrieve contexts (new)',
-      subtitle: 'Friendly inputs → contract → Vertex v1',
-      display_priority: 119,
+    rag_retrieve_contexts: {
+      title: 'RAG: Retrieve contexts',
+      subtitle: 'projects.locations:retrieveContexts (Vertex RAG Store)',
+      display_priority: 90,
 
-      config_fields: [
-        { name: 'show_advanced', label: 'Show advanced options',
-          type: 'boolean', control_type: 'checkbox', default: false, sticky: true, extends_schema: true }
-      ],
+      help: lambda do |_|
+        {
+          body:
+            'Retrieves relevant contexts for a query from a Vertex RAG Store. ' \
+            'Provide parent=projects/{project}/locations/{location} and at least one rag resource (corpus and/or file IDs). ' \
+            'This action normalizes the API response and emits contexts[] as a flat array.',
+          learn_more_url: 'https://cloud.google.com/vertex-ai/generative-ai/docs/reference/rest/v1/projects.locations/retrieveContexts',
+          learn_more_text: 'Vertex AI: locations.retrieveContexts'
+        }
+      end,
 
-      input_fields: lambda do |_od, connection, cfg|
-        adv = (cfg['show_advanced'] == true)
+      # ---- Inputs shown in the recipe UI ----
+      input_fields: lambda do
         [
-          { name: 'parent', hint: 'projects/{project}/locations/{location}. If blank, uses connection.' },
+          # Required path param
+          { name: 'parent', label: 'Parent (Location)',
+            hint: 'Format: projects/{project}/locations/{location}',
+            optional: false },
+
+          # Core query
           { name: 'query_text', label: 'Query text', optional: false },
 
-          # Minimal source targeting
-          { name: 'rag_corpus', label: 'RAG corpus (full name)',
-            hint: 'projects/{proj}/locations/{loc}/ragCorpora/{corpus}', optional: false },
-          { name: 'rag_file_ids', label: 'RAG file IDs', type: 'array', of: 'string', optional: true },
+          # RAG Store resources
+          { name: 'rag_corpus', label: 'RAG corpus resource name',
+            hint: 'projects/{project}/locations/{location}/ragCorpora/{ragCorpus}',
+            optional: true },
+          { name: 'rag_file_ids', type: 'array', of: 'string', optional: true,
+            hint: 'Optional: restrict retrieval to specific file IDs within the corpus' },
 
-          # Optional pass-through tuning (drops directly into ragRetrievalConfig)
-          (adv ? { name: 'rag_retrieval_config', label: 'ragRetrievalConfig (object)',
-                  type: 'object', optional: true } : nil),
+          # Optional retrieval tuning: free-form JSON object passes through
+          { name: 'rag_retrieval_config', type: 'object', optional: true,
+            hint: 'Optional knobs; shape may evolve (topK, filters, etc.)' },
 
-          # Optional headers/diag
-          { name: 'x_goog_user_project', optional: true, sticky: true },
-          { name: 'cid', label: 'Correlation ID', optional: true, sticky: true }
-        ].compact
+          # Optional: emit a debug object for troubleshooting
+          { name: 'emit_debug', type: 'boolean', control_type: 'checkbox',
+            default: false, optional: true, label: 'Emit debug payload' }
+        ]
       end,
 
-      execute: lambda do |connection, input|
-        # Resolve parent
-        parent = input['parent'].presence
-        if parent.blank?
-          proj = connection['project_id'].presence || connection['project'].presence
-          loc  = (connection['location'].presence || 'us-central1')
-          error('Connection missing project_id/project') if proj.blank?
-          parent = "projects/#{proj}/locations/#{loc}"
-        end
-
-        # Build the **contract** body from simple fields
-        body = {
-          'query' => {
-            'text' => input['query_text']
-          },
-          'data_source' => {
-            'vertexRagStore' => {
-              'ragResources' => [
-                {
-                  'ragCorpus' => input['rag_corpus'],
-                  # only include if provided
-                  'ragFileIds' => Array(input['rag_file_ids']).presence
-                }.compact
-              ]
-            }
-          }
-        }
-
-        # Optional tuning passthrough → ragRetrievalConfig
-        if input['rag_retrieval_config'].present?
-          body['query']['ragRetrievalConfig'] = input['rag_retrieval_config']
-        end
-
-        # Guardrails
-        error('query_text required') if body.dig('query', 'text').blank?
-        error('rag_corpus required') if body.dig('data_source', 'vertexRagStore', 'ragResources', 0, 'ragCorpus').blank?
-
-        url = "https://aiplatform.googleapis.com/v1/#{parent}:retrieveContexts"
-        headers = { 'Content-Type' => 'application/json' }
-        headers['x-goog-user-project'] = input['x_goog_user_project'] if input['x_goog_user_project'].present?
-        headers['x-correlation-id']    = input['cid'] if input['cid'].present?
-
-        rsp = post(url, body, headers)
-
-        # Normalize "contexts" shape → flat array
-        contexts =
-          if rsp['contexts'].is_a?(Hash) && rsp['contexts']['contexts'].is_a?(Array)
-            rsp['contexts']['contexts']
-          elsif rsp['contexts'].is_a?(Array)
-            rsp['contexts']
-          else
-            []
-          end
-
-        { contexts: contexts, _raw_response: rsp, _request_body: body }
-      end,
-
-      output_fields: lambda do |_od, _connection|
+      # ---- Output schema ----
+      output_fields: lambda do
         [
           { name: 'contexts', type: 'array', of: 'object', properties: [
               { name: 'sourceUri' },
               { name: 'sourceDisplayName' },
               { name: 'text' },
+              { name: 'score', type: 'number' },
               { name: 'chunk', type: 'object', properties: [
                   { name: 'text' },
-                  { name: 'pageSpan', type: 'object' }
-                ] },
-              { name: 'score', type: 'number' }
-            ] },
-          { name: '_raw_response', type: 'object' },
-          { name: '_request_body', type: 'object' } # helpful for debugging what was sent
+                  { name: 'pageSpan', type: 'object' } # passthrough/future-proof
+                ] }
+            ]},
+          { name: 'debug', type: 'object', properties: [
+              { name: 'http_status', type: 'integer' },
+              { name: 'request_url' },
+              { name: 'request_body', type: 'object' },
+              { name: 'raw_keys', type: 'array', of: 'string' }
+            ]}
         ]
       end,
 
-      sample_output: lambda do
-        {
-          'contexts' => [
-            {
-              'sourceUri' => 'gs://bucket/file.pdf',
-              'sourceDisplayName' => 'file.pdf',
-              'text' => 'Example chunk…',
-              'chunk' => { 'text' => 'Example chunk…', 'pageSpan' => { 'start': 2, 'end': 2 } },
-              'score' => 0.27
-            }
-          ],
-          '_raw_response' => { 'contexts' => { 'contexts' => [] } },
-          '_request_body' => {}
+      # ---- Execute ----
+      execute: lambda do |_connection, input|
+        # 1) Build URL
+        parent = input['parent'].to_s.strip
+        error('Parent is required (projects/{project}/locations/{location}).') if parent.empty?
+        url = "https://aiplatform.googleapis.com/v1/#{parent}:retrieveContexts"
+
+        # 2) Prepare request body from data contract
+        #    {
+        #      "query": { "text": "...", "ragRetrievalConfig": {...} },
+        #      "data_source": { "vertexRagStore": { "ragResources": [ {ragCorpus, ragFileIds} ] } }
+        #    }
+        query_obj = { 'text' => input['query_text'].to_s }
+        if input['rag_retrieval_config'].is_a?(Hash) && !input['rag_retrieval_config'].empty?
+          query_obj['ragRetrievalConfig'] = input['rag_retrieval_config']
+        end
+
+        rag_resource = {}
+        rag_resource['ragCorpus'] = input['rag_corpus'] if input['rag_corpus'].to_s.strip.present?
+        if input['rag_file_ids'].is_a?(Array) && input['rag_file_ids'].any?
+          rag_resource['ragFileIds'] = input['rag_file_ids'].compact
+        end
+
+        rag_resources = []
+        rag_resources << rag_resource unless rag_resource.empty?
+
+        error('Request must set RAG resources (rag_corpus and/or rag_file_ids).') if rag_resources.empty?
+
+        body = {
+          'query' => query_obj,
+          'data_source' => {
+            'vertexRagStore' => { 'ragResources' => rag_resources }
+          }
         }
+
+        # 3) Headers (Workato OAuth2 usually injects Authorization automatically; keep minimal & explicit JSON)
+        headers = {
+          'Content-Type' => 'application/json'
+        }
+
+        # 4) Call API (correct Workato signature: post(url, body: ..., headers: ...))
+        rsp = post(url, body: body, headers: headers)
+
+        # 5) Normalize shape (be resilient to nested {"contexts":{"contexts":[...]}} or flat {"contexts":[...]})
+        #    Also tolerate alternative keys if the API evolves.
+        top = rsp.is_a?(Hash) ? rsp : {}
+        raw_contexts =
+          top.dig('contexts', 'contexts') ||
+          top['contexts'] ||
+          top['ragContexts'] ||
+          []
+
+        contexts = Array(raw_contexts).map do |c|
+          # Keep only stable keys; pass chunk/pageSpan through as-is for downstream use
+          {
+            'sourceUri' => c['sourceUri'],
+            'sourceDisplayName' => c['sourceDisplayName'],
+            'text' => c['text'] || c.dig('chunk', 'text'),
+            'score' => c['score'],
+            'chunk' => (c['chunk'].is_a?(Hash) ? c['chunk'] : nil)
+          }.compact
+        end
+
+        # 6) Optional debug block
+        debug = nil
+        if input['emit_debug'] == true
+          debug = {
+            'http_status' => ( rsp.is_a?(Hash) && rsp['error'] ? rsp['error']['code'] : 200 ),
+            'request_url' => url,
+            'request_body' => body,
+            'raw_keys' => top.keys.map(&:to_s)
+          }
+        end
+
+        { 'contexts' => contexts, 'debug' => debug }.compact
       end
     },
 
