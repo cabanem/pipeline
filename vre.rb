@@ -1444,7 +1444,6 @@ require 'securerandom'
           # (If you kept legacy flat fields for BC, they can remain here; not required.)
         ]
       end,
-
       output_fields: lambda do |object_definitions, _connection|
         [
           { name: 'question' },
@@ -1467,7 +1466,6 @@ require 'securerandom'
           ]}
         ]
       end,
-
       execute: lambda do |connection, input|
         t0   = Time.now
         corr = call(:build_correlation_id_0)
@@ -1500,7 +1498,8 @@ require 'securerandom'
                 .headers(call(:request_headers_auth_0, connection, corr, connection['user_project'], req_par))
                 .payload(call(:json_compact_0, payload))
 
-        raw   = call(:normalize_retrieve_contexts_0!, resp)
+        body  = call(:http_body_json_0, resp)
+        raw   = call(:normalize_retrieve_contexts_0!, body)
         maxn  = call(:clamp_int_0, (input['max_contexts'] || 20), 1, 200)
         mapped= call(:map_context_chunks_0, raw, maxn)
 
@@ -3141,25 +3140,78 @@ require 'securerandom'
       error('Provide only one of rank_service_model OR llm_ranker_model')
     end,
     normalize_retrieve_contexts_0!: lambda do |raw_resp|
-      # Accept both shapes:
-      #   { "contexts": [ {...}, {...} ] }
-      #   { "contexts": { "contexts": [ ... ] } }  # some beta responses
-      arr = raw_resp['contexts']
-      arr = arr['contexts'] if arr.is_a?(Hash) && arr.key?('contexts')
-      Array(arr)
+      b = raw_resp.is_a?(Hash) || raw_resp.is_a?(Array) ? raw_resp : {}
+
+      # Fast paths
+      if b.is_a?(Hash)
+        return Array(b['contexts']) if b['contexts'].is_a?(Array)
+
+        if b['contexts'].is_a?(Hash)
+          inner = b['contexts']
+          return Array(inner['contexts']) if inner['contexts'].is_a?(Array)
+        end
+      end
+
+      # Recursive search for a key literally named "contexts" whose value is an Array
+      finder = lambda do |obj|
+        case obj
+        when Hash
+          obj.each do |k, v|
+            return v if k.to_s == 'contexts' && v.is_a?(Array)
+            if v.is_a?(Hash) || v.is_a?(Array)
+              found = finder.call(v)
+              return found if found
+            end
+          end
+        when Array
+          obj.each do |e|
+            found = finder.call(e)
+            return found if found
+          end
+        end
+        nil
+      end
+
+      Array(finder.call(b))
     end,
     map_context_chunks_0: lambda do |raw_contexts, maxn = 20|
       call(:safe_array_0, raw_contexts).first(maxn).each_with_index.map do |c, i|
-        md = (c['metadata'] || {}).to_h
+        h  = c.is_a?(Hash) ? c : {}
+        md = (
+          h['metadata'] ||
+          h['structuredMetadata'] ||
+          h['customMetadata'] ||
+          {}
+        )
+        md = md.is_a?(Hash) ? md : {}
+
+        # Prefer explicit keys; fall back to common alternates
+        cid = h['chunkId'] || h['id'] || h['name'] || h['chunk_id'] || "ctx-#{i+1}"
+        txt = h['text'] || h['content'] || h['chunkText'] || h['chunk_text'] || ''
+        scr = (
+          h['score'] || h['relevanceScore'] || h['relevance_score'] ||
+          h['similarity'] || h['rankScore']
+        )
+
+        src = (
+          h['sourceDisplayName'] || md['source'] || md['displayName'] || h['source']
+        )
+        uri = (
+          h['sourceUri'] || h['uri'] || md['uri'] || md['gcsUri'] || md['url']
+        )
+
+        # Normalize types
+        scr = scr.to_f if !scr.nil?
+
         {
-          'id'           => (c['chunkId'] || "ctx-#{i+1}"),
-          'text'         => c['text'].to_s,
-          'score'        => (c['score'] || c['relevanceScore'] || 0.0).to_f,
-          'source'       => (c['sourceDisplayName'] || c.dig('metadata','source')),
-          'uri'          => (c['sourceUri']        || c.dig('metadata','uri')),
-          'metadata'     => md,
-          'metadata_kv'  => md.map { |k,v| { 'key' => k.to_s, 'value' => v } },
-          'metadata_json'=> (md.empty? ? nil : md.to_json)
+          'id'            => cid.to_s,
+          'text'          => txt.to_s,
+          'score'         => (scr || 0.0).to_f,
+          'source'        => src,
+          'uri'           => uri,
+          'metadata'      => md,
+          'metadata_kv'   => md.map { |k,v| { 'key' => k.to_s, 'value' => v } },
+          'metadata_json' => (md.empty? ? nil : md.to_json)
         }
       end
     end,
@@ -3254,20 +3306,17 @@ require 'securerandom'
         obj
       end
     end,
-    http_post_json!: lambda do |url, headers, body|
-      post(url)
-        .headers(headers || {})
-        .payload(body || {})
-        .request_format_json
-        .after_error_response(/\A(4|5)\d{2}\z/) do |code, raw, _headers, message|
-          # Surface structured error for step_err!/telemetry
-          err = raw.is_a?(String) ? (JSON.parse(raw) rescue {'message'=>raw}) : raw
-          error({ 'status'=>code, 'message'=>message, 'body'=>err })
-        end
-        .after_response do |code, raw, _headers|
-          parsed = raw.is_a?(String) ? (JSON.parse(raw) rescue raw) : raw
-          { '__http_code__' => code.to_i, '__body__' => parsed }
-        end
+    http_body_json_0: lambda do |resp|
+      if resp.is_a?(Hash) && resp.key?('body')
+        parsed = (JSON.parse(resp['body']) rescue nil)
+        parsed.nil? ? {} : parsed
+      elsif resp.is_a?(String)
+        (JSON.parse(resp) rescue {}) || {}
+      elsif resp.is_a?(Hash) || resp.is_a?(Array)
+        resp
+      else
+        {}
+      end
     end,
 
     # Ultra-tolerant unwrappers
