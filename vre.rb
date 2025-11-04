@@ -328,7 +328,7 @@ require 'securerandom'
         ]
       end
     },
-    envelope_fields: {
+    envelope_fields_1: {
       fields: lambda do |_connection, _config_fields|
         [
           { name: 'ok', type: 'boolean' },
@@ -356,6 +356,121 @@ require 'securerandom'
         [
           { name: 'key' },
           { name: 'value' }
+        ]
+      end
+    },
+    # -- NEW ---
+    # Shared envelope for all action outputs (ok, telemetry, optional debug)
+    envelope_fields: {
+      fields: lambda do |_connection, _config_fields|
+        [
+          { name: 'ok', type: 'boolean' },
+          { name: 'telemetry', type: 'object', properties: [
+              { name: 'http_status',  type: 'integer' },
+              { name: 'message' },
+              { name: 'duration_ms',  type: 'integer' },
+              { name: 'correlation_id' },
+              { name: 'facets',       type: 'object' }
+            ]
+          },
+          { name: 'debug', type: 'object', optional: true }
+        ]
+      end
+    },
+    # Tiny reusable input group for observability
+    observability_input_fields: {
+      fields: lambda do |_connection, _config_fields|
+        [
+          { name: 'correlation_id', label: 'Correlation ID', sticky: true, optional: true,
+            hint: 'Sticky ID for stitching logs/metrics across steps.' },
+          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true,
+            hint: 'Adds request/response preview to output in non-prod connections.' }
+        ]
+      end
+    }, 
+    email_envelope: {
+      fields: lambda do |_connection, _config_fields|
+        [
+          { name: 'subject' }, { name: 'body' }, { name: 'from' },
+          { name: 'headers', type: 'object' },
+          { name: 'attachments', type: 'array', of: 'object', properties: [
+              { name: 'filename' }, { name: 'mimeType' }, { name: 'size' }
+          ]},
+          { name: 'auth', type: 'object' }
+        ]
+      end
+    },
+    category_def: {
+      fields: lambda do |_connection, _config_fields|
+        [
+          { name: 'name', optional: false },
+          { name: 'description' },
+          { name: 'examples', type: 'array', of: 'string' }
+        ]
+      end
+    },
+    rule_rows_table: {
+      fields: lambda do |_connection, _config_fields|
+        [
+          { name: 'rule_id' }, { name: 'family' }, { name: 'field' }, { name: 'operator' },
+          { name: 'pattern' }, { name: 'weight' }, { name: 'action' }, { name: 'cap_per_email' },
+          { name: 'category' }, { name: 'flag_a' }, { name: 'flag_b' },
+          { name: 'enabled' }, { name: 'priority' }, { name: 'notes' }
+        ]
+      end
+    },
+    rulepack_compiled: {
+      fields: lambda do |_connection, _config_fields|
+        [
+          { name: 'hard_exclude', type: 'object' },
+          { name: 'soft_signals', type: 'array', of: 'object' },
+          { name: 'thresholds',   type: 'object' },
+          { name: 'guards',       type: 'object' }
+        ]
+      end
+    },
+    contexts_ranked: {
+      fields: lambda do |_connection, _config_fields|
+        [
+          { name: 'id' }, { name: 'text' }, { name: 'score', type: 'number' },
+          { name: 'source' }, { name: 'uri' }, { name: 'metadata', type: 'object' }
+        ]
+      end
+    },
+    context_chunk: {
+      fields: lambda do |connection, config_fields|
+        [
+          { name: 'id' },
+          { name: 'uri', optional: true },
+          { name: 'content', control_type: 'text-area' },
+          { name: 'score', type: :number, optional: true },
+          { name: 'metadata', type: :object, optional: true }
+        ]
+      end,
+      sample_output: { id: 'c1', uri: 'gs://bucket/a.txt', content: '...', score: 0.83 },
+      additional_properties: false
+    },
+    intent_out: {
+      fields: lambda do |_connection, _config_fields|
+        [ { name: 'label' }, { name: 'confidence', type: 'number' }, { name: 'basis' } ]
+      end
+    },
+    policy_out: {
+      fields: lambda do |_connection, _config_fields|
+        [
+          { name: 'decision' }, { name: 'confidence', type: 'number' },
+          { name: 'matched_signals', type: 'array', of: 'string' },
+          { name: 'reasons', type: 'array', of: 'string' }
+        ]
+      end
+    },
+    referee_out: {
+      fields: lambda do |_connection, _config_fields|
+        [
+          { name: 'category' }, { name: 'confidence', type: 'number' }, { name: 'reasoning' },
+          { name: 'distribution', type: 'array', of: 'object', properties: [
+              { name: 'category' }, { name: 'prob', type: 'number' }
+          ]}
         ]
       end
     },
@@ -391,192 +506,7 @@ require 'securerandom'
 
   # --------- ACTIONS ------------------------------------------------------
   actions: {
-
-    http_probe_flexible: {
-      title: 'HTTP probe (schema-aware)',
-      subtitle: 'Call any endpoint, infer fields from a live sample',
-      display_priority: 50,
-
-      # Make these plain arrays so the UI renders; mark extends_schema where useful
-      config_fields: [
-        { name: 'probe_url',    optional: false, hint: 'https://api.example.com/v1/items', extends_schema: true },
-        { name: 'probe_method', control_type: 'select', extends_schema: true, default: 'GET',
-          pick_list: 'http_methods' }, # define pick_list elsewhere or replace with: options: [['GET','GET'], ...]
-        { name: 'probe_params',  type: 'object', optional: true, extends_schema: true },
-        { name: 'probe_headers', type: 'object', optional: true, extends_schema: true },
-        { name: 'probe_body',    type: 'object', optional: true, extends_schema: true },
-        { name: 'path_to_records', type: 'string', optional: true, label: 'Record path (dot.notation)',
-          hint: 'Optional: e.g. data.items or contexts.contexts', extends_schema: true },
-        { name: 'emit_mode', control_type: 'select', default: 'inferred',
-          options: [['Inferred','inferred'], ['Array as records[]','records'], ['Raw only','raw']], sticky: true }
-      ],
-
-      input_fields: lambda do |_od, _conn, _cfg|
-        [] # all inputs are config_fields for this generic action
-      end,
-
-      output_fields: lambda do |_od, connection, cfg|
-        call(:probe_output_fields, connection, cfg)
-      end,
-
-      execute: lambda do |connection, input|
-        url     = input['probe_url']
-        method  = (input['probe_method'] || 'GET').to_s.upcase
-        headers = (input['probe_headers'] || {})
-        params  = (input['probe_params']  || {})
-        body    = input['probe_body']
-
-        resp =
-          case method
-          when 'GET'    then get(url,    headers: headers, params: params)
-          when 'DELETE' then delete(url, headers: headers, params: params)
-          when 'POST'   then post(url,   headers: headers, params: params, payload: body)
-          when 'PUT'    then put(url,    headers: headers, params: params, payload: body)
-          when 'PATCH'  then patch(url,  headers: headers, params: params, payload: body)
-          else error("Unsupported method: #{method}")
-          end
-
-        payload = resp
-        payload = call(:dig_path, payload, input['path_to_records']) if input['path_to_records'].present?
-
-        # Normalize to match probed schema & tolerate drift
-        data =
-          case input['emit_mode']
-          when 'records'
-            { 'records' => (payload.is_a?(Array) ? payload : Array(payload)) }
-          when 'raw'
-            { 'raw' => (payload.respond_to?(:to_json) ? payload.to_json : payload.to_s) }
-          else # inferred
-            payload.is_a?(Hash) ? payload : { 'value' => payload }
-          end
-
-        # Capture extras (unknown keys) for drift tolerance
-        if payload.is_a?(Hash)
-          # known field names (minus our safety fields)
-          known = (data.is_a?(Hash) ? data.keys : []) - ['raw','extras']
-          extras = payload.reject { |k, _| known.include?(k.to_s) }
-          data['extras'] = extras if extras.any?
-        end
-
-        # Always include a raw fallback for debugging
-        data['raw'] ||= (resp.respond_to?(:to_json) ? resp.to_json : resp.to_s)
-        data
-      end
-    },
-    rag_retrieve_contexts2: {
-      title: 'RAG: Retrieve contexts 2',
-      subtitle: 'projects.locations:retrieveContexts (Vertex RAG Store)',
-      display_priority: 120,
-      retry_on_request: ['GET','HEAD'],
-      retry_on_response: [408,429,500,502,503,504],
-      max_retries: 3,
-
-      # Keep these as plain arrays (no lambdas) so the UI renders reliably
-      config_fields: [
-        { name: 'infer_schema', label: 'Infer schema from live sample',
-          type: 'boolean', control_type: 'checkbox', default: false, sticky: true, extends_schema: true },
-
-        { name: 'rag_corpora', label: 'RAG corpora',
-          type: 'array', of: 'string', optional: false,
-          hint: 'Full resource names: projects/{project}/locations/{location}/ragCorpora/{corpusId}',
-          extends_schema: true },
-
-        { name: 'top_k', type: 'integer', optional: true, default: 20, extends_schema: true },
-        { name: 'vector_similarity_threshold', type: 'number', optional: true, extends_schema: true },
-        { name: 'vector_distance_threshold',   type: 'number', optional: true, extends_schema: true },
-
-        { name: 'x_goog_user_project', type: 'string', optional: true,
-          hint: 'Billing project (x-goog-user-project header)', extends_schema: true },
-
-        { name: 'emit_mode', control_type: 'select', default: 'records', sticky: true,
-          options: [['Array as records[]','records'], ['Inferred','inferred'], ['Raw only','raw']] }
-      ],
-      input_fields: lambda do |_od, _connection, _cfg|
-        [
-          { name: 'query_text', optional: false, label: 'Query text' }
-        ]
-      end,
-      output_fields: lambda do |od, connection, cfg|
-        if cfg['infer_schema'] == true
-          call(:probe_retrieve_contexts_output_fields, connection, cfg)
-        else
-          # Fixed superset that matches typical retrieveContexts shapes
-          [
-            { name: 'records', type: 'array', of: 'object', properties: [
-                { name: 'text' },
-                { name: 'sourceUri' },
-                { name: 'score', type: 'number', optional: true },
-                { name: 'metadata', type: 'object', optional: true }
-            ]},
-            { name: 'extras', type: 'object', optional: true },
-            { name: 'raw',    type: 'string',  optional: true }
-          ]
-        end
-      end,
-      execute: lambda do |connection, input|
-        url, parent = call(:aipl_v1_url_retrieve_contexts, connection)
-
-        # Build headers
-        req_headers = { 'Content-Type' => 'application/json' }
-        req_headers['x-goog-user-project']   = input['x_goog_user_project'] if input['x_goog_user_project'].present?
-        req_headers['x-goog-request-params'] = "parent=#{parent}"
-
-        # Build body (JSON) — nothing but Vertex fields in here
-        req_body = {
-          'query'      => { 'text' => input['query_text'].to_s },
-          'dataSource' => call(:build_rag_resources, input['rag_corpora'])
-        }
-
-        tk = input['top_k'].to_i
-        req_body['topK'] = tk if tk > 0
-
-        if input['vector_similarity_threshold'].present? && input['vector_distance_threshold'].present?
-          error('Use EITHER vector_similarity_threshold OR vector_distance_threshold, not both')
-        end
-        if input['vector_similarity_threshold'].present?
-          req_body['vectorSimilarityThreshold'] = input['vector_similarity_threshold'].to_f
-        elsif input['vector_distance_threshold'].present?
-          req_body['vectorDistanceThreshold'] = input['vector_distance_threshold'].to_f
-        end
-
-        # Guardrail: catch accidental nesting before the call
-        forbidden = (req_body.keys & %w[headers payload])
-        error("Invalid request body: contains #{forbidden.join(', ')}. Do not nest headers/payload into the JSON body.") if forbidden.any?
-
-        # POST — named args only (this is the critical line)
-        resp = post(url, headers: req_headers, payload: req_body)
-
-        # Normalize response
-        payload = call(:dig_path, resp, 'contexts.contexts')
-        payload ||= resp
-
-        data =
-          case (input['emit_mode'] || 'records')
-          when 'raw'
-            { 'raw' => (resp.respond_to?(:to_json) ? resp.to_json : resp.to_s) }
-          when 'inferred'
-            payload.is_a?(Hash) ? payload : { 'value' => payload }
-          else
-            { 'records' => (payload.is_a?(Array) ? payload : Array(payload)) }
-          end
-
-        # Drift tolerance: stash unknown keys if payload was a Hash envelope
-        if payload.is_a?(Hash)
-          known = Array(data['records']).first.is_a?(Hash) ? data['records'].first.keys : data.keys
-          extras = payload.reject { |k, _| known.include?(k) }
-          data['extras'] = extras if extras.any?
-        end
-
-        data['debug'] = {
-          request_url: url,
-          request_headers_sample: req_headers.slice('x-goog-request-params', 'x-goog-user-project', 'Content-Type'),
-          request_body_top_keys: req_body.keys
-        }
-
-        data['raw'] ||= (resp.respond_to?(:to_json) ? resp.to_json : resp.to_s)
-        data
-      end
-    },
+    # 1) Email categorization
     gen_categorize_email: {
       title: 'Email: Categorize email',
       subtitle: 'Classify an email into a category',
@@ -594,38 +524,95 @@ require 'securerandom'
 
       input_fields: lambda do |object_definitions, connection, config_fields|
         [
-          { name: 'mode', control_type: 'select', pick_list: 'modes_classification', optional: false, default: 'embedding',
-            hint: 'embedding (deterministic), generative (LLM-only), or hybrid (embeddings + LLM referee).' },
-          { name: 'correlation_id', label: 'Correlation ID', optional: true, hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
+          { name: 'show_advanced', label: 'Show advanced options', extends_schema: true,
+            type: 'boolean', control_type: 'checkbox', optional: true, default: false },
 
-          { name: 'subject', optional: true },
-          { name: 'body',    optional: true },
+          # === (A) Message -------------------------------------------------
+          { name: 'subject', label: 'Email subject', optional: true },
+          { name: 'body',    label: 'Email body (text/HTML ok)', optional: true },
+          # Advanced: email metadata for rules/pre-filter
+          { name: 'from',    optional: true, ngIf: 'input.show_advanced == true',
+            hint: 'Sender email; used by rules and heuristics.' },
+          { name: 'headers', type: 'object', optional: true, ngIf: 'input.show_advanced == true',
+            hint: 'Key→value map. Ex: Content-Type, List-Unsubscribe.' },
+          { name: 'attachments', type: 'array', of: 'object', optional: true, ngIf: 'input.show_advanced == true',
+            properties: [{ name: 'filename' }, { name: 'mimeType' }, { name: 'size' }],
+            hint: 'Attachment list used by ext_in rules.' },
+          { name: 'auth', type: 'object', optional: true, ngIf: 'input.show_advanced == true',
+            hint: 'Auth flags, e.g., spf_dkim_dmarc_fail: true.' },
 
-          { name: 'categories', optional: false, type: 'array', of: 'object', properties: [
-              { name: 'name',      optional: false },
-              { name: 'description' },
-              { name: 'examples',  type: 'array', of: 'string' }
-            ],
-            hint: 'At least 2. You can also pass simple strings (names only).' },
-          { name: 'embedding_model', label: 'Embedding model', control_type: 'text', optional: true,
-            default: 'text-embedding-005', },
-          { name: 'generative_model', label: 'Generative model', control_type: 'text', optional: true },
-          { name: 'min_confidence', type: 'number', optional: true, default: 0.25,
-            hint: '0–1. If top score falls below this, fallback is used.' },
-          { name: 'fallback_category', optional: true, default: 'Other' },
-          { name: 'top_k', type: 'integer', optional: true, default: 3,
-            hint: 'In hybrid mode, pass top-K candidates to the LLM referee.' },
-          { name: 'return_explanation', type: 'boolean', optional: true, default: false,
-            hint: 'If true and a generative model is provided, returns a short reasoning + distribution.' },
-          # Salience fields
-          { name: 'use_salience', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
-            hint: 'If enabled, classify based on a short salient span (better signal on long threads).' },
-          { name: 'salience_model', control_type: 'text', optional: true, default: 'gemini-2.0-flash',
-            hint: 'Model used to extract the salient span.' },
-          { name: 'salience_max_span_chars', type: 'integer', optional: true, default: 500 },
-          { name: 'salience_temperature', type: 'number', optional: true, hint: 'Default 0' },
-          { name: 'confidence_blend', type: 'number', optional: true, default: 0.15,
-            hint: 'How much to blend salience importance into the final confidence (0–0.5 typical).' },
+          # === (B) Categories ---------------------------------------------
+          { name: 'categories', label: 'Categories', optional: false, type: 'array', of: 'object',
+            properties: [{ name: 'name', optional: false }, { name: 'description' },
+                         { name: 'examples', type: 'array', of: 'string' }],
+            hint: 'Provide ≥2. Strings allowed (names only).' },
+
+          # === (C) Mode & Models ------------------------------------------
+          { name: 'mode', control_type: 'select', pick_list: 'modes_classification',
+            optional: false, default: 'embedding',
+            hint: 'embedding (deterministic), generative, or hybrid.' },
+          { name: 'embedding_model', label: 'Embedding model', control_type: 'text',
+            optional: true, default: 'text-embedding-005',
+            ngIf: 'input.mode != "generative"' },
+          { name: 'generative_model', label: 'Generative model', control_type: 'text',
+            optional: true, ngIf: 'input.mode != "embedding"',
+            hint: 'Gemini model for referee or pure generative mode.' },
+          { name: 'referee_system_preamble', label: 'Referee system preamble',
+            optional: true, ngIf: 'input.show_advanced == true && input.mode != "embedding"',
+            hint: 'Override the built-in strict JSON classifier preamble.' },
+
+          # === (D) Salience (optional) ------------------------------------
+          # Caller-supplied salience only (no in-action extraction)
+          { name: 'salient_span', label: 'Pre-extracted salient span',
+            optional: true,
+            hint: 'If provided, classification uses this span instead of full email.' },
+          { name: 'salience_importance', label: 'Salience importance (0–1)',
+            type: 'number', optional: true,
+            hint: 'Optional; used for confidence blending.' },
+          { name: 'salience_reason', label: 'Salience reason',
+            optional: true,
+            hint: 'Optional note describing why this span was chosen.' },
+
+          # === (E) Rules (optional) ---------------------------------------
+          { name: 'rules_mode', label: 'Rules mode',
+            control_type: 'select', optional: true, default: 'none',
+            pick_list: 'rules_modes', # stub below
+            hint: 'Choose none / single-table rows / compiled JSON.' },
+          { name: 'rules_rows', label: 'Rules (single-table rows)',
+            optional: true, ngIf: 'input.rules_mode == "rows"',
+            hint: 'Bind Lookup Table rows or enter rows manually.',
+            type: 'array', of: 'object', properties: [
+              { name: 'rule_id' }, { name: 'family' }, { name: 'field' }, { name: 'operator' },
+              { name: 'pattern' }, { name: 'weight' }, { name: 'action' }, { name: 'cap_per_email' },
+              { name: 'category' }, { name: 'flag_a' }, { name: 'flag_b' },
+              { name: 'enabled' }, { name: 'priority' }, { name: 'notes' }
+            ]},
+          { name: 'rules_json', label: 'Rules (compiled JSON)', control_type: 'text-area',
+            optional: true, ngIf: 'input.rules_mode == "json"', hint: 'If present, overrides rows.' },
+
+          # === (F) Decision & Fallbacks -----------------------------------
+          { name: 'min_confidence', label: 'Minimum confidence',
+            type: 'number', optional: true, default: 0.25,
+            hint: '0–1. Below this, fallback is used.' },
+          { name: 'fallback_category', label: 'Fallback category',
+            optional: true, default: 'Other' },
+          { name: 'top_k', label: 'Referee shortlist (top-K)',
+            type: 'integer', optional: true, default: 3,
+            ngIf: 'input.mode == "hybrid" || (input.mode != "embedding" && input.show_advanced == true)',
+            hint: 'How many candidates to pass to LLM referee.' },
+          { name: 'return_explanation', label: 'Return explanation',
+            type: 'boolean', control_type: 'checkbox', optional: true, default: false,
+            ngIf: 'input.mode != "embedding"',
+            hint: 'If true and a generative model is set, return reasoning.' },
+
+          # === (G) Observability ------------------------------------------
+          { name: 'correlation_id', label: 'Correlation ID',
+            optional: true, sticky: true,
+            hint: 'Use a sticky ID to stitch logs/metrics.' },
+          { name: 'debug', label: 'Debug (non-prod only)',
+            type: 'boolean', control_type: 'checkbox', optional: true,
+            ngIf: 'input.show_advanced == true',
+            hint: 'Adds request/response preview to output when not in prod.' }
         ]
       end,
       output_fields: lambda do |object_definitions, connection|
@@ -635,6 +622,16 @@ require 'securerandom'
           { name: 'confidence', type: 'number' },
           { name: 'scores', type: 'array', of: 'object', properties: [
               { name: 'category' }, { name: 'score', type: 'number' }, { name: 'cosine', type: 'number' }
+            ]
+          },
+          # Pre-filter outcome (hard exclude or soft signals triage). Optional.
+          { name: 'pre_filter', type: 'object', properties: [
+              { name: 'hit', type: 'boolean' },
+              { name: 'action' },
+              { name: 'reason' },
+              { name: 'score', type: 'number' },
+              { name: 'matched_signals', type: 'array', of: 'string' },
+              { name: 'decision' }
             ]
           },
           { name: 'referee', type: 'object', properties: [
@@ -647,7 +644,7 @@ require 'securerandom'
               { name: 'salient_span' },
               { name: 'reason' },
               { name: 'importance', type: 'number' }]},
-        ] + Array(object_definitions['envelope_fields'])
+        ] + Array(object_definitions['envelope_fields_1'])
       end,
       execute: lambda do |connection, input|
         # 1. Invariants
@@ -656,27 +653,79 @@ require 'securerandom'
         cid = call(:ensure_correlation_id!, input)
         url = nil; req_body = nil
         begin
+          # 1a. Compile rulepack from Workato-native table (if provided)
+          rules =
+            if input['rules_json'].present?
+              call(:safe_json, input['rules_json'])
+            elsif Array(input['rules_rows']).any?
+              call(:hr_compile_rulepack_from_rows!, input['rules_rows'])
+            else
+              nil
+            end
           # 2. Build the request
           subj = (input['subject'] || '').to_s.strip
           body = (input['body']    || '').to_s.strip
           error('Provide subject and/or body') if subj.empty? && body.empty?
 
-          use_sal = call(:normalize_boolean, input['use_salience'])
+          # Salience: accept caller-provided span; no in-action extraction
           preproc = nil
-          if use_sal
-            preproc = call(:extract_salient_span!, connection, subj, body,
-                          (input['salience_model'].presence || 'gemini-2.0-flash'),
-                          (input['salience_max_span_chars'].presence || 500).to_i,
-                          (input['salience_temperature'].presence || 0))
+          if input['salient_span'].to_s.strip.length > 0
+            preproc = {
+              'salient_span' => input['salient_span'].to_s,
+              'reason'       => (input['salience_reason'].presence || nil),
+              'importance'   => (input['salience_importance'].nil? ? nil : input['salience_importance'].to_f)
+            }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
           end
 
           email_text =
-            if use_sal && preproc && preproc['salient_span'].to_s.strip.length > 0
+            if preproc && preproc['salient_span'].to_s.strip.length > 0
               preproc['salient_span'].to_s
             else
               call(:build_email_text, subj, body)
             end
 
+          # 2a. Optional pre-filter using compiled rules (short-circuit irrelevant)
+          if rules.is_a?(Hash)
+            hard_pack = rules['hard_exclude'].is_a?(Hash) ? rules['hard_exclude'] : {}
+            soft_pack = rules['soft_signals'].is_a?(Array) ? rules['soft_signals'] : []
+
+            hf = call(:hr_eval_hard?, {
+              'subject' => subj, 'body' => body,
+              'from' => input['from'], 'headers' => input['headers'],
+              'attachments' => input['attachments'], 'auth' => input['auth']
+            }, hard_pack)
+            if hf[:hit]
+              out = {
+                'mode' => (input['mode'] || 'embedding'),
+                'chosen' => (input['fallback_category'].presence || 'Irrelevant'),
+                'confidence' => 0.0,
+                'pre_filter' => hf
+              }.merge(call(:telemetry_envelope, t0, cid, true, 200, 'OK'))
+              facets = call(:compute_facets_for!, 'gen_categorize_email', out, { 'decision' => 'IRRELEVANT' })
+              (out['telemetry'] ||= {})['facets'] = facets
+              return call(:local_log_attach!, out,
+                call(:local_log_entry, :gen_categorize_email, started_at, t0, out, nil, { 'pre_filter' => hf, 'facets' => facets }))
+            end
+
+            ss = call(:hr_eval_soft, {
+              'subject' => subj, 'body' => body,
+              'from' => input['from'], 'headers' => input['headers'], 'attachments' => input['attachments']
+            }, soft_pack)
+            decision = call(:hr_eval_decide, ss[:score], (rules['thresholds'].is_a?(Hash) ? rules['thresholds'] : {}))
+            if decision == 'IRRELEVANT'
+              out = {
+                'mode' => (input['mode'] || 'embedding'),
+                'chosen' => (input['fallback_category'].presence || 'Irrelevant'),
+                'confidence' => 0.0,
+                'pre_filter' => { 'score' => ss[:score], 'matched_signals' => ss[:matched], 'decision' => decision }
+              }.merge(call(:telemetry_envelope, t0, cid, true, 200, 'OK'))
+              facets = call(:compute_facets_for!, 'gen_categorize_email', out, { 'decision' => 'IRRELEVANT' })
+              (out['telemetry'] ||= {})['facets'] = facets
+              return call(:local_log_attach!, out,
+                call(:local_log_entry, :gen_categorize_email, started_at, t0, out, nil, { 'pre_filter' => out['pre_filter'], 'facets' => facets }))
+            end
+            # REVIEW path: continue to normal classification; you already expose chosen/confidence downstream
+          end
           # Normalize categories
           raw_cats = input['categories']
           cats = call(:safe_array, raw_cats).map { |c|
@@ -732,7 +781,7 @@ require 'securerandom'
             if (mode == 'hybrid' || input['return_explanation']) && input['generative_model'].present?
               top_k     = [[(input['top_k'] || 3).to_i, 1].max, cats.length].min
               shortlist = scores.first(top_k).map { |h| h['category'] }
-              referee   = call(:llm_referee, connection, input['generative_model'], email_text, shortlist, cats, input['fallback_category'], cid)
+              referee   = call(:llm_referee, connection, input['generative_model'], email_text, shortlist, cats, input['fallback_category'], cid, (input['referee_system_preamble'].presence || nil))
               result['referee'] = referee
 
               if referee['category'].present? && shortlist.include?(referee['category'])
@@ -746,7 +795,7 @@ require 'securerandom'
 
           elsif mode == 'generative'
             error('generative_model is required when mode=generative') if input['generative_model'].blank?
-            referee = call(:llm_referee, connection, input['generative_model'], email_text, cats.map { |c| c['name'] }, cats, input['fallback_category'], cid)
+            referee = call(:llm_referee, connection, input['generative_model'], email_text, cats.map { |c| c['name'] }, cats, input['fallback_category'], cid, (input['referee_system_preamble'].presence || nil))
             chosen =
               if referee['confidence'].to_f < min_conf && input['fallback_category'].present?
                 input['fallback_category']
@@ -792,7 +841,7 @@ require 'securerandom'
           msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
 
           # Construct telmetry envelope
-          env = call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg)
+          env = call(:telemetry_envelope, t0, cid, false, call(:telemetry_parse_error_code, e), msg)
 
           # Construct and emit debug attachment, as applicable
           if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
@@ -804,7 +853,7 @@ require 'securerandom'
                 'google_error' => g
               }))
 
-          error(env)   # <-- raise so Workato marks step failed and retries if applicable
+          error(env)
         end
       end,
       sample_output: lambda do
@@ -812,6 +861,11 @@ require 'securerandom'
           'mode' => 'embedding',
           'chosen' => 'Billing',
           'confidence' => 0.91,
+          'pre_filter' => {
+            'score' => 5,
+            'matched_signals' => ['mentions_invoice', 'payment_terms'],
+            'decision' => 'REVIEW'
+          },
           'scores' => [
             { 'category' => 'Billing', 'score' => 0.91, 'cosine' => 0.82 },
             { 'category' => 'Tech Support', 'score' => 0.47, 'cosine' => -0.06 },
@@ -915,6 +969,7 @@ require 'securerandom'
           max_span = call(:clamp_int, (input['max_span_chars'] || 500), 80, 2000)
           want_entities = call(:normalize_boolean, input['include_entities'])
 
+          # System Prompt #
           system_text = "You extract the single most important sentence or short paragraph from an email. " \
                         "Rules: (1) Return VALID JSON only. (2) Do NOT output greetings, signatures, legal footers, " \
                         "auto-replies, or vague pleasantries (e.g., 'Hello', 'Thanks', 'Please see below'). " \
@@ -979,7 +1034,7 @@ require 'securerandom'
           url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
           req_params = "model=#{model_path}"
           req_body = call(:json_compact, payload)
-          resp = post(url).headers(call(:request_headers_auth, connection, cid, connection['user_project'], req_params)).payload(req_body)
+          resp = post(url).headers(call(:request_headers_auth_1, connection, cid, connection['user_project'], req_params)).payload(req_body)
 
           text   = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
           parsed = call(:safe_parse_json, text)
@@ -1081,7 +1136,7 @@ require 'securerandom'
                   { name: 'chunk_id' }, { name: 'source' }, { name: 'uri' }, { name: 'score', type: 'number' }
               ]}
           ]}
-        ] + Array(od['envelope_fields'])
+        ] + Array(od['envelope_fields_1'])
       end,
       execute: lambda do |connection, raw_input|
         started_at = Time.now.utc.iso8601
@@ -1150,12 +1205,24 @@ require 'securerandom'
           { name: 'records', type: 'array', of: 'object', optional: false, properties: [
               { name: 'id', optional: false }, { name: 'content', optional: false }, { name: 'metadata', type: 'object' }
             ], hint: 'id + content required.' },
+          { name: 'category', optional: true, hint: 'Chosen category (e.g., PTO, W2, Payroll).' },
+          { name: 'category_hint_in_query', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+            hint: 'Prepend "Category: <name>" to query_text.' },
+          { name: 'show_advanced', label: 'Show advanced options', type: 'boolean', control_type: 'checkbox',
+            default: false, sticky: true, extends_schema: true },
+          { name: 'filter_records_by_category', type: 'boolean', control_type: 'checkbox', optional: true, default: false,
+            ngIf: 'input.show_advanced', hint: 'Drop records whose metadata does not match the category.' },
+          { name: 'record_category_key', optional: true, default: 'category',
+            ngIf: 'input.show_advanced', hint: 'Metadata key to match the category (string or array).' },
           { name: 'correlation_id', label: 'Correlation ID', optional: true, hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
           { name: 'rank_model', optional: true, hint: 'e.g., semantic-ranker-default@latest' },
           { name: 'top_n', type: 'integer', optional: true },
           { name: 'ignore_record_details_in_response', type: 'boolean', control_type: 'checkbox', optional: true,
             hint: 'If true, response returns only {id, score}. Useful when you only need scores.' },
           { name: 'ranking_config_name', optional: true, hint: 'Full name or simple id. Blank → default_ranking_config' },
+          { name: 'category_ranking_config_map_json', label: 'Category→RankingConfig (JSON)', control_type: 'text-area',
+            optional: true, ngIf: 'input.show_advanced',
+            hint: 'JSON object: {"PTO":"pto_rank","Payroll":"payroll_rank"}; overrides ranking_config_name when category is set.' },
           { name: 'emit_metrics', type: 'boolean', control_type: 'checkbox', optional: true, default: true },
           { name: 'metrics_namespace', optional: true },
           # --- New tidy knobs ---
@@ -1183,7 +1250,7 @@ require 'securerandom'
               { name: 'metadata_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] },
               { name: 'metadata_json' }
             ] }
-        ] + Array(object_definitions['envelope_fields'])
+        ] + Array(object_definitions['envelope_fields_1'])
       end,
       execute: lambda do |connection, input|
         started_at = Time.now.utc.iso8601
@@ -1195,6 +1262,12 @@ require 'securerandom'
         # Normalize connection region → AI-Apps multi-region (global|us|eu), allow per-action override
         loc = call(:aiapps_loc_resolve, connection, input['ai_apps_location'])
 
+        # Category hint + optional config override
+        cat   = input['category'].to_s.strip
+        qtext = input['query_text'].to_s
+        if cat != '' && input['category_hint_in_query'] == true
+          qtext = "Category: #{cat}\n\n#{qtext}"
+        end
         # Resolve config id (not full resource) to avoid double-embedding path parts.
         config_id =
           if input['ranking_config_name'].to_s.strip.empty?
@@ -1202,7 +1275,15 @@ require 'securerandom'
           else
             input['ranking_config_name'].to_s.split('/').last
           end
-
+        # Optional category → rankingConfig override (JSON)
+        if cat != '' && input['category_ranking_config_map_json'].present?
+          rcmap = call(:safe_json, input['category_ranking_config_map_json'])
+          error('Invalid JSON for category→rankingConfig map: expected object') unless rcmap.is_a?(Hash)
+          mapped = (rcmap[cat] || rcmap[cat.downcase] || rcmap[cat.upcase])
+          if mapped.to_s.strip != ''
+            config_id = mapped.to_s.split('/').last
+          end
+        end
         req_params = "ranking_config=projects/#{connection['project_id']}/locations/#{loc}/rankingConfigs/#{config_id}"
 
         # Build absolute URL to Discovery Engine Ranking API (no base_uri usage)
@@ -1216,10 +1297,29 @@ require 'securerandom'
           ver
         )
 
+        # Optionally filter records by category metadata
+        records_in = call(:safe_array, input['records'])
+        records_used = records_in
+        if cat != '' && input['filter_records_by_category'] == true
+          key = (input['record_category_key'].presence || 'category').to_s
+          lc  = cat.downcase
+          records_used = records_in.select do |r|
+            md = (r['metadata'].is_a?(Hash) ? r['metadata'] : {})
+            val = md[key]
+            if val.is_a?(String)
+              val.to_s.downcase.include?(lc)
+            elsif val.is_a?(Array)
+              val.map { |x| x.to_s.downcase }.any? { |x| x == lc || x.include?(lc) }
+            else
+              false
+            end
+          end
+        end
         body = {
           # Ranking expects a scalar string for 'query'
-          'query'   => input['query_text'].to_s,
-          'records' => call(:safe_array, input['records']).map { |r|
+          'query'   => qtext,
+          'records' => records_used.map { |r|
+
             {
               'id'       => r['id'].to_s,
               'content'  => r['content'].to_s,
@@ -1235,7 +1335,7 @@ require 'securerandom'
 
         begin
         resp = post(url)
-                 .headers(call(:request_headers_auth, connection, cid, connection['user_project'], req_params))
+                 .headers(call(:request_headers_auth_1, connection, cid, connection['user_project'], req_params))
                  .payload(req_body)
 
         code = call(:telemetry_success_code, resp)
@@ -1271,7 +1371,8 @@ require 'securerandom'
           'config_id' => config_id,
           'model'     => (input['rank_model'].to_s.strip if input['rank_model'].present?)
         }.compact
-
+        (out['telemetry'] ||= {})['category'] = cat if cat != ''
+        out['telemetry']['ranking']['category_hint'] = true if (cat != '' && input['category_hint_in_query'] == true)
         # Facets: capture rank mode/model when present
         rank_facets = {
           'rank_mode'  => out.dig('telemetry','ranking','api') ? 'rank_service' : nil,
@@ -1284,7 +1385,10 @@ require 'securerandom'
           call(:local_log_entry, :rank_texts_with_ranking_api, started_at, t0, out, nil, {
             'rank_model' => (out.dig('telemetry','ranking','model') || input['rank_model']),
             'n'          => Array(out['records']).length,
-            'facets'     => facets
+            'facets'     => facets,
+            'category'   => (cat if cat != ''),
+            'filtered_in'=> records_used.length,
+            'filtered_out'=> (records_in.length - records_used.length)
           }))
         out
       rescue => e
@@ -1315,165 +1419,431 @@ require 'securerandom'
         }
       end
     },
-    rag_retrieve_contexts: {
-      title: 'RAG Engine: Fetch contexts',
-      subtitle: 'projects.locations:retrieveContexts (Vertex RAG Store)',
-      help: lambda do |_|
-        {
-          body:
-            'Retrieves contexts from a Vertex RAG corpus. ' \
-            'Modifiers: top_k limits pre-ranking candidates; use EITHER vector_distance_threshold OR vector_similarity_threshold (not both). ' \
-            'Pick ONE ranker: rank_service_model (semantic ranker) OR llm_ranker_model (Gemini). ' \
-            'Guidance: if your index uses COSINE distance, distance≈1−similarity (so distance≤0.30 ≈ similarity≥0.70). ' \
-            'Start with top_k=20, then tighten by threshold; add a ranker only if you need stricter ordering.',
-          learn_more_url: 'https://docs.cloud.google.com/vertex-ai/generative-ai/docs/model-reference/rag-api-v1',
-          learn_more_text: 'Find out more about the RAG Engine API'
-        }
-      end,
-      display_priority: 86,
-      retry_on_request: ['GET','HEAD'],
-      retry_on_response: [408,429,500,502,503,504],
+
+    # RAG store engine
+    rag_retrieve_contexts_enhanced: {
+      title: 'RAG: Retrieve contexts (enhanced)',
+      subtitle: 'projects.locations:retrieveContexts (Vertex RAG Engine, v1)',
+      display_priority: 120,
+      retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
-
-      input_fields: lambda do |object_definitions, _connection, _config_fields|
-        [
-          { name: 'correlation_id', label: 'Correlation ID', optional: true, hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
-          { name: 'rag_corpus', optional: false,
-            hint: 'Accepts either full resource name (e.g., "projects/{project}/locations/{region}/ragCorpora/{corpus}") or the "corpus"' },
-          { name: 'question', optional: false },
-          { name: 'restrict_to_file_ids', type: 'array', of: 'string', optional: true },
-          { name: 'max_contexts', type: 'integer', optional: true, default: 20 },
-
-          { name: 'rag_retrieval_config', label: 'Retrieval config', type: 'object',
-            properties: object_definitions['rag_retrieval_config'], optional: true,
-            hint: 'Set top_k, exactly one threshold (distance OR similarity), and exactly one ranker (semantic OR LLM).' }
-        ]
+      help: lambda do |_|
+        { body: 'Retrieve relevant contexts from a Vertex RAG corpus/store. Toggle advanced options to expose thresholds and rankers.' }
       end,
-      output_fields: lambda do |object_definitions, _connection|
+
+      # Keep config_fields as a literal array (no lambdas), supports dynamic re-render.
+      config_fields: [
+        { name: 'show_advanced', label: 'Show advanced options',
+          type: 'boolean', control_type: 'checkbox',
+          default: false, sticky: true, extends_schema: true,
+          hint: 'Toggle to reveal threshold/ranker controls.' }
+      ],
+      input_fields: lambda do |od, connection, cfg|
+        show_adv = (cfg['show_advanced'] == true)
+
+        base = [
+          # Required
+          { name: 'query_text', label: 'Query text', optional: false },
+
+          # Scope (either corpus and/or file IDs)
+          { name: 'rag_corpus', optional: true,
+            hint: 'Full or short ID. Example short ID: my-corpus. Will auto-expand using connection project/location.' },
+          { name: 'rag_file_ids', type: 'array', of: 'string', optional: true,
+            hint: 'Optional: limit to these file IDs (must belong to the same corpus).' },
+
+          # Core knob
+          { name: 'top_k', type: 'integer', optional: true, default: 20, hint: 'Max contexts to return.' },
+
+          # Optional overrides
+          { name: 'project', optional: true, hint: 'Defaults to connection project.' },
+          { name: 'location', optional: true, hint: 'Defaults to connection location (e.g., us-central1).' }
+        ]
+
+        adv = [
+          { name: 'vector_distance_threshold', type: 'number', optional: true,
+            hint: 'Return contexts with distance ≤ threshold. For COSINE, lower is better.' },
+          { name: 'vector_similarity_threshold', type: 'number', optional: true,
+            hint: 'Return contexts with similarity ≥ threshold. Do NOT set both thresholds.' },
+          { name: 'rank_service_model', optional: true,
+            hint: 'Vertex Ranking model, e.g. semantic-ranker-512@latest.' },
+          { name: 'llm_ranker_model', optional: true,
+            hint: 'LLM ranker, e.g. gemini-2.5-flash.' }
+        ]
+
+        base + (show_adv ? adv : []) + Array(od['observability_input_fields']) # includes cid, etc.
+      end,
+      output_fields: lambda do |_od, _connection|
+        context_props = [
+          { name: 'sourceUri' }, { name: 'sourceDisplayName' },
+          { name: 'text' }, { name: 'score', type: 'number' },
+          { name: 'similarity', type: 'number' },
+          { name: 'chunk', type: 'object', properties: [
+              { name: 'text' },
+              { name: 'pageSpan', type: 'object', properties: [
+                  { name: 'firstPage', type: 'integer' },
+                  { name: 'lastPage',  type: 'integer' }
+              ] }
+          ] }
+        ]
+
         [
-          { name: 'question' },
-          { name: 'contexts', type: 'array', of: 'object', properties: [
-              { name: 'id' }, { name: 'text' }, { name: 'score', type: 'number' },
-              { name: 'source' }, { name: 'uri' },
-              { name: 'metadata', type: 'object' },
-              { name: 'metadata_kv', label: 'metadata (KV)', type: 'array', of: 'object', properties: object_definitions['kv_pair'] },
-              { name: 'metadata_json', label: 'metadata (JSON)' }
-            ]
-          }
-        ] + [
+          { name: 'contexts', type: 'object', properties: [
+              { name: 'contexts', type: 'array', of: 'object', properties: context_props }
+          ] },
+          { name: 'contexts_flat', label: 'contexts (flat)', type: 'array', of: 'object', properties: context_props },
+          { name: 'count', type: 'integer' },
+          { name: 'debug_shape', type: 'object', properties: [
+              { name: 'resp_class' }, { name: 'top_keys', type: 'array', of: 'string' }, { name: 'count', type: 'integer' }
+          ]},
+
+          # Telemetry (from step_ok!)
           { name: 'ok', type: 'boolean' },
           { name: 'telemetry', type: 'object', properties: [
-            { name: 'http_status', type: 'integer' },
-            { name: 'message' }, { name: 'duration_ms', type: 'integer' },
-            { name: 'correlation_id' },
-            { name: 'retrieval', type: 'object' },
-            { name: 'rank', type: 'object' }
-          ]}
+              { name: 'http_status', type: 'integer' },
+              { name: 'message' },
+              { name: 'duration_ms', type: 'integer' },
+              { name: 'correlation_id' }
+          ] }
         ]
       end,
       execute: lambda do |connection, input|
-        started_at = Time.now.utc.iso8601
-        t0   = Time.now
-        cid = call(:ensure_correlation_id!, input)
-        retr_url = nil; retr_req_body = nil
+        # Step start (captures correlation_id + timing)
+        ctx = call(:step_begin!, :rag_retrieve_contexts, input)
 
-        proj = connection['project_id']
-        loc  = connection['location']
-        raise 'Connection missing project_id' if proj.blank?
-        raise 'Connection missing location'   if loc.blank?
+        # ---- Resolve project/location and build parent ---------------------------------
+        project  = (input['project'].presence  || connection['project_id']).to_s
+        location = (input['location'].presence || connection['location']).to_s
+        error('Project is required (connection or input).')  if project.blank?
+        error('Location is required (connection or input).') if location.blank?
+        parent = "projects/#{project}/locations/#{location}"
 
-        corpus = call(:normalize_rag_corpus, connection, input['rag_corpus'])
-        error('rag_corpus is required') if corpus.blank?
+        # ---- Expand optional short corpus ID -------------------------------------------
+        corpus = (input['rag_corpus'] || '').to_s.strip
+        if corpus.present? && !corpus.start_with?('projects/')
+          corpus = "#{parent}/ragCorpora/#{corpus}"
+        end
 
-        loc     = (connection['location'] || '').downcase
-        parent  = "projects/#{connection['project_id']}/locations/#{loc}"
-        req_par = "parent=#{parent}"
+        # ---- Union guards (thresholds, rankers) ----------------------------------------
+        if input['vector_distance_threshold'].present? && input['vector_similarity_threshold'].present?
+          error('Set ONLY one of: vector_distance_threshold OR vector_similarity_threshold.')
+        end
+        if input['rank_service_model'].present? && input['llm_ranker_model'].present?
+          error('Choose ONE ranker: rank_service_model OR llm_ranker_model.')
+        end
 
-        # Merge + validate retrieval options from object/flat inputs
-        opts = call(:build_retrieval_opts_from_input!, input)
+        # ---- Build ragResources ---------------------------------------------------------
+        rag_resources = {}
+        rag_resources['ragCorpus']  = corpus if corpus.present?
+        if Array(input['rag_file_ids']).present?
+          rag_resources['ragFileIds'] = Array(input['rag_file_ids'])
+        end
+        # Optional early guard if you don't rely on project-level defaults:
+        # error('Provide rag_corpus and/or rag_file_ids to set vertexRagStore.ragResources[]') if rag_resources.empty?
 
-        payload = call(
-          :build_rag_retrieve_payload,
-          input['question'],
-          corpus,
-          input['restrict_to_file_ids'],
-          opts
-        )
+        # ---- Retrieval config (v1) -----------------------------------------------------
+        retrieval_cfg = {}
+        retrieval_cfg['topK'] = input['top_k'] if input['top_k'].present?
 
-        retr_url  = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
-        retr_req_body = call(:json_compact, payload)
-        # Retrieval must not depend on user-project billing; align with rag_answer
-        resp = post(retr_url)
-                 .headers(call(:headers_rag, connection, cid, req_par))
-                 .payload(retr_req_body)
+        filter = {}
+        if input['vector_distance_threshold'].present?
+          filter['vectorDistanceThreshold'] = input['vector_distance_threshold'].to_f
+        elsif input['vector_similarity_threshold'].present?
+          filter['vectorSimilarityThreshold'] = input['vector_similarity_threshold'].to_f
+        end
+        retrieval_cfg['filter'] = filter unless filter.empty?
 
+        ranking = {}
+        if input['rank_service_model'].present?
+          ranking['rankService'] = { 'modelName' => input['rank_service_model'] }
+        elsif input['llm_ranker_model'].present?
+          ranking['llmRanker'] = { 'modelName' => input['llm_ranker_model'] }
+        end
+        retrieval_cfg['ranking'] = ranking unless ranking.empty?
 
-        raw   = call(:normalize_retrieve_contexts!, resp)
-        maxn  = call(:clamp_int, (input['max_contexts'] || 20), 1, 200)
-        mapped= call(:map_context_chunks, raw, maxn)
+        # ---- Request body (union: vertexRagStore) --------------------------------------
+        body = { 'query' => { 'text' => input['query_text'] } }
+        body['query']['ragRetrievalConfig'] = retrieval_cfg unless retrieval_cfg.empty?
+        body['vertexRagStore'] = (rag_resources.empty? ? {} : { 'ragResources' => [rag_resources] })
 
-        out = {
-          'question' => input['question'],
-          'contexts' => mapped
-        }.merge(call(:telemetry_envelope, t0, cid, true, call(:telemetry_success_code, resp), 'OK'))
+        # ---- Endpoint + headers (Authorization + routing) ------------------------------
+        host = "#{location}-aiplatform.googleapis.com"
+        url  = "https://#{host}/v1/#{parent}:retrieveContexts"
+        cid  = (input['correlation_id'] || (ctx && ctx['cid']))
+        headers = call(:headers_rag, connection, cid, "parent=#{parent}") || {
+          'Content-Type' => 'application/json',
+          'Accept'       => 'application/json',
+          'x-goog-request-params' => "parent=#{parent}"
+        }
 
-        # Telemetry preview from canonical opts:
-        (out['telemetry'] ||= {})['retrieval'] = {}.tap do |h|
-          h['top_k'] = opts['topK'].to_i if opts['topK']
-          if opts['vectorDistanceThreshold']
-            h['filter'] = { 'type' => 'distance',  'value' => opts['vectorDistanceThreshold'].to_f }
-          elsif opts['vectorSimilarityThreshold']
-            h['filter'] = { 'type' => 'similarity','value' => opts['vectorSimilarityThreshold'].to_f }
+        if headers['Authorization'].to_s.strip.empty?
+          error('Missing Authorization header. Check service account / token minting.')
+        end
+        # ---- Call API -------------------------------------------------------------------
+        req = post(url)
+                .headers(headers)
+                .request_format_json 
+                .payload(body)
+
+        resp = 
+          begin
+            req.response_format_json
+          rescue
+            raw = req.response_format_raw
+            (JSON.parse(raw['body']) rescue raw)
+          end
+
+        # ---- Strict JSON envelope handling ---------------------------------------------
+        doc =
+          if resp.is_a?(Hash) && resp.key?('body') && resp['body'].is_a?(String)
+            JSON.parse(resp['body']) rescue {}
+          elsif resp.is_a?(String)
+            JSON.parse(resp) rescue {}
+          elsif resp.is_a?(Hash) || resp.is_a?(Array)
+            resp
+          else
+            {}
+          end
+
+        arr =
+          if doc.is_a?(Hash) && doc.dig('contexts','contexts').is_a?(Array)
+            doc['contexts']['contexts']
+          elsif doc.is_a?(Hash) && doc['contexts'].is_a?(Array)
+            doc['contexts']
+          else
+            []
+          end
+
+        # Symbolized-keys fallback (if some layer turned keys into symbols)
+        if arr.empty? && doc.is_a?(Hash) && doc.key?(:contexts)
+          c = doc[:contexts]
+          if c.is_a?(Hash) && c.key?(:contexts) && c[:contexts].is_a?(Array)
+            arr = c[:contexts]
+          elsif c.is_a?(Array)
+            arr = c
           end
         end
-        if opts['rankServiceModel']
-          (out['telemetry'] ||= {})['rank'] = { 'mode' => 'rank_service', 'model' => opts['rankServiceModel'] }
-        elsif opts['llmRankerModel']
-          (out['telemetry'] ||= {})['rank'] = { 'mode' => 'llm', 'model' => opts['llmRankerModel'] }
+
+        enriched = Array(arr).map do |h|
+          item = h.is_a?(Hash) ? h.transform_keys(&:to_s) : {}
+          sc = item['score']
+          item['similarity'] = (1.0 - sc).round(6) if sc.is_a?(Numeric)
+          item
         end
-        facets = call(:compute_facets_for!, 'rag_retrieve_contexts', out)
-        (out['telemetry'] ||= {})['facets'] = facets
-        call(:local_log_attach!, out,
-          call(:local_log_entry, :rag_retrieve_contexts, started_at, t0, out, nil, {
-            'retrieval_top_k'    => out.dig('telemetry','retrieval','top_k'),
-            'contexts_returned'  => Array(out['contexts']).length,
-            'facets'             => facets
-          }))
-        out
-      rescue => e
-        g = call(:extract_google_error, e)
-        msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-        env = {}.merge(call(:telemetry_envelope, t0, cid, false, call(:telemetry_parse_error_code, e), msg))
-        call(:local_log_attach!,
-             env,
-             call(:local_log_entry, :rag_retrieve_contexts, started_at, t0, nil, e, { 'google_error' => g }))
-        env
+
+        out = {
+          'contexts'      => { 'contexts' => enriched },   # keep documented nesting
+          'contexts_flat' => enriched,
+          'count'         => enriched.length,
+          'debug_shape'   => {
+            'resp_class'    => resp.class.name,
+            'has_body'      => (resp.is_a?(Hash) && resp.key?('body')),
+            'top_keys'      => (doc.is_a?(Hash) ? doc.keys : []),
+            'contexts_type' => (doc.is_a?(Hash) ? (doc['contexts'].class.name rescue 'nil') : doc.class.name),
+            'count'         => enriched.length
+          }
+        }
+
+        call(:step_ok!, ctx, out, 200, 'OK', { 'count' => enriched.length })
+
       end,
       sample_output: lambda do
         {
-          'question' => 'What is the PTO carryover policy?',
-          'contexts' => [
-            { 'id' => 'doc-42#c3', 'text' => 'Employees may carry over up to 40 hours...', 'score' => 0.91,
-              'source' => 'handbook', 'uri' => 'https://drive.google.com/file/d/abc...',
-              'metadata' => { 'page' => 7 },
-              'metadata_kv' => [ { 'key' => 'page', 'value' => 7 } ],
-              'metadata_json' => '{"page":7}' }
+          'contexts' => {
+            'contexts' => [
+              {
+                'sourceUri'         => 'gs://docs/team/handbook.pdf',
+                'sourceDisplayName' => 'handbook.pdf',
+                'text'              => 'All expense reports must be submitted within 30 days…',
+                'score'             => 0.18,
+                'similarity'        => 0.82,
+                'chunk'             => {
+                  'text'     => 'All expense reports must be submitted within 30 days…',
+                  'pageSpan' => { 'firstPage' => 3, 'lastPage' => 3 }
+                }
+              }
+            ]
+          },
+          'contexts_flat' => [
+            {
+              'sourceUri'         => 'gs://docs/team/handbook.pdf',
+              'sourceDisplayName' => 'handbook.pdf',
+              'text'              => 'All expense reports must be submitted within 30 days…',
+                'score'             => 0.18,
+                'similarity'        => 0.82,
+              'chunk' => { 'text' => 'All expense reports must be submitted within 30 days…',
+                          'pageSpan' => { 'firstPage' => 3, 'lastPage' => 3 } }
+            }
           ],
+          'count' => 1,
+          'debug_shape' => {
+            'resp_class' => 'Hash',
+            'top_keys'   => ['contexts'],
+            'count'      => 1
+          },
           'ok' => true,
           'telemetry' => {
-            'http_status' => 200, 'message' => 'OK', 'duration_ms' => 22, 'correlation_id' => 'sample',
-            'retrieval' => { 'top_k' => 20, 'filter' => { 'type' => 'distance', 'value' => 0.35 } },
-            'rank' => { 'mode': 'rank_service', 'model': 'semantic-ranker-512@latest' },
-            'facets' => {
-              'retrieval_top_k' => 20,
-              'retrieval_filter' => 'distance',
-              'retrieval_filter_val' => 0.35,
-              'contexts_returned' => 1
-            }
+            'http_status'    => 200,
+            'message'        => 'OK',
+            'duration_ms'    => 18,
+            'correlation_id' => 'corr-123'
           }
         }
       end
     },
+    rag_retrieve_contexts: {
+      title: 'RAG: Retrieve contexts',
+      subtitle: 'projects.locations:retrieveContexts (Vertex RAG Store)',
+      display_priority: 90,
+
+      help: lambda do |_|
+        {
+          body:
+            'Retrieves relevant contexts for a query from a Vertex RAG Store. ' \
+            'Provide parent=projects/{project}/locations/{location} and at least one rag resource (corpus and/or file IDs). ' \
+            'This action normalizes the API response and emits contexts[] as a flat array.',
+          learn_more_url: 'https://cloud.google.com/vertex-ai/generative-ai/docs/reference/rest/v1/projects.locations/retrieveContexts',
+          learn_more_text: 'Vertex AI: locations.retrieveContexts'
+        }
+      end,
+
+      # ---- Inputs shown in the recipe UI ----
+      input_fields: lambda do
+        [
+          # Required path param
+          { name: 'parent', label: 'Parent (Location)',
+            hint: 'Format: projects/{project}/locations/{location}',
+            optional: false },
+
+          # Core query
+          { name: 'query_text', label: 'Query text', optional: false },
+
+          # RAG Store resources
+          { name: 'rag_corpus', label: 'RAG corpus resource name',
+            hint: 'projects/{project}/locations/{location}/ragCorpora/{ragCorpus}',
+            optional: true },
+          { name: 'rag_file_ids', type: 'array', of: 'string', optional: true,
+            hint: 'Optional: restrict retrieval to specific file IDs within the corpus' },
+
+          # Optional retrieval tuning: free-form JSON object passes through
+          { name: 'rag_retrieval_config', type: 'object', optional: true,
+            hint: 'Optional knobs; shape may evolve (topK, filters, etc.)' },
+
+          # Optional: emit a debug object for troubleshooting
+          { name: 'emit_debug', type: 'boolean', control_type: 'checkbox',
+            default: false, optional: true, label: 'Emit debug payload' }
+        ]
+      end,
+
+      # ---- Output schema ----
+      output_fields: lambda do
+        [
+          { name: 'contexts', type: 'array', of: 'object', properties: [
+              { name: 'sourceUri' },
+              { name: 'sourceDisplayName' },
+              { name: 'text' },
+              { name: 'score', type: 'number' },
+              { name: 'chunk', type: 'object', properties: [
+                  { name: 'text' },
+                  { name: 'pageSpan', type: 'object' } # passthrough/future-proof
+                ] }
+            ]},
+          { name: 'debug', type: 'object', properties: [
+              { name: 'http_status', type: 'integer' },
+              { name: 'request_url' },
+              { name: 'request_body', type: 'object' },
+              { name: 'raw_keys', type: 'array', of: 'string' }
+            ]}
+        ]
+      end,
+
+      # ---- Execute ----
+      execute: lambda do |_connection, input|
+        parent = (input['parent'] || '').to_s.strip
+        error('Parent is required (projects/{project}/locations/{location}).') if parent.empty?
+        url = "https://aiplatform.googleapis.com/v1/#{parent}:retrieveContexts"
+
+        query_text = (input['query_text'] || '').to_s
+        error('query_text is required') if query_text.empty?
+
+        query_obj = { 'text' => query_text }
+        if input['rag_retrieval_config'].is_a?(Hash) && !input['rag_retrieval_config'].empty?
+          query_obj['ragRetrievalConfig'] = input['rag_retrieval_config']
+        end
+
+        rag_resource = {}
+        rc = (input['rag_corpus'] || '').to_s.strip
+        rag_resource['ragCorpus'] = rc unless rc.empty?
+
+        if input['rag_file_ids'].is_a?(Array)
+          ids = input['rag_file_ids'].compact.map(&:to_s).reject(&:empty?)
+          rag_resource['ragFileIds'] = ids unless ids.empty?
+        end
+
+        rag_resources = []
+        rag_resources << rag_resource unless rag_resource.empty?
+        error('Request must set RAG resources (rag_corpus and/or rag_file_ids).') if rag_resources.empty?
+
+        body = {
+          'query' => query_obj,
+          'data_source' => { 'vertexRagStore' => { 'ragResources' => rag_resources } }
+        }
+
+        headers = {
+          'Content-Type' => 'application/json',
+          'Accept' => 'application/json'
+        }
+
+        # KEY CHANGE: use payload:, not body:. This ensures Workato executes and parses JSON.
+        rsp = post(url, payload: body, headers: headers)
+
+        parsed =
+          if rsp.is_a?(Hash)
+            rsp
+          elsif rsp.is_a?(String)
+            begin
+              JSON.parse(rsp)
+            rescue JSON::ParserError
+              { '_raw_string' => rsp }
+            end
+          else
+            { '_unexpected_class' => rsp.class.to_s }
+          end
+
+        raw_contexts =
+          (parsed.dig('contexts', 'contexts')) ||
+          parsed['contexts'] ||
+          parsed['ragContexts'] ||
+          []
+
+        contexts = Array(raw_contexts).map do |c|
+          next unless c.is_a?(Hash)
+          {
+            'sourceUri' => c['sourceUri'],
+            'sourceDisplayName' => c['sourceDisplayName'],
+            'text' => c['text'] || (c['chunk'].is_a?(Hash) ? c['chunk']['text'] : nil),
+            'score' => c['score'],
+            'chunk' => (c['chunk'].is_a?(Hash) ? c['chunk'] : nil)
+          }.delete_if { |_, v| v.nil? }
+        end.compact
+
+        emit_debug = (input['emit_debug'] == true) || contexts.empty?
+        debug = nil
+        if emit_debug
+          debug = {
+            'request_url' => url,
+            'request_body' => body,
+            'response_top_keys' => (parsed.is_a?(Hash) ? parsed.keys.map(&:to_s) : []),
+            'response_class' => rsp.class.to_s,
+            'raw_contexts_class' => raw_contexts.class.to_s,
+            'raw_contexts_length' => Array(raw_contexts).length
+          }
+        end
+
+        { 'contexts' => contexts, 'debug' => debug }.delete_if { |_, v| v.nil? }
+      end
+
+    },
+
     rag_answer: {
       title: 'RAG Engine: Get grounded response (one-shot)',
       subtitle: 'Retrieve contexts from a corpus and generate a cited answer',
@@ -1488,7 +1858,6 @@ require 'securerandom'
         }
       end,
       display_priority: 86,
-      retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
 
@@ -1583,7 +1952,7 @@ require 'securerandom'
         retr_url      = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
         retr_req_body = call(:json_compact, retrieve_payload)
         retr_resp = post(retr_url)
-                      .headers(call(:request_headers_auth, connection, cid, nil, req_params_re))
+                      .headers(call(:request_headers_auth_1, connection, cid, nil, req_params_re))
                       .payload(retr_req_body)
         raw_ctxs = call(:normalize_retrieve_contexts!, retr_resp)
 
@@ -1621,8 +1990,9 @@ require 'securerandom'
         }
 
         want_rat = call(:normalize_boolean, input['return_rationale'])
+        # System Prompt
         sys_text = (input['system_preamble'].presence ||
-          "Answer using ONLY the retrieved context chunks. If the context is insufficient, reply with “I don’t know.” "\
+          "Answer using ONLY the retrieved context chunks. If the context is insufficient, reply with “IDK” "\
           "Keep answers concise and include citations with chunk_id, source, uri, and score."\
           "#{want_rat ? ' Also include a brief rationale (1–2 sentences) explaining which chunks support the answer.' : ''}")
         sys_inst = { 'role' => 'system', 'parts' => [ { 'text' => sys_text } ] }
@@ -1644,7 +2014,7 @@ require 'securerandom'
         gen_req_body = call(:json_compact, gen_payload)
         req_params_g = "model=#{model_path}"
         gen_resp = post(gen_url)
-                    .headers(call(:request_headers_auth, connection, corr, connection['user_project'], req_params_g))
+                    .headers(call(:request_headers_auth_1, connection, corr, connection['user_project'], req_params_g))
                     .payload(gen_req_body)
         text   = gen_resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
         parsed = call(:safe_parse_json, text)
@@ -1700,7 +2070,7 @@ require 'securerandom'
         unless call(:normalize_boolean, connection['prod_mode'])
           if call(:normalize_boolean, input['debug'])
             out = out.merge(call(:request_preview_pack, gen_url, 'POST',
-                                call(:request_headers_auth, connection, cid, connection['user_project'], req_params_g),
+                                call(:request_headers_auth_1, connection, cid, connection['user_project'], req_params_g),
                                 gen_req_body))
           end
         end
@@ -1757,6 +2127,8 @@ require 'securerandom'
         }
       end
     },
+
+    # Utility
     embed_text: {
       title: 'Embed text',
       subtitle: 'Get embeddings from a publisher embedding model',
@@ -1905,7 +2277,7 @@ require 'securerandom'
           { name: 'totalTokens', type: 'integer' },
           { name: 'totalBillableCharacters', type: 'integer' },
           { name: 'promptTokensDetails', type: 'array', of: 'object' }
-        ] + Array(object_definitions['envelope_fields'])
+        ] + Array(object_definitions['envelope_fields_1'])
       end,
       execute:  lambda do |connection, input|
         # Correlation id and duration for logs / analytics
@@ -1931,7 +2303,7 @@ require 'securerandom'
             'systemInstruction' => sys_inst
           })
           resp = post(url)
-                    .headers(call(:request_headers_auth, connection, cid, connection['user_project'], "model=#{model_path}"))
+                    .headers(call(:request_headers_auth_1, connection, cid, connection['user_project'], "model=#{model_path}"))
                     .payload(req_body)
           code = call(:telemetry_success_code, resp)
           result = resp.merge(call(:telemetry_envelope, t0, cid, true, code, 'OK'))
@@ -2026,7 +2398,7 @@ require 'securerandom'
           op = input['operation'].to_s.sub(%r{^/v1/}, '')
           loc = (connection['location'].presence || 'us-central1').to_s.downcase
           url = call(:aipl_v1_url, connection, loc, op.start_with?('projects/') ? op : "projects/#{connection['project_id']}/locations/#{loc}/operations/#{op}")
-          resp = get(url).headers(call(:request_headers_auth, connection, cid, connection['user_project'], nil))
+          resp = get(url).headers(call(:request_headers_auth_1, connection, cid, connection['user_project'], nil))
           code = call(:telemetry_success_code, resp)
           result = resp.merge(call(:telemetry_envelope, t0, cid, true, code, 'OK'))
 
@@ -2068,19 +2440,747 @@ require 'securerandom'
           }
         }
       end
+    },
+    log_assemble: {
+      title: 'Logs: Assemble entries',
+      subtitle: 'Normalize, summarize, and optionally flatten',
+      help: lambda do |_|
+        {
+          body: 'Takes an array of log objects or raw JSON/NDJSON, normalizes fields, groups by correlation_id, and emits summary + timeline + flat table.',
+          learn_more_text: 'Designed to post-process local_logs emitted by other actions.'
+        }
+      end,
+      display_priority: 4,
+      input_fields: lambda do |od, _c, _cf|
+        [
+          { name: 'logs',
+            type: 'array', of: 'object', optional: true,
+            properties: od['log_entry'],
+            hint: 'Preferred: pass an array of log objects (e.g., telemetry.local_logs).' },
+          { name: 'logs_json', control_type: 'text-area', optional: true,
+            hint: 'Alternative: paste JSON array or NDJSON.' },
+          { name: 'correlation_id', optional: true, hint: 'Filter to a single correlation.' },
+          { name: 'since', optional: true, hint: 'ISO string or epoch millis (inclusive)' },
+          { name: 'until', optional: true, hint: 'ISO string or epoch millis (inclusive)' },
+          { name: 'redact', type: 'boolean', control_type: 'checkbox', optional: true, default: true },
+          { name: 'flatten', type: 'boolean', control_type: 'checkbox', optional: true, default: false }
+        ]
+      end,
+      output_fields: lambda do |_od, _c|
+        [
+          { name: 'ingest_count', type: 'integer' },
+          { name: 'valid_count',  type: 'integer' },
+          { name: 'error_count',  type: 'integer' },
+          { name: 'correlations', type: 'array', of: 'object', properties: [
+              { name: 'correlation_id' }, { name: 't_first' }, { name: 't_last' },
+              { name: 'duration_ms', type: 'integer' },
+              { name: 'counts', type: 'object' },
+              { name: 'by_event', type: 'object' },
+              { name: 'errors', type: 'array', of: 'object' },
+              { name: 'facets', type: 'object' }
+            ]
+          },
+          { name: 'timeline', type: 'array', of: 'object', properties: [
+              { name: 'ts' }, { name: 'action' }, { name: 'event' }, { name: 'level' },
+              { name: 'status' }, { name: 'correlation_id' }, { name: 'latency_ms', type: 'integer' },
+              { name: 'delta_ms_prev', type: 'integer' },
+              { name: 'facets', type: 'object' }, { name: 'error', type: 'object' }
+            ]
+          },
+          { name: 'table', type: 'array', of: 'object' }
+        ]
+      end,
+      sample_output: lambda do
+        {
+          'ingest_count' => 3, 'valid_count' => 3, 'error_count' => 0,
+          'correlations' => [
+            { 'correlation_id' => 'cid-123', 't_first' => '2025-10-31T01:13:02.114Z',
+              't_last' => '2025-10-31T01:13:03.987Z', 'duration_ms' => 1873,
+              'counts' => { 'INFO' => 2, 'ERROR' => 1 },
+              'by_event' => { 'begin' => 1, 'end' => 1, 'error' => 1 },
+              'errors' => [ { 'message' => 'Invalid value (query)', 'code' => 'BadRequest', 'where' => 'rag_retrieve_contexts' } ],
+              'facets' => { 'model' => 'text-embedding-005' }
+            }
+          ],
+          'timeline' => [
+            { 'ts' => '2025-10-31T01:13:02.114Z', 'action' => 'embed_text', 'event' => 'begin', 'level' => 'INFO',
+              'status' => 'ok', 'correlation_id' => 'cid-123', 'latency_ms' => 0, 'delta_ms_prev' => nil }
+          ],
+          'table' => [
+            { 'correlation_id' => 'cid-123', 'ts' => '2025-10-31T01:13:03.987Z',
+              'action' => 'gen_answer', 'event' => 'end', 'status' => 'ok',
+              'duration_ms' => 1873, 'delta_ms_prev' => 441, 'facets.model' => 'gemini-2.0-pro' }
+          ]
+        }
+      end,
+      execute: lambda do |_connection, input|
+        # 1) Ingest
+        raw = call(:safe_array, input['logs'])
+        if raw.empty? && input['logs_json'].to_s.strip != ''
+          raw = call(:la_json_parse_safe!, input['logs_json'])
+        end
+        ingest_count = raw.length
+
+        # 2) Normalize & optional redaction
+        valid = []
+        raw.each do |e|
+          next unless e.is_a?(Hash)
+          h = call(:la_norm_entry!, e)
+          if call(:normalize_boolean, input['redact'])
+            h = call(:redact_json, h)
+          end
+          valid << h
+        end
+
+        # 3) Filter by ts and correlation
+        since = call(:la_parse_ts, input['since'])
+        till  = call(:la_parse_ts, input['until'])
+        cid_filter = input['correlation_id'].to_s.strip
+        valid.select! do |e|
+          ok = true
+          if cid_filter != ''
+            ok &&= (e['correlation_id'].to_s == cid_filter || e['correlation'].to_s == cid_filter)
+          end
+          if since
+            te = call(:la_parse_ts, e['ts'])
+            ok &&= te && te >= since
+          end
+          if till
+            te = call(:la_parse_ts, e['ts'])
+            ok &&= te && te <= till
+          end
+          ok
+        end
+
+        # 4) Sort and compute deltas per correlation
+        valid.sort_by! { |e| e['ts'].to_s }
+        by_cid = call(:la_group_by, valid, 'correlation_id')
+        timeline = []
+        by_cid.each do |cid, events|
+          prev = nil
+          events.sort_by! { |e| e['ts'].to_s }
+          events.each do |e|
+            cur = call(:la_parse_ts, e['ts'])
+            e['delta_ms_prev'] = (prev ? call(:la_ms_between, prev, cur) : nil)
+            timeline << e
+            prev = cur
+          end
+        end
+
+        # 5) Build summaries
+        correlations = by_cid.map { |cid, events| call(:la_build_summary, cid, events) }
+
+        # 6) Optional flatten for Sheets/BigQuery
+        table = []
+        if call(:normalize_boolean, input['flatten'])
+          timeline.each do |e|
+            base = e.dup
+            fac  = (base.delete('facets') || {})
+            err  = (base.delete('error')  || {})
+            row  = call(:la_flatten_hash, base)
+            row.merge!(call(:la_flatten_hash, fac, 'facets')) unless fac.empty?
+            row.merge!(call(:la_flatten_hash, err, 'error'))  unless err.empty?
+            table << row
+          end
+        end
+
+        {
+          'ingest_count' => ingest_count,
+          'valid_count'  => valid.length,
+          'error_count'  => ingest_count - valid.length,
+          'correlations' => correlations,
+          'timeline'     => timeline,
+          'table'        => table
+        }
+      end
+    },
+
+    # NEW
+    deterministic_filter: {
+      title: 'Filter: Deterministic (with intent)',
+      subtitle: 'Hard/soft rules + lightweight intent inference',
+      display_priority: 500,
+      help: lambda do |_|
+        { body: 'Runs hard/soft rules and infers coarse intent from headers/auth/keywords.' }
+      end,
+
+      config_fields: [
+        { name: 'show_advanced', label: 'Show advanced options',
+          type: 'boolean', control_type: 'checkbox',
+          default: false, sticky: true, extends_schema: true,
+          hint: 'Toggle to reveal advanced parameters.' }
+      ],
+      input_fields: lambda do |object_definitions, connection, config_fields|
+        call(:ui_df_inputs, object_definitions, config_fields) +
+          Array(object_definitions['observability_input_fields'])
+      end,
+      output_fields: lambda do |object_definitions, connection|
+        [
+          { name: 'pre_filter', type: 'object', properties: [
+              { name: 'hit', type: 'boolean' }, { name: 'action' }, { name: 'reason' },
+              { name: 'score', type: 'integer' }, { name: 'matched_signals', type: 'array', of: 'string' },
+              { name: 'decision' }
+          ]},
+          { name: 'intent', type: 'object', properties: Array(object_definitions['intent_out']) },
+          { name: 'email_text' }
+        ] + Array(object_definitions['envelope_fields'])
+      end,
+
+      execute: lambda do |connection, input|
+        ctx = call(:step_begin!, :deterministic_filter, input)
+
+        env = call(:norm_email_envelope!, (input['email'] || input))
+        subj, body, email_text = env['subject'], env['body'], env['email_text']
+        #subj = (input['subject'] || '').to_s.strip
+        #body = (input['body']    || '').to_s.strip
+        #error('Provide subject and/or body') if subj.empty? && body.empty?
+        #email_text = call(:build_email_text, subj, body)
+
+        # Build/choose rulepack
+        rules =
+          if input['rules_mode'] == 'json' && input['rules_json'].present?
+            call(:safe_json, input['rules_json'])
+          elsif input['rules_mode'] == 'rows' && Array(input['rules_rows']).any?
+            call(:hr_compile_rulepack_from_rows!, input['rules_rows'])
+          else
+            nil
+          end
+
+        pre = { 'hit' => false }
+        if rules.is_a?(Hash)
+          hard = call(:hr_eval_hard?, {
+            'subject'=>subj, 'body'=>body, 'from'=>env['from'],
+            'headers'=>env['headers'], 'attachments'=>env['attachments'], 'auth'=>env['auth']
+          }, (rules['hard_exclude'] || {}))
+
+          if hard[:hit]
+            out = {
+              'pre_filter' => hard.merge({ 'decision' => 'IRRELEVANT' }),
+              'intent'     => nil,
+              'email_text' => email_text
+            }
+            return call(:step_ok!, ctx, out, 200, 'OK', { 'decision'=>'HARD_EXIT' })
+          end
+
+          soft = call(:hr_eval_soft, {
+            'subject'=>subj, 'body'=>body, 'from'=>env['from'],
+            'headers'=>env['headers'], 'attachments'=>env['attachments']
+          }, (rules['soft_signals'] || []))
+          decision = call(:hr_eval_decide, soft[:score], (rules['thresholds'] || {}))
+          pre = { 'hit'=>false, 'score'=>soft[:score], 'matched_signals'=>soft[:matched], 'decision'=>decision }
+        end
+
+        # Lightweight intent (deterministic)
+        headers = (env['headers'] || {}).transform_keys(&:to_s)
+        s = "#{subj}\n\n#{body}".downcase
+        intent = { 'label' => 'unknown', 'confidence' => 0.0, 'basis' => 'deterministic' }
+        if headers['auto-submitted'].to_s.downcase != '' && headers['auto-submitted'].to_s.downcase != 'no'
+          intent = { 'label'=>'auto_reply','confidence'=>0.95,'basis'=>'header:auto-submitted' }
+        elsif headers.key?('x-autoreply') || s =~ /(out of office|auto.?reply|automatic reply)/
+          intent = { 'label'=>'auto_reply','confidence'=>0.9,'basis'=>'header/subject' }
+        elsif headers.key?('list-unsubscribe') || headers.key?('list-id') || headers['precedence'].to_s =~ /(bulk|list)/i
+          intent = { 'label'=>'marketing','confidence'=>0.8,'basis'=>'list-headers' }
+        elsif s =~ /(invoice|receipt|order\s?#|shipment|ticket\s?#)/i
+          intent = { 'label'=>'transactional','confidence'=>0.7,'basis'=>'keywords' }
+        end
+
+        out = {
+          'pre_filter' => pre,
+          'intent'     => intent,
+          'email_text' => email_text
+        }
+        call(:step_ok!, ctx, out, 200, 'OK', { 'intent'=>intent['label'] })
+
+      end,
+      sample_output: lambda do
+        {
+          'pre_filter' => { 'hit'=>false, 'score'=>3, 'matched_signals'=>['mentions_invoice'], 'decision'=>'REVIEW' },
+          'intent'     => { 'label'=>'transactional','confidence'=>0.7,'basis'=>'keywords' },
+          'email_text' => "Subject: ...\n\nBody:\n..."
+        }.merge({ 'ok'=>true, 'telemetry'=>{ 'http_status'=>200, 'message'=>'OK', 'duration_ms'=>12, 'correlation_id'=>'corr' } })
+      end
+    },
+    ai_policy_filter: {
+      title: 'Filter: AI policy (optional)',
+      subtitle: 'Fuzzy triage via LLM under a strict JSON schema',
+      display_priority: 500,
+      help: lambda do |_|
+        { body: 'Constrained LLM decides IRRELEVANT/REVIEW/KEEP. Short-circuits only if confident.' }
+      end,
+
+      config_fields: [
+        { name: 'show_advanced', label: 'Show advanced options',
+          type: 'boolean', control_type: 'checkbox',
+          default: false, sticky: true, extends_schema: true,
+          hint: 'Toggle to reveal advanced parameters.' }
+      ],
+      input_fields: lambda do |object_definitions, connection, config_fields|
+        call(:ui_policy_inputs, object_definitions, config_fields) +
+          Array(object_definitions['observability_input_fields'])
+      end,
+      output_fields: lambda do |object_definitions, connection|
+        [
+          { name: 'policy', type: 'object', properties: Array(object_definitions['policy_out']) },
+          { name: 'short_circuit', type: 'boolean' }
+        ] + Array(object_definitions['envelope_fields'])
+      end,
+
+      execute: lambda do |connection, input|
+        ctx = call(:step_begin!, :ai_policy_filter, input)
+        model_path = call(:build_model_path_with_global_preview, connection, (input['model'] || 'gemini-2.0-flash'))
+        loc  = (model_path[/\/locations\/([^\/]+)/,1] || (connection['location'].presence || 'global')).to_s.downcase
+        url  = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
+        req_params = "model=#{model_path}"
+
+        # Optional policy spec via JSON (testing path)
+        policy_spec = nil
+        if input['policy_mode'].to_s == 'json' && input['policy_json'].present?
+          policy_spec = call(:safe_json_obj!, input['policy_json'])
+        end
+
+        system_text = <<~SYS
+          You are a strict email policy triage. Output JSON only.
+          decision ∈ {IRRELEVANT, REVIEW, KEEP}. confidence ∈ [0,1].
+          matched_signals is a short list of strings; reasons ≤ 2 brief strings.
+        SYS
+
+        if policy_spec
+          system_text << "\n\nPolicy spec JSON:\n#{call(:json_compact, policy_spec)}"
+        end
+
+        payload = {
+          'systemInstruction' => { 'role'=>'system','parts'=>[{'text'=>system_text}] },
+          'contents' => [ { 'role'=>'user', 'parts'=>[ { 'text'=> "Email:\n#{input['email_text']}" } ] } ],
+          'generationConfig' => {
+            'temperature'=>0, 'maxOutputTokens'=>256,
+            'responseMimeType'=>'application/json',
+            'responseSchema'=>{
+              'type'=>'object','additionalProperties'=>false,
+              'properties'=>{
+                'decision'=>{'type'=>'string'},
+                'confidence'=>{'type'=>'number'},
+                'matched_signals'=>{'type'=>'array','items'=>{'type'=>'string'}},
+                'reasons'=>{'type'=>'array','items'=>{'type'=>'string'}}
+              }, 'required'=>['decision']
+            }
+          }
+        }
+
+        resp = post(url).headers(call(:request_headers_auth, connection, ctx['cid'], connection['user_project'], req_params))
+                        .payload(call(:json_compact, payload))
+        text = resp.dig('candidates',0,'content','parts',0,'text').to_s
+        policy = call(:safe_parse_json, text)
+
+        short_circuit = (policy['decision'] == 'IRRELEVANT' && policy['confidence'].to_f >= (input['confidence_short_circuit'] || 0.8).to_f)
+
+        out = { 'policy'=>policy, 'short_circuit'=>short_circuit }
+        call(:step_ok!, ctx, out, call(:telemetry_success_code, resp), 'OK',
+          { 'decision'=>policy['decision'], 'conf'=>policy['confidence'] })
+      rescue => e
+        call(:step_err!, ctx, e)
+      end,
+      sample_output: lambda do
+        {
+          'policy'=>{ 'decision'=>'REVIEW','confidence'=>0.62,'matched_signals'=>['low_detail'],'reasons'=>['thin context'] },
+          'short_circuit'=>false, 'ok'=>true,
+          'telemetry'=>{ 'http_status'=>200,'message'=>'OK','duration_ms'=>20,'correlation_id'=>'corr' }
+        }
+      end
+    },
+    embed_text_against_categories: {
+      title: 'Categorize: Embed email vs categories',
+      subtitle: 'Cosine similarity → scores + shortlist',
+      display_priority: 500,
+      help: lambda do |_|
+        { body: 'Embeds email and categories, returns similarity scores and a top-K shortlist.' }
+      end,
+
+      config_fields: [
+        { name: 'show_advanced', label: 'Show advanced options',
+          type: 'boolean', control_type: 'checkbox',
+          default: false, sticky: true, extends_schema: true,
+          hint: 'Toggle to reveal advanced parameters.' }
+      ],
+      input_fields: lambda do |object_definitions, connection, config_fields|
+        call(:ui_embed_inputs, object_definitions, config_fields) +
+          Array(object_definitions['observability_input_fields'])
+      end,
+      output_fields: lambda do |object_definitions, _conn|
+        [
+          { name: 'scores', type: 'array', of: 'object', properties: [
+              { name: 'category' }, { name: 'score', type: 'number' }, { name: 'cosine', type: 'number' }
+          ]},
+          { name: 'shortlist', type: 'array', of: 'string' }
+        ] + Array(object_definitions['envelope_fields'])
+      end,
+
+      execute: lambda do |connection, input|
+        ctx = call(:step_begin!, :embed_text_against_categories, input)
+        # Select categories source (array vs JSON)
+        cats_raw =
+          if input['categories_mode'].to_s == 'json' && input['categories_json'].present?
+            call(:safe_json_arr!, input['categories_json'])
+          else
+            input['categories']
+          end
+        cats = call(:norm_categories!, cats_raw)
+
+        emb_model      = (input['embedding_model'].presence || 'text-embedding-005')
+        model_path     = call(:build_embedding_model_path, connection, emb_model)
+
+        email_inst = { 'content'=>input['email_text'].to_s, 'task_type'=>'RETRIEVAL_QUERY' }
+        cat_insts  = cats.map do |c|
+          { 'content'=>[c['name'], c['description'], *call(:safe_array,c['examples'])].compact.join("\n"),
+            'task_type'=>'RETRIEVAL_DOCUMENT' }
+        end
+
+        emb_resp = call(:predict_embeddings, connection, model_path, [email_inst] + cat_insts, {}, ctx['cid'])
+        preds    = call(:safe_array, emb_resp && emb_resp['predictions'])
+        error('Embedding model returned no predictions') if preds.empty?
+
+        email_vec = call(:extract_embedding_vector, preds.first)
+        cat_vecs  = preds.drop(1).map { |p| call(:extract_embedding_vector, p) }
+        sims = cat_vecs.each_with_index.map { |v, i| [i, call(:vector_cosine_similarity, email_vec, v)] }
+        sims.sort_by! { |(_i, s)| -s }
+
+        scores = sims.map { |(i,s)| { 'category'=>cats[i]['name'], 'score'=>(((s+1.0)/2.0).round(6)), 'cosine'=>s.round(6) } }
+        k = [[(input['shortlist_k'] || 3).to_i, 1].max, cats.length].min
+        shortlist = scores.first(k).map { |h| h['category'] }
+
+        out = { 'scores'=>scores, 'shortlist'=>shortlist }
+        call(:step_ok!, ctx, out, 200, 'OK', { 'k'=>k })
+
+      end,
+      sample_output: lambda do
+        {
+          'scores'=>[
+            { 'category'=>'Billing','score'=>0.91,'cosine'=>0.82 },
+            { 'category'=>'Support','score'=>0.47,'cosine'=>-0.06 }
+          ],
+          'shortlist'=>['Billing','Support'],
+          'ok'=>true, 'telemetry'=>{ 'http_status'=>200,'message'=>'OK','duration_ms'=>11,'correlation_id'=>'corr' }
+        }
+      end
+    },
+    rerank_shortlist: {
+      title: 'Categorize: Re-rank shortlist',
+      subtitle: 'Optional LLM listwise re-ordering of categories',
+      display_priority: 500,
+      help: lambda do |_|
+        { body: 'Uses LLM to produce a probability distribution over the shortlist and re-orders it.' }
+      end,
+
+      config_fields: [
+        { name: 'show_advanced', label: 'Show advanced options',
+          type: 'boolean', control_type: 'checkbox',
+          default: false, sticky: true, extends_schema: true,
+          hint: 'Toggle to reveal advanced parameters.' }
+      ],  
+      input_fields: lambda do |object_definitions, connection, config_fields|
+        call(:ui_rerank_inputs, object_definitions, config_fields) +
+          Array(object_definitions['observability_input_fields'])
+      end,
+      output_fields: lambda do |object_definitions, connection|
+        [
+          { name: 'ranking', type: 'array', of: 'object', properties: [
+              { name: 'category' }, { name: 'prob', type: 'number' }
+          ]},
+          { name: 'shortlist', type: 'array', of: 'string' }
+        ] + Array(object_definitions['envelope_fields'])
+      end,
+
+      execute: lambda do |connection, input|
+        ctx = call(:step_begin!, :rerank_shortlist, input)
+        mode = (input['mode'] || 'none').to_s
+
+        if mode == 'none'
+          sl = call(:safe_array, input['shortlist'])
+          ranking = sl.map { |c| { 'category'=>c, 'prob'=>nil } }
+          out = { 'ranking'=>ranking, 'shortlist'=>sl }
+          return call(:step_ok!, ctx, out, 200, 'OK', { 'mode'=>'none' })
+        end
+
+        # LLM listwise: reuse your referee to get distribution over shortlist
+        cats_raw =
+          if input['categories_mode'].to_s == 'json' && input['categories_json'].present?
+            call(:safe_json_arr!, input['categories_json'])
+          else
+            input['categories']
+          end
+        cats = call(:norm_categories!, cats_raw)
+        ref  = call(:llm_referee, connection, (input['generative_model'] || 'gemini-2.0-flash'),
+                    input['email_text'], call(:safe_array, input['shortlist']), cats, nil, ctx['cid'], nil)
+        dist = call(:safe_array, ref['distribution']).map { |d| { 'category'=>d['category'], 'prob'=>d['prob'].to_f } }
+        # Ensure all shortlist items present
+        missing = call(:safe_array, input['shortlist']) - dist.map { |d| d['category'] }
+        dist.concat(missing.map { |m| { 'category'=>m, 'prob'=>0.0 } })
+        ranking = dist.sort_by { |h| -h['prob'].to_f }
+        out = { 'ranking'=>ranking, 'shortlist'=>ranking.map { |r| r['category'] } }
+        call(:step_ok!, ctx, out, 200, 'OK', { 'mode'=>'llm' })
+      end,
+      sample_output: lambda do
+        {
+          'ranking'=>[
+            { 'category'=>'Billing','prob'=>0.86 },
+            { 'category'=>'Support','prob'=>0.10 },
+            { 'category'=>'Sales','prob'=>0.04 }
+          ],
+          'shortlist'=>['Billing','Support','Sales'],
+          'ok'=>true, 'telemetry'=>{ 'http_status'=>200,'message'=>'OK','duration_ms'=>18,'correlation_id'=>'corr' }
+        }
+      end
+    },
+    llm_referee_with_contexts: {
+      title: 'Categorize: LLM as referee',
+      subtitle: 'Adjudicate among shortlist; accepts ranked categories',
+      display_priority: 500,
+      help: lambda do |_|
+        { body: 'Chooses final category using shortlist + category metadata; can append ranked contexts to the email text.' }
+      end,
+      config_fields: [
+        { name: 'show_advanced', label: 'Show advanced options',
+          type: 'boolean', control_type: 'checkbox',
+          default: false, sticky: true, extends_schema: true,
+          hint: 'Toggle to reveal advanced parameters.' }
+      ], 
+      input_fields: lambda do |object_definitions, connection, config_fields|
+         call(:ui_ref_inputs, object_definitions, config_fields) + [
+           # --- Salience sidecar (disabled by default; 2-call flow when LLM) ---
+           { name: 'salience_mode', label: 'Salience extraction',
+             control_type: 'select', optional: true, default: 'off', extends_schema: true,
+             options: [['Off','off'], ['Heuristic (no LLM)','heuristic'], ['LLM (extra API call)','llm']],
+             hint: 'Extract a salient sentence/paragraph before refereeing. LLM mode makes a separate API call.' },
+           { name: 'salience_append_to_prompt', label: 'Append salience to prompt',
+             type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+             ngIf: 'input.salience_mode != "off"',
+             hint: 'If enabled, the salient span (and light metadata) is appended to the email text shown to the referee.' },
+           { name: 'salience_max_chars', label: 'Salience max chars', type: 'integer',
+             optional: true, default: 500, ngIf: 'input.salience_mode != "off"' },
+           { name: 'salience_include_entities', label: 'Salience: include entities',
+             type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+             ngIf: 'input.salience_mode == "llm"' },
+           { name: 'salience_model', label: 'Salience model',
+             control_type: 'text', optional: true, default: 'gemini-2.0-flash',
+             ngIf: 'input.salience_mode == "llm"' },
+           { name: 'salience_temperature', label: 'Salience temperature',
+             type: 'number', optional: true, default: 0,
+             ngIf: 'input.salience_mode == "llm"' }
+         ] + Array(object_definitions['observability_input_fields'])
+      end,
+      output_fields: lambda do |object_definitions, connection|
+        [
+          { name: 'referee', type: 'object', properties: Array(object_definitions['referee_out']) },
+          { name: 'chosen' },
+          { name: 'confidence', type: 'number' },
+           # Salience sidecar (top-level field; backward compatible)
+           { name: 'salience', type: 'object', properties: [
+               { name: 'span' },
+               { name: 'reason' },
+               { name: 'importance', type: 'number' },
+               { name: 'tags', type: 'array', of: 'string' },
+               { name: 'entities', type: 'array', of: 'object',
+                 properties: [{ name: 'type' }, { name: 'text' }] },
+               { name: 'cta' },
+               { name: 'deadline_iso' },
+               { name: 'focus_preview' },
+               { name: 'responseId' },
+               { name: 'usage', type: 'object', properties: [
+                   { name: 'promptTokenCount', type: 'integer' },
+                   { name: 'candidatesTokenCount', type: 'integer' },
+                   { name: 'totalTokenCount', type: 'integer' }
+               ]},
+               { name: 'span_source' } # heuristic | llm
+             ]
+           }
+         ] + Array(object_definitions['envelope_fields'])
+      end,
+
+      execute: lambda do |connection, input|
+        ctx = call(:step_begin!, :llm_referee_with_contexts, input)
+        # Select categories source (array vs JSON)
+        cats_raw =
+          if input['categories_mode'].to_s == 'json' && input['categories_json'].present?
+            call(:safe_json_arr!, input['categories_json'])
+          else
+            input['categories']
+          end
+        cats = call(:norm_categories!, cats_raw)
+
+        # Optionally append ranked contexts to the email text for better decisions
+        email_text = input['email_text'].to_s
+        if Array(input['contexts']).any?
+          blob = call(:format_context_chunks, input['contexts'])
+          email_text = "#{email_text}\n\nContext:\n#{blob}"
+        end
+         salience = nil
+         sal_err  = nil
+         mode     = (input['salience_mode'] || 'off').to_s
+         if mode != 'off'
+           begin
+             max_span = (input['salience_max_chars'].to_i rescue 500); max_span = [[max_span,80].max,2000].min
+             # Heuristic extraction (no extra API call)
+             if mode == 'heuristic'
+               focus = email_text.to_s[0, 8000]
+               # drop greetings
+               focus = focus.sub(/\A\s*(subject:\s*[^\n]+\n+)?\s*(hi|hello|hey)[^a-z0-9]*\n+/i, '')
+               cand = focus.split(/(?<=[.!?])\s+/).find { |s| s.strip.length >= 12 && s !~ /\A(hi|hello|hey)\b/i } || focus[0, max_span]
+               span = cand.to_s.strip[0, max_span]
+               salience = {
+                 'span'=>span, 'reason'=>nil, 'importance'=>nil, 'tags'=>nil,
+                 'entities'=>nil, 'cta'=>nil, 'deadline_iso'=>nil,
+                 'focus_preview'=>focus, 'responseId'=>nil, 'usage'=>nil, 'span_source'=>'heuristic'
+               }
+             elsif mode == 'llm'
+               # LLM extraction (separate API call)
+               model = (input['salience_model'].presence || 'gemini-2.0-flash').to_s
+               model_path = call(:build_model_path_with_global_preview, connection, model)
+               loc = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
+               url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
+               req_params = "model=#{model_path}"
+ 
+               schema_props = {
+                 'salient_span'=>{'type'=>'string','minLength'=>12},
+                 'reason'=>{'type'=>'string'},
+                 'importance'=>{'type'=>'number'},
+                 'tags'=>{'type'=>'array','items'=>{'type'=>'string'}},
+                 'call_to_action'=>{'type'=>'string'},
+                 'deadline_iso'=>{'type'=>'string'}
+               }
+               schema_props['entities'] = {
+                 'type'=>'array',
+                 'items'=>{'type'=>'object','additionalProperties'=>false,
+                   'properties'=>{'type'=>{'type'=>'string'},'text'=>{'type'=>'string'}},
+                   'required'=>['text']}
+               } if call(:normalize_boolean, input['salience_include_entities'])
+ 
+               system_text = "You extract the single most important sentence or short paragraph from an email. " \
+                             "Rules: (1) Return VALID JSON only. (2) Do NOT output greetings, signatures, legal footers, " \
+                             "auto-replies, or vague pleasantries. (3) Keep under #{max_span} characters; do not truncate mid-sentence. " \
+                             "(4) importance is in [0,1]; set call_to_action/deadline_iso when clearly present."
+ 
+               gen_cfg = {
+                 'temperature'=> (input['salience_temperature'].present? ? input['salience_temperature'].to_f : 0),
+                 'maxOutputTokens'=>512,
+                 'responseMimeType'=>'application/json',
+                 'responseSchema'=>{
+                   'type'=>'object','additionalProperties'=>false,'properties'=>schema_props,
+                   'required'=>['salient_span']
+                 }
+               }
+               contents = [{ 'role'=>'user', 'parts'=>[{ 'text'=>"Email (trimmed):\n#{email_text.to_s[0,8000]}" }]}]
+               payload = {
+                 'contents'=>contents,
+                 'systemInstruction'=>{ 'role'=>'system', 'parts'=>[{ 'text'=>system_text }]},
+                 'generationConfig'=>gen_cfg
+               }
+               req_body = call(:json_compact, payload)
+               resp = post(url).headers(call(:request_headers_auth, connection, ctx['cid'], connection['user_project'], req_params))
+                              .payload(req_body)
+ 
+               txt = resp.dig('candidates',0,'content','parts',0,'text').to_s
+               parsed = call(:json_parse_gently!, txt)
+               span = parsed['salient_span'].to_s.strip
+               if span.empty? || span =~ /\A(hi|hello|hey)\b[:,\s]*\z/i || span.length < 8
+                 focus = email_text.to_s[0, 8000]
+                 focus = focus.sub(/\A\s*(subject:\s*[^\n]+\n+)?\s*(hi|hello|hey)[^a-z0-9]*\n+/i, '')
+                 cand = focus.split(/(?<=[.!?])\s+/).find { |s| s.strip.length >= 12 && s !~ /\A(hi|hello|hey)\b/i } || focus[0, max_span]
+                 span = cand.to_s.strip[0, max_span]
+               end
+               salience = {
+                 'span'=>span,
+                 'reason'=>parsed['reason'],
+                 'importance'=>parsed['importance'],
+                 'tags'=>parsed['tags'],
+                 'entities'=>parsed['entities'],
+                 'cta'=>parsed['call_to_action'],
+                 'deadline_iso'=>parsed['deadline_iso'],
+                 'focus_preview'=>email_text.to_s[0,8000],
+                 'responseId'=>resp['responseId'],
+                 'usage'=>resp['usageMetadata'],
+                 'span_source'=>'llm'
+               }
+             end
+           rescue => e
+             sal_err = e.to_s
+             salience = nil
+           end
+         end
+         # Optionally append salience to the prompt sent to the referee
+         if salience && call(:normalize_boolean, input['salience_append_to_prompt'])
+           email_text = call(:maybe_append_salience, email_text, salience, salience['importance'])
+         end
+        shortlist = call(:safe_array, input['shortlist'])
+        ref = call(:llm_referee, connection, (input['generative_model'] || 'gemini-2.0-flash'),
+                  email_text, (shortlist.any? ? shortlist : nil), cats, input['fallback_category'], ctx['cid'], nil)
+
+        min_conf = (input['min_confidence'].presence || 0.25).to_f
+        chosen =
+          if ref['confidence'].to_f < min_conf && input['fallback_category'].present?
+            input['fallback_category']
+          else
+            ref['category']
+          end
+
+         out = {
+           'referee'=>ref,
+           'chosen'=>chosen,
+           'confidence'=>[ref['confidence'], 0.0].compact.first.to_f
+         }
+         out['salience'] = salience if salience
+ 
+         extras = {
+           'chosen'=>chosen, 'conf'=>out['confidence'],
+           'salience_len'=> (salience && salience['span'] ? salience['span'].to_s.length : nil),
+           'salience_source'=> (salience && salience['span_source']),
+           'salience_err'=> sal_err
+         }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
+         call(:step_ok!, ctx, out, 200, 'OK', extras)
+      end,
+      sample_output: lambda do
+        {
+          'referee'=>{
+            'category'=>'Billing','confidence'=>0.86,'reasoning'=>'Mentions invoice 4411.',
+            'distribution'=>[
+              { 'category'=>'Billing','prob'=>0.86 }, { 'category'=>'Support','prob'=>0.10 }, { 'category'=>'Sales','prob'=>0.04 }
+            ]
+          },
+           'chosen'=>'Billing','confidence'=>0.86,
+           'salience'=>{
+             'span'=>'Can you approve the Q4 budget increase by Friday?',
+             'reason'=>'Explicit ask with a clear deadline',
+             'importance'=>0.92,
+             'tags'=>['approval','budget','deadline'],
+             'entities'=>[{ 'type'=>'team','text'=>'Finance' }],
+             'cta'=>'Approve Q4 budget increase',
+             'deadline_iso'=>'2025-10-24T17:00:00Z',
+             'focus_preview'=>'Email (trimmed): ...',
+             'responseId'=>'resp-sal-xyz',
+             'usage'=>{ 'promptTokenCount'=>120,'candidatesTokenCount'=>70,'totalTokenCount'=>190 },
+             'span_source'=>'llm'
+           },
+
+          'ok'=>true,'telemetry'=>{ 'http_status'=>200,'message'=>'OK','duration_ms'=>19,'correlation_id'=>'corr' }
+        }
+      end
     }
   },
   
   # --------- PICK LISTS ---------------------------------------------------
   pick_lists: {
-    http_methods: lambda do |_connection|
-      [%w[GET GET], %w[POST POST], %w[PUT PUT], %w[PATCH PATCH], %w[DELETE DELETE]]
+    modes_classification: lambda do |_connection|
+      [ ['Embedding (deterministic)', 'embedding'],
+        ['Generative (LLM only)',     'generative'],
+        ['Hybrid (embed + referee)',  'hybrid'] ]
     end,
-    # What to emit from rerank for ergonomics/BC:
-    # - records_only:     [{id, score, rank}]
-    # - enriched_records: [{id, score, rank, content, metadata}]
-    # - context_chunks:   enriched records + generator-ready context_chunks
+    # rules
+    rules_modes: lambda do |_connection|
+      [ ['None', 'none'], ['Rows (Lookup Table)', 'rows'], ['Compiled JSON', 'json'] ]
+    end,
     rerank_emit_shapes: lambda do |_connection|
+      # What to emit from rerank for ergonomics/BC:
+      # - records_only:     [{id, score, rank}]
+      # - enriched_records: [{id, score, rank, content, metadata}]
+      # - context_chunks:   enriched records + generator-ready context_chunks
       [
         ['Records only (id, score, rank)','records_only'],
         ['Enriched records (adds content/metadata)','enriched_records'],
@@ -2158,145 +3258,853 @@ require 'securerandom'
     end
 
   },
-
+  
   # --------- METHODS ------------------------------------------------------
   methods: {
-    # ---- SCHEMA DISCOVERY METHODS
-    dig_path: lambda do |obj, path|
-      return obj if path.to_s.strip.empty?
-      path.split('.').reduce(obj) do |acc, key|
-        if acc.is_a?(Hash)        then acc[key]
-        elsif acc.is_a?(Array) && key =~ /\A\d+\z/ then acc[key.to_i]
-        else nil end
+    coerce_integer: lambda do |v, fallback|
+      Integer(v) rescue fallback
+    end,
+    path_rag_retrieve_contexts: lambda do |connection|
+      "/v1/projects/#{call(:ensure_project_id!, connection)}/locations/#{call(:ensure_location!, connection)}:retrieveContexts"
+    end,
+    safe_parse_json: lambda do |maybe_string|
+      return maybe_string unless maybe_string.is_a?(String)
+      begin
+        parse_json(maybe_string)
+      rescue
+        # If the server lied about content-type or returned pretty text,
+        # keep the original; the caller can handle/log.
+        maybe_string
       end
     end,
-    infer_type: lambda do |v|
-      case v
-      when TrueClass, FalseClass then 'boolean'
-      when Integer               then 'integer'
-      when Float                 then 'number'
-      when Hash                  then 'object'
-      when Array                 then 'array'
-      when NilClass              then 'string'
-      else 'string'
-      end
+    ensure_project_id!: lambda do |connection|
+      pid = connection['project'].to_s.strip
+      error('Project is required') if pid.empty?
+      pid
     end,
-    json_schema_fields: lambda do |value|
-      case value
-      when Hash
-        value.map do |k, v|
-          t = call(:infer_type, v)
-          base = { name: k.to_s, optional: true }
-          if t == 'object'
-            base.merge(type: 'object', properties: call(:json_schema_fields, v))
-          elsif t == 'array'
-            first = Array(v).find { |x| !x.nil? }
-            if first.is_a?(Hash)
-              base.merge(type: 'array', of: 'object', properties: call(:json_schema_fields, first))
-            else
-              base.merge(type: 'array', of: call(:infer_type, first))
+    ensure_location!: lambda do |connection|
+      loc = connection['location'].to_s.strip
+      error('Location is required') if loc.empty?
+      loc
+    end,
+    default_headers: lambda do |connection|
+      # Deliberately keep these minimal to avoid duplication of headers
+      {
+      'Content-Type' => 'application/json; charset=utf-8',
+      'Accept' => 'application/json'
+      }
+    end,
+    aiplatform_host: lambda do |connection|
+      "#{call(:ensure_location!, connection)}-aiplatform.googleapis.com"
+    end,
+    build_retrieval_opts_from_input!: lambda do |input|
+      cfg  = (input['rag_retrieval_config'].is_a?(Hash) ? input['rag_retrieval_config'] : {})
+      filt = cfg['filter'].is_a?(Hash) ? cfg['filter'] : {}
+      rank = cfg['ranking'].is_a?(Hash) ? cfg['ranking'] : {}
+
+      topk = cfg['top_k'] || input['similarity_top_k']
+      dist = filt['vector_distance_threshold']   || input['vector_distance_threshold']
+      sim  = filt['vector_similarity_threshold'] || input['vector_similarity_threshold']
+      rsm  = rank['rank_service_model']          || input['rank_service_model']
+      llm  = rank['llm_ranker_model']            || input['llm_ranker_model']
+
+      # Validate oneof unions
+      call(:guard_threshold_union_0!, dist, sim)
+      call(:guard_ranker_union_0!, rsm, llm)
+
+      {
+        'topK'                      => topk,
+        'vectorDistanceThreshold'   => dist,
+        'vectorSimilarityThreshold' => sim,
+        'rankServiceModel'          => rsm,
+        'llmRankerModel'            => llm
+      }.delete_if { |_k, v| v.nil? || v == '' }
+    end,
+    request_headers_auth_0: lambda do |_connection, correlation_id, user_project=nil, request_params=nil|
+      h = {
+        'X-Correlation-Id' => correlation_id.to_s,
+        'Content-Type'     => 'application/json',
+        'Accept'           => 'application/json'
+      }
+      up = user_project.to_s.strip
+      h['x-goog-user-project']   = up unless up.empty?
+      rp = request_params.to_s.strip
+      h['x-goog-request-params'] = rp unless rp.empty?
+      h
+    end,
+    aipl_service_host_0: lambda do |connection, loc=nil|
+      l = (loc || connection['location']).to_s.downcase
+      (l.blank? || l == 'global') ? 'aiplatform.googleapis.com' : "#{l}-aiplatform.googleapis.com"
+    end,
+    aipl_v1_url_0: lambda do |connection, loc, path|
+      "https://#{call(:aipl_service_host_0, connection, loc)}/v1/#{path}"
+    end,
+    normalize_rag_corpus_0: lambda do |connection, raw|
+      v = raw.to_s.strip
+      return '' if v.blank?
+      return v if v.start_with?('projects/')
+      # Allow short form: just corpus id -> expand using connection project/region
+      call(:ensure_project_id_0!, connection)
+      loc = (connection['location'] || '').to_s.downcase
+      error("RAG corpus requires regional location; got '#{loc}'") if loc.blank? || loc == 'global'
+      "projects/#{connection['project_id']}/locations/#{loc}/ragCorpora/#{v}"
+    end,
+    ensure_project_id_0!: lambda do |connection|
+      # Method mutates caller-visible state, but this is a known and desired side effect.
+      pid = (connection['project_id'].presence ||
+              (JSON.parse(connection['service_account_key_json'].to_s)['project_id'] rescue nil)).to_s
+      error('Project ID is required (not found in connection or key)') if pid.blank?
+      connection['project_id'] = pid
+      pid
+    end,
+    build_rag_retrieve_payload_0: lambda do |question, rag_corpus, restrict_ids = [], opts = {}|
+      # Optional opts:
+      #   'topK', 'vectorDistanceThreshold', 'vectorSimilarityThreshold',
+      #   'rankServiceModel', 'llmRankerModel'
+
+      rag_res = { 'ragCorpus' => rag_corpus }
+      ids     = call(:sanitize_drive_ids_0, restrict_ids, allow_empty: true, label: 'restrict_to_file_ids')
+      rag_res['ragFileIds'] = ids if ids.present?
+
+      query = { 'text' => question.to_s }
+      rr_cfg = {}
+      if opts.is_a?(Hash)
+        if opts['topK']
+          rr_cfg['topK'] = call(:clamp_int_0, (opts['topK'] || 0), 1, 200)
+        end
+        # Filter union
+        dist = opts['vectorDistanceThreshold']
+        sim  = opts['vectorSimilarityThreshold']
+        call(:guard_threshold_union_0!, dist, sim)
+        filt = {}
+        filt['vectorDistanceThreshold']   = call(:safe_float_0, dist) if !dist.nil?
+        filt['vectorSimilarityThreshold'] = call(:safe_float_0, sim)  if !sim.nil?
+        rr_cfg['filter'] = filt unless filt.empty?
+
+        # Ranking union
+        rsm = (opts['rankServiceModel'].to_s.strip)
+        llm = (opts['llmRankerModel'].to_s.strip)
+        call(:guard_ranker_union_0!, rsm, llm)
+        if rsm != ''
+          rr_cfg['ranking'] = { 'rankService' => { 'modelName' => rsm } }
+        elsif llm != ''
+          rr_cfg['ranking'] = { 'llmRanker'   => { 'modelName' => llm } }
+        end
+      end
+      query['ragRetrievalConfig'] = rr_cfg unless rr_cfg.empty?
+
+      {
+        'query'          => query,
+        'vertexRagStore' => { 'ragResources'  => [rag_res] }
+      }
+    end,
+    sanitize_drive_ids_0: lambda do |raw_list, allow_empty: false, label: 'drive_file_ids'|
+      # 1) normalize → 2) drop empties → 3) de-dup
+      norm = call(:safe_array_0, raw_list)
+              .map { |x| call(:normalize_drive_file_id_0, x) }
+              .reject { |x| x.to_s.strip.empty? }
+              .uniq
+      return [] if norm.empty? && allow_empty
+      error("No valid Drive IDs found in #{label}. Remove empty entries or fix links.") if norm.empty?
+      bad = norm.find { |id| id !~ /\A[A-Za-z0-9_-]{8,}\z/ }
+      error("Invalid Drive ID in #{label}: #{bad}") if bad
+      norm
+    end,
+    safe_array_0: lambda do |v|
+      return [] if v.nil? || v == false
+      return v  if v.is_a?(Array)
+      [v]
+    end,
+    normalize_drive_file_id_0:   lambda { |raw| call(:normalize_drive_resource_id_0, raw) },
+    normalize_drive_resource_id_0: lambda do |raw|
+      # Accept strings, datapill Hashes, and common Drive URLs → bare ID
+      return '' if raw.nil? || raw == false
+      v =
+        if raw.is_a?(Hash)
+          raw['id'] || raw[:id] ||
+          raw['fileId'] || raw[:fileId] ||
+          raw['value'] || raw[:value] ||
+          raw['name'] || raw[:name] ||
+          raw['path'] || raw[:path] ||
+          raw.to_s
+        else
+          raw
+        end.to_s.strip
+      return '' if v.empty? || %w[null nil none undefined - (blank)].include?(v.downcase)
+
+      if v.start_with?('http://', 'https://')
+        if (m = v.match(%r{/file/d/([^/?#]+)}))      then v = m[1]
+        elsif (m = v.match(%r{/folders/([^/?#]+)}))  then v = m[1]
+        elsif (m = v.match(/[?&]id=([^&#]+)/))       then v = m[1]
+        end
+      end
+
+      if v.include?('=>') || v.include?('{') || v.include?('}')
+        begin
+          j = JSON.parse(v) rescue nil
+          if j.is_a?(Hash)
+            v = j['id'] || j['fileId'] || j['value'] || ''
+          end
+        rescue; end
+      end
+
+      prior = v.dup
+      v = v[/[A-Za-z0-9_-]+/].to_s
+      v = '' if v.length < 8 && prior.start_with?('http')
+      v
+    end,
+    clamp_int_0: lambda do |n, min, max|
+      [[n.to_i, min].max, max].min
+    end,
+    safe_float_0: lambda do |v|
+      return nil if v.nil?; Float(v) rescue v.to_f
+    end,
+    guard_threshold_union_0!: lambda do |dist, sim|
+      return true if dist.nil? || dist.to_s == ''
+      return true if sim.nil?  || sim.to_s  == ''
+      error('Provide only one of vector_distance_threshold OR vector_similarity_threshold')
+    end,
+    guard_ranker_union_0!: lambda do |rank_service_model, llm_ranker_model|
+      r = rank_service_model.to_s.strip
+      l = llm_ranker_model.to_s.strip
+      return true if r.empty? || l.empty?
+      error('Provide only one of rank_service_model OR llm_ranker_model')
+    end,
+    normalize_retrieve_contexts_0!: lambda do |raw_resp|
+      b = raw_resp.is_a?(Hash) || raw_resp.is_a?(Array) ? raw_resp : {}
+
+      # Fast paths
+      if b.is_a?(Hash)
+        return Array(b['contexts']) if b['contexts'].is_a?(Array)
+
+        if b['contexts'].is_a?(Hash)
+          inner = b['contexts']
+          return Array(inner['contexts']) if inner['contexts'].is_a?(Array)
+        end
+      end
+
+      # Recursive search for a key literally named "contexts" whose value is an Array
+      finder = lambda do |obj|
+        case obj
+        when Hash
+          obj.each do |k, v|
+            return v if k.to_s == 'contexts' && v.is_a?(Array)
+            if v.is_a?(Hash) || v.is_a?(Array)
+              found = finder.call(v)
+              return found if found
             end
-          else
-            base.merge(type: t)
+          end
+        when Array
+          obj.each do |e|
+            found = finder.call(e)
+            return found if found
           end
         end
-      when Array
-        first = value.find { |x| x.is_a?(Hash) } || {}
-        [{
-          name: 'records', type: 'array', of: 'object',
-          properties: call(:json_schema_fields, first)
-        }]
-      else
-        [{ name: 'value', type: call(:infer_type, value) }]
+        nil
+      end
+
+      Array(finder.call(b))
+    end,
+    map_context_chunks_0: lambda do |raw_contexts, maxn = 20|
+      call(:safe_array_0, raw_contexts).first(maxn).each_with_index.map do |c, i|
+        h  = c.is_a?(Hash) ? c : {}
+        md = (
+          h['metadata'] ||
+          h['structuredMetadata'] ||
+          h['customMetadata'] ||
+          {}
+        )
+        md = md.is_a?(Hash) ? md : {}
+
+        # Prefer explicit keys; fall back to common alternates
+        cid = h['chunkId'] || h['id'] || h['name'] || h['chunk_id'] || "ctx-#{i+1}"
+        txt = h['text'] || h['content'] || h['chunkText'] || h['chunk_text'] || ''
+        scr = (
+          h['score'] || h['relevanceScore'] || h['relevance_score'] ||
+          h['similarity'] || h['rankScore']
+        )
+
+        src = (
+          h['sourceDisplayName'] || md['source'] || md['displayName'] || h['source']
+        )
+        uri = (
+          h['sourceUri'] || h['uri'] || md['uri'] || md['gcsUri'] || md['url']
+        )
+
+        # Normalize types
+        scr = scr.to_f if !scr.nil?
+
+        {
+          'id'            => cid.to_s,
+          'text'          => txt.to_s,
+          'score'         => (scr || 0.0).to_f,
+          'source'        => src,
+          'uri'           => uri,
+          'metadata'      => md,
+          'metadata_kv'   => md.map { |k,v| { 'key' => k.to_s, 'value' => v } },
+          'metadata_json' => (md.empty? ? nil : md.to_json)
+        }
       end
     end,
-    # --- Vertex URL + body builders (no external method deps) ---
-    aipl_v1_url_retrieve_contexts: lambda do |connection|
-      project  = connection['project'].presence || connection['project_id']
-      location = connection['location'].presence || 'us-east4'
-      error('Connection missing project')  if project.blank?
-      error('Connection missing location') if location.blank?
-      parent = "projects/#{project}/locations/#{location}"
-      ["https://aiplatform.googleapis.com/v1/#{parent}:retrieveContexts", parent]
-    end,
-    build_rag_resources: lambda do |rag_corpora|
-      arr = Array(rag_corpora).compact.map(&:to_s).reject(&:empty?)
-      error('At least one rag corpus is required') if arr.empty?
+    telemetry_envelope_0: lambda do |started_at, correlation_id, ok, code, message|
+      dur = ((Time.now - started_at) * 1000.0).to_i
       {
-        'vertexRagStore' => {
-          'ragResources' => arr.map { |c| { 'ragCorpus' => c } }
+        'ok' => !!ok,
+        'telemetry' => {
+          'http_status'    => code.to_i,
+          'message'        => (message || (ok ? 'OK' : 'ERROR')).to_s,
+          'duration_ms'    => dur,
+          'correlation_id' => correlation_id
         }
       }
     end,
-    # --- Probe the endpoint to infer output fields (optional) ---
-    probe_retrieve_contexts_output_fields: lambda do |connection, cfg|
+    telemetry_success_code_0: lambda do |resp|
+      (resp.is_a?(Hash) && (resp['status'] || resp['status_code'])) ? (resp['status'] || resp['status_code']).to_i : 200
+    end,
+    telemetry_parse_error_code_0: lambda do |err|
       begin
-        url, _parent = call(:aipl_v1_url_retrieve_contexts, connection)
-
-        headers = { 'Content-Type' => 'application/json' }
-        if cfg['x_goog_user_project'].present?
-          headers['x-goog-user-project'] = cfg['x_goog_user_project']
+        if err.respond_to?(:[])
+          code = err['status'] || err.dig('response', 'status') ||
+                err.dig('response', 'status_code') || err.dig('error', 'code')
+          return code.to_i if code
         end
-
-        body = {
-          'query' => { 'text' => (cfg['probe_query_text'].presence || 'schema-probe') }
-        }.merge(
-          'dataSource' => call(:build_rag_resources, cfg['rag_corpora'])
-        )
-        body['topK'] = (cfg['top_k'].to_i) if cfg['top_k'].to_i > 0
-        if cfg['vector_similarity_threshold'].present? && cfg['vector_distance_threshold'].present?
-          error('Use EITHER vector_similarity_threshold OR vector_distance_threshold, not both')
+      rescue; end
+      begin
+        body = (err.respond_to?(:[]) && err.dig('response','body')).to_s
+        j = JSON.parse(body) rescue nil
+        c = j && j.dig('error','code')
+        return c.to_i if c
+      rescue; end
+      m = err.to_s.match(/\b(\d{3})\b/)
+      m ? m[1].to_i : 500
+    end,
+    extract_google_error_0: lambda do |err|
+      begin
+        body = (err.respond_to?(:[]) && err.dig('response','body')).to_s
+        json = JSON.parse(body) rescue nil
+        if json
+          if json['error']
+            det   = json['error']['details'] || []
+            bad   = det.find { |d| (d['@type'] || '').end_with?('google.rpc.BadRequest') } || {}
+            vlist = (bad['fieldViolations'] || bad['violations'] || []).map do |v|
+              {
+                'field'  => v['field'] || v['fieldPath'] || v['subject'],
+                'reason' => v['description'] || v['message'] || v['reason']
+              }.compact
+            end.reject(&:empty?)
+            return {
+              'code'       => json['error']['code'],
+              'message'    => json['error']['message'],
+              'details'    => json['error']['details'],
+              'violations' => vlist,
+              'raw'        => json
+            }
+          end
+          return { 'message' => json['message'], 'raw' => json } if json['message']
         end
-        if cfg['vector_similarity_threshold'].present?
-          body['vectorSimilarityThreshold'] = cfg['vector_similarity_threshold'].to_f
-        elsif cfg['vector_distance_threshold'].present?
-          body['vectorDistanceThreshold'] = cfg['vector_distance_threshold'].to_f
+      rescue
+      end
+      {}
+    end,
+    build_correlation_id_0: lambda do
+      SecureRandom.uuid
+    end,
+    json_compact_0: lambda do |obj|
+      case obj
+      when Hash
+        obj.each_with_object({}) do |(k, v), h|
+          next if v.nil?
+          cv = call(:json_compact_0, v)
+          keep =
+            case cv
+            when String then !cv.empty?
+            when Array  then !cv.empty?
+            when Hash   then !cv.empty?
+            else true
+            end
+          h[k] = cv if keep
         end
-
-        resp = post(url, headers: headers, payload: body)
-        sample = call(:dig_path, resp, 'contexts.contexts')
-        sample ||= resp
-        fields = call(:json_schema_fields, sample)
-        fields + [
-          { name: 'extras', type: 'object', optional: true },
-          { name: 'raw',    type: 'string', optional: true }
-        ]
-      rescue => e
-        # Fallback superset if probe fails (auth, quota, or no corpus yet)
-        [
-          { name: 'records', type: 'array', of: 'object', properties: [
-              { name: 'text' },
-              { name: 'sourceUri' },
-              { name: 'score', type: 'number', optional: true },
-              { name: 'metadata', type: 'object', optional: true }
-          ]},
-          { name: 'raw', type: 'string' },
-          { name: 'error', type: 'object', properties: [
-              { name: 'message' }, { name: 'class' }, { name: 'hint' }
-          ]}
-        ]
+      when Array
+        obj.map { |e| call(:json_compact_0, e) }.reject do |cv|
+          case cv
+          when String then cv.empty?
+          when Array  then cv.empty?
+          when Hash   then cv.empty?
+          else false
+          end
+        end
+      else
+        obj
       end
     end,
-    probe_output_fields: lambda do |connection, cfg|
-      begin
-        sample = call(:http_sample, connection, cfg)
-        sample = call(:dig_path, sample, cfg['path_to_records']) if cfg['path_to_records'].present?
-        fields = call(:json_schema_fields, sample)
-        # Always add safe fallbacks
-        fields + [
-          { name: 'extras', type: 'object', optional: true },
-          { name: 'raw',    type: 'string', optional: true }
-        ]
-      rescue => e
-        [
-          { name: 'raw', type: 'string' },
-          { name: 'error', type: 'object', properties: [
-              { name: 'message' }, { name: 'class' }, { name: 'hint' }
-          ]}
-        ]
+    http_body_json_0: lambda do |resp|
+      if resp.is_a?(Hash) && resp.key?('body')
+        parsed = (JSON.parse(resp['body']) rescue nil)
+        parsed.nil? ? {} : parsed
+      elsif resp.is_a?(String)
+        (JSON.parse(resp) rescue {}) || {}
+      elsif resp.is_a?(Hash) || resp.is_a?(Array)
+        resp
+      else
+        {}
       end
     end,
-    # --------
+
+    # Ultra-tolerant unwrappers
+    unwrap_json_like!: lambda do |v|
+      return v if v.is_a?(Hash) || v.is_a?(Array)
+      return (call(:safe_json, v) || v) if v.is_a?(String)
+      v
+    end,
+
+    find_contexts_array_any!: lambda do |v|
+      # Depth-first search for an Array of context objects.
+      # Handles:
+      #   {contexts:[...]}
+      #   {contexts:{contexts:[...]}}
+      #   stringified JSON at any level
+      #   wrappers like {body|data|response|payload|result: ...}
+      v = call(:unwrap_json_like!, v)
+      if v.is_a?(Array)
+        return v if !v.empty? && v.first.is_a?(Hash) &&
+                    (v.first.key?('text') || v.first.key?('chunkText') ||
+                    v.first.key?('sourceUri') || v.first.key?('chunkId'))
+        v.each do |e|
+          r = call(:find_contexts_array_any!, e)
+          return r if r
+        end
+        return nil
+      elsif v.is_a?(Hash)
+        c = v['contexts']
+        c = call(:unwrap_json_like!, c) if c
+        return c if c.is_a?(Array)
+        return c['contexts'] if c.is_a?(Hash) && c['contexts'].is_a?(Array)
+        %w[body data result response payload vertexRagStore].each do |k|
+          r = call(:find_contexts_array_any!, v[k])
+          return r if r
+        end
+        v.each_value do |e|
+          r = call(:find_contexts_array_any!, e)
+          return r if r
+        end
+      end
+      nil
+    end,
+    coerce_contexts_array!: lambda do |maybe|
+      # 1) try as-is
+      arr = call(:find_contexts_array_any!, maybe)
+      arr = Array(arr)
+      # 2) if elements are stringified JSON contexts, parse them
+      arr = arr.map { |e| e.is_a?(String) ? (call(:safe_json, e) || e) : e }
+      # 3) final filter: keep only Hash elements (context objects)
+      arr.select { |e| e.is_a?(Hash) }
+    end,
+    # --- JSON helpers (gentle, friendly errors) -------------------------------
+    json_parse_gently!: lambda do |raw|
+      return raw if raw.is_a?(Hash) || raw.is_a?(Array)
+      s = raw.to_s.strip
+      return nil if s.empty?
+      # Common copy/paste mistakes: Ruby hashes or smart quotes
+      if s.include?('=>')
+        error('Invalid JSON: looks like a Ruby hash (=>). Convert to JSON (":" and double quotes).')
+      end
+      begin
+        JSON.parse(s)
+      rescue JSON::ParserError => e
+        head = s.gsub(/[\r\n\t]/, ' ')[0, 120]
+        error("Invalid JSON: #{e.message.split(':').first}. Starts with: #{head.inspect}")
+      end
+    end,
+    safe_json_obj!: lambda do |raw|
+      v = call(:json_parse_gently!, raw)
+      error('Invalid JSON for policy: empty input') if v.nil?
+      error('Invalid JSON for policy: expected object') unless v.is_a?(Hash)
+      v
+    end,
+    safe_json_arr!: lambda do |raw|
+      v = call(:json_parse_gently!, raw)
+      error('Invalid JSON for categories: expected array') unless v.is_a?(Array)
+      v
+    end,
+    # UI assembly helpers (schema-by-config)
+    ui_show_advanced_toggle: lambda do |default=false|
+      { name: 'show_advanced', label: 'Show advanced options',
+        type: 'boolean', control_type: 'checkbox',
+        default: default, sticky: true, extends_schema: true,
+        hint: 'Toggle to reveal advanced parameters.' }
+    end,
+    ui_truthy: lambda do |v|
+      (v == true) || (v.to_s.downcase == 'true') || (v.to_s == '1')
+    end,
+    ui_df_inputs: lambda do |object_definitions, cfg|
+      [
+        { name: 'email', label: 'Email', type: 'object',
+          properties: Array(object_definitions['email_envelope']), optional: false },
+        { name: 'rules_mode', control_type: 'select', default: 'none', pick_list: 'rules_modes' },
+        { name: 'rules_rows', ngIf: 'input.rules_mode == "rows"',
+          type: 'array', of: 'object', properties: Array(object_definitions['rule_rows_table']), optional: true },
+        { name: 'rules_json', ngIf: 'input.rules_mode == "json"', optional: true, control_type: 'text-area' },
+        { name: 'fallback_category', optional: true, default: 'Other' }
+      ]
+    end,
+    ui_policy_inputs: lambda do |object_definitions, cfg|
+      adv = call(:ui_truthy, cfg['show_advanced'])
+      base = [
+        { name: 'email_text', optional: false },
+        { name: 'policy_mode', label: 'Policy input mode', control_type: 'select',
+          options: [['None','none'], ['JSON','json']], default: 'none', optional: false,
+          extends_schema: true, hint: 'Switch to use JSON policy for testing.' }
+      ]
+      base << { name: 'model', label: 'Generative model', control_type: 'text',
+                optional: true, default: 'gemini-2.0-flash' } if adv
+      base << { name: 'policy_json', label: 'Policy JSON',
+                ngIf: 'input.policy_mode == "json"', optional: true,
+                hint: 'Paste policy spec JSON for testing (overrides defaults this run).' } if adv
+      base << { name: 'confidence_short_circuit', type: 'number', optional: true, default: 0.8,
+                hint: 'Short-circuit only when decision=IRRELEVANT and confidence ≥ this value.' }
+      base
+    end,
+    ui_embed_inputs: lambda do |object_definitions, cfg|
+      adv = call(:ui_truthy, cfg['show_advanced'])
+      base = [
+        { name: 'email_text', optional: false },
+        { name: 'categories_mode', label: 'Categories input mode', control_type: 'select',
+          options: [['Array (pills)','array'], ['JSON','json']], default: 'array',
+          optional: false, extends_schema: true, hint: 'Switch to paste categories as JSON.' },
+        { name: 'categories', type: 'array', of: 'object', optional: true,
+          ngIf: 'input.categories_mode == "array"',
+          properties: Array(object_definitions['category_def']) }
+      ]
+      if adv
+        base += [
+          { name: 'embedding_model', control_type: 'text', optional: true, default: 'text-embedding-005' },
+          { name: 'shortlist_k', type: 'integer', optional: true, default: 3 },
+          { name: 'categories_json', label: 'Categories JSON',
+            ngIf: 'input.categories_mode == "json"', optional: true, control_type: 'text-area',
+            hint: 'Paste categories array JSON for testing (overrides pills this run).' }
+        ]
+      end
+      base
+    end,
+    ui_rerank_inputs: lambda do |object_definitions, cfg|
+      adv = call(:ui_truthy, cfg['show_advanced'])
+      base = [
+        { name: 'email_text', optional: false },
+        { name: 'categories_mode', label: 'Categories input mode', control_type: 'select',
+          options: [['Array (pills)','array'], ['JSON','json']], default: 'array',
+          optional: false, extends_schema: true, hint: 'Switch to paste categories as JSON.' },
+        { name: 'categories', type: 'array', of: 'object', optional: true,
+          ngIf: 'input.mode == "llm" && input.categories_mode == "array"',
+          properties: Array(object_definitions['category_def']) },
+        { name: 'shortlist', type: 'array', of: 'string', optional: false },
+        { name: 'mode', control_type: 'select', optional: false, default: 'none',
+          options: [['None','none'], ['LLM','llm']], extends_schema: true }
+      ]
+      if adv
+        base << { name: 'generative_model', control_type: 'text', optional: true, default: 'gemini-2.0-flash',
+                  ngIf: 'input.mode == "llm"' }
+        base << { name: 'categories_json', label: 'Categories JSON', control_type: 'text-area',
+                  ngIf: 'input.mode == "llm" && input.categories_mode == "json"', optional: true,
+                  hint: 'Paste categories array JSON for testing (overrides pills this run).' }
+
+      end
+      base
+    end,
+    ui_ref_inputs: lambda do |object_definitions, cfg|
+      adv = call(:ui_truthy, cfg['show_advanced'])
+      base = [
+        { name: 'email_text', optional: false },
+        { name: 'categories_mode', label: 'Categories input mode', control_type: 'select',
+          options: [['Array (pills)','array'], ['JSON','json']], default: 'array',
+          optional: false, extends_schema: true, hint: 'Switch to paste categories as JSON.' },
+        { name: 'categories', type: 'array', of: 'object', optional: true,
+          ngIf: 'input.categories_mode == "array"',
+          properties: Array(object_definitions['category_def']) },
+        { name: 'shortlist', type: 'array', of: 'string', optional: true,
+          hint: 'If omitted, all categories are allowed.' },
+        { name: 'generative_model', control_type: 'text', optional: true, default: 'gemini-2.0-flash' },
+        { name: 'min_confidence', type: 'number', optional: true, default: 0.25 },
+        { name: 'fallback_category', optional: true, default: 'Other' }
+      ]
+      if adv
+        base << { name: 'categories_json', label: 'Categories JSON', control_type: 'text-area',
+                  ngIf: 'input.categories_mode == "json"', optional: true,
+                  hint: 'Paste categories array JSON for testing (overrides pills this run).' }
+      end
+      base
+    end,
+    ui_retrieve_inputs: lambda do |object_definitions, cfg|
+      adv = call(:ui_truthy, cfg['show_advanced'])
+      base = [
+        { name: 'email_text', optional: false, hint: 'Free text query (use norm_email_envelope upstream if you have subject/body).' },
+        { name: 'rag_corpus', label: 'RAG corpus ID', optional: false, hint: 'Vertex RAG corpus name/id.' }
+      ]
+      if adv
+        props = Array(object_definitions['rag_retrieval_config'])
+        if props.empty?
+          props = [
+            { name: 'top_k', type: 'integer', hint: 'Max contexts to return (default 6).' },
+            { name: 'filter', type: 'object', properties: [
+                { name: 'vector_distance_threshold', type: 'number' },
+                { name: 'vector_similarity_threshold', type: 'number' }
+            ]},
+            { name: 'ranking', type: 'object', properties: [
+                { name: 'rank_service_model' },
+                { name: 'llm_ranker_model' }
+            ]}
+          ]
+        end
+        base << { name: 'rag_retrieval_config', label: 'Retrieval config', type: 'object', optional: true,
+                  properties: props }
+      end
+      base
+    end,
+
+    # Steps
+    step_begin!: lambda do |action_id, input|
+      { 'action'=>action_id.to_s, 'started_at'=>Time.now.utc.iso8601,
+        't0'=>Time.now, 'cid'=>call(:ensure_correlation_id!, input) }
+    end,
+    step_ok!: lambda do |ctx, result, code=200, msg='OK', extras=nil|
+      env = call(:telemetry_envelope, ctx['t0'], ctx['cid'], true, code, msg)
+      out = (result || {}).merge(env)
+      call(:local_log_attach!, out,
+        call(:local_log_entry, ctx['action'], ctx['started_at'], ctx['t0'], out, nil, (extras||{})))
+    end,
+    step_err!: lambda do |ctx, err|
+      g   = call(:extract_google_error, err)
+      msg = [err.to_s, (g['message'] || nil)].compact.join(' | ')
+      env = call(:telemetry_envelope, ctx['t0'], ctx['cid'], false, call(:telemetry_parse_error_code, err), msg)
+      call(:local_log_attach!, env,
+        call(:local_log_entry, ctx['action'], ctx['started_at'], ctx['t0'], nil, err, { 'google_error'=>g }))
+      error(env)
+    end,
+
+    # --- Normalizers (single source of truth) --------------------------------
+    norm_email_envelope!: lambda do |h|
+      s = (h || {}).to_h
+      subj = (s['subject'] || s[:subject]).to_s
+      body = (s['body']    || s[:body]).to_s
+      error('Provide subject and/or body') if subj.strip.empty? && body.strip.empty?
+      {
+        'subject'=>subj, 'body'=>body, 'from'=>s['from'] || s[:from],
+        'headers'=> (s['headers'].is_a?(Hash) ? s['headers'] : {}),
+        'attachments'=> Array(s['attachments']),
+        'auth'=> (s['auth'].is_a?(Hash) ? s['auth'] : {}),
+        'email_text'=>call(:build_email_text, subj, body)
+      }
+    end,
+    norm_categories!: lambda do |raw|
+      cats = call(:safe_array, raw).map { |c|
+        c.is_a?(String) ? { 'name'=>c } :
+          { 'name'=>c['name'] || c[:name],
+            'description'=>c['description'] || c[:description],
+            'examples'=>call(:safe_array,(c['examples'] || c[:examples])) }
+      }.select { |c| c['name'].to_s.strip != '' }
+      error('At least 2 categories are required') if cats.length < 2
+      cats
+    end,
+
+    # --- Header helper (auth + routing) -----------------------------------------
+    request_headers_auth: lambda do |connection, correlation_id=nil, user_project=nil, req_params=nil|
+      h = {
+        'Authorization'      => "Bearer #{connection['access_token']}",
+        'Content-Type'       => 'application/json; charset=UTF-8',
+        'X-Client-Cid'       => (correlation_id.to_s if correlation_id.to_s != '')
+      }.compact
+      h['x-goog-user-project']  = user_project if user_project.to_s != ''
+      h['x-goog-request-params'] = req_params if req_params.to_s != ''
+      h
+    end,
+    # --- Salience blending (no extraction) --------------------------------------
+    maybe_append_salience: lambda do |email_text, salience, importance|
+      imp = (importance.to_f rescue 0.0)
+      return email_text if !salience.is_a?(Hash) && !salience.is_a?(Array)
+      return email_text if imp <= 0.0
+      block = salience.is_a?(Array) ? salience.compact.map(&:to_s).join(', ') : call(:json_compact, salience)
+      "#{email_text}\n\nSignals (weight=#{imp}):\n#{block}"
+    end,
+    # Compile Workato-native "single-table" rows into the rulepack JSON
+    hr_compile_rulepack_from_rows!: lambda do |rows|
+      arr = call(:safe_array, rows)
+      # normalize columns -> strings
+      rows_n = arr.map { |r| (r || {}).to_h.transform_keys(&:to_s) }
+      on = lambda { |r| (r['enabled'].to_s.strip.downcase != 'false') }
+      parse_list = lambda do |s|
+        str = s.to_s
+        if str.include?('|')
+          str.split('|').map { |x| x.strip }.reject(&:empty?)
+        elsif str.include?(',')
+          str.split(',').map { |x| x.strip }.reject(&:empty?)
+        else
+          str
+        end
+      end
+      sortd = rows_n.select(&on).sort_by { |r| (r['priority'].to_i rescue 999) }
+      hard = sortd.select { |r| r['family'] == 'HARD' }
+      soft = sortd.select { |r| r['family'] == 'SOFT' }
+      thr  = sortd.select { |r| r['family'] == 'THRESHOLD' }
+      grd  = sortd.select { |r| r['family'] == 'GUARD' }
+
+      hard_pack = {}
+      hard.each do |r|
+        fld = r['field'].to_s
+        (hard_pack[fld] ||= []) << {
+          'operator' => r['operator'],
+          'pattern'  => r['pattern'],
+          'value'    => parse_list.call(r['pattern']),
+          'action'   => r['action']
+        }
+      end
+
+      soft_pack = soft.map do |r|
+        {
+          'name'          => (r['rule_id'] || r['notes'] || 'signal'),
+          'field'         => r['field'],
+          'pattern_type'  => r['operator'],
+          'pattern_value' => r['pattern'],
+          'weight'        => (r['weight'].to_i rescue 0),
+          'cap_per_email' => (r['cap_per_email'].to_s == '' ? nil : r['cap_per_email'].to_i)
+        }
+      end
+
+      thr_pack = {}
+      thr.each do |r|
+        key = r['pattern'].to_s # keep | triage_min | triage_max
+        val = (r['weight'].to_i rescue 0)
+        thr_pack[key] = val if key != ''
+      end
+
+      guards = {}
+      grd.each do |r|
+        cat = r['category'].to_s; next if cat == ''
+        g = (guards[cat] ||= { 'required' => [], 'forbidden' => [], 'flags' => {} })
+        case r['operator']
+        when 'required'  then g['required']  << r['pattern']
+        when 'forbidden' then g['forbidden'] << r['pattern']
+        when 'value'     then g['flags'][(r['pattern'] || '').to_s] = (r['flag_a'] || r['flag_b'] || true)
+        when 'is_true'   then g['flags'][(r['pattern'] || '').to_s] = true
+        end
+      end
+
+      {
+        'hard_exclude' => hard_pack,
+        'soft_signals' => soft_pack,
+        'thresholds'   => thr_pack,
+        'guards'       => guards
+      }
+    end,
+    hr_rx:        lambda { |s| Regexp.new(s) rescue nil },
+    hr_list:      lambda { |s| s.to_s.split(/[|,]/).map { |x| x.strip.downcase }.reject(&:empty?) },
+    hr_pick:      lambda { |email|
+      {
+        'subject'     => email['subject'].to_s,
+        'body'        => email['body'].to_s,
+        'from'        => email['from'].to_s,
+        'headers'     => (email['headers'] || {}),
+        'attachments' => Array(email['attachments']).map { |a| a['filename'].to_s.downcase },
+        'auth'        => (email['auth'] || {})
+      }
+    },
+    hr_eval_hard?: lambda do |email, hard_pack|
+      f = call(:hr_pick, email)
+
+      # generic helper
+      match = lambda do |field, rule|
+        case rule['operator']
+        when 'equals'
+          k, v = rule['pattern'].to_s.split(':', 2)
+          val = (field == 'headers' ? f['headers'][k.to_s] : f[field]).to_s.downcase
+          return val.start_with?((v || '').downcase)
+        when 'contains'
+          f[field].to_s.downcase.include?(rule['pattern'].to_s.downcase)
+        when 'regex'
+          (rx = call(:hr_rx, rule['pattern'])) && f[field].to_s =~ rx
+        when 'header_present'
+          f['headers'].key?(rule['pattern'].to_s)
+        when 'ext_in'
+          exts = call(:hr_list, rule['pattern'])
+          f['attachments'].any? { |fn| exts.any? { |e| fn.end_with?(".#{e}") || fn =~ /\.(#{e})$/ } }
+        when 'is_true'
+          # security flags carried on email['auth']
+          f['auth'][rule['pattern'].to_s] == true
+        else false
+        end
+      end
+
+      hard_pack.each do |field, rules|
+        Array(rules).each do |r|
+          if match.call(field, r)
+            return { hit: true, action: r['action'] || 'exclude', reason: "#{field}:#{r['operator']}" }
+          end
+        end
+      end
+
+      { hit: false }
+    end,
+    hr_eval_soft: lambda do |email, signals|
+      f = call(:hr_pick, email)
+      score = 0; hits = []
+
+      signals.each do |s|
+        field = (s['field'] || 'any')
+        text_sources =
+          case field
+          when 'subject' then [f['subject']]
+          when 'body'    then [f['body']]
+          when 'from'    then [f['from']]
+          when 'headers' then [f['headers'].to_json]
+          when 'attachments' then [f['attachments'].join(' ')]
+          else [f['subject'], f['body']]
+          end
+
+        matched =
+          case s['pattern_type']
+          when 'regex'
+            (rx = call(:hr_rx, s['pattern_value'])) && text_sources.any? { |t| t =~ rx }
+          when 'contains'
+            needles = call(:hr_list, s['pattern_value'])
+            text_sources.any? { |t| nt = t.to_s.downcase; needles.any? { |n| nt.include?(n) } }
+          when 'ext_in'
+            exts = call(:hr_list, s['pattern_value'])
+            f['attachments'].any? { |fn| exts.any? { |e| fn.end_with?(".#{e}") || fn =~ /\.(#{e})$/ } }
+          when 'header_present'
+            f['headers'].key?(s['pattern_value'].to_s)
+          else false
+          end
+
+        if matched
+          score += s['weight'].to_i
+          hits << (s['name'] || 'signal')
+        end
+      end
+
+      { score: score, matched: hits }
+    end,
+    hr_eval_decide: lambda do |score, thr|
+      keep = (thr['keep'] || 6).to_i
+      lo   = (thr['triage_min'] || 4).to_i
+      hi   = (thr['triage_max'] || 5).to_i
+      if score >= keep then 'HR-REQUEST'
+      elsif score >= lo && score <= hi then 'REVIEW'
+      else 'IRRELEVANT'
+      end
+    end,
+    hr_eval_guards_ok?: lambda do |category, email, guards|
+      g = guards[category] || {}
+      f = {
+        'subject' => email['subject'].to_s,
+        'body'    => email['body'].to_s
+      }
+
+      Array(g['required']).each do |rxs|
+        rx = call(:hr_rx, rxs); return false unless rx && (f['subject'] =~ rx || f['body'] =~ rx)
+      end
+      Array(g['forbidden']).each do |rxs|
+        rx = call(:hr_rx, rxs); return false if rx && (f['subject'] =~ rx || f['body'] =~ rx)
+      end
+      true
+    end,
     ensure_correlation_id!: lambda do |input|
       cid = input['correlation_id']
       (cid.is_a?(String) && cid.strip != '') ? cid.strip : SecureRandom.uuid
@@ -2547,7 +4355,7 @@ require 'securerandom'
         'generationConfig'  => gen_cfg
       }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
 
-      resp = post(url).headers(call(:request_headers_auth, connection, corr, connection['user_project'], req_params))
+      resp = post(url).headers(call(:request_headers_auth_1, connection, corr, connection['user_project'], req_params))
                       .payload(call(:json_compact, payload))
       code = call(:telemetry_success_code, resp)
 
@@ -2735,32 +4543,6 @@ require 'securerandom'
       }
     end,
 
-    # Build canonical retrieval opts from either the object field
-    #   input['rag_retrieval_config'] OR legacy flat fields on the action.
-    # Returns a Hash suitable for build_rag_retrieve_payload.
-    build_retrieval_opts_from_input!: lambda do |input|
-      cfg = (input['rag_retrieval_config'].is_a?(Hash) ? input['rag_retrieval_config'] : {})
-      filt = cfg['filter'].is_a?(Hash) ? cfg['filter'] : {}
-      rank = cfg['ranking'].is_a?(Hash) ? cfg['ranking'] : {}
-
-      topk = cfg['top_k'] || input['similarity_top_k']
-      dist = filt['vector_distance_threshold']   || input['vector_distance_threshold']
-      sim  = filt['vector_similarity_threshold'] || input['vector_similarity_threshold']
-      rsm  = rank['rank_service_model']          || input['rank_service_model']
-      llm  = rank['llm_ranker_model']            || input['llm_ranker_model']
-
-      # Validate oneof unions
-      call(:guard_threshold_union!, dist, sim)
-      call(:guard_ranker_union!, rsm, llm)
-
-      {
-        'topK'                         => topk,
-        'vectorDistanceThreshold'      => dist,
-        'vectorSimilarityThreshold'    => sim,
-        'rankServiceModel'             => rsm,
-        'llmRankerModel'               => llm
-      }.delete_if { |_k, v| v.nil? || v == '' }
-    end,
     # --- Auth (JWT → OAuth) -----------------------------------------------
     const_default_scopes: lambda { ['https://www.googleapis.com/auth/cloud-platform'].freeze },
     b64url: lambda do |bytes|
@@ -2845,10 +4627,10 @@ require 'securerandom'
     # --- Purpose-specific header helpers ---------------------------------
     headers_rag: lambda do |connection, correlation_id, request_params=nil|
       # Retrieval calls: NEVER send x-goog-user-project
-      call(:request_headers_auth, connection, correlation_id, nil, request_params)
+      call(:request_headers_auth_1, connection, correlation_id, nil, request_params)
     end,
     # Unified auth+header builder.
-    request_headers_auth: lambda do |connection, correlation_id, user_project=nil, request_params=nil, opts=nil|
+    request_headers_auth_1: lambda do |connection, correlation_id, user_project=nil, request_params=nil, opts=nil|
       # Backward-compatible signature; final arg `opts` is optional:
       #   opts = {
       #     scopes:        Array|String (default: cloud-platform),
@@ -2901,7 +4683,7 @@ require 'securerandom'
           unless call(:normalize_boolean, connection['prod_mode'])
             connection['__last_tail_log_error'] = {
               timestamp: Time.now.utc.iso8601,
-              method: 'request_headers_auth',
+              method: 'request_headers_auth_1',
               message: e.message.to_s[0,512],
               class: e.class.to_s
             }
@@ -3101,7 +4883,6 @@ require 'securerandom'
       arr = arr['contexts'] if arr.is_a?(Hash) && arr.key?('contexts')
       Array(arr)
     end,
-
     guard_threshold_union!: lambda do |dist, sim|
       return true if dist.nil? || dist.to_s == ''
       return true if sim.nil?  || sim.to_s  == ''
@@ -3161,17 +4942,27 @@ require 'securerandom'
     end,
     map_context_chunks: lambda do |raw_contexts, maxn = 20|
       call(:safe_array, raw_contexts).first(maxn).each_with_index.map do |c, i|
-        md = (c['metadata'] || {}).to_h
+        h  = c.is_a?(Hash) ? c : {}
+        # metadata may arrive as a JSON string
+        md_raw = h['metadata']
+        md     = md_raw.is_a?(Hash) ? md_raw : (call(:safe_json, md_raw) || {})
+        # text/id/score aliases across API variants
+        text = h['text'] ||
+               h['chunkText'] ||
+               h.dig('context','text') ||
+               h.dig('documentContext','text') ||
+               ''
+        src = h['sourceDisplayName'] || md['source']
+        uri = h['sourceUri'] || md['uri'] || md['gcsUri'] || md['url']
         {
-          'id'       => (c['chunkId'] || "ctx-#{i+1}"),
-          'text'     => c['text'].to_s,
-          'score'    => (c['score'] || c['relevanceScore'] || 0.0).to_f,
-          'source'   => (c['sourceDisplayName'] || c.dig('metadata','source')),
-          'uri'      => (c['sourceUri']        || c.dig('metadata','uri')),
-          'metadata' => md,
-          'metadata_kv' => md.map { |k,v| { 'key' => k.to_s, 'value' => v } },
+          'id'            => (h['chunkId'] || h['id'] || "ctx-#{i+1}"),
+          'text'          => text.to_s,
+          'score'         => (h['score'] || h['relevanceScore'] || 0.0).to_f,
+          'source'        => src,
+          'uri'           => uri,
+          'metadata'      => md,
+          'metadata_kv'   => md.map { |k,v| { 'key' => k.to_s, 'value' => v } },
           'metadata_json' => (md.empty? ? nil : md.to_json)
-
         }
       end
     end,
@@ -3302,7 +5093,7 @@ require 'securerandom'
       (instances || []).each_slice(max) do |slice|
         url  = call(:aipl_v1_url, connection, loc, "#{model_path}:predict")
         resp = post(url)
-                .headers(call(:request_headers_auth, connection, (corr || call(:build_correlation_id)), connection['user_project'], req_params))
+                .headers(call(:request_headers_auth_1, connection, (corr || call(:build_correlation_id)), connection['user_project'], req_params))
                 .payload({
                   'instances'  => slice,
                   'parameters' => (params.presence || {})
@@ -3342,7 +5133,7 @@ require 'securerandom'
     safe_parse_json: lambda do |s|
       JSON.parse(s) rescue { 'answer' => s }
     end,
-    llm_referee: lambda do |connection, model, email_text, shortlist_names, all_cats, fallback_category = nil, corr=nil|
+    llm_referee: lambda do |connection, model, email_text, shortlist_names, all_cats, fallback_category = nil, corr=nil, system_preamble=nil|
       # Minimal, schema-constrained JSON referee using Gemini
       model_path = call(:build_model_path_with_global_preview, connection, model)
       req_params = "model=#{model_path}"
@@ -3353,8 +5144,8 @@ require 'securerandom'
                    else
                      cats_norm.map { |c| c['name'] }
                    end
-
-      system_text = <<~SYS
+      # System Prompt (overrideable per-run)
+      system_text = system_preamble.presence || <<~SYS
         You are a strict email classifier. Choose exactly one category from the allowed list.
         Output MUST be valid JSON only (no prose).
         Confidence is a calibrated estimate in [0,1]. Keep reasoning crisp (<= 2 sentences).
@@ -3415,7 +5206,7 @@ require 'securerandom'
       loc  = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
       url  = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
       resp = post(url)
-               .headers(call(:request_headers_auth, connection, (corr || call(:build_correlation_id)), connection['user_project'], req_params))
+               .headers(call(:request_headers_auth_1, connection, (corr || call(:build_correlation_id)), connection['user_project'], req_params))
                .payload(call(:json_compact, payload))
 
       text   = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s.strip
@@ -3579,13 +5370,16 @@ require 'securerandom'
       # Keep head of the message if extremely long
       t.length > max_chars ? t[0, max_chars] : t
     end,
-    extract_salient_span!: lambda do |connection, subject, body, model='gemini-2.0-flash', max_span=500, temperature=0, corr=nil|
+    extract_salient_span!: lambda do |connection, subject, body, model='gemini-2.0-flash', max_span=500, temperature=0, corr=nil, system_preamble=nil|
       plain = call(:email_minify, subject, body)
       focus = call(:email_focus_trim, plain, 8000)
 
-      system_text = "Extract the single most important sentence or short paragraph from an email. " \
-                    "Return valid JSON only. Keep the extracted span under #{max_span} characters. " \
-                    "importance is a calibrated score in [0,1]."
+      # System Prompt (overrideable per-run)
+      system_text = system_preamble.presence || (
+        "Extract the single most important sentence or short paragraph from an email. " \
+        "Return valid JSON only. Keep the extracted span under #{max_span} characters. " \
+        "importance is a calibrated score in [0,1]."
+      )
 
       gen_cfg = {
         'temperature'      => temperature.to_f,
@@ -3615,7 +5409,7 @@ require 'securerandom'
       loc = (connection['location'].presence || 'global').to_s.downcase
       url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
       resp = post(url)
-               .headers(call(:request_headers_auth, connection, (corr || call(:build_correlation_id)), nil, req_params))
+               .headers(call(:request_headers_auth_1, connection, (corr || call(:build_correlation_id)), nil, req_params))
                .payload({
                   'contents' => contents,
                   'systemInstruction' => { 'role' => 'system', 'parts' => [ { 'text' => system_text } ] },
@@ -3644,7 +5438,7 @@ require 'securerandom'
       }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
 
       begin
-        post(url).headers(call(:request_headers_auth, connection, (corr || call(:build_correlation_id)), connection['user_project'], req_params))
+        post(url).headers(call(:request_headers_auth_1, connection, (corr || call(:build_correlation_id)), connection['user_project'], req_params))
                  .payload(call(:json_compact, payload))
 
       rescue
