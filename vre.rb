@@ -573,9 +573,8 @@ require 'securerandom'
               { name: 'category' }, { name: 'flag_a' }, { name: 'flag_b' },
               { name: 'enabled' }, { name: 'priority' }, { name: 'notes' }
             ]},
-          { name: 'rules_json', label: 'Rules (compiled JSON)',
-            optional: true, ngIf: 'input.rules_mode == "json"',
-            hint: 'If present, overrides rows.' },
+          { name: 'rules_json', label: 'Rules (compiled JSON)', control_type: 'text-area',
+            optional: true, ngIf: 'input.rules_mode == "json"', hint: 'If present, overrides rows.' },
 
           # === (F) Decision & Fallbacks -----------------------------------
           { name: 'min_confidence', label: 'Minimum confidence',
@@ -960,9 +959,8 @@ require 'securerandom'
               { name: 'category' }, { name: 'flag_a' }, { name: 'flag_b' },
               { name: 'enabled' }, { name: 'priority' }, { name: 'notes' }
             ]},
-          { name: 'rules_json', label: 'Rules (compiled JSON)',
-            optional: true, ngIf: 'input.rules_mode == "json"',
-            hint: 'If present, overrides rows.' },
+          { name: 'rules_json', label: 'Rules (compiled JSON)', control_type: 'text-area'
+            optional: true, ngIf: 'input.rules_mode == "json"', hint: 'If present, overrides rows.' },
 
           # === (F) Decision & Fallbacks -----------------------------------
           { name: 'min_confidence', label: 'Minimum confidence',
@@ -2798,9 +2796,7 @@ require 'securerandom'
         # Optional policy spec via JSON (testing path)
         policy_spec = nil
         if input['policy_mode'].to_s == 'json' && input['policy_json'].present?
-          spec = call(:safe_json, input['policy_json'])
-          error('Invalid JSON for policy: expected object') unless spec.is_a?(Hash)
-          policy_spec = spec
+          policy_spec = call(:safe_json_obj!, input['policy_json'])
         end
 
         system_text = <<~SYS
@@ -2885,9 +2881,7 @@ require 'securerandom'
         # Select categories source (array vs JSON)
         cats_raw =
           if input['categories_mode'].to_s == 'json' && input['categories_json'].present?
-            parsed = call(:safe_json, input['categories_json'])
-            error('Invalid JSON for categories: expected array') unless parsed.is_a?(Array)
-            parsed
+            call(:safe_json_arr!, input['categories_json'])
           else
             input['categories']
           end
@@ -2972,9 +2966,7 @@ require 'securerandom'
         # LLM listwise: reuse your referee to get distribution over shortlist
         cats_raw =
           if input['categories_mode'].to_s == 'json' && input['categories_json'].present?
-            parsed = call(:safe_json, input['categories_json'])
-            error('Invalid JSON for categories: expected array') unless parsed.is_a?(Array)
-            parsed
+            call(:safe_json_arr!, input['categories_json'])
           else
             input['categories']
           end
@@ -3032,9 +3024,7 @@ require 'securerandom'
         # Select categories source (array vs JSON)
         cats_raw =
           if input['categories_mode'].to_s == 'json' && input['categories_json'].present?
-            parsed = call(:safe_json, input['categories_json'])
-            error('Invalid JSON for categories: expected array') unless parsed.is_a?(Array)
-            parsed
+            call(:safe_json_arr!, input['categories_json'])
           else
             input['categories']
           end
@@ -3229,6 +3219,33 @@ require 'securerandom'
   
   # --------- METHODS ------------------------------------------------------
   methods: {
+    # --- JSON helpers (gentle, friendly errors) -------------------------------
+    json_parse_gently!: lambda do |raw|
+      return raw if raw.is_a?(Hash) || raw.is_a?(Array)
+      s = raw.to_s.strip
+      return nil if s.empty?
+      # Common copy/paste mistakes: Ruby hashes or smart quotes
+      if s.include?('=>')
+        error('Invalid JSON: looks like a Ruby hash (=>). Convert to JSON (":" and double quotes).')
+      end
+      begin
+        JSON.parse(s)
+      rescue JSON::ParserError => e
+        head = s.gsub(/[\r\n\t]/, ' ')[0, 120]
+        error("Invalid JSON: #{e.message.split(':').first}. Starts with: #{head.inspect}")
+      end
+    end,
+    safe_json_obj!: lambda do |raw|
+      v = call(:json_parse_gently!, raw)
+      error('Invalid JSON for policy: empty input') if v.nil?
+      error('Invalid JSON for policy: expected object') unless v.is_a?(Hash)
+      v
+    end,
+    safe_json_arr!: lambda do |raw|
+      v = call(:json_parse_gently!, raw)
+      error('Invalid JSON for categories: expected array') unless v.is_a?(Array)
+      v
+    end,
     # ---------- UI assembly helpers (schema-by-config) --------------------------
     ui_show_advanced_toggle: lambda do |default=false|
       { name: 'show_advanced', label: 'Show advanced options',
@@ -3246,7 +3263,7 @@ require 'securerandom'
         { name: 'rules_mode', control_type: 'select', default: 'none', pick_list: 'rules_modes' },
         { name: 'rules_rows', ngIf: 'input.rules_mode == "rows"',
           type: 'array', of: 'object', properties: Array(object_definitions['rule_rows_table']), optional: true },
-        { name: 'rules_json', ngIf: 'input.rules_mode == "json"', optional: true },
+        { name: 'rules_json', ngIf: 'input.rules_mode == "json"', optional: true, control_type: 'text-area' },
         { name: 'fallback_category', optional: true, default: 'Other' }
       ]
     end,
