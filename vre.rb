@@ -4649,21 +4649,12 @@ require 'securerandom'
     normalize_drive_file_id:   lambda { |raw| call(:normalize_drive_resource_id, raw) },
     normalize_drive_folder_id: lambda { |raw| call(:normalize_drive_resource_id, raw) },
     normalize_retrieve_contexts!: lambda do |raw_resp|
-      # Accept:
-      #   1) { "contexts":[...] }
-      #   2) { "contexts":{"contexts":[...]} }
-      #   3) stringified JSON of either of the above
-      doc = raw_resp.is_a?(String) ? (call(:safe_json, raw_resp) || {}) : raw_resp
-      # Some runtimes embed the body as a string
-      if doc.is_a?(Hash) && doc['body'].is_a?(String)
-        parsed = call(:safe_json, doc['body'])
-        doc = parsed if parsed.is_a?(Hash)
-      end
-      arr = doc.is_a?(Hash) ? doc['contexts'] : doc
-      arr = (call(:safe_json, arr) || arr) if arr.is_a?(String)
+      # Accept both shapes:
+      #   { "contexts": [ {...}, {...} ] }
+      #   { "contexts": { "contexts": [ ... ] } }  # some beta responses
+      arr = raw_resp['contexts']
       arr = arr['contexts'] if arr.is_a?(Hash) && arr.key?('contexts')
       Array(arr)
-    end,
 
     guard_threshold_union!: lambda do |dist, sim|
       return true if dist.nil? || dist.to_s == ''
