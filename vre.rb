@@ -959,7 +959,7 @@ require 'securerandom'
               { name: 'category' }, { name: 'flag_a' }, { name: 'flag_b' },
               { name: 'enabled' }, { name: 'priority' }, { name: 'notes' }
             ]},
-          { name: 'rules_json', label: 'Rules (compiled JSON)', control_type: 'text-area'
+          { name: 'rules_json', label: 'Rules (compiled JSON)', control_type: 'text-area',
             optional: true, ngIf: 'input.rules_mode == "json"', hint: 'If present, overrides rows.' },
 
           # === (F) Decision & Fallbacks -----------------------------------
@@ -3246,7 +3246,7 @@ require 'securerandom'
       error('Invalid JSON for categories: expected array') unless v.is_a?(Array)
       v
     end,
-    # ---------- UI assembly helpers (schema-by-config) --------------------------
+    # UI assembly helpers (schema-by-config)
     ui_show_advanced_toggle: lambda do |default=false|
       { name: 'show_advanced', label: 'Show advanced options',
         type: 'boolean', control_type: 'checkbox',
@@ -3291,7 +3291,7 @@ require 'securerandom'
         { name: 'categories_mode', label: 'Categories input mode', control_type: 'select',
           options: [['Array (pills)','array'], ['JSON','json']], default: 'array',
           optional: false, extends_schema: true, hint: 'Switch to paste categories as JSON.' },
-        { name: 'categories', type: 'array', of: 'object', optional: false,
+        { name: 'categories', type: 'array', of: 'object', optional: true,
           ngIf: 'input.categories_mode == "array"',
           properties: Array(object_definitions['category_def']) }
       ]
@@ -3300,7 +3300,7 @@ require 'securerandom'
           { name: 'embedding_model', control_type: 'text', optional: true, default: 'text-embedding-005' },
           { name: 'shortlist_k', type: 'integer', optional: true, default: 3 },
           { name: 'categories_json', label: 'Categories JSON',
-            ngIf: 'input.categories_mode == "json"', optional: true,
+            ngIf: 'input.categories_mode == "json"', optional: true, control_type: 'text-area',
             hint: 'Paste categories array JSON for testing (overrides pills this run).' }
         ]
       end
@@ -3313,18 +3313,18 @@ require 'securerandom'
         { name: 'categories_mode', label: 'Categories input mode', control_type: 'select',
           options: [['Array (pills)','array'], ['JSON','json']], default: 'array',
           optional: false, extends_schema: true, hint: 'Switch to paste categories as JSON.' },
-        { name: 'categories', type: 'array', of: 'object', optional: false,
-          ngIf: 'input.categories_mode == "array"',
+        { name: 'categories', type: 'array', of: 'object', optional: true,
+          ngIf: 'input.mode == "llm" && input.categories_mode == "array"',
           properties: Array(object_definitions['category_def']) },
         { name: 'shortlist', type: 'array', of: 'string', optional: false },
         { name: 'mode', control_type: 'select', optional: false, default: 'none',
-          options: [['None','none'], ['LLM','llm']] }
+          options: [['None','none'], ['LLM','llm']], extends_schema: true }
       ]
       if adv
         base << { name: 'generative_model', control_type: 'text', optional: true, default: 'gemini-2.0-flash',
                   ngIf: 'input.mode == "llm"' }
-        base << { name: 'categories_json', label: 'Categories JSON',
-                  ngIf: 'input.categories_mode == "json"', optional: true,
+        base << { name: 'categories_json', label: 'Categories JSON', control_type: 'text-area',
+                  ngIf: 'input.mode == "llm" && input.categories_mode == "json"', optional: true,
                   hint: 'Paste categories array JSON for testing (overrides pills this run).' }
 
       end
@@ -3337,7 +3337,7 @@ require 'securerandom'
         { name: 'categories_mode', label: 'Categories input mode', control_type: 'select',
           options: [['Array (pills)','array'], ['JSON','json']], default: 'array',
           optional: false, extends_schema: true, hint: 'Switch to paste categories as JSON.' },
-        { name: 'categories', type: 'array', of: 'object', optional: false,
+        { name: 'categories', type: 'array', of: 'object', optional: true,
           ngIf: 'input.categories_mode == "array"',
           properties: Array(object_definitions['category_def']) },
         { name: 'shortlist', type: 'array', of: 'string', optional: true,
@@ -3347,7 +3347,7 @@ require 'securerandom'
         { name: 'fallback_category', optional: true, default: 'Other' }
       ]
       if adv
-        base << { name: 'categories_json', label: 'Categories JSON',
+        base << { name: 'categories_json', label: 'Categories JSON', control_type: 'text-area',
                   ngIf: 'input.categories_mode == "json"', optional: true,
                   hint: 'Paste categories array JSON for testing (overrides pills this run).' }
       end
@@ -3380,6 +3380,7 @@ require 'securerandom'
       base
     end,
 
+    # Steps
     step_begin!: lambda do |action_id, input|
       { 'action'=>action_id.to_s, 'started_at'=>Time.now.utc.iso8601,
         't0'=>Time.now, 'cid'=>call(:ensure_correlation_id!, input) }
@@ -3423,6 +3424,7 @@ require 'securerandom'
       error('At least 2 categories are required') if cats.length < 2
       cats
     end,
+
     # --- Header helper (auth + routing) -----------------------------------------
     request_headers_auth: lambda do |connection, correlation_id=nil, user_project=nil, req_params=nil|
       h = {
