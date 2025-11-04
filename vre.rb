@@ -1536,9 +1536,8 @@ require 'securerandom'
         # ---- Build ragResources ---------------------------------------------------------
         rag_resources = {}
         rag_resources['ragCorpus']  = corpus if corpus.present?
-        if Array(input['rag_file_ids']).present?
-          rag_resources['ragFileIds'] = Array(input['rag_file_ids'])
-        end
+        file_ids = Array(input['rag_file_ids']).map { |v| v.to_s.strip }.reject(&:empty?)
+        rag_resources['ragFileIds'] = file_ids if file_ids.any?
         # v1 requires ragResources; be explicit and fail early
         if rag_resources.empty?
           error('Provide rag_corpus and/or rag_file_ids (vertexRagStore.ragResources is required).')
@@ -1546,7 +1545,7 @@ require 'securerandom'
 
         # ---- Retrieval config (v1) -----------------------------------------------------
         retrieval_cfg = {}
-        retrieval_cfg['topK'] = input['top_k'] if input['top_k'].present?
+        retrieval_cfg['topK'] = (input['top_k'].presence || 50).to_i
 
         filter = {}
         if input['vector_distance_threshold'].present?
@@ -1646,6 +1645,21 @@ require 'securerandom'
             'count'         => enriched.length
           }
         }
+
+        # Optional request/response preview in non-prod with debug=true
+        if !call(:normalize_boolean, connection['prod_mode']) && input['debug']
+          out['request_preview'] = {
+            'url'     => url,
+            'headers' => call(:redact_json, headers),
+            'payload' => call(:redact_json, body),
+            'parent'  => parent,
+            'rag_corpus_expanded' => corpus
+          }
+          out['response_preview'] = {
+            'top_level_keys' => (doc.is_a?(Hash) ? doc.keys : []),
+            'raw_count'      => Array(arr).length
+          }
+        end
 
         call(:step_ok!, ctx, out, 200, 'OK', { 'count' => enriched.length })
 
