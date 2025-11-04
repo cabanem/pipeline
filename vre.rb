@@ -1472,38 +1472,27 @@ require 'securerandom'
 
         base + (show_adv ? adv : []) + Array(od['observability_input_fields']) # includes cid, etc.
       end,
-      output_fields: lambda do |_od, _connection|
-        context_props = [
-          { name: 'sourceUri' }, { name: 'sourceDisplayName' },
-          { name: 'text' }, { name: 'score', type: 'number' },
-          { name: 'similarity', type: 'number' },
-          { name: 'chunk', type: 'object', properties: [
-              { name: 'text' },
-              { name: 'pageSpan', type: 'object', properties: [
-                  { name: 'firstPage', type: 'integer' },
-                  { name: 'lastPage',  type: 'integer' }
-              ] }
-          ] }
-        ]
-
+      output_fields: lambda do |object_definitions, connection|
         [
-          { name: 'contexts', type: 'object', properties: [
-              { name: 'contexts', type: 'array', of: 'object', properties: context_props }
-          ] },
-          { name: 'contexts_flat', label: 'contexts (flat)', type: 'array', of: 'object', properties: context_props },
-          { name: 'count', type: 'integer' },
-          { name: 'debug_shape', type: 'object', properties: [
-              { name: 'resp_class' }, { name: 'top_keys', type: 'array', of: 'string' }, { name: 'count', type: 'integer' }
-          ]},
-
-          # Telemetry (from step_ok!)
+          { name: 'question' },
+          { name: 'contexts', type: 'array', of: 'object', properties: [
+              { name: 'id' },
+              { name: 'text' },
+              { name: 'score', type: 'number' },
+              { name: 'source' },
+              { name: 'uri' },
+              { name: 'metadata', type: 'object' },
+              { name: 'metadata_kv', label: 'metadata (KV)', type: 'array', of: 'object', properties: object_definitions['kv_pair'] },
+              { name: 'metadata_json', label: 'metadata (JSON)', }
+            ]
+          }
+        ] + [
           { name: 'ok', type: 'boolean' },
           { name: 'telemetry', type: 'object', properties: [
               { name: 'http_status', type: 'integer' },
-              { name: 'message' },
-              { name: 'duration_ms', type: 'integer' },
+              { name: 'message' }, { name: 'duration_ms', type: 'integer' },
               { name: 'correlation_id' }
-          ] }
+            ]}
         ]
       end,
       execute: lambda do |connection, input|
