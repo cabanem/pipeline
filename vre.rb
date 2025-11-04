@@ -1520,7 +1520,7 @@ require 'securerandom'
           error('rag_corpus is required') if corpus.to_s.strip.empty?
 
           # Optional restrict-to-file IDs (accept empty)
-          restrict_ids = call(:sanitize_drive_ids, input['restrict_to_file_ids'], allow_empty: true, label: 'restrict_to_file_ids')
+          restrict_ids = call(:sanitize_drive_ids, input['rag_file_ids'], allow_empty: true, label: 'rag_file_ids')
 
           # Build canonical retrieval opts (handles unions + legacy fields)
           opts    = call(:build_retrieval_opts_from_input!, input)
@@ -1536,7 +1536,7 @@ require 'securerandom'
 
           # Normalize v1 / v1beta1 shape and map to your chunk shape
           raw_contexts = call(:normalize_retrieve_contexts!, resp)
-          maxn         = call(:clamp_int, (input['max_chunks'] || 20), 1, 100)
+          maxn         = call(:clamp_int, (input['top_k'] || 20), 1, 100)
           contexts     = call(:map_context_chunks, raw_contexts, maxn)
 
           out = { 'contexts' => contexts }
@@ -4297,7 +4297,7 @@ require 'securerandom'
       filt = cfg['filter'].is_a?(Hash) ? cfg['filter'] : {}
       rank = cfg['ranking'].is_a?(Hash) ? cfg['ranking'] : {}
 
-      topk = cfg['top_k'] || input['similarity_top_k']
+      topk = cfg['top_k'] || input['top_k']
       dist = filt['vector_distance_threshold']   || input['vector_distance_threshold']
       sim  = filt['vector_similarity_threshold'] || input['vector_similarity_threshold']
       rsm  = rank['rank_service_model']          || input['rank_service_model']
