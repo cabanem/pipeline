@@ -1794,7 +1794,7 @@ require 'securerandom'
 
     # RAG store engine
     rag_retrieve_contexts: {
-      title: 'RAG Engine: Fetch contexts',
+      title: 'RAG Engine: Retrieve contexts',
       subtitle: 'projects.locations:retrieveContexts (Vertex RAG Store)',
       help: lambda do |_|
         {
@@ -2806,7 +2806,7 @@ require 'securerandom'
             nil
           end
 
-        pre = { hit => false }
+        pre = { 'hit' => false }
         if rules.is_a?(Hash)
           hard = call(:hr_eval_hard?, {
             'subject'=>subj, 'body'=>body, 'from'=>env['from'],
@@ -2860,7 +2860,6 @@ require 'securerandom'
         }.merge({ 'ok'=>true, 'telemetry'=>{ 'http_status'=>200, 'message'=>'OK', 'duration_ms'=>12, 'correlation_id'=>'corr' } })
       end
     },
-    # --- AI policy filter (LLM, strict JSON) -----------------------------------
     ai_policy_filter: {
       title: 'Filter: AI policy (optional)',
       subtitle: 'Fuzzy triage via LLM under a strict JSON schema',
@@ -2948,7 +2947,6 @@ require 'securerandom'
         }
       end
     },
-    # --- Embedder: email vs categories ----------------------------------------
     embed_text_against_categories: {
       title: 'Embed: Email vs categories',
       subtitle: 'Cosine similarity → scores + shortlist',
@@ -3024,7 +3022,6 @@ require 'securerandom'
         }
       end
     },
-    # --- Re-ranker: shortlist (LLM distribution) -------------------------------
     rerank_shortlist: {
       title: 'Re-rank: Shortlist',
       subtitle: 'Optional LLM listwise re-ordering of categories',
@@ -3093,7 +3090,6 @@ require 'securerandom'
         }
       end
     },
-    # --- LLM referee (can consume ranked contexts) -----------------------------
     llm_referee_with_contexts: {
       title: 'Referee: LLM (with optional contexts)',
       subtitle: 'Adjudicate among shortlist; accepts ranked RAG chunks',
@@ -3108,15 +3104,55 @@ require 'securerandom'
           hint: 'Toggle to reveal advanced parameters.' }
       ], 
       input_fields: lambda do |object_definitions, connection, config_fields|
-        call(:ui_ref_inputs, object_definitions, config_fields) +
-          Array(object_definitions['observability_input_fields'])
+         call(:ui_ref_inputs, object_definitions, config_fields) + [
+           # --- Salience sidecar (disabled by default; 2-call flow when LLM) ---
+           { name: 'salience_mode', label: 'Salience extraction',
+             control_type: 'select', optional: true, default: 'off', extends_schema: true,
+             options: [['Off','off'], ['Heuristic (no LLM)','heuristic'], ['LLM (extra API call)','llm']],
+             hint: 'Extract a salient sentence/paragraph before refereeing. LLM mode makes a separate API call.' },
+           { name: 'salience_append_to_prompt', label: 'Append salience to prompt',
+             type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+             ngIf: 'input.salience_mode != "off"',
+             hint: 'If enabled, the salient span (and light metadata) is appended to the email text shown to the referee.' },
+           { name: 'salience_max_chars', label: 'Salience max chars', type: 'integer',
+             optional: true, default: 500, ngIf: 'input.salience_mode != "off"' },
+           { name: 'salience_include_entities', label: 'Salience: include entities',
+             type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+             ngIf: 'input.salience_mode == "llm"' },
+           { name: 'salience_model', label: 'Salience model',
+             control_type: 'text', optional: true, default: 'gemini-2.0-flash',
+             ngIf: 'input.salience_mode == "llm"' },
+           { name: 'salience_temperature', label: 'Salience temperature',
+             type: 'number', optional: true, default: 0,
+             ngIf: 'input.salience_mode == "llm"' }
+         ] + Array(object_definitions['observability_input_fields'])
       end,
       output_fields: lambda do |object_definitions, connection|
         [
           { name: 'referee', type: 'object', properties: Array(object_definitions['referee_out']) },
           { name: 'chosen' },
-          { name: 'confidence', type: 'number' }
-        ] + Array(object_definitions['envelope_fields'])
+          { name: 'confidence', type: 'number' },
+           # Salience sidecar (top-level field; backward compatible)
+           { name: 'salience', type: 'object', properties: [
+               { name: 'span' },
+               { name: 'reason' },
+               { name: 'importance', type: 'number' },
+               { name: 'tags', type: 'array', of: 'string' },
+               { name: 'entities', type: 'array', of: 'object',
+                 properties: [{ name: 'type' }, { name: 'text' }] },
+               { name: 'cta' },
+               { name: 'deadline_iso' },
+               { name: 'focus_preview' },
+               { name: 'responseId' },
+               { name: 'usage', type: 'object', properties: [
+                   { name: 'promptTokenCount', type: 'integer' },
+                   { name: 'candidatesTokenCount', type: 'integer' },
+                   { name: 'totalTokenCount', type: 'integer' }
+               ]},
+               { name: 'span_source' } # heuristic | llm
+             ]
+           }
+         ] + Array(object_definitions['envelope_fields'])
       end,
 
       execute: lambda do |connection, input|
@@ -3136,7 +3172,103 @@ require 'securerandom'
           blob = call(:format_context_chunks, input['contexts'])
           email_text = "#{email_text}\n\nContext:\n#{blob}"
         end
-
+         salience = nil
+         sal_err  = nil
+         mode     = (input['salience_mode'] || 'off').to_s
+         if mode != 'off'
+           begin
+             max_span = (input['salience_max_chars'].to_i rescue 500); max_span = [[max_span,80].max,2000].min
+             # Heuristic extraction (no extra API call)
+             if mode == 'heuristic'
+               focus = email_text.to_s[0, 8000]
+               # drop greetings
+               focus = focus.sub(/\A\s*(subject:\s*[^\n]+\n+)?\s*(hi|hello|hey)[^a-z0-9]*\n+/i, '')
+               cand = focus.split(/(?<=[.!?])\s+/).find { |s| s.strip.length >= 12 && s !~ /\A(hi|hello|hey)\b/i } || focus[0, max_span]
+               span = cand.to_s.strip[0, max_span]
+               salience = {
+                 'span'=>span, 'reason'=>nil, 'importance'=>nil, 'tags'=>nil,
+                 'entities'=>nil, 'cta'=>nil, 'deadline_iso'=>nil,
+                 'focus_preview'=>focus, 'responseId'=>nil, 'usage'=>nil, 'span_source'=>'heuristic'
+               }
+             elsif mode == 'llm'
+               # LLM extraction (separate API call)
+               model = (input['salience_model'].presence || 'gemini-2.0-flash').to_s
+               model_path = call(:build_model_path_with_global_preview, connection, model)
+               loc = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
+               url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
+               req_params = "model=#{model_path}"
+ 
+               schema_props = {
+                 'salient_span'=>{'type'=>'string','minLength'=>12},
+                 'reason'=>{'type'=>'string'},
+                 'importance'=>{'type'=>'number'},
+                 'tags'=>{'type'=>'array','items'=>{'type'=>'string'}},
+                 'call_to_action'=>{'type'=>'string'},
+                 'deadline_iso'=>{'type'=>'string'}
+               }
+               schema_props['entities'] = {
+                 'type'=>'array',
+                 'items'=>{'type'=>'object','additionalProperties'=>false,
+                   'properties'=>{'type'=>{'type'=>'string'},'text'=>{'type'=>'string'}},
+                   'required'=>['text']}
+               } if call(:normalize_boolean, input['salience_include_entities'])
+ 
+               system_text = "You extract the single most important sentence or short paragraph from an email. " \
+                             "Rules: (1) Return VALID JSON only. (2) Do NOT output greetings, signatures, legal footers, " \
+                             "auto-replies, or vague pleasantries. (3) Keep under #{max_span} characters; do not truncate mid-sentence. " \
+                             "(4) importance is in [0,1]; set call_to_action/deadline_iso when clearly present."
+ 
+               gen_cfg = {
+                 'temperature'=> (input['salience_temperature'].present? ? input['salience_temperature'].to_f : 0),
+                 'maxOutputTokens'=>512,
+                 'responseMimeType'=>'application/json',
+                 'responseSchema'=>{
+                   'type'=>'object','additionalProperties'=>false,'properties'=>schema_props,
+                   'required'=>['salient_span']
+                 }
+               }
+               contents = [{ 'role'=>'user', 'parts'=>[{ 'text'=>"Email (trimmed):\n#{email_text.to_s[0,8000]}" }]}]
+               payload = {
+                 'contents'=>contents,
+                 'systemInstruction'=>{ 'role'=>'system', 'parts'=>[{ 'text'=>system_text }]},
+                 'generationConfig'=>gen_cfg
+               }
+               req_body = call(:json_compact, payload)
+               resp = post(url).headers(call(:request_headers_auth, connection, ctx['cid'], connection['user_project'], req_params))
+                              .payload(req_body)
+ 
+               txt = resp.dig('candidates',0,'content','parts',0,'text').to_s
+               parsed = call(:json_parse_gently!, txt)
+               span = parsed['salient_span'].to_s.strip
+               if span.empty? || span =~ /\A(hi|hello|hey)\b[:,\s]*\z/i || span.length < 8
+                 focus = email_text.to_s[0, 8000]
+                 focus = focus.sub(/\A\s*(subject:\s*[^\n]+\n+)?\s*(hi|hello|hey)[^a-z0-9]*\n+/i, '')
+                 cand = focus.split(/(?<=[.!?])\s+/).find { |s| s.strip.length >= 12 && s !~ /\A(hi|hello|hey)\b/i } || focus[0, max_span]
+                 span = cand.to_s.strip[0, max_span]
+               end
+               salience = {
+                 'span'=>span,
+                 'reason'=>parsed['reason'],
+                 'importance'=>parsed['importance'],
+                 'tags'=>parsed['tags'],
+                 'entities'=>parsed['entities'],
+                 'cta'=>parsed['call_to_action'],
+                 'deadline_iso'=>parsed['deadline_iso'],
+                 'focus_preview'=>email_text.to_s[0,8000],
+                 'responseId'=>resp['responseId'],
+                 'usage'=>resp['usageMetadata'],
+                 'span_source'=>'llm'
+               }
+             end
+           rescue => e
+             sal_err = e.to_s
+             salience = nil
+           end
+         end
+         # Optionally append salience to the prompt sent to the referee
+         if salience && call(:normalize_boolean, input['salience_append_to_prompt'])
+           email_text = call(:maybe_append_salience, email_text, salience, salience['importance'])
+         end
         shortlist = call(:safe_array, input['shortlist'])
         ref = call(:llm_referee, connection, (input['generative_model'] || 'gemini-2.0-flash'),
                   email_text, (shortlist.any? ? shortlist : nil), cats, input['fallback_category'], ctx['cid'], nil)
@@ -3149,8 +3281,20 @@ require 'securerandom'
             ref['category']
           end
 
-        out = { 'referee'=>ref, 'chosen'=>chosen, 'confidence'=>[ref['confidence'], 0.0].compact.first.to_f }
-        call(:step_ok!, ctx, out, 200, 'OK', { 'chosen'=>chosen, 'conf'=>out['confidence'] })
+         out = {
+           'referee'=>ref,
+           'chosen'=>chosen,
+           'confidence'=>[ref['confidence'], 0.0].compact.first.to_f
+         }
+         out['salience'] = salience if salience
+ 
+         extras = {
+           'chosen'=>chosen, 'conf'=>out['confidence'],
+           'salience_len'=> (salience && salience['span'] ? salience['span'].to_s.length : nil),
+           'salience_source'=> (salience && salience['span_source']),
+           'salience_err'=> sal_err
+         }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
+         call(:step_ok!, ctx, out, 200, 'OK', extras)
       end,
       sample_output: lambda do
         {
@@ -3160,7 +3304,21 @@ require 'securerandom'
               { 'category'=>'Billing','prob'=>0.86 }, { 'category'=>'Support','prob'=>0.10 }, { 'category'=>'Sales','prob'=>0.04 }
             ]
           },
-          'chosen'=>'Billing','confidence'=>0.86,
+           'chosen'=>'Billing','confidence'=>0.86,
+           'salience'=>{
+             'span'=>'Can you approve the Q4 budget increase by Friday?',
+             'reason'=>'Explicit ask with a clear deadline',
+             'importance'=>0.92,
+             'tags'=>['approval','budget','deadline'],
+             'entities'=>[{ 'type'=>'team','text'=>'Finance' }],
+             'cta'=>'Approve Q4 budget increase',
+             'deadline_iso'=>'2025-10-24T17:00:00Z',
+             'focus_preview'=>'Email (trimmed): ...',
+             'responseId'=>'resp-sal-xyz',
+             'usage'=>{ 'promptTokenCount'=>120,'candidatesTokenCount'=>70,'totalTokenCount'=>190 },
+             'span_source'=>'llm'
+           },
+
           'ok'=>true,'telemetry'=>{ 'http_status'=>200,'message'=>'OK','duration_ms'=>19,'correlation_id'=>'corr' }
         }
       end
