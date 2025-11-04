@@ -1505,26 +1505,23 @@ require 'securerandom'
         )
 
         url  = call(:aipl_v1_url, connection, loc_str, "#{parent}:retrieveContexts")
-        resp = post(url)
-                .headers(call(:headers_rag, connection, cid, req_par))
-                .payload(call(:json_compact, payload))
+        res  = call(:http_post_json!, url,
+                    call(:headers_rag, connection, cid, req_par),
+                    call(:json_compact, payload))
 
-        # --- Find contexts robustly, then map ----------------------------------
-        raw_contexts = call(:coerce_contexts_array!, resp) # <— finds/unwraps anywhere
+        resp_code = res['__http_code__'].to_i
+        resp_body = res['__body__']  # <- this is the real parsed JSON/Hash now
+
+        # Use resp_body from here on:
+        raw_contexts = call(:coerce_contexts_array!, resp_body)
         maxn         = call(:clamp_int, (input['max_contexts'] || 20), 1, 200)
         mapped       = call(:map_context_chunks, raw_contexts, maxn)
 
-        # --- Final guard: flatten any accidental wrapper/string -----------------
         contexts_final =
           if mapped.is_a?(String)
             parsed = call(:safe_json, mapped)
-            if parsed.is_a?(Hash) && parsed['contexts'].is_a?(Array)
-              parsed['contexts']
-            elsif parsed.is_a?(Array)
-              parsed
-            else
-              []
-            end
+            if parsed.is_a?(Hash) && parsed['contexts'].is_a?(Array) then parsed['contexts']
+            elsif parsed.is_a?(Array) then parsed else [] end
           elsif mapped.is_a?(Hash) && mapped['contexts'].is_a?(Array)
             mapped['contexts']
           else
@@ -1534,7 +1531,8 @@ require 'securerandom'
         out = {
           'question' => input['question'].to_s,
           'contexts' => contexts_final
-        }.merge(call(:telemetry_envelope, t0, cid, true, call(:telemetry_success_code, resp), 'OK'))
+        }.merge(call(:telemetry_envelope, t0, cid, true, resp_code, 'OK'))
+
 
         # Telemetry knobs preview
         (out['telemetry'] ||= {})['retrieval'] = {}.tap do |h|
@@ -1551,10 +1549,11 @@ require 'securerandom'
           (out['telemetry'] ||= {})['rank'] = { 'mode' => 'llm', 'model' => opts['llmRankerModel'] }
         end
 
-        # Optional probe outside prod: confirms shape before any downstream step
+        # Debug probe (fix typos too)
         unless call(:normalize_boolean, connection['prod_mode'])
           (out['telemetry'] ||= {})['debug_shape'] = {
-            'resp_keys'      => (resp.is_a?(Hash) ? resp.keys.take(8) : resp.class.to_s),
+            'resp_cls'       => resp_body.class.to_s,
+            'resp_keys'      => (resp_body.is_a?(Hash) ? resp_body.keys.take(8) : nil),
             'contexts_cls'   => out['contexts'].class.to_s,
             'contexts0_keys' => (Array(out['contexts']).first || {}).keys.take(8)
           }
@@ -3022,6 +3021,22 @@ require 'securerandom'
   
   # --------- METHODS ------------------------------------------------------
   methods: {
+    http_post_json!: lambda do |url, headers, body|
+      post(url)
+        .headers(headers || {})
+        .payload(body || {})
+        .request_format_json
+        .after_error_response(/\A(4|5)\d{2}\z/) do |code, raw, _headers, message|
+          # Surface structured error for step_err!/telemetry
+          err = raw.is_a?(String) ? (JSON.parse(raw) rescue {'message'=>raw}) : raw
+          error({ 'status'=>code, 'message'=>message, 'body'=>err })
+        end
+        .after_response do |code, raw, _headers|
+          parsed = raw.is_a?(String) ? (JSON.parse(raw) rescue raw) : raw
+          { '__http_code__' => code.to_i, '__body__' => parsed }
+        end
+    end,
+
     # Ultra-tolerant unwrappers
     unwrap_json_like!: lambda do |v|
       return v if v.is_a?(Hash) || v.is_a?(Array)
