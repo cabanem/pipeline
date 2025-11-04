@@ -1677,33 +1677,28 @@ require 'securerandom'
           deep_found = arr.length
         end
 
-        # Map/enrich (ok if empty; no hard fail during triage)
-        enriched = Array(arr).map do |h|
-          item = h.is_a?(Hash) ? h.transform_keys(&:to_s) : {}
-          sc = item['score']
-          item['similarity'] = (1.0 - sc).round(6) if sc.is_a?(Numeric)
-          item
-        end
+        # Map using the existing helper method that properly formats contexts
+        mapped_contexts = call(:map_context_chunks, arr, 100) 
 
+        # Build the output
         out = {
-          'contexts'      => { 'contexts' => enriched },
-          'contexts_flat' => enriched,
-          'count'         => enriched.length,
+          'question'      => input['query_text'],
+          'contexts'      => mapped_contexts,
+          'count'         => mapped_contexts.length,
           'debug_shape'   => {
             'http_status'   => code,
             'resp_class'    => wire.class.name,
             'has_body'      => wire.is_a?(Hash) && wire.key?('body'),
             'top_keys'      => (doc.is_a?(Hash) ? doc.keys : []),
             'contexts_type' => (doc.is_a?(Hash) ? (doc['contexts'].class.name rescue 'nil') : doc.class.name),
-            'count'         => enriched.length,
+            'count'         => mapped_contexts.length,
             'net_ms'        => net_ms,
-            # extra crumbs to prove the unwrappers’ work
             'raw_length'    => text.length,
             'parsed'        => parsed ? true : false,
             'arrays_found'  => arrays_found,
             'deep_found'    => deep_found
           }
-        }
+
 
         if !call(:normalize_boolean, connection['prod_mode']) && input['debug']
           out['response_preview'] = {
@@ -1804,7 +1799,6 @@ require 'securerandom'
             default: false, optional: true, label: 'Emit debug payload' }
         ]
       end,
-
       # ---- Output schema ----
       output_fields: lambda do
         [
@@ -1826,7 +1820,6 @@ require 'securerandom'
             ]}
         ]
       end,
-
       # ---- Execute ----
       execute: lambda do |_connection, input|
         parent = (input['parent'] || '').to_s.strip
