@@ -2017,7 +2017,6 @@ require 'securerandom'
         }
       end,
       display_priority: 86,
-      retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
 
@@ -3324,8 +3323,8 @@ require 'securerandom'
       end
     },
     # --- RAG retrieval: ranked contexts ----------------------------------------
-    rag_retrieve_contexts: {
-      title: 'RAG Engine: Fetch contexts',
+    rag_retrieve_contexts_new: {
+      title: 'Fetch contexts (new)',
       subtitle: 'projects.locations:retrieveContexts (Vertex RAG Store)',
       display_priority: 500,
       help: lambda do |_|
@@ -4674,10 +4673,24 @@ require 'securerandom'
     normalize_drive_file_id:   lambda { |raw| call(:normalize_drive_resource_id, raw) },
     normalize_drive_folder_id: lambda { |raw| call(:normalize_drive_resource_id, raw) },
     normalize_retrieve_contexts!: lambda do |raw_resp|
-      # Accept both shapes:
-      #   { "contexts": [ {...}, {...} ] }
-      #   { "contexts": { "contexts": [ ... ] } }  # some beta responses
-      arr = raw_resp['contexts']
+      # Accept:
+      #   1) Hash: { "contexts":[...] }
+      #   2) Hash: { "contexts": { "contexts":[...] } }
+      #   3) Stringified JSON of either of the above
+      #   4) Hash with stringified inner "contexts"
+      doc = raw_resp
+      # If top-level is a String, try to parse it
+      doc = call(:safe_json, doc) if doc.is_a?(String)
+      # Some wrappers may stash the body as a string under "body"
+      if doc.is_a?(Hash) && doc['body'].is_a?(String)
+        parsed = call(:safe_json, doc['body'])
+        doc = parsed if parsed.is_a?(Hash)
+      end
+      # Pull contexts
+      arr = (doc.is_a?(Hash) ? doc['contexts'] : doc)
+      # If contexts itself is stringified, parse again
+      arr = call(:safe_json, arr) if arr.is_a?(String)
+      # Handle nested { "contexts": { "contexts": [...] } }
       arr = arr['contexts'] if arr.is_a?(Hash) && arr.key?('contexts')
       Array(arr)
     end,
@@ -4741,17 +4754,29 @@ require 'securerandom'
     end,
     map_context_chunks: lambda do |raw_contexts, maxn = 20|
       call(:safe_array, raw_contexts).first(maxn).each_with_index.map do |c, i|
-        md = (c['metadata'] || {}).to_h
+        h  = c.is_a?(Hash) ? c : {}
+        # metadata can be a Hash or a JSON string—normalize it
+        md_raw = h['metadata']
+        md     = md_raw.is_a?(Hash) ? md_raw : (call(:safe_json, md_raw) || {})
+        # Derive source/uri with broad fallbacks
+        der = call(:derive_source_uri, md)
+        src = h['sourceDisplayName'] || md['source'] || der['source']
+        uri = h['sourceUri'] || md['uri'] || der['uri']
+        # Text/id/score aliases across API variants
+        text = h['text'] ||
+               h['chunkText'] ||
+               h.dig('context','text') ||
+               h.dig('documentContext','text') ||
+               ''
         {
-          'id'       => (c['chunkId'] || "ctx-#{i+1}"),
-          'text'     => c['text'].to_s,
-          'score'    => (c['score'] || c['relevanceScore'] || 0.0).to_f,
-          'source'   => (c['sourceDisplayName'] || c.dig('metadata','source')),
-          'uri'      => (c['sourceUri']        || c.dig('metadata','uri')),
-          'metadata' => md,
-          'metadata_kv' => md.map { |k,v| { 'key' => k.to_s, 'value' => v } },
+          'id'            => (h['chunkId'] || h['id'] || "ctx-#{i+1}"),
+          'text'          => text.to_s,
+          'score'         => (h['score'] || h['relevanceScore'] || 0.0).to_f,
+          'source'        => src,
+          'uri'           => uri,
+          'metadata'      => md,
+          'metadata_kv'   => md.map { |k,v| { 'key' => k.to_s, 'value' => v } },
           'metadata_json' => (md.empty? ? nil : md.to_json)
-
         }
       end
     end,
