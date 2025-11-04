@@ -1504,17 +1504,17 @@ require 'securerandom'
           opts
         )
 
-        url = call(:aipl_v1_url, connection, loc_str, "#{parent}:retrieveContexts")
+        url  = call(:aipl_v1_url, connection, loc_str, "#{parent}:retrieveContexts")
         resp = post(url)
                 .headers(call(:headers_rag, connection, cid, req_par))
                 .payload(call(:json_compact, payload))
 
-        # --- Normalize → map → (defensive) de-stringify ------------------------
-        raw    = call(:normalize_retrieve_contexts!, resp)
-        maxn   = call(:clamp_int, (input['max_contexts'] || 20), 1, 200)
-        mapped = call(:map_context_chunks, raw, maxn)
+        # --- Find contexts robustly, then map ----------------------------------
+        raw_contexts = call(:coerce_contexts_array!, resp) # <— finds/unwraps anywhere
+        maxn         = call(:clamp_int, (input['max_contexts'] || 20), 1, 200)
+        mapped       = call(:map_context_chunks, raw_contexts, maxn)
 
-        # Final guard: ensure contexts is an Array-of-Objects (never a JSON string/wrapper)
+        # --- Final guard: flatten any accidental wrapper/string -----------------
         contexts_final =
           if mapped.is_a?(String)
             parsed = call(:safe_json, mapped)
@@ -1523,7 +1523,7 @@ require 'securerandom'
             elsif parsed.is_a?(Array)
               parsed
             else
-              [] # fail-soft: avoid returning a quoted blob
+              []
             end
           elsif mapped.is_a?(Hash) && mapped['contexts'].is_a?(Array)
             mapped['contexts']
@@ -1536,7 +1536,7 @@ require 'securerandom'
           'contexts' => contexts_final
         }.merge(call(:telemetry_envelope, t0, cid, true, call(:telemetry_success_code, resp), 'OK'))
 
-        # Telemetry preview from canonical knobs
+        # Telemetry knobs preview
         (out['telemetry'] ||= {})['retrieval'] = {}.tap do |h|
           h['top_k'] = opts['topK'].to_i if opts['topK']
           if opts['vectorDistanceThreshold']
@@ -1551,11 +1551,12 @@ require 'securerandom'
           (out['telemetry'] ||= {})['rank'] = { 'mode' => 'llm', 'model' => opts['llmRankerModel'] }
         end
 
-        # Optional one-line probe (only outside prod) to catch shape regressions quickly
+        # Optional probe outside prod: confirms shape before any downstream step
         unless call(:normalize_boolean, connection['prod_mode'])
           (out['telemetry'] ||= {})['debug_shape'] = {
+            'resp_keys'      => (resp.is_a?(Hash) ? resp.keys.take(8) : resp.class.to_s),
             'contexts_cls'   => out['contexts'].class.to_s,
-            'contexts0_keys' => (Array(out['contexts']).first || {}).keys.take(6)
+            'contexts0_keys' => (Array(out['contexts']).first || {}).keys.take(8)
           }
         end
 
@@ -3021,6 +3022,55 @@ require 'securerandom'
   
   # --------- METHODS ------------------------------------------------------
   methods: {
+    # Ultra-tolerant unwrappers
+    unwrap_json_like!: lambda do |v|
+      return v if v.is_a?(Hash) || v.is_a?(Array)
+      return (call(:safe_json, v) || v) if v.is_a?(String)
+      v
+    end,
+
+    find_contexts_array_any!: lambda do |v|
+      # Depth-first search for an Array of context objects.
+      # Handles:
+      #   {contexts:[...]}
+      #   {contexts:{contexts:[...]}}
+      #   stringified JSON at any level
+      #   wrappers like {body|data|response|payload|result: ...}
+      v = call(:unwrap_json_like!, v)
+      if v.is_a?(Array)
+        return v if !v.empty? && v.first.is_a?(Hash) &&
+                    (v.first.key?('text') || v.first.key?('chunkText') ||
+                    v.first.key?('sourceUri') || v.first.key?('chunkId'))
+        v.each do |e|
+          r = call(:find_contexts_array_any!, e)
+          return r if r
+        end
+        return nil
+      elsif v.is_a?(Hash)
+        c = v['contexts']
+        c = call(:unwrap_json_like!, c) if c
+        return c if c.is_a?(Array)
+        return c['contexts'] if c.is_a?(Hash) && c['contexts'].is_a?(Array)
+        %w[body data result response payload vertexRagStore].each do |k|
+          r = call(:find_contexts_array_any!, v[k])
+          return r if r
+        end
+        v.each_value do |e|
+          r = call(:find_contexts_array_any!, e)
+          return r if r
+        end
+      end
+      nil
+    end,
+    coerce_contexts_array!: lambda do |maybe|
+      # 1) try as-is
+      arr = call(:find_contexts_array_any!, maybe)
+      arr = Array(arr)
+      # 2) if elements are stringified JSON contexts, parse them
+      arr = arr.map { |e| e.is_a?(String) ? (call(:safe_json, e) || e) : e }
+      # 3) final filter: keep only Hash elements (context objects)
+      arr.select { |e| e.is_a?(Hash) }
+    end,
     # --- JSON helpers (gentle, friendly errors) -------------------------------
     json_parse_gently!: lambda do |raw|
       return raw if raw.is_a?(Hash) || raw.is_a?(Array)
