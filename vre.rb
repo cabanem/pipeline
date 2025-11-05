@@ -1887,166 +1887,117 @@ require 'securerandom'
       end
 
     },
-    rag_retrieve_contexts_fixed: {
-      title: 'RAG: Retrieve contexts (fixed)',
+    rag_retrieve_contexts_fix: {
+      title: 'RAG: Retrieve contexts (fix)',
       subtitle: 'projects.locations:retrieveContexts (Vertex RAG Engine, v1)',
       display_priority: 120,
-      retry_on_response: [408, 429, 500, 502, 503, 504],
-      max_retries: 3,
       
       config_fields: [
         { name: 'show_advanced', label: 'Show advanced options',
           type: 'boolean', control_type: 'checkbox',
-          default: false, sticky: true, extends_schema: true,
-          hint: 'Toggle to reveal threshold/ranker controls.' }
+          default: false, sticky: true, extends_schema: true }
       ],
       
       input_fields: lambda do |od, connection, cfg|
-        show_adv = (cfg['show_advanced'] == true)
-        base = [
+        [
           { name: 'query_text', label: 'Query text', optional: false },
-          { name: 'rag_corpus', optional: true,
-            hint: 'Full or short ID. Example short ID: my-corpus.' },
-          { name: 'rag_file_ids', type: 'array', of: 'string', optional: true },
-          { name: 'top_k', type: 'integer', optional: true, default: 20 },
-          { name: 'project', optional: true },
-          { name: 'location', optional: true }
+          { name: 'rag_corpus', optional: true, hint: 'Corpus ID or full path' },
+          { name: 'top_k', type: 'integer', optional: true, default: 20 }
         ]
-        adv = [
-          { name: 'vector_distance_threshold', type: 'number', optional: true },
-          { name: 'vector_similarity_threshold', type: 'number', optional: true },
-          { name: 'rank_service_model', optional: true },
-          { name: 'llm_ranker_model', optional: true }
-        ]
-        base + (show_adv ? adv : []) + Array(od['observability_input_fields'])
       end,
       
-      output_fields: lambda do |object_definitions, connection|
+      output_fields: lambda do |od, connection|
         [
           { name: 'question' },
-          { name: 'contexts', type: 'array', of: 'object' },
-          { name: 'debug', type: 'object' },
-          { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object' }
+          { name: 'raw_response', type: 'object' },
+          { name: 'contexts_extracted', type: 'array', of: 'object' },
+          { name: 'error_info', type: 'object' }
         ]
       end,
       
       execute: lambda do |connection, input|
-        debug_info = { 'steps' => [] }
+        # NO HELPER METHODS - everything inline
+        error_info = {}
         
         begin
-          # Step 1: Setup
-          debug_info['steps'] << 'Starting setup'
-          project  = (input['project'].presence || connection['project_id']).to_s
-          location = (input['location'].presence || connection['location']).to_s
+          # Get project from service account key
+          sa_key = JSON.parse(connection['service_account_key_json'] || '{}') rescue {}
+          project = connection['project_id'] || sa_key['project_id']
+          location = connection['location'] || 'us-central1'
           
-          if project.blank? || location.blank?
-            debug_info['error'] = 'Missing project or location'
-            return { 'debug' => debug_info, 'contexts' => [] }
+          if project.nil? || project.empty?
+            return { 'error_info' => { 'message' => 'No project found' } }
           end
           
-          parent = "projects/#{project}/locations/#{location}"
-          debug_info['parent'] = parent
-          
-          # Step 2: Build corpus
+          # Build corpus path
           corpus = input['rag_corpus'].to_s.strip
-          if corpus.present? && !corpus.start_with?('projects/')
-            corpus = "#{parent}/ragCorpora/#{corpus}"
+          if corpus && !corpus.start_with?('projects/')
+            corpus = "projects/#{project}/locations/#{location}/ragCorpora/#{corpus}"
           end
-          debug_info['corpus'] = corpus
           
-          # Step 3: Build request
-          rag_resources = {}
-          rag_resources['ragCorpus'] = corpus if corpus.present?
+          # Build URL
+          url = "https://#{location}-aiplatform.googleapis.com/v1/projects/#{project}/locations/#{location}:retrieveContexts"
           
+          # Build request body - minimal
           body = {
-            'query' => { 
+            'query' => {
               'text' => input['query_text'],
-              'ragRetrievalConfig' => { 'topK' => (input['top_k'] || 20).to_i }
+              'ragRetrievalConfig' => {
+                'topK' => (input['top_k'] || 20).to_i
+              }
             },
-            'vertexRagStore' => { 'ragResources' => [rag_resources] }
-          }
-          debug_info['request_body'] = body
-          
-          # Step 4: Build URL and headers
-          url = "https://#{location}-aiplatform.googleapis.com/v1/#{parent}:retrieveContexts"
-          debug_info['url'] = url
-          
-          headers = {
-            'Authorization' => "Bearer #{connection['access_token']}",
-            'Content-Type' => 'application/json',
-            'x-goog-request-params' => "parent=#{parent}"
-          }
-          debug_info['has_token'] = !connection['access_token'].to_s.empty?
-          
-          # Step 5: Make request
-          debug_info['steps'] << 'Making request'
-          resp = post(url).headers(headers).payload(body)
-          debug_info['steps'] << 'Request completed'
-          
-          # Step 6: Check response structure
-          debug_info['response_type'] = resp.class.name
-          debug_info['response_keys'] = resp.is_a?(Hash) ? resp.keys : []
-          
-          # Step 7: Extract contexts - try multiple paths
-          contexts_array = nil
-          
-          if resp.is_a?(Hash)
-            if resp['contexts'].is_a?(Hash) && resp['contexts']['contexts'].is_a?(Array)
-              contexts_array = resp['contexts']['contexts']
-              debug_info['found_at'] = 'contexts.contexts'
-            elsif resp['contexts'].is_a?(Array)
-              contexts_array = resp['contexts']
-              debug_info['found_at'] = 'contexts'
-            end
-          end
-          
-          debug_info['contexts_found'] = contexts_array ? contexts_array.length : 0
-          
-          # Step 8: Map contexts (without text cleaning for now)
-          mapped = []
-          if contexts_array
-            contexts_array.each_with_index do |ctx, idx|
-              begin
-                mapped << {
-                  'id' => "ctx-#{idx + 1}",
-                  'text' => (ctx['text'] || ctx.dig('chunk', 'text') || '').to_s,
-                  'score' => (ctx['score'] || 0.0).to_f,
-                  'source' => ctx['sourceDisplayName'] || 'unknown',
-                  'uri' => ctx['sourceUri']
-                }
-              rescue => e
-                debug_info["context_#{idx}_error"] = e.message
-              end
-            end
-          end
-          
-          debug_info['mapped_count'] = mapped.length
-          
-          {
-            'question' => input['query_text'],
-            'contexts' => mapped,
-            'debug' => debug_info,
-            'ok' => true,
-            'telemetry' => {
-              'http_status' => 200,
-              'message' => "Retrieved #{mapped.length} contexts"
+            'vertexRagStore' => {
+              'ragResources' => [
+                { 'ragCorpus' => corpus }
+              ]
             }
           }
           
-        rescue => e
-          debug_info['error'] = e.message
-          debug_info['error_class'] = e.class.name
-          debug_info['error_trace'] = e.backtrace ? e.backtrace.first(3) : []
+          # Build headers - minimal
+          token = connection['access_token']
+          if !token || token.empty?
+            return { 'error_info' => { 'message' => 'No access token' } }
+          end
+          
+          headers = {
+            'Authorization' => "Bearer #{token}",
+            'Content-Type' => 'application/json'
+          }
+          
+          # Make the request - simplest possible way
+          response = post(url)
+                      .headers(headers)
+                      .payload(body)
+          
+          # Extract contexts
+          contexts = []
+          if response && response['contexts'] && response['contexts']['contexts']
+            raw_contexts = response['contexts']['contexts']
+            raw_contexts.each_with_index do |ctx, i|
+              contexts << {
+                'index' => i,
+                'text' => ctx['text'],
+                'score' => ctx['score'],
+                'source' => ctx['sourceDisplayName']
+              }
+            end
+          end
           
           {
             'question' => input['query_text'],
-            'contexts' => [],
-            'debug' => debug_info,
-            'ok' => false,
-            'telemetry' => {
-              'http_status' => 500,
-              'message' => "Error: #{e.message}"
+            'raw_response' => response,
+            'contexts_extracted' => contexts,
+            'error_info' => { 'status' => 'success' }
+          }
+          
+        rescue => e
+          {
+            'question' => input['query_text'],
+            'raw_response' => nil,
+            'contexts_extracted' => [],
+            'error_info' => {
+              'message' => e.message,
+              'class' => e.class.name
             }
           }
         end
