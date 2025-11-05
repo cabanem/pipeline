@@ -1621,345 +1621,347 @@ require 'securerandom'
       end
     },
 
-    # RAG store engine
-    rag_retrieve_contexts_enhanced: {
-      title: 'RAG: Retrieve contexts (enhanced)',
-      subtitle: 'projects.locations:retrieveContexts (Vertex RAG Engine, v1)',
-      display_priority: 120,
-      retry_on_response: [408, 429, 500, 502, 503, 504],
-      max_retries: 3,
-      
-      config_fields: [
-        { name: 'show_advanced', label: 'Show advanced options',
-          type: 'boolean', control_type: 'checkbox',
-          default: false, sticky: true, extends_schema: true,
-          hint: 'Toggle to reveal threshold/ranker controls.' }
-      ],    
-      input_fields: lambda do |od, connection, cfg|
-        show_adv = (cfg['show_advanced'] == true)
-        
-        base = [
-          { name: 'query_text', label: 'Query text', optional: false },
-          { name: 'rag_corpus', optional: true,
-            hint: 'Full or short ID. Example: my-corpus. Will auto-expand using connection project/location.' },
-          { name: 'rag_file_ids', type: 'array', of: 'string', optional: true,
-            hint: 'Optional: limit to these file IDs (must belong to the same corpus).' },
-          { name: 'top_k', type: 'integer', optional: true, default: 20, hint: 'Max contexts to return.' },
-          { name: 'correlation_id', optional: true, hint: 'For tracking related requests.' },
-          { name: 'sanitize_pdf_content', 
-            type: 'boolean', 
-            control_type: 'checkbox',
-            default: true,
-            hint: 'Clean PDF extraction artifacts when detected (recommended)' },
-          { name: 'on_error_behavior', 
-            control_type: 'select',
-            pick_list: [
-              ['Skip failed contexts', 'skip'],
-              ['Include error placeholders', 'include'],
-              ['Fail entire request', 'fail']
-            ],
-            default: 'skip',
-            hint: 'How to handle individual context processing errors' }
-        ]
-        
-        adv = [
-          { name: 'vector_distance_threshold', type: 'number', optional: true,
-            hint: 'Return contexts with distance ≤ threshold. For COSINE, lower is better.' },
-          { name: 'vector_similarity_threshold', type: 'number', optional: true,
-            hint: 'Return contexts with similarity ≥ threshold. Do NOT set both thresholds.' },
-          { name: 'rank_service_model', optional: true,
-            hint: 'Vertex Ranking model, e.g. semantic-ranker-512@latest.' },
-          { name: 'llm_ranker_model', optional: true,
-            hint: 'LLM ranker, e.g. gemini-2.5-flash.' }
-        ]
-        
-        show_adv ? (base + adv) : base
+    rank_texts_with_ranking_api: {
+      title: 'Rerank contexts',
+      subtitle: 'projects.locations.rankingConfigs:rank',
+      description: '',
+      help: lambda do |input, picklist_label|
+        {
+          body: 'Rerank retrieved contexts for a query within a known category using LLM-based ranking with category awareness.',
+          learn_more_url: 'https://cloud.google.com/vertex-ai/generative-ai/docs/rag-engine/retrieval-and-ranking',
+          learn_more_text: 'Check out Google docs for retrieval and ranking'
+        }
       end,
-      output_fields: lambda do |object_definitions, connection|
+      display_priority: 89,
+      retry_on_request: ['GET','HEAD'],
+      retry_on_response: [408,429,500,502,503,504],
+      max_retries: 3,
+
+      input_fields: lambda do |_object_definitions, _connection, _config_fields|
         [
-          { name: 'question' },
-          { name: 'contexts', type: 'array', of: 'object', properties: [
-              { name: 'id' },
-              { name: 'text' },
+          { name: 'query_text', optional: false, hint: 'The user query to rank contexts against' },
+          { name: 'records', type: 'array', of: 'object', optional: false, properties: [
+              { name: 'id', optional: false }, 
+              { name: 'content', optional: false }, 
+              { name: 'metadata', type: 'object' }
+            ], hint: 'Retrieved contexts to rank (id + content required)' },
+          { name: 'category', optional: true, 
+            hint: 'Pre-determined category (e.g., PTO, Billing, Support) to inform ranking' },
+          { name: 'category_context', optional: true,
+            hint: 'Additional context about the category to guide ranking (description, scope, etc.)' },
+          { name: 'include_category_in_query', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+            hint: 'Include category context in ranking query for better relevance' },
+          { name: 'correlation_id', label: 'Correlation ID', optional: true, 
+            hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
+          
+          # LLM ranking options (no longer conditional)
+          { name: 'llm_model', optional: true, default: 'gemini-2.0-flash',
+            hint: 'LLM model for semantic ranking' },
+          { name: 'top_n', type: 'integer', optional: true, hint: 'Max contexts to return (default: all)' },
+          
+          # Advanced options toggle
+          { name: 'show_advanced', label: 'Show advanced options', type: 'boolean', control_type: 'checkbox',
+            default: false, sticky: true, extends_schema: true },
+          
+          # Context filtering
+          { name: 'filter_by_category_metadata', type: 'boolean', control_type: 'checkbox', optional: true, default: false,
+            ngIf: 'input.show_advanced', 
+            hint: 'Pre-filter contexts by category match in metadata before ranking' },
+          { name: 'category_metadata_key', optional: true, default: 'category',
+            ngIf: 'input.show_advanced && input.filter_by_category_metadata', 
+            hint: 'Metadata field containing category tags' },
+          
+          # LLM processing limits
+          { name: 'llm_max_contexts', type: 'integer', optional: true, default: 50,
+            ngIf: 'input.show_advanced',
+            hint: 'Maximum number of contexts to process with LLM (for cost/performance)' },
+          { name: 'include_confidence_distribution', type: 'boolean', control_type: 'checkbox', optional: true, default: false,
+            ngIf: 'input.show_advanced',
+            hint: 'Return probability distribution across contexts' },
+          
+          # Output shape control
+          { name: 'emit_shape', control_type: 'select', pick_list: 'rerank_emit_shapes', 
+            optional: true, default: 'context_chunks',
+            hint: 'Output format: minimal records, enriched records, or RAG-ready context_chunks' },
+          { name: 'source_key', optional: true, default: 'source',
+            hint: 'Metadata key for document source' },
+          { name: 'uri_key', optional: true, default: 'uri',
+            hint: 'Metadata key for document URI' },
+          
+          # Location override
+          { name: 'ai_apps_location', label: 'AI-Apps location (override)', control_type: 'select', 
+            pick_list: 'ai_apps_locations', optional: true,
+            hint: 'Force specific multi-region (global/us/eu). Usually auto-detected.' }
+        ]
+      end,
+      
+      output_fields: lambda do |object_definitions, _connection|
+        [
+          { name: 'records', type: 'array', of: 'object', properties: [
+              { name: 'id' }, 
+              { name: 'score', type: 'number' }, 
+              { name: 'rank', type: 'integer' },
+              { name: 'content' }, 
+              { name: 'metadata', type: 'object' },
+              { name: 'llm_relevance', type: 'number' },
+              { name: 'category_alignment', type: 'number' }
+            ] },
+          { name: 'context_chunks', type: 'array', of: 'object', properties: [
+              { name: 'id' }, 
+              { name: 'text' }, 
               { name: 'score', type: 'number' },
-              { name: 'source' },
+              { name: 'source' }, 
               { name: 'uri' },
               { name: 'metadata', type: 'object' },
-              { name: 'metadata_kv', type: 'array', of: 'object' },
+              { name: 'metadata_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] },
               { name: 'metadata_json' },
-              { name: 'is_pdf', type: 'boolean' },
-              { name: 'processing_error', type: 'boolean' }
-            ]
-          },
-          { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object', properties: [
-              { name: 'http_status', type: 'integer' },
-              { name: 'message' },
-              { name: 'duration_ms', type: 'integer' },
-              { name: 'correlation_id' },
-              { name: 'success_count', type: 'integer' },
-              { name: 'error_count', type: 'integer' },
-              { name: 'partial_failure', type: 'boolean' },
-              { name: 'local_logs', type: 'array', of: 'object', optional: true }
-            ]}
-        ]
+              { name: 'llm_relevance', type: 'number' },
+              { name: 'category_alignment', type: 'number' }
+            ] },
+          { name: 'confidence_distribution', type: 'array', of: 'object', properties: [
+              { name: 'id' }, 
+              { name: 'probability', type: 'number' },
+              { name: 'reasoning' }
+            ] },
+          { name: 'ranking_metadata', type: 'object', properties: [
+              { name: 'category' },
+              { name: 'llm_model' },
+              { name: 'contexts_filtered', type: 'integer' },
+              { name: 'contexts_ranked', type: 'integer' }
+            ] },
+          { name: 'complete_output', type: 'object', hint: 'All outputs consolidated for easy downstream use' },
+          { name: 'facets', type: 'object', optional: true, hint: 'Analytics facets when available' }
+        ] + Array(object_definitions['envelope_fields_1'])
       end,
+      
       execute: lambda do |connection, input|
-        # Initialize tracking context
-        ctx = call(:step_begin!, :rag_retrieve_contexts_enhanced, input)
+        ctx = call(:step_begin!, :rank_texts_with_ranking_api, input)
         
         begin
-          # Extract project/location from connection
-          sa_key = JSON.parse(connection['service_account_key_json'] || '{}') rescue {}
-          project = connection['project_id'] || sa_key['project_id']
-          location = connection['location'] || 'us-central1'
+          call(:ensure_project_id!, connection)
+          loc = call(:aiapps_loc_resolve, connection, input['ai_apps_location'])
           
-          error('Project is required') if project.nil? || project.empty?
-          error('Location is required') if location.nil? || location.empty?
-          error('Location cannot be global for RAG retrieval') if location.downcase == 'global'
+          # Extract category and prepare query
+          category = input['category'].to_s.strip
+          category_ctx = input['category_context'].to_s.strip
+          query = input['query_text'].to_s
           
-          # Build corpus path
-          corpus = input['rag_corpus'].to_s.strip
-          if corpus.present? && !corpus.start_with?('projects/')
-            corpus = "projects/#{project}/locations/#{location}/ragCorpora/#{corpus}"
+          # Enhance query with category context if requested
+          if category.present? && input['include_category_in_query'] == true
+            query_prefix = "Category: #{category}"
+            query_prefix += " (#{category_ctx})" if category_ctx.present?
+            enhanced_query = "#{query_prefix}\n\n#{query}"
+          else
+            enhanced_query = query
           end
           
-          # Validate threshold parameters
-          if input['vector_distance_threshold'].present? && input['vector_similarity_threshold'].present?
-            error('Set ONLY one of: vector_distance_threshold OR vector_similarity_threshold.')
-          end
-          if input['rank_service_model'].present? && input['llm_ranker_model'].present?
-            error('Choose ONE ranker: rank_service_model OR llm_ranker_model.')
-          end
+          # Pre-filter contexts by category metadata if requested
+          records_in = call(:safe_array, input['records'])
           
-          # Build ragResources
-          rag_resources = {}
-          rag_resources['ragCorpus'] = corpus if corpus.present?
-          file_ids = Array(input['rag_file_ids']).map(&:to_s).map(&:strip).reject(&:empty?)
-          rag_resources['ragFileIds'] = file_ids if file_ids.any?
-          
-          error('Provide rag_corpus and/or rag_file_ids') if rag_resources.empty?
-          
-          # Build retrieval config
-          retrieval_cfg = { 'topK' => (input['top_k'] || 20).to_i }
-          
-          # Add filter if specified
-          if input['vector_distance_threshold'].present?
-            retrieval_cfg['filter'] = { 'vectorDistanceThreshold' => input['vector_distance_threshold'].to_f }
-          elsif input['vector_similarity_threshold'].present?
-            retrieval_cfg['filter'] = { 'vectorSimilarityThreshold' => input['vector_similarity_threshold'].to_f }
+          # Validate that records have required fields
+          records_in.each_with_index do |r, i|
+            error("Record at index #{i} missing required 'id' field") unless r['id'].present?
+            error("Record at index #{i} missing required 'content' field") unless r['content'].present?
           end
           
-          # Add ranking if specified
-          if input['rank_service_model'].present?
-            retrieval_cfg['ranking'] = { 'rankService' => { 'modelName' => input['rank_service_model'] } }
-          elsif input['llm_ranker_model'].present?
-            retrieval_cfg['ranking'] = { 'llmRanker' => { 'modelName' => input['llm_ranker_model'] } }
-          end
+          records_to_rank = records_in
           
-          # Build request
-          url = "https://#{location}-aiplatform.googleapis.com/v1/projects/#{project}/locations/#{location}:retrieveContexts"
-          
-          body = {
-            'query' => {
-              'text' => input['query_text'],
-              'ragRetrievalConfig' => retrieval_cfg
-            },
-            'vertexRagStore' => {
-              'ragResources' => [rag_resources]
-            }
-          }
-          
-          headers = {
-            'Authorization' => "Bearer #{connection['access_token']}",
-            'Content-Type' => 'application/json',
-            'X-Correlation-Id' => ctx['cid'],
-            'x-goog-request-params' => "parent=projects/#{project}/locations/#{location}"
-          }
-          
-          # Make request with error handling
-          response = begin
-            post(url).headers(headers).payload(body)
-          rescue => e
-            if e.message.include?('timeout') || e.message.include?('connection')
-              # Return empty but valid response for network issues
-              {
-                'contexts' => { 'contexts' => [] },
-                '_network_error' => "Network error: #{e.message[0..200]}"
-              }
-            else
-              raise e  # Re-raise non-network errors
+          if category.present? && input['filter_by_category_metadata'] == true
+            meta_key = input['category_metadata_key'] || 'category'
+            cat_lower = category.downcase
+            
+            records_to_rank = records_in.select do |r|
+              md = r['metadata'].is_a?(Hash) ? r['metadata'] : {}
+              cat_value = md[meta_key]
+              
+              case cat_value
+              when String
+                cat_value.downcase.include?(cat_lower)
+              when Array
+                cat_value.any? { |v| v.to_s.downcase.include?(cat_lower) }
+              else
+                false
+              end
+            end
+            
+            if records_to_rank.empty? && records_in.any?
+              error("Category filtering removed all #{records_in.length} records. Check category metadata key '#{meta_key}' and value '#{category}'")
             end
           end
           
-          # Extract and map contexts with graceful failure
-          contexts = []
-          #raw_contexts = call(:safe_extract_contexts, response)
-          raw_contexts = if response && response['contexts'] && response['contexts']['contexts']
-            response['contexts']['contexts']
-          else
-            []
+          # LLM-based ranking
+          llm_model = input['llm_model'] || 'gemini-2.0-flash'
+          distribution = nil
+          enriched = []
+          
+          # Initialize all records with base scores
+          enriched = records_to_rank.map do |orig|
+            orig.merge(
+              'score' => 0.0,
+              'rank' => 999
+            )
           end
           
-          if raw_contexts.empty? && !response['_network_error']
-            # Add informational context for empty responses
-            contexts << {
-              'id' => 'no-results',
-              'text' => 'No contexts were returned for this query.',
-              'score' => 0.0,
-              'source' => 'system',
-              'uri' => nil,
-              'metadata' => { 'info' => 'empty_response' },
-              'metadata_kv' => [{ 'key' => 'info', 'value' => 'empty_response' }],
-              'metadata_json' => '{"info":"empty_response"}',
-              'is_pdf' => false,
-              'processing_error' => false
-            }
-          else
-            raw_contexts.each_with_index do |ctx_item, idx|
-              begin
-                # Extract metadata
-                md = ctx_item['metadata'] || {}
-                
-                # Get source URI for PDF detection
-                source_uri = ctx_item['sourceUri'] || ctx_item['uri']
-                
-                # DEBUGGING: Log what we're seeing
-                is_pdf = call(:is_pdf_source?, source_uri, md)
-                sanitize_enabled = input['sanitize_pdf_content'] != false
-                
-                # Extract text
-                raw_text = (ctx_item['text'] || ctx_item.dig('chunk', 'text') || '').to_s
-                
-                # DEBUGGING: Check for PDF indicators
-                has_double_escapes = raw_text.include?('\\\\n') || raw_text.include?('\\\\t')
-                
-                # Log for debugging (remove after fixing)
-                if has_double_escapes || is_pdf
-                  puts "DEBUG Context #{idx}: is_pdf=#{is_pdf}, sanitize=#{sanitize_enabled}, has_escapes=#{has_double_escapes}, uri=#{source_uri}"
-                end
-                
-                # Apply PDF-specific cleaning based on preference and detection
-                text = if sanitize_enabled && is_pdf
-                  puts "DEBUG: Sanitizing PDF context #{idx}"
-                  call(:sanitize_pdf_text, raw_text)
-                elsif has_double_escapes && sanitize_enabled
-                  # FALLBACK: Even if not detected as PDF, clean obvious PDF artifacts
-                  puts "DEBUG: Cleaning escaped content in context #{idx}"
-                  call(:sanitize_pdf_text, raw_text)
-                else
-                  # Regular cleaning for non-PDF content
-                  raw_text.encode('UTF-8', invalid: :replace, undef: :replace, replace: ' ')
-                          .gsub(/\s+/, ' ')
-                          .strip
-                end
-                
-                # Try JSON serialization with fallback
-                metadata_json = begin
-                  md.empty? ? nil : md.to_json
-                rescue => json_err
-                  { error: 'metadata_serialization_failed', keys: md.keys.take(10) }.to_json
-                end
-                
-                contexts << {
-                  'id' => ctx_item['chunkId'] || ctx_item['id'] || "ctx-#{idx + 1}",
-                  'text' => text,
-                  'score' => (ctx_item['score'] || ctx_item['relevanceScore'] || 0.0).to_f,
-                  'source' => ctx_item['sourceDisplayName'] || source_uri&.split('/')&.last,
-                  'uri' => source_uri,
-                  'metadata' => md,
-                  'metadata_kv' => md.map { |k, v| { 'key' => k.to_s, 'value' => v.to_s[0..1000] } }, # Limit value size
-                  'metadata_json' => metadata_json,
-                  'is_pdf' => call(:is_pdf_source?, source_uri, md),
-                  'processing_error' => false
+          # Perform LLM ranking if category is present
+          if category.present?
+            # Limit contexts for LLM processing
+            max_llm_contexts = (input['llm_max_contexts'] || 50).to_i
+            contexts_for_llm = enriched.first(max_llm_contexts)
+            
+            # Call LLM ranker
+            llm_result = call(:llm_category_aware_ranker,
+                            connection,
+                            llm_model,
+                            enhanced_query,
+                            category,
+                            category_ctx,
+                            contexts_for_llm,
+                            ctx['cid'])
+            
+            if llm_result && llm_result['rankings']
+              # Process LLM rankings
+              llm_scores = {}
+              llm_result['rankings'].each do |r|
+                llm_scores[r['id']] = {
+                  'relevance' => r['relevance'].to_f,
+                  'category_alignment' => r['category_alignment'].to_f,
+                  'reasoning' => r['reasoning']
                 }
+              end
+              
+              # Apply LLM scores
+              enriched.each do |rec|
+                if llm_data = llm_scores[rec['id']]
+                  rec['llm_relevance'] = llm_data['relevance']
+                  rec['category_alignment'] = llm_data['category_alignment']
+                  # Score is weighted combination of relevance and category alignment
+                  rec['score'] = 0.8 * llm_data['relevance'] + 0.2 * llm_data['category_alignment']
+                else
+                  # Records not evaluated by LLM get zero score
+                  rec['score'] = 0.0
+                end
+              end
+              
+              # Build confidence distribution if requested
+              if input['include_confidence_distribution'] == true
+                total_score = enriched.sum { |x| x['score'].to_f }
+                total_score = 0.001 if total_score <= 0
                 
-              rescue => e
-                # Handle individual context errors based on configuration
-                case input['on_error_behavior']
-                when 'fail'
-                  raise e  # Re-raise to fail entire action
-                when 'include'
-                  # Add error placeholder context
-                  contexts << {
-                    'id' => "ctx-#{idx + 1}-error",
-                    'text' => "[Error processing context: #{e.message[0..200]}]",
-                    'score' => 0.0,
-                    'source' => 'error',
-                    'uri' => nil,
-                    'metadata' => { 
-                      'error' => e.message[0..500], 
-                      'error_class' => e.class.name,
-                      'original_id' => ctx_item['chunkId'] || ctx_item['id'] 
-                    },
-                    'metadata_kv' => [
-                      { 'key' => 'error', 'value' => e.message[0..500] },
-                      { 'key' => 'error_class', 'value' => e.class.name }
-                    ],
-                    'metadata_json' => nil,
-                    'is_pdf' => false,
-                    'processing_error' => true
+                distribution = enriched.map { |r|
+                  llm_data = llm_scores[r['id']] || {}
+                  {
+                    'id' => r['id'],
+                    'probability' => r['score'].to_f / total_score,
+                    'reasoning' => llm_data['reasoning']
                   }
-                when 'skip', nil
-                  # Skip this context, continue processing
-                  next
+                }.sort_by { |d| -d['probability'] }
+              end
+            end
+          else
+            # If no category provided, use simple query-based relevance scoring
+            contexts_for_llm = enriched.first((input['llm_max_contexts'] || 50).to_i)
+            
+            # Simplified LLM ranking without category
+            llm_result = call(:llm_category_aware_ranker,
+                            connection,
+                            llm_model,
+                            enhanced_query,
+                            '',  # No category
+                            '',  # No category context
+                            contexts_for_llm,
+                            ctx['cid'])
+            
+            if llm_result && llm_result['rankings']
+              llm_result['rankings'].each do |r|
+                matching_record = enriched.find { |rec| rec['id'] == r['id'] }
+                if matching_record
+                  matching_record['llm_relevance'] = r['relevance'].to_f
+                  matching_record['score'] = r['relevance'].to_f
                 end
               end
             end
           end
           
-          # Calculate success metrics
-          error_count = contexts.count { |c| c['processing_error'] == true }
-          pdf_count = contexts.count { |c| c['is_pdf'] && !c['processing_error'] }
-          success_count = contexts.count { |c| !c['processing_error'] }
+          # Re-rank by final scores
+          enriched = enriched.sort_by { |r| [-r['score'].to_f, r['id']] }
+                            .each_with_index { |r, i| r['rank'] = i + 1 }
           
-          # Build output
-          out = {
-            'question' => input['query_text'],
-            'contexts' => contexts
-          }
-          
-          # Add telemetry with success tracking
-          extras = {
-            'retrieval' => {
-              'top_k' => retrieval_cfg['topK'],
-              'filter' => retrieval_cfg['filter'] ? {
-                'type' => retrieval_cfg['filter'].keys.first.to_s.sub('vector', '').sub('Threshold', ''),
-                'value' => retrieval_cfg['filter'].values.first
-              } : nil,
-              'contexts_count' => contexts.length,
-              'success_count' => success_count,
-              'error_count' => error_count,
-              'pdf_contexts_count' => pdf_count,
-              'partial_failure' => error_count > 0
-            }.compact,
-            'rank' => retrieval_cfg['ranking'] ? {
-              'mode' => retrieval_cfg['ranking'].keys.first,
-              'model' => retrieval_cfg['ranking'].values.first['modelName']
-            } : nil,
-            'network_error' => response['_network_error']
-          }.compact
-          
-          # Build appropriate message
-          message = if response['_network_error']
-            "Retrieved #{contexts.length} contexts (network issues detected)"
-          elsif error_count > 0
-            "Retrieved #{success_count} contexts (#{error_count} failed)"
-          else
-            "Retrieved #{contexts.length} contexts"
+          # Apply top_n limit if specified
+          if input['top_n'].present?
+            enriched = enriched.first(input['top_n'].to_i)
           end
           
-          # Return success with telemetry
-          call(:step_ok!, ctx, out, 200, message, extras)
+          # Shape Output
+          shape = input['emit_shape'] || 'context_chunks'
+          result = {}
+          
+          case shape
+          when 'records_only'
+            result['records'] = enriched.map { |r|
+              { 'id' => r['id'], 'score' => r['score'], 'rank' => r['rank'] }
+            }
+          when 'enriched_records'
+            result['records'] = enriched
+          else  # context_chunks
+            chunks = enriched.map { |r|
+              md = r['metadata'] || {}
+              source_key = input['source_key'] || 'source'
+              uri_key = input['uri_key'] || 'uri'
+              
+              chunk = {
+                'id' => r['id'],
+                'text' => r['content'].to_s,
+                'score' => r['score'].to_f,
+                'source' => md[source_key],
+                'uri' => md[uri_key],
+                'metadata' => md,
+                'metadata_kv' => md.map { |k, v| { 'key' => k, 'value' => v } },
+                'metadata_json' => md.empty? ? nil : md.to_json
+              }
+              
+              chunk['llm_relevance'] = r['llm_relevance'] if r['llm_relevance']
+              chunk['category_alignment'] = r['category_alignment'] if r['category_alignment']
+              
+              chunk
+            }
+            result['context_chunks'] = chunks
+            result['records'] = enriched
+          end
+          
+          result['confidence_distribution'] = distribution if distribution
+          
+          result['ranking_metadata'] = {
+            'category' => category.presence,
+            'llm_model' => llm_model,
+            'contexts_filtered' => records_in.length - records_to_rank.length,
+            'contexts_ranked' => records_to_rank.length
+          }.compact
+          
+          # Build facets
+          facets = {
+            'ranking_api' => 'llm.category_ranker',
+            'category' => category.presence,
+            'llm_model' => llm_model,
+            'emit_shape' => shape,
+            'records_input' => records_in.length,
+            'records_filtered' => records_in.length - records_to_rank.length,
+            'records_ranked' => records_to_rank.length,
+            'records_output' => enriched.length,
+            'has_distribution' => distribution.present?,
+            'top_score' => enriched.first&.dig('score'),
+            'category_filtered' => input['filter_by_category_metadata'] == true
+          }.compact
+          
+          call(:step_ok!, ctx, result, 200, 'OK', facets)
           
         rescue => e
-          # Handle errors with telemetry
           call(:step_err!, ctx, e)
         end
       end,
+      
       sample_output: lambda do
-        call(:sample_rag_retrieve_contexts_enhanced)
-      end,
+        call(:sample_rank_texts_with_ranking_api)
+      end
     },
     rag_answer: {
       title: 'RAG Engine: Get grounded response (one-shot)',
@@ -3736,9 +3738,8 @@ require 'securerandom'
           'rank' => 1,
           'content' => 'Our PTO policy allows employees to take up to 20 days per year...',
           'metadata' => { 'source' => 'hr-handbook.pdf', 'category' => 'PTO', 'page' => 15 },
-          'discovery_score' => 0.88,
           'llm_relevance' => 0.95,
-          'category_alignment' => 0.98
+          'category_alignment' => 0.85
         },
         {
           'id' => 'doc-2',
@@ -3746,9 +3747,8 @@ require 'securerandom'
           'rank' => 2,
           'content' => 'Vacation requests must be submitted at least 2 weeks in advance...',
           'metadata' => { 'source' => 'hr-handbook.pdf', 'category' => 'PTO', 'page' => 16 },
-          'discovery_score' => 0.82,
           'llm_relevance' => 0.86,
-          'category_alignment' => 0.85
+          'category_alignment' => 0.78
         }
       ]
       
@@ -3767,7 +3767,7 @@ require 'securerandom'
           ],
           'metadata_json' => '{"source":"hr-handbook.pdf","category":"PTO","page":15}',
           'llm_relevance' => 0.95,
-          'category_alignment' => 0.98
+          'category_alignment' => 0.85
         },
         {
           'id' => 'doc-2',
@@ -3783,7 +3783,7 @@ require 'securerandom'
           ],
           'metadata_json' => '{"source":"hr-handbook.pdf","category":"PTO","page":16}',
           'llm_relevance' => 0.86,
-          'category_alignment' => 0.85
+          'category_alignment' => 0.78
         }
       ]
       
@@ -3794,8 +3794,7 @@ require 'securerandom'
       
       ranking_metadata = {
         'category' => 'PTO',
-        'ranking_config_used' => 'default_ranking_config',
-        'llm_mode' => 'enhance',
+        'llm_model' => 'gemini-2.0-flash',
         'contexts_filtered' => 0,
         'contexts_ranked' => 2
       }
@@ -3809,10 +3808,8 @@ require 'securerandom'
       
       # Build facets
       facets = {
-        'ranking_api' => 'discoveryengine.ranking',
-        'ranking_config' => 'default_ranking_config',
+        'ranking_api' => 'llm.category_ranker',
         'category' => 'PTO',
-        'llm_mode' => 'enhance',
         'llm_model' => 'gemini-2.0-flash',
         'emit_shape' => 'context_chunks',
         'records_input' => 5,
@@ -3830,7 +3827,7 @@ require 'securerandom'
         'complete_output' => business_data.dup,
         'facets' => facets,
         'ok' => true,
-        'telemetry' => call(:sample_telemetry, 85)  # Ranking typically faster than generation
+        'telemetry' => call(:sample_telemetry, 85)
       })
     end,
     sample_rag_retrieve_contexts_enhanced: lambda do
