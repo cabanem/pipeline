@@ -1189,7 +1189,7 @@ require 'securerandom'
       description: '',
       help: lambda do |input, picklist_label|
         {
-          body: 'Rerank candidate texts for a query using Vertex Ranking.',
+          body: 'Rerank candidate texts for a query using Vertex Ranking with optional LLM refinement.',
           learn_more_url: 'https://cloud.google.com/vertex-ai/generative-ai/docs/rag-engine/retrieval-and-ranking',
           learn_more_text: 'Check out Google docs for retrieval and ranking'
         }
@@ -1203,7 +1203,9 @@ require 'securerandom'
         [
           { name: 'query_text', optional: false },
           { name: 'records', type: 'array', of: 'object', optional: false, properties: [
-              { name: 'id', optional: false }, { name: 'content', optional: false }, { name: 'metadata', type: 'object' }
+              { name: 'id', optional: false }, 
+              { name: 'content', optional: false }, 
+              { name: 'metadata', type: 'object' }
             ], hint: 'id + content required.' },
           { name: 'category', optional: true, hint: 'Chosen category (e.g., PTO, W2, Payroll).' },
           { name: 'category_hint_in_query', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
@@ -1214,7 +1216,8 @@ require 'securerandom'
             ngIf: 'input.show_advanced', hint: 'Drop records whose metadata does not match the category.' },
           { name: 'record_category_key', optional: true, default: 'category',
             ngIf: 'input.show_advanced', hint: 'Metadata key to match the category (string or array).' },
-          { name: 'correlation_id', label: 'Correlation ID', optional: true, hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
+          { name: 'correlation_id', label: 'Correlation ID', optional: true, 
+            hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
           { name: 'rank_model', optional: true, hint: 'e.g., semantic-ranker-default@latest' },
           { name: 'top_n', type: 'integer', optional: true },
           { name: 'ignore_record_details_in_response', type: 'boolean', control_type: 'checkbox', optional: true,
@@ -1225,197 +1228,347 @@ require 'securerandom'
             hint: 'JSON object: {"PTO":"pto_rank","Payroll":"payroll_rank"}; overrides ranking_config_name when category is set.' },
           { name: 'emit_metrics', type: 'boolean', control_type: 'checkbox', optional: true, default: true },
           { name: 'metrics_namespace', optional: true },
-          # --- New tidy knobs ---
+          # --- New LLM reranking fields ---
+          { name: 'llm_rerank_mode', control_type: 'select', optional: true,
+            pick_list: [['None','none'], ['Post-process top results','post'], ['Replace ranking','replace']], 
+            default: 'none', ngIf: 'input.show_advanced',
+            hint: 'Use LLM for semantic reranking with confidence scores' },
+          { name: 'llm_rerank_model', optional: true, default: 'gemini-2.0-flash',
+            ngIf: 'input.show_advanced && input.llm_rerank_mode != "none"',
+            hint: 'LLM model for reranking (e.g., gemini-2.0-flash)' },
+          { name: 'llm_rerank_top_k', type: 'integer', optional: true, default: 5,
+            ngIf: 'input.show_advanced && input.llm_rerank_mode == "post"',
+            hint: 'Number of top results to rerank with LLM' },
+          { name: 'return_distribution', type: 'boolean', control_type: 'checkbox', optional: true, default: false,
+            ngIf: 'input.show_advanced && input.llm_rerank_mode != "none"',
+            hint: 'Include probability distribution in output' },
+          { name: 'llm_confidence_weight', type: 'number', optional: true, default: 0.5,
+            ngIf: 'input.show_advanced && input.llm_rerank_mode == "post"',
+            hint: 'Weight for LLM confidence when blending scores (0-1)' },
+          # --- Tidy knobs ---
           { name: 'emit_shape', control_type: 'select', pick_list: 'rerank_emit_shapes', optional: true, default: 'context_chunks',
             hint: 'Choose output shape: records-only, enriched records, or generator-ready context_chunks.' },
           { name: 'source_key', optional: true, hint: 'Metadata key to use for source (default: "source")' },
           { name: 'uri_key',    optional: true, hint: 'Metadata key to use for uri (default: "uri")' },
-          # Optional override when your connection 'location' is regional (e.g., us-central1)
-          { name: 'ai_apps_location', label: 'AI-Apps location (override)', control_type: 'select', pick_list: 'ai_apps_locations', optional: true,
+          { name: 'ai_apps_location', label: 'AI-Apps location (override)', control_type: 'select', 
+            pick_list: 'ai_apps_locations', optional: true,
             hint: 'Ranking/Search use multi-regions only: global, us, or eu. Leave blank to derive from connection location.' }
         ]
       end,
+      
       output_fields: lambda do |object_definitions, _connection|
         [
-          # Always present; shape controls richness
           { name: 'records', type: 'array', of: 'object', properties: [
               { name: 'id' }, { name: 'score', type: 'number' }, { name: 'rank', type: 'integer' },
-              { name: 'content' }, { name: 'metadata', type: 'object' }
+              { name: 'content' }, { name: 'metadata', type: 'object' },
+              { name: 'llm_confidence', type: 'number' }  # New field
             ] },
-          # Present when emit_shape == 'context_chunks'
           { name: 'context_chunks', type: 'array', of: 'object', properties: [
               { name: 'id' }, { name: 'text' }, { name: 'score', type: 'number' },
               { name: 'source' }, { name: 'uri' },
               { name: 'metadata', type: 'object' },
               { name: 'metadata_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] },
-              { name: 'metadata_json' }
+              { name: 'metadata_json' },
+              { name: 'llm_confidence', type: 'number' }  # New field
+            ] },
+          { name: 'distribution', type: 'array', of: 'object', properties: [  # New field
+              { name: 'id' }, { name: 'prob', type: 'number' }
             ] }
         ] + Array(object_definitions['envelope_fields_1'])
       end,
+      
       execute: lambda do |connection, input|
-        started_at = Time.now.utc.iso8601
-        t0   = Time.now
-        cid = call(:ensure_correlation_id!, input)
-        url = nil; req_body = nil
-
-        call(:ensure_project_id!, connection)
-        # Normalize connection region → AI-Apps multi-region (global|us|eu), allow per-action override
-        loc = call(:aiapps_loc_resolve, connection, input['ai_apps_location'])
-
-        # Category hint + optional config override
-        cat   = input['category'].to_s.strip
-        qtext = input['query_text'].to_s
-        if cat != '' && input['category_hint_in_query'] == true
-          qtext = "Category: #{cat}\n\n#{qtext}"
-        end
-        # Resolve config id (not full resource) to avoid double-embedding path parts.
-        config_id =
-          if input['ranking_config_name'].to_s.strip.empty?
-            'default_ranking_config'
-          else
-            input['ranking_config_name'].to_s.split('/').last
+        # Initialize with step tracking pattern from rerank_shortlist
+        ctx = call(:step_begin!, :rank_texts_with_ranking_api, input)
+        
+        begin
+          # === Phase 1: Discovery Engine Ranking ===
+          call(:ensure_project_id!, connection)
+          loc = call(:aiapps_loc_resolve, connection, input['ai_apps_location'])
+          
+          # Category handling
+          cat   = input['category'].to_s.strip
+          qtext = input['query_text'].to_s
+          if cat != '' && input['category_hint_in_query'] == true
+            qtext = "Category: #{cat}\n\n#{qtext}"
           end
-        # Optional category → rankingConfig override (JSON)
-        if cat != '' && input['category_ranking_config_map_json'].present?
-          rcmap = call(:safe_json, input['category_ranking_config_map_json'])
-          error('Invalid JSON for category→rankingConfig map: expected object') unless rcmap.is_a?(Hash)
-          mapped = (rcmap[cat] || rcmap[cat.downcase] || rcmap[cat.upcase])
-          if mapped.to_s.strip != ''
-            config_id = mapped.to_s.split('/').last
+          
+          # Config resolution
+          config_id = if input['ranking_config_name'].to_s.strip.empty?
+                        'default_ranking_config'
+                      else
+                        input['ranking_config_name'].to_s.split('/').last
+                      end
+          
+          # Category → rankingConfig override
+          if cat != '' && input['category_ranking_config_map_json'].present?
+            rcmap = call(:safe_json, input['category_ranking_config_map_json'])
+            error('Invalid JSON for category→rankingConfig map: expected object') unless rcmap.is_a?(Hash)
+            mapped = (rcmap[cat] || rcmap[cat.downcase] || rcmap[cat.upcase])
+            config_id = mapped.to_s.split('/').last if mapped.to_s.strip != ''
           end
-        end
-        req_params = "ranking_config=projects/#{connection['project_id']}/locations/#{loc}/rankingConfigs/#{config_id}"
-
-        # Build absolute URL to Discovery Engine Ranking API (no base_uri usage)
-        # POST https://discoveryengine.googleapis.com/{ver}/projects/*/locations/*/rankingConfigs/*:rank
-        ver = (connection['discovery_api_version'].presence || 'v1alpha').to_s
-        url = call(
-          :discovery_url,
-          connection,
-          loc,
-          "projects/#{connection['project_id']}/locations/#{loc}/rankingConfigs/#{config_id}:rank",
-          ver
-        )
-
-        # Optionally filter records by category metadata
-        records_in = call(:safe_array, input['records'])
-        records_used = records_in
-        if cat != '' && input['filter_records_by_category'] == true
-          key = (input['record_category_key'].presence || 'category').to_s
-          lc  = cat.downcase
-          records_used = records_in.select do |r|
-            md = (r['metadata'].is_a?(Hash) ? r['metadata'] : {})
-            val = md[key]
-            if val.is_a?(String)
-              val.to_s.downcase.include?(lc)
-            elsif val.is_a?(Array)
-              val.map { |x| x.to_s.downcase }.any? { |x| x == lc || x.include?(lc) }
-            else
-              false
+          
+          req_params = "ranking_config=projects/#{connection['project_id']}/locations/#{loc}/rankingConfigs/#{config_id}"
+          
+          # Build URL
+          ver = (connection['discovery_api_version'].presence || 'v1alpha').to_s
+          url = call(:discovery_url, connection, loc,
+                    "projects/#{connection['project_id']}/locations/#{loc}/rankingConfigs/#{config_id}:rank", ver)
+          
+          # Filter records by category if needed
+          records_in = call(:safe_array, input['records'])
+          records_used = records_in
+          
+          if cat != '' && input['filter_records_by_category'] == true
+            key = (input['record_category_key'].presence || 'category').to_s
+            lc  = cat.downcase
+            records_used = records_in.select do |r|
+              md = (r['metadata'].is_a?(Hash) ? r['metadata'] : {})
+              val = md[key]
+              if val.is_a?(String)
+                val.to_s.downcase.include?(lc)
+              elsif val.is_a?(Array)
+                val.map { |x| x.to_s.downcase }.any? { |x| x == lc || x.include?(lc) }
+              else
+                false
+              end
             end
           end
-        end
-        body = {
-          # Ranking expects a scalar string for 'query'
-          'query'   => qtext,
-          'records' => records_used.map { |r|
-
-            {
-              'id'       => r['id'].to_s,
-              'content'  => r['content'].to_s,
-              'metadata' => (r['metadata'].is_a?(Hash) ? r['metadata'] : nil)
-            }.delete_if { |_k, v| v.nil? }
-          },
-          'model'   => (input['rank_model'].to_s.strip.empty? ? nil : input['rank_model'].to_s.strip),
-          'topN'    => (input['top_n'].to_i > 0 ? input['top_n'].to_i : nil),
-          'ignoreRecordDetailsInResponse' => (input['ignore_record_details_in_response'] == true ? true : nil)
-        }.delete_if { |_k, v| v.nil? }
-
-        req_body = call(:json_compact, body)
-
-        begin
-        resp = post(url)
-                 .headers(call(:request_headers_auth_1, connection, cid, connection['user_project'], req_params))
-                 .payload(req_body)
-
-        code = call(:telemetry_success_code, resp)
-        # Minimal ranked list from API (or accurate when API omits details)
-        ranked_min = Array(resp['records']).each_with_index.map { |r, i|
-          { 'id' => r['id'].to_s, 'score' => r['score'].to_f, 'rank' => i + 1 }
-        }
-
-        # Enrich from caller input; centralized helpers keep this tidy
-        enriched = call(:rerank_enrich_records, input['records'], ranked_min)
-
-        # Shape
-        shape = (input['emit_shape'].presence || 'context_chunks').to_s
-        out_records =
-          case shape
-          when 'records_only'     then ranked_min
-          when 'enriched_records' then enriched
-          else                          enriched
+          
+          # Build request body
+          body = {
+            'query'   => qtext,
+            'records' => records_used.map { |r|
+              {
+                'id'       => r['id'].to_s,
+                'content'  => r['content'].to_s,
+                'metadata' => (r['metadata'].is_a?(Hash) ? r['metadata'] : nil)
+              }.delete_if { |_k, v| v.nil? }
+            },
+            'model'   => (input['rank_model'].to_s.strip.empty? ? nil : input['rank_model'].to_s.strip),
+            'topN'    => (input['top_n'].to_i > 0 ? input['top_n'].to_i : nil),
+            'ignoreRecordDetailsInResponse' => (input['ignore_record_details_in_response'] == true ? true : nil)
+          }.delete_if { |_k, v| v.nil? }
+          
+          req_body = call(:json_compact, body)
+          
+          # Make Discovery Engine request
+          resp = post(url)
+                  .headers(call(:request_headers_auth_1, connection, ctx['cid'], connection['user_project'], req_params))
+                  .payload(req_body)
+          
+          code = call(:telemetry_success_code, resp)
+          
+          # Process initial ranking results
+          ranked_min = Array(resp['records']).each_with_index.map { |r, i|
+            { 'id' => r['id'].to_s, 'score' => r['score'].to_f, 'rank' => i + 1 }
+          }
+          
+          # Enrich with original content
+          enriched = call(:rerank_enrich_records, input['records'], ranked_min)
+          
+          # === Phase 2: LLM Reranking (if enabled) ===
+          llm_mode = (input['llm_rerank_mode'].presence || 'none').to_s
+          distribution = nil
+          llm_telemetry = {}
+          
+          if llm_mode != 'none'
+            llm_start = Time.now
+            
+            if llm_mode == 'post'
+              # Post-process mode: rerank only top-K results
+              top_k = (input['llm_rerank_top_k'] || 5).to_i
+              candidates = enriched.first(top_k)
+            elsif llm_mode == 'replace'
+              # Replace mode: use LLM for all records
+              candidates = enriched
+            end
+            
+            # Call LLM ranker
+            llm_result = call(:llm_context_ranker, 
+                            connection, 
+                            (input['llm_rerank_model'] || 'gemini-2.0-flash'),
+                            qtext,
+                            candidates,
+                            ctx['cid'])
+            
+            # Process LLM results
+            if llm_result && llm_result['distribution']
+              distribution = llm_result['distribution']
+              
+              # Create confidence lookup
+              conf_map = {}
+              distribution.each { |d| conf_map[d['id']] = d['prob'].to_f }
+              
+              if llm_mode == 'post'
+                # Blend scores: weighted average of Discovery score and LLM confidence
+                weight = (input['llm_confidence_weight'] || 0.5).to_f
+                weight = [[weight, 0.0].max, 1.0].min  # Clamp to [0,1]
+                
+                enriched.each do |r|
+                  if conf_map[r['id']]
+                    # Normalize Discovery score to [0,1] if needed
+                    norm_score = r['score'].to_f  # Assume already normalized
+                    llm_conf = conf_map[r['id']]
+                    
+                    # Weighted blend
+                    r['original_score'] = r['score']
+                    r['llm_confidence'] = llm_conf
+                    r['score'] = (1 - weight) * norm_score + weight * llm_conf
+                  end
+                end
+                
+                # Re-sort by new blended scores
+                enriched = enriched.sort_by { |r| [-r['score'].to_f, r['id'].to_s] }
+                                  .each_with_index { |r, i| r['rank'] = i + 1 }
+                
+              elsif llm_mode == 'replace'
+                # Replace mode: use LLM confidence as primary score
+                enriched.each do |r|
+                  r['original_score'] = r['score']
+                  r['llm_confidence'] = conf_map[r['id']] || 0.0
+                  r['score'] = r['llm_confidence']
+                end
+                
+                # Sort by LLM confidence
+                enriched = enriched.sort_by { |r| [-r['score'].to_f, r['id'].to_s] }
+                                  .each_with_index { |r, i| r['rank'] = i + 1 }
+              end
+              
+              # Track LLM telemetry
+              llm_telemetry = {
+                'llm_rerank_mode' => llm_mode,
+                'llm_rerank_model' => input['llm_rerank_model'] || 'gemini-2.0-flash',
+                'llm_rerank_duration_ms' => ((Time.now - llm_start) * 1000).to_i,
+                'llm_candidates_count' => candidates.length,
+                'llm_confidence_weight' => (llm_mode == 'post' ? weight : nil)
+              }.compact
+            end
           end
-
-        out = { 'records' => out_records }
-        if shape == 'context_chunks'
-          out['context_chunks'] = call(:context_chunks_from_enriched, enriched,
-                                       (input['source_key'].presence || 'source'),
-                                       (input['uri_key'].presence    || 'uri'))
+          
+          # === Phase 3: Shape output ===
+          shape = (input['emit_shape'].presence || 'context_chunks').to_s
+          out_records = case shape
+                        when 'records_only'     then ranked_min
+                        when 'enriched_records' then enriched
+                        else                          enriched
+                        end
+          
+          out = { 'records' => out_records }
+          
+          if shape == 'context_chunks'
+            chunks = call(:context_chunks_from_enriched, enriched,
+                        (input['source_key'].presence || 'source'),
+                        (input['uri_key'].presence || 'uri'))
+            
+            # Add LLM confidence to chunks if available
+            if llm_mode != 'none'
+              chunks.each do |chunk|
+                rec = enriched.find { |r| r['id'] == chunk['id'] }
+                chunk['llm_confidence'] = rec['llm_confidence'] if rec && rec['llm_confidence']
+              end
+            end
+            
+            out['context_chunks'] = chunks
+          end
+          
+          # Add distribution if requested
+          if input['return_distribution'] == true && distribution
+            out['distribution'] = distribution
+          end
+          
+          # === Phase 4: Telemetry and logging ===
+          out = out.merge(call(:telemetry_envelope, ctx['t0'], ctx['cid'], true, code, 'OK'))
+          
+          # Annotate with detailed provenance
+          tel = (out['telemetry'] ||= {})
+          tel['ranking'] = {
+            'api'       => 'discoveryengine.ranking:rank',
+            'version'   => ver,
+            'location'  => loc,
+            'config_id' => config_id,
+            'model'     => (input['rank_model'].to_s.strip if input['rank_model'].present?)
+          }.compact
+          
+          tel['category'] = cat if cat != ''
+          tel['ranking']['category_hint'] = true if (cat != '' && input['category_hint_in_query'] == true)
+          
+          # Add LLM telemetry if used
+          tel.merge!(llm_telemetry) if llm_telemetry.any?
+          
+          # Compute facets for metrics
+          rank_facets = {
+            'rank_mode'  => 'rank_service',
+            'rank_model' => tel['ranking']['model'],
+            'llm_rerank_mode' => llm_mode != 'none' ? llm_mode : nil,
+            'llm_rerank_model' => llm_telemetry['llm_rerank_model']
+          }.delete_if { |_k, v| v.nil? }
+          
+          facets = call(:compute_facets_for!, 'rank_texts_with_ranking_api', out, rank_facets)
+          
+          # Local logging with comprehensive details
+          log_extras = {
+            'rank_model' => (tel['ranking']['model'] || input['rank_model']),
+            'n' => Array(out['records']).length,
+            'facets' => facets,
+            'category' => (cat if cat != ''),
+            'filtered_in' => records_used.length,
+            'filtered_out' => (records_in.length - records_used.length),
+            'llm_rerank' => llm_telemetry.any? ? llm_telemetry : nil
+          }.delete_if { |_k, v| v.nil? }
+          
+          call(:local_log_attach!, out,
+            call(:local_log_entry, :rank_texts_with_ranking_api, ctx['started_at'], ctx['t0'], out, nil, log_extras))
+          
+          out
+          
+        rescue => e
+          # Error handling with telemetry
+          g   = call(:extract_google_error, e)
+          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
+          env = call(:telemetry_envelope, ctx['t0'], ctx['cid'], false, call(:telemetry_parse_error_code, e), msg)
+          
+          # Optional debug attachment in non-prod
+          if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
+            env['debug'] = call(:debug_pack, true, url, req_body, g)
+          end
+          
+          call(:local_log_attach!, env,
+            call(:local_log_entry, :rank_texts_with_ranking_api, ctx['started_at'], ctx['t0'], nil, e, 
+                                  { 'google_error' => g, 'llm_mode' => llm_mode }))
+          
+          error(env)
         end
-        out = out.merge(call(:telemetry_envelope, t0, cid, true, code, 'OK'))
-        # annotate ranking call provenance for observability
-        (out['telemetry'] ||= {})['ranking'] = {
-          'api'       => 'discoveryengine.ranking:rank',
-          'version'   => (connection['discovery_api_version'].presence || 'v1alpha'),
-          'location'  => call(:aiapps_loc_resolve, connection, input['ai_apps_location']),
-          'config_id' => config_id,
-          'model'     => (input['rank_model'].to_s.strip if input['rank_model'].present?)
-        }.compact
-        (out['telemetry'] ||= {})['category'] = cat if cat != ''
-        out['telemetry']['ranking']['category_hint'] = true if (cat != '' && input['category_hint_in_query'] == true)
-        # Facets: capture rank mode/model when present
-        rank_facets = {
-          'rank_mode'  => out.dig('telemetry','ranking','api') ? 'rank_service' : nil,
-          'rank_model' => out.dig('telemetry','ranking','model')
-        }.delete_if { |_k,v| v.nil? }
-
-        # Facets + local logging
-        facets = call(:compute_facets_for!, 'rank_texts_with_ranking_api', out, rank_facets)
-        call(:local_log_attach!, out,
-          call(:local_log_entry, :rank_texts_with_ranking_api, started_at, t0, out, nil, {
-            'rank_model' => (out.dig('telemetry','ranking','model') || input['rank_model']),
-            'n'          => Array(out['records']).length,
-            'facets'     => facets,
-            'category'   => (cat if cat != ''),
-            'filtered_in'=> records_used.length,
-            'filtered_out'=> (records_in.length - records_used.length)
-          }))
-        out
-      rescue => e
-        g   = call(:extract_google_error, e)
-        msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-        env = call(:telemetry_envelope, t0, cid, false, call(:telemetry_parse_error_code, e), msg)
-        # Optional debug attachment in non-prod:
-        if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
-          env['debug'] = call(:debug_pack, true, url, req_body, g)
-        end
-
-        call(:local_log_attach!, env,
-          call(:local_log_entry, :rank_texts_with_ranking_api, started_at, t0, nil, e, { 'google_error' => g }))
-
-        error(env)
-      end
       end,
+      
       sample_output: lambda do |_connection, _input|
         {
           'records' => [
-            { 'id' => 'ctx-1', 'score' => 0.92, 'rank' => 1, 'content' => '...', 'metadata' => { 'source' => 'handbook', 'uri' => 'https://...' } }
+            { 'id' => 'ctx-1', 'score' => 0.92, 'rank' => 1, 'content' => '...', 
+              'metadata' => { 'source' => 'handbook', 'uri' => 'https://...' },
+              'llm_confidence' => 0.89 }
           ],
           'context_chunks' => [
-            { 'id' => 'ctx-1', 'text' => '...', 'score' => 0.92, 'source' => 'handbook', 'uri' => 'https://...',
-              'metadata' => { 'page' => 7 }, 'metadata_kv' => [{ 'key' => 'page', 'value' => 7 }], 'metadata_json' => '{"page":7}' }
+            { 'id' => 'ctx-1', 'text' => '...', 'score' => 0.92, 'source' => 'handbook', 
+              'uri' => 'https://...', 'metadata' => { 'page' => 7 }, 
+              'metadata_kv' => [{ 'key' => 'page', 'value' => 7 }], 
+              'metadata_json' => '{"page":7}',
+              'llm_confidence' => 0.89 }
           ],
-          'ok' => true, 'telemetry' => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 9, 'correlation_id' => 'sample' }
+          'distribution' => [
+            { 'id' => 'ctx-1', 'prob' => 0.89 },
+            { 'id' => 'ctx-2', 'prob' => 0.08 },
+            { 'id' => 'ctx-3', 'prob' => 0.03 }
+          ],
+          'ok' => true, 
+          'telemetry' => { 
+            'http_status' => 200, 
+            'message' => 'OK', 
+            'duration_ms' => 450, 
+            'correlation_id' => 'sample',
+            'llm_rerank_mode' => 'post',
+            'llm_rerank_duration_ms' => 320
+          }
         }
       end
     },
@@ -3039,6 +3192,99 @@ require 'securerandom'
   
   # --------- METHODS ------------------------------------------------------
   methods: {
+    llm_context_ranker: lambda do |connection, model, query, contexts, corr=nil|
+      # LLM-based context ranking with probability distribution
+      model_path = call(:build_model_path_with_global_preview, connection, model)
+      req_params = "model=#{model_path}"
+      
+      # Prepare context summaries for LLM
+      context_list = call(:safe_array, contexts).map { |c|
+        {
+          'id' => c['id'],
+          'text' => (c['content'] || c['text']).to_s[0..500]  # Truncate for efficiency
+        }
+      }
+      
+      system_text = <<~SYS
+        You are a precise relevance scorer. Given a query and context chunks, produce a 
+        probability distribution over the chunks indicating their relevance.
+        Output MUST be valid JSON only. Probabilities should sum to approximately 1.0.
+        Include brief reasoning for the top result only.
+      SYS
+      
+      user_text = <<~USR
+        Query: #{query}
+        
+        Context chunks to rank:
+        #{context_list.map { |c| "ID: #{c['id']}\nText: #{c['text']}" }.join("\n---\n")}
+        
+        Produce a probability distribution over these chunks based on relevance to the query.
+      USR
+      
+      payload = {
+        'systemInstruction' => { 'role' => 'system', 'parts' => [{ 'text' => system_text }] },
+        'contents' => [
+          { 'role' => 'user', 'parts' => [{ 'text' => user_text }] }
+        ],
+        'generationConfig' => {
+          'temperature' => 0,
+          'maxOutputTokens' => 512,
+          'responseMimeType' => 'application/json',
+          'responseSchema' => {
+            'type' => 'object',
+            'additionalProperties' => false,
+            'properties' => {
+              'distribution' => {
+                'type' => 'array',
+                'items' => {
+                  'type' => 'object',
+                  'additionalProperties' => false,
+                  'properties' => {
+                    'id' => { 'type' => 'string' },
+                    'prob' => { 'type' => 'number' }
+                  },
+                  'required' => ['id', 'prob']
+                }
+              },
+              'top_reasoning' => { 'type' => 'string' }
+            },
+            'required' => ['distribution']
+          }
+        }
+      }
+      
+      loc = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
+      url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
+      
+      resp = post(url)
+              .headers(call(:request_headers_auth_1, connection, (corr || call(:build_correlation_id)), 
+                            connection['user_project'], req_params))
+              .payload(call(:json_compact, payload))
+      
+      text = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s.strip
+      parsed = JSON.parse(text) rescue { 'distribution' => [] }
+      
+      # Normalize distribution (ensure all contexts have a probability)
+      dist_map = {}
+      parsed['distribution'].each { |d| dist_map[d['id']] = d['prob'].to_f }
+      
+      # Add missing contexts with minimal probability
+      context_list.each do |c|
+        dist_map[c['id']] ||= 0.001
+      end
+      
+      # Renormalize to sum to 1.0
+      total = dist_map.values.sum
+      if total > 0
+        dist_map.each { |k, v| dist_map[k] = (v / total).round(4) }
+      end
+      
+      {
+        'distribution' => dist_map.map { |id, prob| { 'id' => id, 'prob' => prob } }
+                                  .sort_by { |d| -d['prob'] },
+        'reasoning' => parsed['top_reasoning']
+      }
+    end,
     coerce_integer: lambda do |v, fallback|
       Integer(v) rescue fallback
     end,
