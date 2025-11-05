@@ -2740,6 +2740,11 @@ require 'securerandom'
           ]},
           { name: 'intent', type: 'object', properties: Array(object_definitions['intent_out']) },
           { name: 'email_text' },
+          { name: 'email_type' },
+          { name: 'gate', type: 'object', properties: [
+              { name: 'prelim_pass', type: 'boolean' }, { name: 'hard_block', type: 'boolean' },
+              { name: 'hard_reason' }, { name: 'soft_score', type: 'integer' }, { name: 'decision' }, { name: 'generator_hint' }
+            ]},
           { name: 'complete_output', type: 'object', hint: 'All outputs consolidated for easy downstream use' },
           { name: 'facets', type: 'object', optional: true, hint: 'Analytics facets when available' }
         ] + Array(object_definitions['envelope_fields'])
@@ -2766,6 +2771,9 @@ require 'securerandom'
           end
 
         pre = { 'hit' => false }
+        email_type = 'direct_request'
+        hard_block = false
+        hard_reason = nil
         if rules.is_a?(Hash)
           hard = call(:hr_eval_hard?, {
             'subject'=>subj, 'body'=>body, 'from'=>env['from'],
@@ -2773,16 +2781,31 @@ require 'securerandom'
           }, (rules['hard_exclude'] || {}))
 
           if hard[:hit]
-            # Standard outputs
+            hard_reason = hard[:reason] # e.g., forwarded_chain | internal_discussion | mailing_list | bounce | safety_block
+            # Map hard reasons to a deterministic decision and email_type
+            decision_map = {
+              'forwarded_chain'     => 'REVIEW',
+              'internal_discussion' => 'REVIEW',
+              'mailing_list'        => 'IRRELEVANT',
+              'bounce'              => 'IRRELEVANT',
+              'safety_block'        => 'REVIEW'
+            }
+            email_type = 'forwarded_chain'     if hard_reason == 'forwarded_chain'
+            email_type = 'internal_discussion' if hard_reason == 'internal_discussion'
+            hard_block = %w[forwarded_chain internal_discussion safety_block mailing_list bounce].include?(hard_reason)
+            dec = (decision_map[hard_reason] || 'IRRELEVANT')
+            gate = { 'prelim_pass'=>false, 'hard_block'=>hard_block, 'hard_reason'=>hard_reason, 'soft_score'=>0, 'decision'=>dec, 'generator_hint'=>'blocked' }
             out = {
-              'pre_filter' => hard.merge({ 'decision' => 'IRRELEVANT' }),
+              'pre_filter' => hard.merge({ 'decision' => dec }),
               'intent'     => nil,
-              'email_text' => email_text
+              'email_text' => email_text,
+              'email_type' => email_type,
+              'gate'       => gate
             }
             # Compute facets
             return call(:step_ok!, ctx, out, 200, 'OK', { 
               'decision_path' => 'hard_exit',
-              'final_decision' => 'IRRELEVANT',
+              'final_decision' => dec,
               'hard_rule_triggered' => hard[:reason],
               'rules_evaluated' => true,
               'intent_label' => 'none',
@@ -2812,11 +2835,24 @@ require 'securerandom'
           intent = { 'label'=>'transactional','confidence'=>0.7,'basis'=>'keywords' }
         end
 
+        # Preliminary generator gate (upstream of policy): block if any hard_block; require direct_request; disallow IRRELEVANT
+        prelim_pass = (!hard_block) && (email_type == 'direct_request') && (pre['decision'] != 'IRRELEVANT')
+        gate = {
+          'prelim_pass'    => prelim_pass,
+          'hard_block'     => hard_block,
+          'hard_reason'    => hard_reason,
+          'soft_score'     => pre['score'] || 0,
+          'decision'       => pre['decision'],
+          'generator_hint' => (prelim_pass ? 'pass' : 'blocked')
+        }
+
         # Standard outputs
         out = {
           'pre_filter' => pre,
           'intent'     => intent,
-          'email_text' => email_text
+          'email_text' => email_text,
+          'email_type' => email_type,
+          'gate'       => gate
         }
         # Compute facets
         call(:step_ok!, ctx, out, 200, 'OK', { 
@@ -2832,7 +2868,9 @@ require 'securerandom'
           'soft_signals_count' => rules.is_a?(Hash) ? (rules['soft_signals'] || []).length : 0,
           'has_attachments' => env['attachments'].present? && env['attachments'].any?,
           'email_length' => email_text.length,
-          'special_headers' => headers.keys.any? { |k| k.match(/^(x-|list-|auto-|precedence)/i) }
+          'special_headers' => headers.keys.any? { |k| k.match(/^(x-|list-|auto-|precedence)/i) },
+          'email_type' => email_type,
+          'generator_hint' => gate['generator_hint']
         })
       end,
       sample_output: lambda do
@@ -2861,6 +2899,10 @@ require 'securerandom'
         [
           { name: 'policy', type: 'object', properties: Array(object_definitions['policy_out']) },
           { name: 'short_circuit', type: 'boolean' },
+          { name: 'email_type' },
+          { name: 'generator_gate', type: 'object', properties: [
+              { name: 'pass_to_responder', type: 'boolean' }, { name: 'reason' }, { name: 'generator_hint' }
+            ]},
           { name: 'complete_output', type: 'object', hint: 'All outputs consolidated for easy downstream use' },
           { name: 'facets', type: 'object', optional: true, hint: 'Analytics facets when available' }
         ] + Array(object_definitions['envelope_fields'])
@@ -2913,11 +2955,34 @@ require 'securerandom'
 
         short_circuit = (policy['decision'] == 'IRRELEVANT' && policy['confidence'].to_f >= (input['confidence_short_circuit'] || 0.8).to_f)
 
-        out = { 'policy'=>policy, 'short_circuit'=>short_circuit }
+        # Generator gate (strict): require direct_request + ≥0.60 + not IRRELEVANT
+        email_type = (input['email_type'].presence || 'direct_request')
+        min_conf = (input['min_confidence_for_generation'].presence || 0.60).to_f
+        decision  = policy['decision'].to_s.upcase
+        conf      = policy['confidence'].to_f
+        block_reasons = []
+        block_reasons << 'non_direct_request' if email_type != 'direct_request'
+        block_reasons << 'policy_irrelevant'  if decision == 'IRRELEVANT'
+        block_reasons << 'low_confidence'     if conf < min_conf
+        pass_to_responder = block_reasons.empty?
+        generator_hint = pass_to_responder ? 'pass' : 'blocked'
+
+        out = {
+          'policy'=>policy,
+          'short_circuit'=>short_circuit,
+          'email_type'=>email_type,
+          'generator_gate'=>{
+            'pass_to_responder'=>pass_to_responder,
+            'reason'=> (block_reasons.any? ? block_reasons.join(',') : 'meets_minimums'),
+            'generator_hint'=>generator_hint
+          }
+        }
         call(:step_ok!, ctx, out, call(:telemetry_success_code, resp), 'OK', {
           'decision' => policy['decision'],
           'confidence' => policy['confidence'],
           'short_circuit' => short_circuit,
+          'email_type' => email_type,
+          'generator_hint' => generator_hint,
           'signals_count' => (policy['matched_signals'] || []).length,
           'reasons_count' => (policy['reasons'] || []).length,
           'model_used' => input['model'] || 'gemini-2.0-flash',
