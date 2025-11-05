@@ -37,7 +37,7 @@ require 'securerandom'
       { name: 'user_project',               optional: true,   control_type: 'text',      label: 'User project for quota/billing',
         extends_schema: true, hint: 'Sets x-goog-user-project for billing/quota. Service account must have roles/serviceusage.serviceUsageConsumer on this project.' },
       { name: 'discovery_api_version', label: 'Discovery API version', control_type: 'select', optional: true, default: 'v1alpha',
-        pick_list: 'discovery_versions', hint: 'v1alpha for AI Applications; switch to v1beta/v1 if/when you migrate.' },
+        options: [['v1alpha','v1alpha'], ['v1beta','v1beta'], ['v1','v1']], hint: 'v1alpha for AI Applications; switch to v1beta/v1 if/when you migrate.' },
       # Facets logging feature-flag (on by default)
       { name: 'enable_facets_logging', label: 'Enable facets in tail logs',
         type: 'boolean', control_type: 'checkbox', optional: true, default: true,
@@ -3841,48 +3841,85 @@ require 'securerandom'
         
         text = raw_text.to_s
         
-        # Limit input size upfront
+        # Limit input size upfront to prevent performance issues
         if text.length > 50000
           text = text[0..50000] + '...[truncated]'
         end
         
-        # Fix common PDF extraction artifacts
+        # Phase 1: Fix double-escaped sequences (most common PDF artifact)
         text = text
-          # Handle double-escaped sequences first
           .gsub(/\\\\n/, "\n")        # Convert \\n to actual newline
-          .gsub(/\\\\t/, " ")         # Convert \\t to space
-          .gsub(/\\\\r/, "")          # Remove \\r
+          .gsub(/\\\\t/, " ")         # Convert \\t to space (not tab to avoid layout issues)
+          .gsub(/\\\\r/, "")          # Remove \\r entirely
           .gsub(/\\\\"/, '"')         # Convert \\" to "
           .gsub(/\\\\'/, "'")         # Convert \\' to '
           .gsub(/\\\\/, "\\")         # Cleanup remaining double backslashes
         
-        # Remove control characters except tab, newline, carriage return
+        # Phase 2: Handle single-escaped sequences (if not caught above)
+        text = text
+          .gsub(/\\n/, "\n")          # Convert \n to newline
+          .gsub(/\\t/, " ")           # Convert \t to space
+          .gsub(/\\r/, "")            # Remove \r
+        
+        # Phase 3: Remove control characters except tab, newline, carriage return
         control_chars = (0..31).map { |i| i.chr }.join
         keep_chars = "\t\n\r"
         chars_to_remove = control_chars.delete(keep_chars)
         text = text.delete(chars_to_remove)
         
-        # Continue with other transformations
+        # Phase 4: Fix PDF-specific layout artifacts
         text = text
-          .gsub(/(\w)-\n(\w)/, '\1\2')  # Rejoin hyphenated words
-          .gsub(/\r\n|\r/, "\n")         # Normalize line endings
-          .gsub(/\n{3,}/, "\n\n")        # Collapse excessive newlines
-          .gsub(/[ \t]+/, ' ')           # Collapse spaces and tabs
-          .gsub(/^[ \t]+|[ \t]+$/, '')   # Trim line starts/ends
-          .gsub(/##(\w)/, '## \1')       # Add space after ## headers
-          .gsub(/\.\.+$/, '...')         # Normalize ellipsis at end
+          .gsub(/(\w)-\n(\w)/, '\1\2')    # Rejoin hyphenated words across lines
+          .gsub(/\r\n|\r/, "\n")          # Normalize line endings
+          .gsub(/\n{3,}/, "\n\n")         # Collapse excessive newlines
+          .gsub(/[ \t]+/, ' ')            # Collapse spaces and tabs
+          .gsub(/^[ \t]+|[ \t]+$/m, '')   # Trim line starts/ends (multiline mode)
+          .gsub(/##(\w)/, '## \1')        # Add space after ## headers
+          .gsub(/\.\.+$/, '...')          # Normalize ellipsis at end
+        
+        # Phase 5: Fix common PDF extraction patterns
+        text = text
+          .gsub(/\s*\n\s*-\s*/, "\n• ")   # Convert hyphen lists to bullets
+          .gsub(/([.!?])\s*\n+([A-Z])/, '\1 \2')  # Join sentences split across lines
+          .gsub(/\[\s*\]/, '')            # Remove empty brackets
+          .gsub(/\(\s*\)/, '')            # Remove empty parentheses
+        
+        # Phase 6: Final cleanup and encoding
+        text = text
+          .strip                          # Remove leading/trailing whitespace
+          .gsub(/\s+\n/, "\n")           # Remove trailing spaces on lines
+          .gsub(/\n\s+/, "\n")           # Remove leading spaces on lines
         
         # Truncate if still too long after cleaning
-        text = text[0..10000] + '...[truncated]' if text.length > 10000
+        if text.length > 10000
+          text = text[0..10000] + '...[truncated]'
+        end
         
-        # Final encoding cleanup with fallback
+        # Final encoding cleanup with multiple fallbacks
         begin
-          text.encode('UTF-8', invalid: :replace, undef: :replace, replace: ' ')
+          # Try UTF-8 first
+          text.encode('UTF-8', 
+                      invalid: :replace, 
+                      undef: :replace, 
+                      replace: ' ')
               .strip
         rescue Encoding::UndefinedConversionError => e
-          # Last resort: ASCII-safe version
-          text.encode('ASCII', invalid: :replace, undef: :replace, replace: '?')
-              .encode('UTF-8')
+          # Fallback: try Windows-1252 (common in PDFs)
+          begin
+            text.encode('UTF-8', 'Windows-1252', 
+                        invalid: :replace, 
+                        undef: :replace, 
+                        replace: '?')
+                .strip
+          rescue
+            # Last resort: ASCII-safe version
+            text.encode('ASCII', 
+                        invalid: :replace, 
+                        undef: :replace, 
+                        replace: '?')
+                .encode('UTF-8')
+                .strip
+          end
         end
         
       rescue => e
@@ -3892,31 +3929,62 @@ require 'securerandom'
     end,
     is_pdf_source?: lambda do |source_uri, metadata|
       begin
-        # Check if this context comes from a PDF
+        # Return false if we have nothing to check
         return false if source_uri.nil? && metadata.nil?
         
-        # Check source URI extension
-        if source_uri.to_s.downcase.end_with?('.pdf')
-          return true
+        # Check source URI extension (most reliable)
+        uri = source_uri.to_s.downcase.strip
+        if uri.present?
+          # Direct PDF extension check
+          return true if uri.end_with?('.pdf')
+          
+          # Check for URL-encoded PDF extension
+          return true if uri.include?('.pdf?') || uri.include?('.pdf#')
+          
+          # Check for PDF in path even if not at end
+          return true if uri.include?('/pdf/') || uri.include?('_pdf_')
         end
         
         # Check metadata for file type indicators
         if metadata.is_a?(Hash)
-          file_type = metadata['file_type'] || 
+          # Check explicit file type fields
+          file_type = (metadata['file_type'] || 
                       metadata['fileType'] || 
                       metadata['mimeType'] || 
-                      metadata['mime_type'] || ''
+                      metadata['mime_type'] || 
+                      metadata['content_type'] || 
+                      metadata['contentType'] || '').to_s.downcase
           
-          return true if file_type.to_s.downcase.include?('pdf')
+          return true if file_type.include?('pdf')
           
           # Check source/filename in metadata
-          source = metadata['source'] || metadata['filename'] || ''
-          return true if source.to_s.downcase.end_with?('.pdf')
+          source = (metadata['source'] || 
+                    metadata['filename'] || 
+                    metadata['file_name'] || 
+                    metadata['fileName'] || 
+                    metadata['name'] || '').to_s.downcase
+          
+          return true if source.end_with?('.pdf')
+          
+          # Check for PDF processor indicators
+          processor = (metadata['processor'] || 
+                      metadata['parser'] || '').to_s.downcase
+          
+          return true if processor.include?('pdf') || 
+                        processor.include?('document_ai') || 
+                        processor.include?('ocr')
+          
+          # Check for page numbers (strong PDF indicator)
+          return true if metadata.key?('page') || 
+                        metadata.key?('pageNumber') || 
+                        metadata.key?('page_number')
         end
         
         false
+        
       rescue => e
         # Default to false if detection fails
+        puts "Error in is_pdf_source?: #{e.message}"
         false
       end
     end,
@@ -3934,47 +4002,54 @@ require 'securerandom'
           return response['contexts']
         end
         
-        # Tertiary: look for any 'contexts' key recursively
-        def find_contexts_array(obj, depth = 0)
+        # Tertiary: look for any 'contexts' key recursively (with depth limit)
+        find_contexts_array = lambda do |obj, depth = 0|
           return nil if depth > 3  # Prevent infinite recursion
           
           case obj
           when Hash
             # Check if this hash has a 'contexts' key with an array
             if obj['contexts'].is_a?(Array) && !obj['contexts'].empty?
-              # Verify it looks like context objects (has text or chunkId)
-              if obj['contexts'].first.is_a?(Hash) && 
-                (obj['contexts'].first.key?('text') || 
-                  obj['contexts'].first.key?('chunkId') ||
-                  obj['contexts'].first.key?('chunkText'))
+              # Verify it looks like context objects (has expected fields)
+              first = obj['contexts'].first
+              if first.is_a?(Hash) && 
+                (first.key?('text') || first.key?('chunkText') || 
+                  first.key?('chunkId') || first.key?('sourceUri'))
                 return obj['contexts']
               end
             end
             
             # Recursively search hash values
             obj.each_value do |v|
-              result = find_contexts_array(v, depth + 1)
+              result = find_contexts_array.call(v, depth + 1)
               return result if result
             end
           when Array
-            # Check if this looks like a contexts array
+            # Check if this looks like a contexts array directly
             if !obj.empty? && obj.first.is_a?(Hash) && 
-              (obj.first.key?('text') || obj.first.key?('chunkId'))
+              (obj.first.key?('text') || obj.first.key?('chunkId') || 
+                obj.first.key?('chunkText'))
               return obj
+            end
+            
+            # Search array elements
+            obj.each do |elem|
+              result = find_contexts_array.call(elem, depth + 1)
+              return result if result
             end
           end
           nil
         end
         
         # Try to find contexts anywhere in response
-        found = find_contexts_array(response)
+        found = find_contexts_array.call(response)
         return found if found
         
         # Last resort: empty array
         []
         
       rescue => e
-        # Log the error for debugging
+        # Log the error for debugging but don't fail
         puts "Error in safe_extract_contexts: #{e.message}"
         []
       end
@@ -4945,8 +5020,13 @@ require 'securerandom'
       return {} unless out.is_a?(Hash)
       h = {}
   
-      # Handle rag_retrieve_contexts_enhanced action
-      if action_id.to_s == 'rag_retrieve_contexts_enhanced'
+      # Get telemetry for correlation_id (always needed)
+      tel = out['telemetry'].is_a?(Hash) ? out['telemetry'] : {}
+
+      # Action-specific facet extraction
+      case action_id.to_s
+      when 'rag_retrieve_contexts_enhanced'
+        # Extract from extras passed by the action
         retrieval = extras['retrieval'] || {}
         rank = extras['rank'] || {}
         
@@ -4968,59 +5048,48 @@ require 'securerandom'
         end
         
         h['network_error'] = extras['network_error'].present?
+        
+      when 'gen_generate'
+        # For generation actions, extract from output
+        # Context counts
+        ctxs = out['contexts'] || out['context_chunks']
+        h['contexts_returned'] = Array(ctxs).length if ctxs
+        
+        # Token usage
+        usage = out['usage'] || out['usageMetadata']
+        h.merge!(call(:_facet_tokens, usage)) if usage
+        
+        # Generation outcome fields
+        fr = call(:_facet_finish_reason, out)
+        h['gen_finish_reason'] = call(:_facet_str, fr) if fr
+        
+        # Safety blocked
+        c0 = Array(out['candidates']).first || {}
+        h['safety_blocked'] = call(:_facet_safety_blocked?, c0) if c0.any?
+        
+        # Confidence
+        h['confidence'] = call(:_facet_float, out['confidence']) if out.key?('confidence')
+        
+        # Abstention detection
+        ans = out['answer']
+        if ans.is_a?(String)
+          h['answered_unknown'] = true if ans.strip =~ /\A(?i:(i\s+don['']?t\s+know|cannot\s+answer|no\s+context|not\s+enough\s+context))/
+        end
+        
+      else
+        # For all other actions, just merge the extras directly
+        # (deterministic_filter, ai_policy_filter, embed_text_against_categories, etc.)
+        # These actions already provide clean extras
+        extras_clean = extras.is_a?(Hash) ? extras.dup : {}
+        extras_clean.delete_if { |_k,v| v.is_a?(Array) || v.is_a?(Hash) } # avoid bloat
+        h.merge!(extras_clean)
       end
-
-      # Retrieval knobs
-      h['retrieval_top_k']       = call(:_facet_int, ret['top_k'])
-      if ret['filter'].is_a?(Hash)
-        h['retrieval_filter']     = call(:_facet_str, ret['filter']['type'])
-        h['retrieval_filter_val'] = call(:_facet_float, ret['filter']['value'])
-      end
-
-      # Ranker provenance
-      h['rank_mode']  = call(:_facet_str, rnk['mode'])
-      h['rank_model'] = call(:_facet_str, rnk['model'], 256)
-
-      # Context counts (works for both retrieve→contexts and rag-lite→context_chunks)
-      ctxs = out['contexts'] || out['context_chunks']
-      h['contexts_returned'] = Array(ctxs).length
-
-      # Token usage (usage or usageMetadata)
-      usage = out['usage'] || out['usageMetadata']
-      h.merge!(call(:_facet_tokens, usage))
-
-      # Generation outcome fields (if present)
-      # Try structured finishReason first (from candidates), otherwise from parsed meta if caller attached it later.
-      fr = call(:_facet_finish_reason, out)
-      h['gen_finish_reason'] = call(:_facet_str, fr) if fr
-
-      # Safety: true if any candidate blocked
-      c0 = Array(out['candidates']).first || {}
-      h['safety_blocked'] = call(:_facet_bool, call(:_facet_safety_blocked?, c0)) if c0 && c0.any?
-
-      # Confidence proxy (rag-lite)
-      h['confidence'] = call(:_facet_float, out['confidence']) if out.key?('confidence')
-
-      # Abstention detection (simple heuristic)
-      ans = out['answer']
-      if ans.is_a?(String)
-        h['answered_unknown'] = true if ans.strip =~ /\A(?i:(i\s+don[’']?t\s+know|cannot\s+answer|no\s+context|not\s+enough\s+context))/
-      end
-
-      # Merge caller extras (pre-sanitized small scalars only)
-      extras = extras.is_a?(Hash) ? extras.dup : {}
-      extras.delete_if { |_k,v| v.is_a?(Array) || v.is_a?(Hash) } # avoid bloat
-      h.merge!(extras)
-    
-      # Always surface correlation_id
-      tel = out['telemetry'].is_a?(Hash) ? out['telemetry'] : {}
+      
+      # Always surface correlation_id for downstream grouping
       if tel['correlation_id'].to_s.strip != ''
         h['correlation_id'] = tel['correlation_id'].to_s.strip
       end
-
-      ret = tel['retrieval'].is_a?(Hash) ? tel['retrieval'] : {}
-      rnk = tel['rank'].is_a?(Hash)      ? tel['rank']      : {}
-
+      
       # Final compaction: drop nils/empties
       h.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
       h
