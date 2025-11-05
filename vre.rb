@@ -3408,19 +3408,58 @@ require 'securerandom'
       begin
         return [] unless response.is_a?(Hash)
         
-        # Try multiple possible paths for contexts
-        contexts = response.dig('contexts', 'contexts') ||
-                  response['contexts'] ||
-                  response.dig('results', 'contexts') ||
-                  response.dig('contextChunks') ||
-                  []
+        # Primary path: response.contexts.contexts (Vertex AI RAG standard)
+        if response.dig('contexts', 'contexts').is_a?(Array)
+          return response.dig('contexts', 'contexts')
+        end
         
-        # Ensure it's an array
-        contexts = [contexts] unless contexts.is_a?(Array)
+        # Secondary: response.contexts as array
+        if response['contexts'].is_a?(Array)
+          return response['contexts']
+        end
         
-        # Filter out non-hash elements
-        contexts.select { |c| c.is_a?(Hash) }
+        # Tertiary: look for any 'contexts' key recursively
+        def find_contexts_array(obj, depth = 0)
+          return nil if depth > 3  # Prevent infinite recursion
+          
+          case obj
+          when Hash
+            # Check if this hash has a 'contexts' key with an array
+            if obj['contexts'].is_a?(Array) && !obj['contexts'].empty?
+              # Verify it looks like context objects (has text or chunkId)
+              if obj['contexts'].first.is_a?(Hash) && 
+                (obj['contexts'].first.key?('text') || 
+                  obj['contexts'].first.key?('chunkId') ||
+                  obj['contexts'].first.key?('chunkText'))
+                return obj['contexts']
+              end
+            end
+            
+            # Recursively search hash values
+            obj.each_value do |v|
+              result = find_contexts_array(v, depth + 1)
+              return result if result
+            end
+          when Array
+            # Check if this looks like a contexts array
+            if !obj.empty? && obj.first.is_a?(Hash) && 
+              (obj.first.key?('text') || obj.first.key?('chunkId'))
+              return obj
+            end
+          end
+          nil
+        end
+        
+        # Try to find contexts anywhere in response
+        found = find_contexts_array(response)
+        return found if found
+        
+        # Last resort: empty array
+        []
+        
       rescue => e
+        # Log the error for debugging
+        puts "Error in safe_extract_contexts: #{e.message}"
         []
       end
     end,
