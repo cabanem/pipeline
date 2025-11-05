@@ -149,338 +149,306 @@
 }
 // DET_FILTER
 {
-  "hard_exclude": {
-    "auto_reply": [
-      { "field": "headers.auto-submitted", "operator": "not_equals", "value": "no" },
-      { "field": "subject", "operator": "matches", "pattern": "(?i)(out of office|auto.?reply|automatic reply|vacation responder)" }
-    ],
-    "forwarded_chain": [
-      { "field": "subject", "operator": "matches", "pattern": "(?i)^(fwd?:|re:\\s*fwd?:|forwarded)" },
-      { "field": "body", "operator": "matches", "pattern": "(?i)(----\\s*original message\\s*----|-+\\s*forwarded message\\s*-+)" },
-      { "field": "body", "operator": "matches", "pattern": "(?i)^(from:|sent:|to:|subject:).*(from:|sent:|to:|subject:)" },
-      { "field": "headers.x-forwarded-for", "operator": "exists" }
-    ],
-    "internal_discussion": [
-      { "field": "body", "operator": "matches", "pattern": "(?i)(please (help|assist|respond to) (this employee|them|this person|this request))" },
-      { "field": "body", "operator": "matches", "pattern": "(?i)(can you (handle|take care of|look into) this)" },
-      { "field": "body", "operator": "matches", "pattern": "(?i)(FYI|for your (information|action|review))" },
-      { "field": "body", "operator": "matches", "pattern": "(?i)(see below|see attached email|per our discussion)" }
-    ],
-    "mailing_list": [
-      { "field": "headers.list-unsubscribe", "operator": "exists" },
-      { "field": "headers.list-id", "operator": "exists" },
-      { "field": "headers.precedence", "operator": "matches", "pattern": "(?i)(bulk|list)" },
-      { "field": "body", "operator": "matches", "pattern": "(?i)unsubscribe" }
-    ],
-    "bounce": [
-      { "field": "from", "operator": "matches", "pattern": "(?i)(mailer-daemon|postmaster)" },
-      { "field": "subject", "operator": "matches", "pattern": "(?i)(delivery status notification|undeliverable|mail failure|returned mail)" }
-    ]
-  },
-  "soft_signals": [
-    { "id": "emp_domain_from", "family": "employee", "field": "from", "operator": "matches", "pattern": "@company\\.com$", "weight": 2, "cap_per_email": 1, "enabled": true },
-    { "id": "emp_signature", "family": "employee", "field": "body", "operator": "matches", "pattern": "@company\\.com", "weight": 2, "cap_per_email": 1, "enabled": true },
-    { "id": "emp_manager", "family": "employee", "field": "body", "operator": "matches", "pattern": "(?i)(my manager|approved by|people manager)", "weight": 1, "cap_per_email": 1, "enabled": true },
-    { "id": "emp_tools", "family": "employee", "field": "body", "operator": "matches", "pattern": "(?i)(Workday|ADP|UKG|Rippling|HR portal)", "weight": 1, "cap_per_email": 2, "enabled": true },
-    
-    { "id": "chain_indicator", "family": "chain_forward", "field": "body", "operator": "matches", "pattern": "(?i)(>\\s*from:|>\\s*sent:|>\\s*subject:|>{2,})", "weight": -4, "cap_per_email": 1, "enabled": true },
-    { "id": "third_person_ref", "family": "chain_forward", "field": "body", "operator": "matches", "pattern": "(?i)\\b(this employee|this person|they are asking|they need|their request|the employee|he is asking|she is asking)\\b", "weight": -3, "cap_per_email": 2, "enabled": true },
-    { "id": "internal_routing", "family": "chain_forward", "field": "body", "operator": "matches", "pattern": "(?i)(please handle|can you help with|take a look at this|see email below|forwarding to you)", "weight": -3, "cap_per_email": 1, "enabled": true },
-    { "id": "email_quotes", "family": "chain_forward", "field": "body", "operator": "matches", "pattern": "(?:^|\\n)\\s*>[>\\s]*.{20,}", "weight": -2, "cap_per_email": 3, "enabled": true },
-    { "id": "multiple_senders", "family": "chain_forward", "field": "body", "operator": "matches", "pattern": "From:.*From:", "weight": -4, "cap_per_email": 1, "enabled": true },
-
-    { "id": "first_person_request", "family": "direct_request", "field": "body", "operator": "matches", "pattern": "(?i)\\b(I need|I would like|I'?m requesting|my (pto|paycheck|benefits)|can I|could I|I want to)\\b", "weight": 3, "cap_per_email": 2, "enabled": true },
-    { "id": "direct_question", "family": "direct_request", "field": "body", "operator": "matches", "pattern": "(?i)^(can I|could I|how do I|when can I|what is my|where is my|why is my)", "weight": 2, "cap_per_email": 1, "enabled": true },
-
-    { "id": "topic_pto", "family": "hr_topics", "field": "body", "operator": "matches", "pattern": "(?i)\\b(PTO|paid time off|vacation|holiday|sick (day|leave))\\b", "weight": 2, "cap_per_email": 2, "enabled": true },
-    { "id": "topic_w2", "family": "hr_topics", "field": "body", "operator": "matches", "pattern": "(?i)\\b(W-?2|tax (form|paperwork|document))\\b", "weight": 2, "cap_per_email": 2, "enabled": true },
-    { "id": "topic_payroll", "family": "hr_topics", "field": "body", "operator": "matches", "pattern": "(?i)\\b(payroll|paycheck|direct deposit|timesheet|timecard|didn'?t submit time)\\b", "weight": 2, "cap_per_email": 2, "enabled": true },
-
-    { "id": "nonemp_marketing", "family": "non_employee", "field": "body", "operator": "matches", "pattern": "(?i)(free trial|demo|pricing|quote(?: request)?|our services|newsletter)", "weight": -3, "cap_per_email": 1, "enabled": true },
-    { "id": "nonemp_unsub", "family": "non_employee", "field": "body", "operator": "matches", "pattern": "(?i)unsubscribe", "weight": -3, "cap_per_email": 1, "enabled": true },
-
-    { "id": "soft_auto_reply_text", "family": "auto_reply", "field": "body", "operator": "matches", "pattern": "(?i)(out of office|automatic reply)", "weight": -3, "cap_per_email": 1, "enabled": true },
-
-    { "id": "pii_ssn", "family": "pii", "field": "body", "operator": "matches", "pattern": "\\b\\d{3}-\\d{2}-\\d{4}\\b", "weight": -4, "cap_per_email": 1, "enabled": true },
-    { "id": "pii_bank", "family": "pii", "field": "body", "operator": "matches", "pattern": "(?i)(routing number|account number|direct deposit form)", "weight": -3, "cap_per_email": 1, "enabled": true },
-
-    { "id": "legal_language", "family": "reply_safety", "field": "body", "operator": "matches", "pattern": "(?i)(lawsuit|attorney|legal action|discrimination|harassment|hostile work environment)", "weight": -5, "action": "escalate_to_human", "no_auto_reply": true, "cap_per_email": 1, "enabled": true },
-    { "id": "medical_detail", "family": "reply_safety", "field": "body", "operator": "matches", "pattern": "(?i)(diagnosis|medical condition|disability|FMLA|workers comp|injury)", "weight": -3, "action": "review_before_reply", "cap_per_email": 1, "enabled": true },
-    { "id": "termination_language", "family": "reply_safety", "field": "body", "operator": "matches", "pattern": "(?i)(wrongful termination|unfair dismissal|constructive dismissal|severance dispute)", "weight": -5, "action": "escalate_to_human", "no_auto_reply": true, "cap_per_email": 1, "enabled": true },
-    { "id": "emotional_distress", "family": "reply_safety", "field": "body", "operator": "matches", "pattern": "(?i)(emotional distress|mental health crisis|suicidal|self-harm|threat)", "weight": -5, "action": "immediate_escalation", "no_auto_reply": true, "cap_per_email": 1, "enabled": true }
-  ],
-  "thresholds": {
-    "keep_min": 4,
-    "review_min": 2,
-    "floor": -6,
-    "cap_total": 10,
-    "auto_reply_min": 6,
-    "no_reply_max": -2
-  },
-  "guards": {
-    "cap_per_family": { 
-      "employee": 3, 
-      "hr_topics": 3, 
-      "non_employee": 2, 
-      "pii": 2,
-      "reply_safety": 2,
-      "chain_forward": 3,
-      "direct_request": 2
+  "semantic_config": {
+    "hard_exclude": {
+      "auto_reply": [
+        { "field": "headers.auto-submitted", "operator": "not_equals", "value": "no" },
+        { "field": "subject", "operator": "matches", "pattern": "(?i)(out of office|auto.?reply|automatic reply|vacation responder)" }
+      ],
+      "forwarded_chain": [
+        { "field": "subject", "operator": "matches", "pattern": "(?i)^(fwd?:|re:\\s*fwd?:|forwarded)" },
+        { "field": "body", "operator": "matches", "pattern": "(?i)(----\\s*original message\\s*----|-+\\s*forwarded message\\s*-+)" },
+        { "field": "body", "operator": "matches", "pattern": "(?i)(^|\\n)(from:|sent:|to:|subject:).*(^|\\n)(from:|sent:|to:|subject:)" },
+        { "field": "headers.x-forwarded-for", "operator": "exists" }
+      ],
+      "internal_discussion": [
+        { "field": "body", "operator": "matches", "pattern": "(?i)(please (help|assist|respond to) (this employee|this person))" },
+        { "field": "body", "operator": "matches", "pattern": "(?i)(can you (handle|take care of|look into) this)" },
+        { "field": "body", "operator": "matches", "pattern": "(?i)\\b(FYI|for your (information|action|review))\\b" },
+        { "field": "body", "operator": "matches", "pattern": "(?i)(see below|see attached email|per our discussion)" }
+      ],
+      "mailing_list": [
+        { "field": "headers.list-unsubscribe", "operator": "exists" },
+        { "field": "headers.list-id", "operator": "exists" },
+        { "field": "headers.precedence", "operator": "matches", "pattern": "(?i)(bulk|list)" },
+        { "field": "body", "operator": "matches", "pattern": "(?i)unsubscribe" }
+      ],
+      "bounce": [
+        { "field": "from", "operator": "matches", "pattern": "(?i)(mailer-daemon|postmaster)" },
+        { "field": "subject", "operator": "matches", "pattern": "(?i)(delivery status notification|undeliverable|mail failure|returned mail)" }
+      ],
+      "safety_block": [
+        { "field": "body", "operator": "matches", "pattern": "(?i)(lawsuit|attorney|legal action|discrimination|harassment|hostile work environment)" },
+        { "field": "body", "operator": "matches", "pattern": "(?i)(diagnosis|medical condition|disability|FMLA|workers comp|injury)" },
+        { "field": "body", "operator": "matches", "pattern": "(?i)(suicidal|self-harm|threat|crisis)" }
+      ]
     },
-    "notes": "Headers may be absent; rely on subject/body patterns and signatures. Hard excludes cover auto-replies, lists, and bounces. Reply safety signals prevent inappropriate auto-responses. Detects forwarded chains and internal discussions to prevent auto-response. Direct first-person requests score higher."
+
+    "soft_signals": [
+      { "id": "emp_domain_from", "family": "employee", "field": "from", "operator": "matches", "pattern": "@company\\.com$", "weight": 2, "cap_per_email": 1, "enabled": true },
+      { "id": "emp_signature", "family": "employee", "field": "body", "operator": "matches", "pattern": "@company\\.com", "weight": 2, "cap_per_email": 1, "enabled": true },
+      { "id": "emp_manager", "family": "employee", "field": "body", "operator": "matches", "pattern": "(?i)(my manager|approved by|people manager)", "weight": 1, "cap_per_email": 1, "enabled": true },
+      { "id": "emp_tools", "family": "employee", "field": "body", "operator": "matches", "pattern": "(?i)(Workday|ADP|UKG|Rippling|HR portal)", "weight": 1, "cap_per_email": 2, "enabled": true },
+
+      { "id": "chain_indicator", "family": "chain_forward", "field": "body", "operator": "matches", "pattern": "(?i)(>\\s*from:|>\\s*sent:|>\\s*subject:|>{2,})", "weight": -4, "cap_per_email": 1, "enabled": true },
+      { "id": "third_person_ref", "family": "chain_forward", "field": "body", "operator": "matches", "pattern": "(?i)\\b(this employee|this person|the employee)\\b", "weight": -3, "cap_per_email": 2, "enabled": true },
+      { "id": "internal_routing", "family": "chain_forward", "field": "body", "operator": "matches", "pattern": "(?i)(please handle|can you help with|take a look at this|see email below|forwarding to you)", "weight": -3, "cap_per_email": 1, "enabled": true },
+      { "id": "email_quotes", "family": "chain_forward", "field": "body", "operator": "matches", "pattern": "(?:^|\\n)\\s*>[>\\s]*.{20,}", "weight": -2, "cap_per_email": 3, "enabled": true },
+      { "id": "multiple_senders", "family": "chain_forward", "field": "body", "operator": "matches", "pattern": "From:.*From:", "weight": -4, "cap_per_email": 1, "enabled": true },
+
+      { "id": "first_person_request", "family": "direct_request", "field": "body", "operator": "matches", "pattern": "(?i)\\b(I (need|would like|am requesting|can'?t access|want to)|my (pto|paycheck|benefits))\\b", "weight": 3, "cap_per_email": 2, "enabled": true },
+      { "id": "direct_question", "family": "direct_request", "field": "body", "operator": "matches", "pattern": "(?i)^(can I|could I|how do I|when can I|what is my|where is my|why is my)", "weight": 2, "cap_per_email": 1, "enabled": true },
+
+      { "id": "topic_pto", "family": "hr_topics", "field": "body", "operator": "matches", "pattern": "(?i)\\b(PTO|paid time off|vacation|holiday|sick (day|leave))\\b", "weight": 2, "cap_per_email": 2, "enabled": true },
+      { "id": "topic_w2", "family": "hr_topics", "field": "body", "operator": "matches", "pattern": "(?i)\\b(W-?2|tax (form|paperwork|document))\\b", "weight": 2, "cap_per_email": 2, "enabled": true },
+      { "id": "topic_payroll", "family": "hr_topics", "field": "body", "operator": "matches", "pattern": "(?i)\\b(payroll|paycheck|direct deposit|timesheet|timecard|didn'?t submit time)\\b", "weight": 2, "cap_per_email": 2, "enabled": true },
+
+      { "id": "nonemp_marketing", "family": "non_employee", "field": "body", "operator": "matches", "pattern": "(?i)(free trial|demo|pricing|quote(?: request)?|our services|newsletter)", "weight": -3, "cap_per_email": 1, "enabled": true },
+      { "id": "nonemp_unsub", "family": "non_employee", "field": "body", "operator": "matches", "pattern": "(?i)unsubscribe", "weight": -3, "cap_per_email": 1, "enabled": true },
+
+      { "id": "soft_auto_reply_text", "family": "auto_reply", "field": "body", "operator": "matches", "pattern": "(?i)(out of office|automatic reply)", "weight": -3, "cap_per_email": 1, "enabled": true },
+
+      { "id": "pii_ssn", "family": "pii", "field": "body", "operator": "matches", "pattern": "\\b\\d{3}-\\d{2}-\\d{4}\\b", "weight": -4, "cap_per_email": 1, "enabled": true },
+      { "id": "pii_bank", "family": "pii", "field": "body", "operator": "matches", "pattern": "(?i)(routing number|account number|direct deposit form)", "weight": -3, "cap_per_email": 1, "enabled": true },
+
+      { "id": "legal_language", "family": "reply_safety", "field": "body", "operator": "matches", "pattern": "(?i)(lawsuit|attorney|legal action|discrimination|harassment|hostile work environment)", "weight": -5, "action": "escalate_to_human", "no_auto_reply": true, "cap_per_email": 1, "enabled": true },
+      { "id": "medical_detail", "family": "reply_safety", "field": "body", "operator": "matches", "pattern": "(?i)(diagnosis|medical condition|disability|FMLA|workers comp|injury)", "weight": -3, "action": "review_before_reply", "no_auto_reply": true, "cap_per_email": 1, "enabled": true },
+      { "id": "termination_language", "family": "reply_safety", "field": "body", "operator": "matches", "pattern": "(?i)(wrongful termination|unfair dismissal|constructive dismissal|severance dispute)", "weight": -5, "action": "escalate_to_human", "no_auto_reply": true, "cap_per_email": 1, "enabled": true },
+      { "id": "emotional_distress", "family": "reply_safety", "field": "body", "operator": "matches", "pattern": "(?i)(emotional distress|mental health crisis|suicidal|self-harm|threat)", "weight": -5, "action": "immediate_escalation", "no_auto_reply": true, "cap_per_email": 1, "enabled": true }
+    ],
+
+    "thresholds": {
+      "keep_min": 4,
+      "review_min": 2,
+      "floor": -6,
+      "cap_total": 10,
+      "auto_reply_min": 6,
+      "no_reply_max": -2
+    },
+
+    "guards": {
+      "cap_per_family": {
+        "employee": 3,
+        "hr_topics": 3,
+        "non_employee": 2,
+        "pii": 2,
+        "reply_safety": 2,
+        "chain_forward": 3,
+        "direct_request": 2
+      },
+      "generator_gate": {
+        "min_confidence_for_generation": 0.60,
+        "block_if_hard_exclude_present": true,
+        "block_if_reply_safety_no_auto_reply": true,
+        "require_email_type": "direct_request"
+      },
+      "notes": "Headers may be absent; rely on subject/body patterns and signatures. Hard excludes cover auto-replies, lists, and bounces. Reply safety signals prevent inappropriate auto-responses. Detects forwarded chains and internal discussions to prevent auto-response. Direct first-person requests score higher."
+    }
   }
 }
 // POLICY_FILTER
 {
-  "schema": {
-    "decision": ["IRRELEVANT", "REVIEW", "KEEP"],
-    "confidence_range": [0, 1],
-    "category": ["PTO", "W2", "Payroll", "Benefits & Enrollment", "Leaves & Accommodations", "Employee Data Changes", "HRIS/Portal Access", "Verification & Letters", "Policy & Employee Relations", "Immigration/Work Authorization", "Offboarding/Exit", "Other"],
-    "response_eligibility": ["auto_reply", "assisted_reply", "human_only", "no_reply"],
-    "email_type": ["direct_request", "forwarded_chain", "internal_discussion", "cc_consultation"]
-  },
-  "purpose": "Evaluate emails for legitimate HR requests from employees, classify by category, determine appropriate response strategy, and prevent auto-responses to forwarded chains or internal discussions.",
-  "company": {
-    "domains": ["@company.com", "@subsidiary.com"],
-    "hr_topics": ["pto", "paid time off", "vacation", "holiday", "leave", "w-2", "w2", "tax", "payroll", "paycheck", "timesheet", "timecard", "direct deposit", "benefits", "address change"]
-  },
-  "chain_detection": {
-    "indicators": {
-      "forwarded": [
-        "Subject starts with Fwd: or FW:",
-        "Contains '---- Original Message ----'",
-        "Multiple 'From:' headers in body",
-        "Quoted email indicators (> symbols)",
-        "Contains 'Begin forwarded message'"
+  "policy_config": {
+    "phase": "shadow_alpha_testing",
+    "send_policy": { "mode": "draft_only" },
+
+    "schema": {
+      "decision": ["IRRELEVANT", "REVIEW", "KEEP"],
+      "confidence_range": [0, 1],
+      "category": ["PTO", "W2", "Payroll", "Benefits & Enrollment", "Leaves & Accommodations", "Employee Data Changes", "HRIS/Portal Access", "Verification & Letters", "Policy & Employee Relations", "Immigration/Work Authorization", "Offboarding/Exit", "Other"],
+      "response_eligibility": ["auto_reply", "assisted_reply", "human_only", "no_reply"],
+      "email_type": ["direct_request", "forwarded_chain", "internal_discussion", "cc_consultation"]
+    },
+
+    "purpose": "Evaluate emails upstream to filter out chains/internal discussions/sensitive topics, classify category, and decide whether to generate a draft-only acknowledgment/information response.",
+    "company": {
+      "domains": ["@company.com", "@subsidiary.com"],
+      "hr_topics": ["pto", "paid time off", "vacation", "holiday", "leave", "w-2", "w2", "tax", "payroll", "paycheck", "timesheet", "timecard", "direct deposit", "benefits", "address change"]
+    },
+
+    "min_confidence_for_generation": 0.60,
+    "confidence_thresholds": {
+      "auto_reply_as_draft_only": 0.85,
+      "assisted_reply_as_draft_only": 0.70
+    },
+
+    "chain_detection": {
+      "indicators": {
+        "forwarded": [
+          "Subject starts with Fwd: or FW:",
+          "Contains '---- Original Message ----'",
+          "Multiple 'From:' headers in body",
+          "Quoted email indicators (> symbols)",
+          "Contains 'Begin forwarded message'"
+        ],
+        "internal_discussion": [
+          "Third-person references to employee",
+          "Manager discussing employee issue",
+          "HR-to-HR communication patterns",
+          "'Please help this person' language",
+          "FYI or 'for your review' phrases"
+        ],
+        "cc_consultation": [
+          "Multiple recipients in CC",
+          "HR team members in CC",
+          "Manager CC'd on employee request"
+        ]
+      },
+      "rules": {
+        "forwarded_chain": {
+          "decision": "REVIEW",
+          "response_eligibility": "human_only",
+          "generator_pass": false,
+          "note": "Forwarded emails require human context; block responder."
+        },
+        "internal_discussion": {
+          "decision": "REVIEW",
+          "response_eligibility": "no_reply",
+          "generator_pass": false,
+          "note": "Internal discussions never auto-respond; block responder."
+        },
+        "direct_request": {
+          "continue_normal_evaluation": true,
+          "note": "Direct employee requests may proceed if other gates pass."
+        }
+      }
+    },
+
+    "safety_gates": {
+      "legal_language": { "generator_pass": false, "response_eligibility": "human_only" },
+      "medical_detail": { "generator_pass": false, "response_eligibility": "human_only" },
+      "crisis_language": { "generator_pass": false, "response_eligibility": "human_only" },
+      "pii_financial": { "generator_pass": true, "response_eligibility": "assisted_reply" }
+    },
+
+    "extraction_patterns": {
+      "dates": "\\b(\\d{1,2}/\\d{1,2}(?:/\\d{2,4})?|Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\\s*\\d{1,2}(?:st|nd|rd|th)?(?:[,\\s]+\\d{2,4})?\\b",
+      "date_ranges": "(?:from|between)\\s*([^to\\n]+)\\s*(?:to|through|-|and)\\s*([^.,;\\n]+)",
+      "tax_year": "(?i)\\b20\\d{2}\\b",
+      "purpose": "(?i)\\b(visa|mortgage|apartment|loan|background check|employment verification|proof of employment)\\b",
+      "system": "(?i)\\b(Workday|ADP|UKG|Rippling|BambooHR|SuccessFactors|Oracle HCM)\\b",
+      "issue_type": "(?i)\\b(password|locked out|can'?t access|underpayment|missing hours|direct deposit|address change)\\b",
+      "employee_id": "\\b[Ee]mp(?:loyee)?\\s*(?:ID|#)?\\s*[:]*\\s*(\\d{5,7})\\b",
+      "dollar_amounts": "\\$[\\d,]+(?:\\.\\d{2})?",
+      "manager_names": "(?:manager|supervisor|lead)\\s+(?:is\\s+)?([A-Z][a-z]+\\s+[A-Z][a-z]+)",
+      "phone_numbers": "\\b(?:\\+1[-.]?)?\\(?\\d{3}\\)?[-.]?\\d{3}[-.]?\\d{4}\\b",
+      "email_addresses": "\\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}\\b",
+      "original_sender": "(?:^|\\n)From:\\s*([^\\n]+)",
+      "forward_indicators": "(?i)(^|\\n)(fwd?:|re:\\s*fwd?:)|>>>>|----\\s*original",
+      "chain_depth": "(?:^|\\n)\\s*>\\s*>+",
+      "third_person_refs": "(?i)\\b(this employee|this person|the employee)\\b",
+      "first_person_request": "(?i)\\b(I\\s+(need|would like|am requesting|can't access|can'?t access|want to)|my\\s+(pto|paycheck|benefits))\\b"
+    },
+
+    "response_rules": {
+      "auto_reply_eligible": {
+        "categories": ["PTO", "W2", "Verification & Letters", "HRIS/Portal Access"],
+        "confidence_threshold": 0.85,
+        "email_type_required": "direct_request",
+        "required_extractions": {
+          "PTO": ["dates"],
+          "W2": ["tax_year"],
+          "Verification & Letters": ["purpose"],
+          "HRIS/Portal Access": ["system", "issue_type"]
+        },
+        "generator_mode": "draft_only"
+      },
+      "assisted_reply": {
+        "categories": ["Payroll", "Benefits & Enrollment", "Employee Data Changes"],
+        "confidence_threshold": 0.70,
+        "email_type_required": "direct_request",
+        "review_triggers": ["dollar_amounts", "multiple_issues", "unclear_request"],
+        "generator_mode": "draft_only"
+      },
+      "human_only": {
+        "categories": ["Leaves & Accommodations", "Policy & Employee Relations", "Immigration/Work Authorization", "Offboarding/Exit"],
+        "email_types": ["forwarded_chain", "cc_consultation"],
+        "escalation_triggers": ["legal_language", "medical_detail", "termination", "discrimination"],
+        "generator_mode": "blocked"
+      },
+      "no_reply": {
+        "categories": ["IRRELEVANT"],
+        "email_types": ["internal_discussion"],
+        "conditions": ["auto_reply", "marketing", "bounce", "spam", "forwarded_without_context"],
+        "generator_mode": "blocked"
+      }
+    },
+
+    "response_timing": {
+      "immediate": ["HRIS/Portal Access"],
+      "business_hours_only": ["PTO", "W2", "general_inquiry"],
+      "delay_24h": ["Offboarding/Exit", "final_paycheck"],
+      "never_auto": ["Policy & Employee Relations", "legal_concerns", "medical_leave", "forwarded_chain", "internal_discussion"]
+    },
+
+    "reply_complexity": {
+      "simple": { "complexity_signals": ["routine_dates", "known_system", "single_issue"], "avg_triage_time": "< 5 minutes" },
+      "moderate": { "complexity_signals": ["requires_lookup", "multiple_fields", "policy_reference"], "avg_triage_time": "15-30 minutes" },
+      "complex": { "complexity_signals": ["multi_policy", "ambiguous_request", "missing_info"], "avg_triage_time": "1-2 hours" },
+      "escalate": { "complexity_signals": ["legal", "medical", "crisis", "forwarded_chain_resolution"], "avg_triage_time": "immediate human review" }
+    },
+
+    "context_requirements": {
+      "global_minimum": ["can_identify_request", "one_grounded_info_or_placeholder"],
+      "by_category": {
+        "PTO": ["dates_or_policy_or_timeline_or_next_steps"],
+        "W2": ["tax_year_or_availability_or_delivery_or_timeline"],
+        "Payroll": ["issue_type_or_review_or_timeline_or_resources"]
+      }
+    },
+
+    "output_format": {
+      "structure": {
+        "decision": "IRRELEVANT|REVIEW|KEEP",
+        "confidence": "number 0..1",
+        "category": "string or null",
+        "email_type": "direct_request|forwarded_chain|internal_discussion|cc_consultation",
+        "response_eligibility": "auto_reply|assisted_reply|human_only|no_reply",
+        "extracted_data": {
+          "dates": ["array"],
+          "employee_id": "string or null",
+          "manager_name": "string or null",
+          "dollar_amounts": ["array"],
+          "systems_mentioned": ["array"],
+          "original_sender": "string or null",
+          "chain_detected": "boolean"
+        },
+        "response_priority": "immediate|high|medium|low",
+        "suggested_template": "string or null",
+        "required_lookups": ["array"],
+        "matched_signals": ["array"],
+        "escalation_reasons": ["array"],
+        "reasons": ["array"],
+        "generator_hint": "blocked|draft_only|pass"
+      },
+      "instructions": "Return ONLY valid JSON matching the structure. No additional text."
+    },
+
+    "generator_gate": {
+      "pass_conditions": [
+        "decision == 'KEEP'",
+        "email_type == 'direct_request'",
+        "confidence >= min_confidence_for_generation",
+        "response_eligibility in ['auto_reply','assisted_reply']",
+        "no safety_gates with generator_pass=false"
       ],
-      "internal_discussion": [
-        "Third-person references to employee",
-        "Manager discussing employee issue",
-        "HR-to-HR communication patterns",
-        "'Please help this person' language",
-        "FYI or 'for your review' phrases"
+      "blocked_conditions": [
+        "email_type in ['forwarded_chain','internal_discussion']",
+        "safety_gates.legal_language || safety_gates.medical_detail || safety_gates.crisis_language",
+        "response_eligibility in ['human_only','no_reply']"
       ],
-      "cc_consultation": [
-        "Multiple recipients in CC",
-        "HR team members in CC",
-        "Manager CC'd on employee request"
-      ]
-    },
-    "rules": {
-      "forwarded_chain": {
-        "decision": "REVIEW",
-        "response_eligibility": "human_only",
-        "note": "Forwarded emails require human context to determine appropriate response"
-      },
-      "internal_discussion": {
-        "decision": "REVIEW",
-        "response_eligibility": "no_reply",
-        "note": "Internal discussions should not trigger auto-responses"
-      },
-      "direct_request": {
-        "continue_normal_evaluation": true,
-        "note": "Direct employee requests proceed through standard categorization"
-      }
-    }
-  },
-  "extraction_patterns": {
-    "dates": "\\b(\\d{1,2}/\\d{1,2}(?:/\\d{2,4})?|Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\\s*\\d{1,2}(?:st|nd|rd|th)?(?:[,\\s]+\\d{2,4})?\\b",
-    "date_ranges": "(?:from|between)\\s*([^to]+)\\s*(?:to|through|-|and)\\s*([^.,;]+)",
-    "employee_id": "\\b[Ee]mp(?:loyee)?\\s*(?:ID|#)?\\s*[:]*\\s*(\\d{5,7})\\b",
-    "dollar_amounts": "\\$[\\d,]+(?:\\.\\d{2})?",
-    "manager_names": "(?:manager|supervisor|lead)\\s+(?:is\\s+)?([A-Z][a-z]+\\s+[A-Z][a-z]+)",
-    "phone_numbers": "\\b(?:\\+1[-.]?)?\\(?\\d{3}\\)?[-.]?\\d{3}[-.]?\\d{4}\\b",
-    "email_addresses": "\\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Z|a-z]{2,}\\b",
-    "system_references": "(?i)(Workday|ADP|UKG|Rippling|BambooHR|SuccessFactors|Oracle HCM)",
-    "original_sender": "(?:^|\\n)From:\\s*([^\\n]+)",
-    "forward_indicators": "(?i)(fwd?:|re:\\s*fwd?:|>>>>|----\\s*original)",
-    "chain_depth": "(?:>){1,}",
-    "third_person_refs": "(?i)\\b(this employee|this person|they|them|their|he|she|the employee)\\b",
-    "first_person_refs": "(?i)\\b(I|me|my|mine|myself)\\b"
-  },
-  "response_rules": {
-    "auto_reply_eligible": {
-      "categories": ["PTO", "W2", "Verification & Letters", "HRIS/Portal Access"],
-      "confidence_threshold": 0.85,
-      "email_type_required": "direct_request",
-      "required_extractions": {
-        "PTO": ["dates"],
-        "W2": ["tax_year"],
-        "Verification & Letters": ["purpose"],
-        "HRIS/Portal Access": ["system", "issue_type"]
+      "modes": {
+        "auto_reply": "draft_only",
+        "assisted_reply": "draft_only",
+        "human_only": "blocked",
+        "no_reply": "blocked"
       }
     },
-    "assisted_reply": {
-      "categories": ["Payroll", "Benefits & Enrollment", "Employee Data Changes"],
-      "confidence_threshold": 0.70,
-      "email_type_required": "direct_request",
-      "review_triggers": ["dollar_amounts", "multiple_issues", "unclear_request"]
-    },
-    "human_only": {
-      "categories": ["Leaves & Accommodations", "Policy & Employee Relations", "Immigration/Work Authorization", "Offboarding/Exit"],
-      "email_types": ["forwarded_chain", "cc_consultation"],
-      "escalation_triggers": ["legal_language", "medical_detail", "termination", "discrimination"]
-    },
-    "no_reply": {
-      "categories": ["IRRELEVANT"],
-      "email_types": ["internal_discussion"],
-      "conditions": ["auto_reply", "marketing", "bounce", "spam", "forwarded_without_context"]
-    }
-  },
-  "response_timing": {
-    "immediate": ["HRIS/Portal Access", "password_reset"],
-    "business_hours_only": ["PTO", "W2", "general_inquiry"],
-    "delay_24h": ["Offboarding/Exit", "final_paycheck"],
-    "never_auto": ["Policy & Employee Relations", "legal_concerns", "medical_leave", "forwarded_chain", "internal_discussion"]
-  },
-  "reply_complexity": {
-    "simple": {
-      "actions": ["check_pto_balance", "resend_w2", "verify_address", "reset_password"],
-      "avg_response_time": "< 5 minutes"
-    },
-    "moderate": {
-      "actions": ["benefits_enrollment", "payroll_discrepancy", "data_updates"],
-      "avg_response_time": "15-30 minutes"
-    },
-    "complex": {
-      "actions": ["leave_request", "accommodation", "policy_interpretation"],
-      "avg_response_time": "1-2 hours"
-    },
-    "escalate": {
-      "actions": ["legal_concern", "discrimination_claim", "termination", "harassment", "forwarded_chain_resolution"],
-      "avg_response_time": "immediate human review"
-    }
-  },
-  "output_format": {
-    "structure": {
-      "decision": "IRRELEVANT|REVIEW|KEEP",
-      "confidence": "number 0..1",
-      "category": "string or null",
-      "email_type": "direct_request|forwarded_chain|internal_discussion|cc_consultation",
-      "response_eligibility": "auto_reply|assisted_reply|human_only|no_reply",
-      "extracted_data": {
-        "dates": ["array of extracted dates"],
-        "employee_id": "string or null",
-        "manager_name": "string or null",
-        "dollar_amounts": ["array of amounts"],
-        "systems_mentioned": ["array of systems"],
-        "original_sender": "string or null if forwarded",
-        "chain_detected": "boolean"
-      },
-      "response_priority": "immediate|high|medium|low",
-      "suggested_template": "template_name or null",
-      "required_lookups": ["array of data lookups needed"],
-      "matched_signals": ["array of signal ids"],
-      "escalation_reasons": ["array of escalation triggers if any"],
-      "reasons": ["≤2 brief strings explaining decision"]
-    },
-    "instructions": "Return ONLY valid JSON matching the structure above. No additional text or formatting."
-  },
-  "examples": [
-    {
-      "email": "Hi HR—I'd like to request PTO for 12/24–12/27. My manager, Jane Lee, approved in Workday.",
-      "expected": {
-        "decision": "KEEP",
-        "confidence": 0.92,
-        "category": "PTO",
-        "email_type": "direct_request",
-        "response_eligibility": "auto_reply",
-        "extracted_data": {
-          "dates": ["12/24", "12/27"],
-          "manager_name": "Jane Lee",
-          "systems_mentioned": ["Workday"],
-          "chain_detected": false
-        },
-        "response_priority": "high",
-        "suggested_template": "pto_approved",
-        "required_lookups": ["pto_balance", "manager_verification"]
-      }
-    },
-    {
-      "email": "FWD: PTO Request\n\n---- Original Message ----\nFrom: john.doe@company.com\nSubject: PTO Request\n\nHi, I need PTO for next Friday.",
-      "expected": {
-        "decision": "REVIEW",
-        "confidence": 0.85,
-        "category": "PTO",
-        "email_type": "forwarded_chain",
-        "response_eligibility": "human_only",
-        "extracted_data": {
-          "original_sender": "john.doe@company.com",
-          "dates": ["next Friday"],
-          "chain_detected": true
-        },
-        "response_priority": "medium",
-        "escalation_reasons": ["forwarded_chain"],
-        "reasons": ["Forwarded email chain detected", "Requires context about who should respond"]
-      }
-    },
-    {
-      "email": "Hi team,\n\nCan someone help this employee with their W-2 request? They've been waiting for a response.\n\nThanks,\nSarah",
-      "expected": {
-        "decision": "REVIEW",
-        "confidence": 0.90,
-        "category": "W2",
-        "email_type": "internal_discussion",
-        "response_eligibility": "no_reply",
-        "extracted_data": {
-          "chain_detected": false
-        },
-        "response_priority": "low",
-        "escalation_reasons": ["internal_discussion"],
-        "reasons": ["Internal HR discussion", "Third-person reference to employee"]
-      }
-    },
-    {
-      "email": "I believe I'm facing discrimination based on my disability. My manager refuses to provide accommodations.",
-      "expected": {
-        "decision": "KEEP",
-        "confidence": 0.95,
-        "category": "Policy & Employee Relations",
-        "email_type": "direct_request",
-        "response_eligibility": "human_only",
-        "extracted_data": {
-          "chain_detected": false
-        },
-        "response_priority": "immediate",
-        "escalation_reasons": ["discrimination", "disability", "accommodation_denial"]
-      }
-    },
-    {
-      "email": "Here is my new bank information for direct deposit: routing 021000021, account 123456789.",
-      "expected": {
-        "decision": "REVIEW",
-        "confidence": 0.85,
-        "category": "Payroll",
-        "email_type": "direct_request",
-        "response_eligibility": "assisted_reply",
-        "extracted_data": {
-          "contains_pii": true,
-          "chain_detected": false
-        },
-        "escalation_reasons": ["pii_detected", "bank_details"]
-      }
-    },
-    {
-      "email": "FYI - please see below request from John about his benefits enrollment issue.\n\n> From: john@company.com\n> I can't access the benefits portal",
-      "expected": {
-        "decision": "REVIEW",
-        "confidence": 0.88,
-        "category": "Benefits & Enrollment",
-        "email_type": "internal_discussion",
-        "response_eligibility": "no_reply",
-        "extracted_data": {
-          "original_sender": "john@company.com",
-          "systems_mentioned": ["benefits portal"],
-          "chain_detected": true
-        },
-        "response_priority": "low",
-        "escalation_reasons": ["internal_discussion"],
-        "reasons": ["FYI pattern", "Forwarded with commentary"]
-      }
-    }
-  ],
-  "notes": "System prioritizes employee safety and legal compliance. Auto-replies only for routine, low-risk DIRECT requests. Forwarded chains and internal discussions are never auto-responded to. Human review required for sensitive topics. Temperature=0 for consistency."
+
+    "examples": []
+  }
 }
+
 // RESP_TEMP
 {
   "response_templates": {
