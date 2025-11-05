@@ -3231,25 +3231,23 @@ require 'securerandom'
         .gsub(/\\\\"/, '"')         # Convert \\" to "
         .gsub(/\\\\'/, "'")         # Convert \\' to '
         .gsub(/\\\\/, "\\")         # Cleanup remaining double backslashes
-        
-        # Remove NULL bytes and control characters (except \t\n)
-        .gsub(/\x00/, '')           # NULL bytes common in PDFs
-        .gsub(/[\x01-\x08\x0B\x0C\x0E-\x1F]/, '') # Other control chars
-        
-        # Fix broken hyphenation from PDF line breaks
+      
+      # Remove control characters except tab, newline, carriage return
+      # Using delete with ranges (more Workato-friendly)
+      control_chars = (0..31).map { |i| i.chr }.join
+      keep_chars = "\t\n\r"
+      chars_to_remove = control_chars.delete(keep_chars)
+      text = text.delete(chars_to_remove)
+      
+      # Continue with other transformations
+      text = text
         .gsub(/(\w)-\n(\w)/, '\1\2')  # Rejoin hyphenated words
-        
-        # Normalize whitespace
-        .gsub(/\r\n|\r/, "\n")      # Normalize line endings
-        .gsub(/\n{3,}/, "\n\n")     # Collapse excessive newlines
-        .gsub(/[ \t]+/, ' ')        # Collapse spaces and tabs
-        .gsub(/^[ \t]+|[ \t]+$/, '') # Trim line starts/ends
-        
-        # Handle PDF header artifacts (##word patterns)
-        .gsub(/##(\w)/, '## \1')    # Add space after ## headers
-        
-        # Fix truncation indicators
-        .gsub(/\.\.+$/, '...')      # Normalize ellipsis at end
+        .gsub(/\r\n|\r/, "\n")         # Normalize line endings
+        .gsub(/\n{3,}/, "\n\n")        # Collapse excessive newlines
+        .gsub(/[ \t]+/, ' ')           # Collapse spaces and tabs
+        .gsub(/^[ \t]+|[ \t]+$/, '')   # Trim line starts/ends
+        .gsub(/##(\w)/, '## \1')       # Add space after ## headers
+        .gsub(/\.\.+$/, '...')         # Normalize ellipsis at end
         
       # Final encoding cleanup
       text.encode('UTF-8', invalid: :replace, undef: :replace, replace: ' ')
