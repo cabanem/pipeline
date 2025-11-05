@@ -1597,7 +1597,6 @@ require 'securerandom'
           default: false, sticky: true, extends_schema: true,
           hint: 'Toggle to reveal threshold/ranker controls.' }
       ],
-      
       input_fields: lambda do |od, connection, cfg|
         show_adv = (cfg['show_advanced'] == true)
         
@@ -1608,7 +1607,12 @@ require 'securerandom'
           { name: 'rag_file_ids', type: 'array', of: 'string', optional: true,
             hint: 'Optional: limit to these file IDs (must belong to the same corpus).' },
           { name: 'top_k', type: 'integer', optional: true, default: 20, hint: 'Max contexts to return.' },
-          { name: 'correlation_id', optional: true, hint: 'For tracking related requests.' }
+          { name: 'correlation_id', optional: true, hint: 'For tracking related requests.' },
+          { name: 'sanitize_pdf_content', 
+            type: 'boolean', 
+            control_type: 'checkbox',
+            default: true,
+            hint: 'Clean PDF extraction artifacts when detected (recommended)' }
         ]
         
         adv = [
@@ -1624,7 +1628,6 @@ require 'securerandom'
         
         show_adv ? (base + adv) : base
       end,
-      
       output_fields: lambda do |object_definitions, connection|
         [
           { name: 'question' },
@@ -1648,8 +1651,7 @@ require 'securerandom'
               { name: 'local_logs', type: 'array', of: 'object', optional: true }
             ]}
         ]
-      end,
-      
+      end,     
       execute: lambda do |connection, input|
         # Initialize tracking context
         ctx = call(:step_begin!, :rag_retrieve_contexts_enhanced, input)
@@ -1735,21 +1737,32 @@ require 'securerandom'
               # Extract metadata
               md = ctx_item['metadata'] || {}
               
-              # Clean text - remove problematic Unicode but keep it readable
-              text = (ctx_item['text'] || ctx_item.dig('chunk', 'text') || '').to_s
-              text = text.encode('UTF-8', invalid: :replace, undef: :replace, replace: ' ')
+              # Get source URI for PDF detection
+              source_uri = ctx_item['sourceUri'] || ctx_item['uri']
+              
+              # Extract text
+              raw_text = (ctx_item['text'] || ctx_item.dig('chunk', 'text') || '').to_s
+              
+              # Apply PDF-specific cleaning ONLY for PDF sources
+              text = if call(:is_pdf_source?, source_uri, md)
+                call(:sanitize_pdf_text, raw_text)
+              else
+                # Regular cleaning for non-PDF content
+                raw_text.encode('UTF-8', invalid: :replace, undef: :replace, replace: ' ')
                         .gsub(/\s+/, ' ')
                         .strip
+              end
               
               contexts << {
                 'id' => ctx_item['chunkId'] || ctx_item['id'] || "ctx-#{idx + 1}",
                 'text' => text,
                 'score' => (ctx_item['score'] || ctx_item['relevanceScore'] || 0.0).to_f,
                 'source' => ctx_item['sourceDisplayName'] || ctx_item['sourceUri']&.split('/')&.last,
-                'uri' => ctx_item['sourceUri'],
+                'uri' => source_uri,
                 'metadata' => md,
                 'metadata_kv' => md.map { |k, v| { 'key' => k.to_s, 'value' => v } },
-                'metadata_json' => md.empty? ? nil : md.to_json
+                'metadata_json' => md.empty? ? nil : md.to_json,
+                'is_pdf' => call(:is_pdf_source?, source_uri, md)  # Optional: track PDF sources
               }
             end
           end
@@ -1761,6 +1774,7 @@ require 'securerandom'
           }
           
           # Add extra telemetry data about the retrieval config
+          pdf_count = contexts.count { |c| c['is_pdf'] }
           extras = {
             'retrieval' => {
               'top_k' => retrieval_cfg['topK'],
@@ -1768,7 +1782,8 @@ require 'securerandom'
                 'type' => retrieval_cfg['filter'].keys.first.to_s.sub('vector', '').sub('Threshold', ''),
                 'value' => retrieval_cfg['filter'].values.first
               } : nil,
-              'contexts_count' => contexts.length
+              'contexts_count' => contexts.length,
+              'pdf_contexts_count' => pdf_count,
             }.compact,
             'rank' => retrieval_cfg['ranking'] ? {
               'mode' => retrieval_cfg['ranking'].keys.first,
@@ -3202,6 +3217,70 @@ require 'securerandom'
   
   # --------- METHODS ------------------------------------------------------
   methods: {
+    sanitize_pdf_text: lambda do |raw_text|
+      return '' if raw_text.nil?
+      
+      text = raw_text.to_s
+      
+      # Fix common PDF extraction artifacts
+      text = text
+        # Handle double-escaped sequences first
+        .gsub(/\\\\n/, "\n")        # Convert \\n to actual newline
+        .gsub(/\\\\t/, " ")         # Convert \\t to space
+        .gsub(/\\\\r/, "")          # Remove \\r
+        .gsub(/\\\\"/, '"')         # Convert \\" to "
+        .gsub(/\\\\'/, "'")         # Convert \\' to '
+        .gsub(/\\\\/, "\\")         # Cleanup remaining double backslashes
+        
+        # Remove NULL bytes and control characters (except \t\n)
+        .gsub(/\x00/, '')           # NULL bytes common in PDFs
+        .gsub(/[\x01-\x08\x0B\x0C\x0E-\x1F]/, '') # Other control chars
+        
+        # Fix broken hyphenation from PDF line breaks
+        .gsub(/(\w)-\n(\w)/, '\1\2')  # Rejoin hyphenated words
+        
+        # Normalize whitespace
+        .gsub(/\r\n|\r/, "\n")      # Normalize line endings
+        .gsub(/\n{3,}/, "\n\n")     # Collapse excessive newlines
+        .gsub(/[ \t]+/, ' ')        # Collapse spaces and tabs
+        .gsub(/^[ \t]+|[ \t]+$/, '') # Trim line starts/ends
+        
+        # Handle PDF header artifacts (##word patterns)
+        .gsub(/##(\w)/, '## \1')    # Add space after ## headers
+        
+        # Fix truncation indicators
+        .gsub(/\.\.+$/, '...')      # Normalize ellipsis at end
+        
+      # Final encoding cleanup
+      text.encode('UTF-8', invalid: :replace, undef: :replace, replace: ' ')
+          .strip
+    end,
+
+    is_pdf_source?: lambda do |source_uri, metadata|
+      # Check if this context comes from a PDF
+      return false if source_uri.nil? && metadata.nil?
+      
+      # Check source URI extension
+      if source_uri.to_s.downcase.end_with?('.pdf')
+        return true
+      end
+      
+      # Check metadata for file type indicators
+      if metadata.is_a?(Hash)
+        file_type = metadata['file_type'] || 
+                    metadata['fileType'] || 
+                    metadata['mimeType'] || 
+                    metadata['mime_type'] || ''
+        
+        return true if file_type.to_s.downcase.include?('pdf')
+        
+        # Check source/filename in metadata
+        source = metadata['source'] || metadata['filename'] || ''
+        return true if source.to_s.downcase.end_with?('.pdf')
+      end
+      
+      false
+    end,
     llm_category_aware_ranker: lambda do |connection, model, query, category, category_context, contexts, corr=nil|
       model_path = call(:build_model_path_with_global_preview, connection, model)
       
