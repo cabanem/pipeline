@@ -1481,14 +1481,15 @@ require 'securerandom'
               { name: 'http_status', type: 'integer' },
               { name: 'message' },
               { name: 'duration_ms', type: 'integer' },
-              { name: 'correlation_id' }
+              { name: 'correlation_id' },
+              { name: 'local_logs', type: 'array', of: 'object', optional: true }
             ]}
         ]
       end,
       
       execute: lambda do |connection, input|
-        started_at = Time.now
-        correlation_id = input['correlation_id'] || SecureRandom.uuid
+        # Initialize tracking context
+        ctx = call(:step_begin!, :rag_retrieve_contexts_enhanced, input)
         
         begin
           # Extract project/location from connection
@@ -1555,36 +1556,34 @@ require 'securerandom'
           headers = {
             'Authorization' => "Bearer #{connection['access_token']}",
             'Content-Type' => 'application/json',
-            'X-Correlation-Id' => correlation_id,
+            'X-Correlation-Id' => ctx['cid'],
             'x-goog-request-params' => "parent=projects/#{project}/locations/#{location}"
           }
           
           # Make request
-          t_req = Time.now
           response = post(url).headers(headers).payload(body)
-          req_ms = ((Time.now - t_req) * 1000).round
           
           # Extract and map contexts
           contexts = []
           if response && response['contexts'] && response['contexts']['contexts']
             raw_contexts = response['contexts']['contexts']
             
-            raw_contexts.each_with_index do |ctx, idx|
+            raw_contexts.each_with_index do |ctx_item, idx|
               # Extract metadata
-              md = ctx['metadata'] || {}
+              md = ctx_item['metadata'] || {}
               
               # Clean text - remove problematic Unicode but keep it readable
-              text = (ctx['text'] || ctx.dig('chunk', 'text') || '').to_s
+              text = (ctx_item['text'] || ctx_item.dig('chunk', 'text') || '').to_s
               text = text.encode('UTF-8', invalid: :replace, undef: :replace, replace: ' ')
                         .gsub(/\s+/, ' ')
                         .strip
               
               contexts << {
-                'id' => ctx['chunkId'] || ctx['id'] || "ctx-#{idx + 1}",
+                'id' => ctx_item['chunkId'] || ctx_item['id'] || "ctx-#{idx + 1}",
                 'text' => text,
-                'score' => (ctx['score'] || ctx['relevanceScore'] || 0.0).to_f,
-                'source' => ctx['sourceDisplayName'] || ctx['sourceUri']&.split('/')&.last,
-                'uri' => ctx['sourceUri'],
+                'score' => (ctx_item['score'] || ctx_item['relevanceScore'] || 0.0).to_f,
+                'source' => ctx_item['sourceDisplayName'] || ctx_item['sourceUri']&.split('/')&.last,
+                'uri' => ctx_item['sourceUri'],
                 'metadata' => md,
                 'metadata_kv' => md.map { |k, v| { 'key' => k.to_s, 'value' => v } },
                 'metadata_json' => md.empty? ? nil : md.to_json
@@ -1592,31 +1591,34 @@ require 'securerandom'
             end
           end
           
-          # Build output
-          {
+          # Build output using standard helper
+          out = {
             'question' => input['query_text'],
-            'contexts' => contexts,
-            'ok' => true,
-            'telemetry' => {
-              'http_status' => 200,
-              'message' => "Retrieved #{contexts.length} contexts",
-              'duration_ms' => ((Time.now - started_at) * 1000).round,
-              'correlation_id' => correlation_id
-            }
+            'contexts' => contexts
           }
           
+          # Add extra telemetry data about the retrieval config
+          extras = {
+            'retrieval' => {
+              'top_k' => retrieval_cfg['topK'],
+              'filter' => retrieval_cfg['filter'] ? {
+                'type' => retrieval_cfg['filter'].keys.first.to_s.sub('vector', '').sub('Threshold', ''),
+                'value' => retrieval_cfg['filter'].values.first
+              } : nil,
+              'contexts_count' => contexts.length
+            }.compact,
+            'rank' => retrieval_cfg['ranking'] ? {
+              'mode' => retrieval_cfg['ranking'].keys.first,
+              'model' => retrieval_cfg['ranking'].values.first['modelName']
+            } : nil
+          }.compact
+          
+          # Return success with telemetry
+          call(:step_ok!, ctx, out, 200, "Retrieved #{contexts.length} contexts", extras)
+          
         rescue => e
-          {
-            'question' => input['query_text'],
-            'contexts' => [],
-            'ok' => false,
-            'telemetry' => {
-              'http_status' => 500,
-              'message' => e.message,
-              'duration_ms' => ((Time.now - started_at) * 1000).round,
-              'correlation_id' => correlation_id
-            }
-          }
+          # Handle errors with telemetry
+          call(:step_err!, ctx, e)
         end
       end
     },
