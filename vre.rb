@@ -1665,7 +1665,6 @@ require 'securerandom'
         
         show_adv ? (base + adv) : base
       end,
-      
       output_fields: lambda do |object_definitions, connection|
         [
           { name: 'question' },
@@ -1695,259 +1694,313 @@ require 'securerandom'
             ]}
         ]
       end,
-      
       execute: lambda do |connection, input|
-        # Initialize tracking context
-        ctx = call(:step_begin!, :rag_retrieve_contexts_enhanced, input)
+        ctx = call(:step_begin!, :rank_texts_with_ranking_api, input)
         
         begin
-          # Extract project/location from connection
-          sa_key = JSON.parse(connection['service_account_key_json'] || '{}') rescue {}
-          project = connection['project_id'] || sa_key['project_id']
-          location = connection['location'] || 'us-central1'
+          call(:ensure_project_id!, connection)
+          loc = call(:aiapps_loc_resolve, connection, input['ai_apps_location'])
           
-          error('Project is required') if project.nil? || project.empty?
-          error('Location is required') if location.nil? || location.empty?
-          error('Location cannot be global for RAG retrieval') if location.downcase == 'global'
+          # Extract category and prepare query
+          category = input['category'].to_s.strip
+          category_ctx = input['category_context'].to_s.strip
+          query = input['query_text'].to_s
           
-          # Build corpus path
-          corpus = input['rag_corpus'].to_s.strip
-          if corpus.present? && !corpus.start_with?('projects/')
-            corpus = "projects/#{project}/locations/#{location}/ragCorpora/#{corpus}"
+          # Enhance query with category context if requested
+          if category.present? && input['include_category_in_query'] == true
+            query_prefix = "Category: #{category}"
+            query_prefix += " (#{category_ctx})" if category_ctx.present?
+            enhanced_query = "#{query_prefix}\n\n#{query}"
+          else
+            enhanced_query = query
           end
           
-          # Validate threshold parameters
-          if input['vector_distance_threshold'].present? && input['vector_similarity_threshold'].present?
-            error('Set ONLY one of: vector_distance_threshold OR vector_similarity_threshold.')
-          end
-          if input['rank_service_model'].present? && input['llm_ranker_model'].present?
-            error('Choose ONE ranker: rank_service_model OR llm_ranker_model.')
-          end
+          # Determine ranking config based on category
+          config_id = 'default_ranking_config'
           
-          # Build ragResources
-          rag_resources = {}
-          rag_resources['ragCorpus'] = corpus if corpus.present?
-          file_ids = Array(input['rag_file_ids']).map(&:to_s).map(&:strip).reject(&:empty?)
-          rag_resources['ragFileIds'] = file_ids if file_ids.any?
-          
-          error('Provide rag_corpus and/or rag_file_ids') if rag_resources.empty?
-          
-          # Build retrieval config
-          retrieval_cfg = { 'topK' => (input['top_k'] || 20).to_i }
-          
-          # Add filter if specified
-          if input['vector_distance_threshold'].present?
-            retrieval_cfg['filter'] = { 'vectorDistanceThreshold' => input['vector_distance_threshold'].to_f }
-          elsif input['vector_similarity_threshold'].present?
-            retrieval_cfg['filter'] = { 'vectorSimilarityThreshold' => input['vector_similarity_threshold'].to_f }
-          end
-          
-          # Add ranking if specified
-          if input['rank_service_model'].present?
-            retrieval_cfg['ranking'] = { 'rankService' => { 'modelName' => input['rank_service_model'] } }
-          elsif input['llm_ranker_model'].present?
-            retrieval_cfg['ranking'] = { 'llmRanker' => { 'modelName' => input['llm_ranker_model'] } }
-          end
-          
-          # Build request
-          url = "https://#{location}-aiplatform.googleapis.com/v1/projects/#{project}/locations/#{location}:retrieveContexts"
-          
-          body = {
-            'query' => {
-              'text' => input['query_text'],
-              'ragRetrievalConfig' => retrieval_cfg
-            },
-            'vertexRagStore' => {
-              'ragResources' => [rag_resources]
-            }
-          }
-          
-          headers = {
-            'Authorization' => "Bearer #{connection['access_token']}",
-            'Content-Type' => 'application/json',
-            'X-Correlation-Id' => ctx['cid'],
-            'x-goog-request-params' => "parent=projects/#{project}/locations/#{location}"
-          }
-          
-          # Make request with error handling
-          response = begin
-            post(url).headers(headers).payload(body)
-          rescue => e
-            if e.message.include?('timeout') || e.message.include?('connection')
-              # Return empty but valid response for network issues
-              {
-                'contexts' => { 'contexts' => [] },
-                '_network_error' => "Network error: #{e.message[0..200]}"
-              }
-            else
-              raise e  # Re-raise non-network errors
+          if input['ranking_config_name'].present?
+            config_id = input['ranking_config_name'].to_s.split('/').last
+          elsif category.present? && input['category_ranking_configs'].present?
+            # Use category-specific config if mapped
+            config_map = call(:safe_json, input['category_ranking_configs']) || {}
+            if config_map.is_a?(Hash)
+              mapped = config_map[category] || config_map[category.downcase]
+              config_id = mapped.to_s.split('/').last if mapped.present?
             end
           end
           
-          # Extract and map contexts with graceful failure
-          contexts = []
-          #raw_contexts = call(:safe_extract_contexts, response)
-          raw_contexts = if response && response['contexts'] && response['contexts']['contexts']
-            response['contexts']['contexts']
-          else
-            []
+          # Pre-filter contexts by category metadata if requested
+          records_in = call(:safe_array, input['records'])
+          
+          # Validate that records have required fields
+          records_in.each_with_index do |r, i|
+            error("Record at index #{i} missing required 'id' field") unless r['id'].present?
+            error("Record at index #{i} missing required 'content' field") unless r['content'].present?
           end
           
-          if raw_contexts.empty? && !response['_network_error']
-            # Add informational context for empty responses
-            contexts << {
-              'id' => 'no-results',
-              'text' => 'No contexts were returned for this query.',
-              'score' => 0.0,
-              'source' => 'system',
-              'uri' => nil,
-              'metadata' => { 'info' => 'empty_response' },
-              'metadata_kv' => [{ 'key' => 'info', 'value' => 'empty_response' }],
-              'metadata_json' => '{"info":"empty_response"}',
-              'is_pdf' => false,
-              'processing_error' => false
-            }
-          else
-            raw_contexts.each_with_index do |ctx_item, idx|
-              begin
-                # Extract metadata
-                md = ctx_item['metadata'] || {}
-                
-                # Get source URI for PDF detection
-                source_uri = ctx_item['sourceUri'] || ctx_item['uri']
-                
-                # DEBUGGING: Log what we're seeing
-                is_pdf = call(:is_pdf_source?, source_uri, md)
-                sanitize_enabled = input['sanitize_pdf_content'] != false
-                
-                # Extract text
-                raw_text = (ctx_item['text'] || ctx_item.dig('chunk', 'text') || '').to_s
-                
-                # DEBUGGING: Check for PDF indicators
-                has_double_escapes = raw_text.include?('\\\\n') || raw_text.include?('\\\\t')
-                
-                # Log for debugging (remove after fixing)
-                if has_double_escapes || is_pdf
-                  puts "DEBUG Context #{idx}: is_pdf=#{is_pdf}, sanitize=#{sanitize_enabled}, has_escapes=#{has_double_escapes}, uri=#{source_uri}"
-                end
-                
-                # Apply PDF-specific cleaning based on preference and detection
-                text = if sanitize_enabled && is_pdf
-                  puts "DEBUG: Sanitizing PDF context #{idx}"
-                  call(:sanitize_pdf_text, raw_text)
-                elsif has_double_escapes && sanitize_enabled
-                  # FALLBACK: Even if not detected as PDF, clean obvious PDF artifacts
-                  puts "DEBUG: Cleaning escaped content in context #{idx}"
-                  call(:sanitize_pdf_text, raw_text)
-                else
-                  # Regular cleaning for non-PDF content
-                  raw_text.encode('UTF-8', invalid: :replace, undef: :replace, replace: ' ')
-                          .gsub(/\s+/, ' ')
-                          .strip
-                end
-                
-                # Try JSON serialization with fallback
-                metadata_json = begin
-                  md.empty? ? nil : md.to_json
-                rescue => json_err
-                  { error: 'metadata_serialization_failed', keys: md.keys.take(10) }.to_json
-                end
-                
-                contexts << {
-                  'id' => ctx_item['chunkId'] || ctx_item['id'] || "ctx-#{idx + 1}",
-                  'text' => text,
-                  'score' => (ctx_item['score'] || ctx_item['relevanceScore'] || 0.0).to_f,
-                  'source' => ctx_item['sourceDisplayName'] || source_uri&.split('/')&.last,
-                  'uri' => source_uri,
-                  'metadata' => md,
-                  'metadata_kv' => md.map { |k, v| { 'key' => k.to_s, 'value' => v.to_s[0..1000] } }, # Limit value size
-                  'metadata_json' => metadata_json,
-                  'is_pdf' => call(:is_pdf_source?, source_uri, md),
-                  'processing_error' => false
-                }
-                
-              rescue => e
-                # Handle individual context errors based on configuration
-                case input['on_error_behavior']
-                when 'fail'
-                  raise e  # Re-raise to fail entire action
-                when 'include'
-                  # Add error placeholder context
-                  contexts << {
-                    'id' => "ctx-#{idx + 1}-error",
-                    'text' => "[Error processing context: #{e.message[0..200]}]",
-                    'score' => 0.0,
-                    'source' => 'error',
-                    'uri' => nil,
-                    'metadata' => { 
-                      'error' => e.message[0..500], 
-                      'error_class' => e.class.name,
-                      'original_id' => ctx_item['chunkId'] || ctx_item['id'] 
-                    },
-                    'metadata_kv' => [
-                      { 'key' => 'error', 'value' => e.message[0..500] },
-                      { 'key' => 'error_class', 'value' => e.class.name }
-                    ],
-                    'metadata_json' => nil,
-                    'is_pdf' => false,
-                    'processing_error' => true
-                  }
-                when 'skip', nil
-                  # Skip this context, continue processing
-                  next
-                end
+          records_to_rank = records_in
+          
+          if category.present? && input['filter_by_category_metadata'] == true
+            meta_key = input['category_metadata_key'] || 'category'
+            cat_lower = category.downcase
+            
+            records_to_rank = records_in.select do |r|
+              md = r['metadata'].is_a?(Hash) ? r['metadata'] : {}
+              cat_value = md[meta_key]
+              
+              case cat_value
+              when String
+                cat_value.downcase.include?(cat_lower)
+              when Array
+                cat_value.any? { |v| v.to_s.downcase.include?(cat_lower) }
+              else
+                false  # No category metadata, exclude
               end
             end
+            
+            # Warn if filtering removed all records
+            if records_to_rank.empty? && records_in.any?
+              error("Category filtering removed all #{records_in.length} records. Check category metadata key '#{meta_key}' and value '#{category}'")
+            end
           end
           
-          # Calculate success metrics
-          error_count = contexts.count { |c| c['processing_error'] == true }
-          pdf_count = contexts.count { |c| c['is_pdf'] && !c['processing_error'] }
-          success_count = contexts.count { |c| !c['processing_error'] }
+          # === Phase 1: Discovery Engine Ranking ===
+          ver = (connection['discovery_api_version'].presence || 'v1alpha').to_s
           
-          # Build output
-          out = {
-            'question' => input['query_text'],
-            'contexts' => contexts
-          }
+          # FIX: Use parent= instead of ranking_config= for request params
+          req_params = "parent=projects/#{connection['project_id']}/locations/#{loc}"
           
-          # Add telemetry with success tracking
-          extras = {
-            'retrieval' => {
-              'top_k' => retrieval_cfg['topK'],
-              'filter' => retrieval_cfg['filter'] ? {
-                'type' => retrieval_cfg['filter'].keys.first.to_s.sub('vector', '').sub('Threshold', ''),
-                'value' => retrieval_cfg['filter'].values.first
-              } : nil,
-              'contexts_count' => contexts.length,
-              'success_count' => success_count,
-              'error_count' => error_count,
-              'pdf_contexts_count' => pdf_count,
-              'partial_failure' => error_count > 0
-            }.compact,
-            'rank' => retrieval_cfg['ranking'] ? {
-              'mode' => retrieval_cfg['ranking'].keys.first,
-              'model' => retrieval_cfg['ranking'].values.first['modelName']
-            } : nil,
-            'network_error' => response['_network_error']
+          url = call(:discovery_url, connection, loc,
+                    "projects/#{connection['project_id']}/locations/#{loc}/rankingConfigs/#{config_id}:rank", ver)
+          
+          # Limit batch size to Discovery Engine's limits (typically 100-200 records)
+          max_batch_size = 100
+          if records_to_rank.length > max_batch_size
+            records_to_rank = records_to_rank.first(max_batch_size)
+            # Note: Should probably warn user or handle pagination
+          end
+          
+          discovery_body = {
+            'query' => enhanced_query,
+            'records' => records_to_rank.map { |r|
+              {
+                'id' => r['id'].to_s,
+                'content' => r['content'].to_s,
+                'metadata' => (r['metadata'].is_a?(Hash) ? r['metadata'] : nil)
+              }.compact
+            },
+            'model' => input['rank_model'].presence,
+            'topN' => input['top_n'].presence&.to_i,
+            'ignoreRecordDetailsInResponse' => false  # We need details for enrichment
           }.compact
           
-          # Build appropriate message
-          message = if response['_network_error']
-            "Retrieved #{contexts.length} contexts (network issues detected)"
-          elsif error_count > 0
-            "Retrieved #{success_count} contexts (#{error_count} failed)"
-          else
-            "Retrieved #{contexts.length} contexts"
+          discovery_resp = post(url)
+                            .headers(call(:request_headers_auth_1, connection, ctx['cid'], 
+                                        connection['user_project'], req_params))
+                            .payload(call(:json_compact, discovery_body))
+          
+          # Process Discovery results
+          discovery_scores = {}
+          Array(discovery_resp['records']).each_with_index do |r, i|
+            discovery_scores[r['id'].to_s] = {
+              'score' => r['score'].to_f,
+              'rank' => i + 1
+            }
           end
           
-          # Return success with telemetry
-          call(:step_ok!, ctx, out, 200, message, extras)
+          # Enrich with original content
+          enriched = records_in.map do |orig|
+            id = orig['id'].to_s
+            disc = discovery_scores[id] || { 'score' => 0.0, 'rank' => 999 }
+            
+            orig.merge(
+              'discovery_score' => disc['score'],
+              'score' => disc['score'],  # Initial score
+              'rank' => disc['rank']
+            )
+          end
+          
+          # === Phase 2: LLM Category-Aware Reranking ===
+          llm_mode = input['llm_rerank_mode'] || 'none'
+          distribution = nil
+          llm_model_used = nil
+          
+          if llm_mode != 'none' && category.present?
+            llm_model_used = input['llm_model'] || 'gemini-2.0-flash'
+            
+            # Select contexts for LLM reranking
+            contexts_for_llm = if llm_mode == 'enhance'
+                                # Only rerank top-K from Discovery
+                                k = (input['llm_top_k'] || 10).to_i
+                                enriched.sort_by { |r| -r['discovery_score'].to_f }.first(k)
+                              else  # override mode
+                                # Rerank all contexts (but limit to prevent timeout)
+                                max_llm_contexts = 50
+                                if enriched.length > max_llm_contexts
+                                  enriched.sort_by { |r| -r['discovery_score'].to_f }.first(max_llm_contexts)
+                                else
+                                  enriched
+                                end
+                              end
+            
+            # Call category-aware LLM ranker
+            llm_result = call(:llm_category_aware_ranker,
+                            connection,
+                            llm_model_used,
+                            query,
+                            category,
+                            category_ctx,
+                            contexts_for_llm,
+                            ctx['cid'])
+            
+            if llm_result && llm_result['rankings']
+              # Process LLM rankings
+              llm_scores = {}
+              llm_result['rankings'].each do |r|
+                llm_scores[r['id']] = {
+                  'relevance' => r['relevance'].to_f,
+                  'category_alignment' => r['category_alignment'].to_f,
+                  'reasoning' => r['reasoning']
+                }
+              end
+              
+              # Apply LLM scores
+              if llm_mode == 'enhance'
+                # Blend Discovery and LLM scores
+                weight = (input['llm_score_weight'] || 0.4).to_f.clamp(0, 1)
+                
+                enriched.each do |rec|
+                  if llm_data = llm_scores[rec['id']]
+                    rec['llm_relevance'] = llm_data['relevance']
+                    rec['category_alignment'] = llm_data['category_alignment']
+                    
+                    # Weighted blend: Discovery + LLM relevance + category alignment
+                    rec['score'] = (1 - weight) * rec['discovery_score'].to_f +
+                                  weight * 0.7 * llm_data['relevance'] +
+                                  weight * 0.3 * llm_data['category_alignment']
+                  end
+                end
+              else  # override mode
+                # Use LLM scores as primary ranking
+                enriched.each do |rec|
+                  if llm_data = llm_scores[rec['id']]
+                    rec['llm_relevance'] = llm_data['relevance']
+                    rec['category_alignment'] = llm_data['category_alignment']
+                    
+                    # Combine relevance and category alignment
+                    rec['score'] = 0.8 * llm_data['relevance'] + 0.2 * llm_data['category_alignment']
+                  else
+                    rec['score'] = 0.0  # Not evaluated by LLM
+                  end
+                end
+              end
+              
+              # Build confidence distribution if requested
+              if input['include_confidence_distribution'] == true
+                total_score = enriched.sum { |x| x['score'].to_f }
+                total_score = 0.001 if total_score <= 0  # Prevent division by zero
+                
+                distribution = enriched.map { |r|
+                  llm_data = llm_scores[r['id']] || {}
+                  {
+                    'id' => r['id'],
+                    'probability' => r['score'].to_f / total_score,
+                    'reasoning' => llm_data['reasoning']
+                  }
+                }.sort_by { |d| -d['probability'] }
+              end
+            end
+            
+            # Re-rank by final scores
+            enriched = enriched.sort_by { |r| [-r['score'].to_f, r['id']] }
+                              .each_with_index { |r, i| r['rank'] = i + 1 }
+          end
+          
+          # === Phase 3: Shape Output ===
+          shape = input['emit_shape'] || 'context_chunks'
+          
+          # Apply top_n limit if specified
+          if input['top_n'].present?
+            enriched = enriched.first(input['top_n'].to_i)
+          end
+          
+          result = {}
+          
+          case shape
+          when 'records_only'
+            # Minimal output
+            result['records'] = enriched.map { |r|
+              { 'id' => r['id'], 'score' => r['score'], 'rank' => r['rank'] }
+            }
+          when 'enriched_records'
+            # Full records with all scores
+            result['records'] = enriched
+          else  # context_chunks
+            # RAG-ready chunks
+            chunks = enriched.map { |r|
+              md = r['metadata'] || {}
+              source_key = input['source_key'] || 'source'
+              uri_key = input['uri_key'] || 'uri'
+              
+              chunk = {
+                'id' => r['id'],
+                'text' => r['content'].to_s,
+                'score' => r['score'].to_f,
+                'source' => md[source_key],
+                'uri' => md[uri_key],
+                'metadata' => md,
+                'metadata_kv' => md.map { |k, v| { 'key' => k, 'value' => v } },
+                'metadata_json' => md.empty? ? nil : md.to_json
+              }
+              
+              # Add LLM scores if available
+              chunk['llm_relevance'] = r['llm_relevance'] if r['llm_relevance']
+              chunk['category_alignment'] = r['category_alignment'] if r['category_alignment']
+              
+              chunk
+            }
+            result['context_chunks'] = chunks
+            result['records'] = enriched  # Also include full records
+          end
+          
+          # Add distribution if generated
+          result['confidence_distribution'] = distribution if distribution
+          
+          # Add ranking metadata
+          result['ranking_metadata'] = {
+            'category' => category.presence,
+            'ranking_config_used' => config_id,
+            'llm_mode' => (llm_mode != 'none' ? llm_mode : nil),
+            'contexts_filtered' => records_in.length - records_to_rank.length,
+            'contexts_ranked' => records_to_rank.length
+          }.compact
+          
+          # Build facets
+          facets = {
+            'ranking_api' => 'discoveryengine.ranking',
+            'ranking_config' => config_id,
+            'category' => category.presence,
+            'llm_mode' => (llm_mode != 'none' ? llm_mode : nil),
+            'llm_model' => llm_model_used,
+            'emit_shape' => shape,
+            'records_input' => records_in.length,
+            'records_filtered' => records_in.length - records_to_rank.length,
+            'records_ranked' => records_to_rank.length,
+            'records_output' => enriched.length,
+            'has_distribution' => distribution.present?,
+            'top_score' => enriched.first&.dig('score'),
+            'category_filtered' => input['filter_by_category_metadata'] == true
+          }.compact
+          
+          # Use step_ok! for consistent telemetry and output structure
+          call(:step_ok!, ctx, result, 200, 'OK', facets)
           
         rescue => e
-          # Handle errors with telemetry
           call(:step_err!, ctx, e)
         end
+      end,
+      sample_output: lambda do
+        call(:sample_rag_retrieve_contexts_enhanced)
       end
     },
     rag_answer: {
