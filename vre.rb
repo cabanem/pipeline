@@ -1758,8 +1758,13 @@ require 'securerandom'
           end
           
           # Extract and map contexts with graceful failure
-          contexts = []
-          raw_contexts = call(:safe_extract_contexts, response)
+          #contexts = []
+          #raw_contexts = call(:safe_extract_contexts, response)
+          raw_contexts = if response && response['contexts'] && response['contexts']['contexts']
+            response['contexts']['contexts']
+          else
+            []
+          end
           
           if raw_contexts.empty? && !response['_network_error']
             # Add informational context for empty responses
@@ -1784,12 +1789,28 @@ require 'securerandom'
                 # Get source URI for PDF detection
                 source_uri = ctx_item['sourceUri'] || ctx_item['uri']
                 
+                # DEBUGGING: Log what we're seeing
+                is_pdf = call(:is_pdf_source?, source_uri, md)
+                sanitize_enabled = input['sanitize_pdf_content'] != false
+                
                 # Extract text
                 raw_text = (ctx_item['text'] || ctx_item.dig('chunk', 'text') || '').to_s
                 
+                # DEBUGGING: Check for PDF indicators
+                has_double_escapes = raw_text.include?('\\\\n') || raw_text.include?('\\\\t')
+                
+                # Log for debugging (remove after fixing)
+                if has_double_escapes || is_pdf
+                  puts "DEBUG Context #{idx}: is_pdf=#{is_pdf}, sanitize=#{sanitize_enabled}, has_escapes=#{has_double_escapes}, uri=#{source_uri}"
+                end
+                
                 # Apply PDF-specific cleaning based on preference and detection
-                text = if input['sanitize_pdf_content'] != false && 
-                          call(:is_pdf_source?, source_uri, md)
+                text = if sanitize_enabled && is_pdf
+                  puts "DEBUG: Sanitizing PDF context #{idx}"
+                  call(:sanitize_pdf_text, raw_text)
+                elsif has_double_escapes && sanitize_enabled
+                  # FALLBACK: Even if not detected as PDF, clean obvious PDF artifacts
+                  puts "DEBUG: Cleaning escaped content in context #{idx}"
                   call(:sanitize_pdf_text, raw_text)
                 else
                   # Regular cleaning for non-PDF content
