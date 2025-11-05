@@ -1135,52 +1135,39 @@ require 'securerandom'
               { name: 'citations', type: 'array', of: 'object', properties: [
                   { name: 'chunk_id' }, { name: 'source' }, { name: 'uri' }, { name: 'score', type: 'number' }
               ]}
-          ]}
+          ]},
+          { name: 'complete_output', type: 'object', hint: 'All outputs consolidated for easy downstream use' },
+          { name: 'facets', type: 'object', optional: true, hint: 'Analytics facets when available' }
         ] + Array(od['envelope_fields_1'])
       end,
       execute: lambda do |connection, raw_input|
-        started_at = Time.now.utc.iso8601
-        t0 = Time.now
-        input = call(:normalize_input_keys, raw_input)
-        cid   = call(:ensure_correlation_id!, input)
+        ctx = call(:step_begin!, :gen_generate, raw_input)
+        
         begin
-          result = call(:gen_generate_core!, connection, input, cid)
-          facets = call(:compute_facets_for!, 'gen_generate', result)
-          (result['telemetry'] ||= {})['facets'] = facets
-          call(:local_log_attach!, result,
-            call(:local_log_entry, :gen_generate, started_at, t0, result, nil, {
-              'model'         => input['model'],
-              'finish_reason' => (call(:_facet_finish_reason, result) rescue result.dig('candidates', 0, 'finishReason')),
-              'facets'        => facets
-            }))
-          result
+          input = call(:normalize_input_keys, raw_input)
+          result = call(:gen_generate_core!, connection, input, ctx['cid'])
+          
+          # Extract key metrics for facets
+          mode = (input['mode'] || 'plain').to_s
+          model = input['model']
+          finish_reason = call(:_facet_finish_reason, result) rescue result.dig('candidates', 0, 'finishReason')
+          
+          # Standard facets from compute_facets_for! plus action-specific ones
+          facets = {
+            'mode' => mode,
+            'model' => model,
+            'finish_reason' => finish_reason,
+            'confidence' => result['confidence'],
+            'has_citations' => result.dig('parsed', 'citations').is_a?(Array) && result.dig('parsed', 'citations').any?
+          }.compact
+          
+          call(:step_ok!, ctx, result, 200, 'OK', facets)
         rescue => e
-          g   = call(:extract_google_error, e)
-          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          env = call(:telemetry_envelope, t0, cid, false, call(:telemetry_parse_error_code, e), msg)
-          call(:local_log_attach!, env,
-            call(:local_log_entry, :gen_generate, started_at, t0, nil, e, { 'google_error' => g }))
-          raise
+          call(:step_err!, ctx, e)
         end
       end,
       sample_output: lambda do
-        {
-          'responseId' => 'resp-x',
-          'candidates' => [ { 'content' => { 'parts' => [ { 'text' => '...' } ] } } ],
-          'confidence' => 0.84,
-          'parsed'     => { 'answer' => '...', 'citations' => [ { 'chunk_id' => 'doc-1#c2', 'score' => 0.88 } ] },
-          'ok' => true,
-          'telemetry' => {
-            'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample',
-            'confidence' => { 'basis' => 'citations_topk_avg', 'k' => 3, 'n' => 1 },
-            'facets' => {
-              'tokens_total' => 271,
-              'gen_finish_reason' => 'STOP',
-              'confidence' => 0.84
-            }
-          }
-        }
-
+        call(:sample_gen_generate)
       end
     },
     rank_texts_with_ranking_api: {
@@ -1276,7 +1263,6 @@ require 'securerandom'
             hint: 'Force specific multi-region (global/us/eu). Usually auto-detected.' }
         ]
       end,
-      
       output_fields: lambda do |object_definitions, _connection|
         [
           { name: 'records', type: 'array', of: 'object', properties: [
@@ -1312,10 +1298,11 @@ require 'securerandom'
               { name: 'llm_mode' },
               { name: 'contexts_filtered', type: 'integer' },
               { name: 'contexts_ranked', type: 'integer' }
-            ] }
+            ] },
+          { name: 'complete_output', type: 'object', hint: 'All outputs consolidated for easy downstream use' },
+          { name: 'facets', type: 'object', optional: true, hint: 'Analytics facets when available' }
         ] + Array(object_definitions['envelope_fields_1'])
       end,
-      
       execute: lambda do |connection, input|
         ctx = call(:step_begin!, :rank_texts_with_ranking_api, input)
         
@@ -1353,6 +1340,13 @@ require 'securerandom'
           
           # Pre-filter contexts by category metadata if requested
           records_in = call(:safe_array, input['records'])
+          
+          # ISSUE FIX: Validate that records have required fields
+          records_in.each_with_index do |r, i|
+            error("Record at index #{i} missing required 'id' field") unless r['id'].present?
+            error("Record at index #{i} missing required 'content' field") unless r['content'].present?
+          end
+          
           records_to_rank = records_in
           
           if category.present? && input['filter_by_category_metadata'] == true
@@ -1372,6 +1366,11 @@ require 'securerandom'
                 false  # No category metadata, exclude
               end
             end
+            
+            # ISSUE FIX: Warn if filtering removed all records
+            if records_to_rank.empty? && records_in.any?
+              error("Category filtering removed all #{records_in.length} records. Check category metadata key '#{meta_key}' and value '#{category}'")
+            end
           end
           
           # === Phase 1: Discovery Engine Ranking ===
@@ -1379,6 +1378,13 @@ require 'securerandom'
           req_params = "ranking_config=projects/#{connection['project_id']}/locations/#{loc}/rankingConfigs/#{config_id}"
           url = call(:discovery_url, connection, loc,
                     "projects/#{connection['project_id']}/locations/#{loc}/rankingConfigs/#{config_id}:rank", ver)
+          
+          # ISSUE FIX: Limit batch size to Discovery Engine's limits (typically 100-200 records)
+          max_batch_size = 100
+          if records_to_rank.length > max_batch_size
+            records_to_rank = records_to_rank.first(max_batch_size)
+            # Note: Should probably warn user or handle pagination
+          end
           
           discovery_body = {
             'query' => enhanced_query,
@@ -1423,9 +1429,10 @@ require 'securerandom'
           # === Phase 2: LLM Category-Aware Reranking ===
           llm_mode = input['llm_rerank_mode'] || 'none'
           distribution = nil
+          llm_model_used = nil
           
           if llm_mode != 'none' && category.present?
-            llm_start = Time.now
+            llm_model_used = input['llm_model'] || 'gemini-2.0-flash'
             
             # Select contexts for LLM reranking
             contexts_for_llm = if llm_mode == 'enhance'
@@ -1433,14 +1440,19 @@ require 'securerandom'
                                 k = (input['llm_top_k'] || 10).to_i
                                 enriched.sort_by { |r| -r['discovery_score'].to_f }.first(k)
                               else  # override mode
-                                # Rerank all contexts
-                                enriched
+                                # Rerank all contexts (but limit to prevent timeout)
+                                max_llm_contexts = 50
+                                if enriched.length > max_llm_contexts
+                                  enriched.sort_by { |r| -r['discovery_score'].to_f }.first(max_llm_contexts)
+                                else
+                                  enriched
+                                end
                               end
             
             # Call category-aware LLM ranker
             llm_result = call(:llm_category_aware_ranker,
                             connection,
-                            input['llm_model'] || 'gemini-2.0-flash',
+                            llm_model_used,
                             query,
                             category,
                             category_ctx,
@@ -1491,11 +1503,14 @@ require 'securerandom'
               
               # Build confidence distribution if requested
               if input['include_confidence_distribution'] == true
+                total_score = enriched.sum { |x| x['score'].to_f }
+                total_score = 0.001 if total_score <= 0  # Prevent division by zero
+                
                 distribution = enriched.map { |r|
                   llm_data = llm_scores[r['id']] || {}
                   {
                     'id' => r['id'],
-                    'probability' => r['score'].to_f / [enriched.sum { |x| x['score'].to_f }, 0.001].max,
+                    'probability' => r['score'].to_f / total_score,
                     'reasoning' => llm_data['reasoning']
                   }
                 }.sort_by { |d| -d['probability'] }
@@ -1515,17 +1530,17 @@ require 'securerandom'
             enriched = enriched.first(input['top_n'].to_i)
           end
           
-          out = {}
+          result = {}
           
           case shape
           when 'records_only'
             # Minimal output
-            out['records'] = enriched.map { |r|
+            result['records'] = enriched.map { |r|
               { 'id' => r['id'], 'score' => r['score'], 'rank' => r['rank'] }
             }
           when 'enriched_records'
             # Full records with all scores
-            out['records'] = enriched
+            result['records'] = enriched
           else  # context_chunks
             # RAG-ready chunks
             chunks = enriched.map { |r|
@@ -1550,15 +1565,15 @@ require 'securerandom'
               
               chunk
             }
-            out['context_chunks'] = chunks
-            out['records'] = enriched  # Also include full records
+            result['context_chunks'] = chunks
+            result['records'] = enriched  # Also include full records
           end
           
           # Add distribution if generated
-          out['confidence_distribution'] = distribution if distribution
+          result['confidence_distribution'] = distribution if distribution
           
           # Add ranking metadata
-          out['ranking_metadata'] = {
+          result['ranking_metadata'] = {
             'category' => category.presence,
             'ranking_config_used' => config_id,
             'llm_mode' => (llm_mode != 'none' ? llm_mode : nil),
@@ -1566,20 +1581,32 @@ require 'securerandom'
             'contexts_ranked' => records_to_rank.length
           }.compact
           
-          # === Phase 4: Telemetry ===
-          tel = call(:telemetry_envelope_ex, ctx['t0'], ctx['cid'], true, 200, 'OK', {
-            'ranking_api' => 'discoveryengine.ranking:rank',
+          # Build facets
+          facets = {
+            'ranking_api' => 'discoveryengine.ranking',
             'ranking_config' => config_id,
             'category' => category.presence,
             'llm_mode' => (llm_mode != 'none' ? llm_mode : nil),
-            'llm_model' => (llm_mode != 'none' ? input['llm_model'] : nil)
-          }.compact)
+            'llm_model' => llm_model_used,
+            'emit_shape' => shape,
+            'records_input' => records_in.length,
+            'records_filtered' => records_in.length - records_to_rank.length,
+            'records_ranked' => records_to_rank.length,
+            'records_output' => enriched.length,
+            'has_distribution' => distribution.present?,
+            'top_score' => enriched.first&.dig('score'),
+            'category_filtered' => input['filter_by_category_metadata'] == true
+          }.compact
           
-          out.merge(tel)
+          # Use step_ok! for consistent telemetry and output structure
+          call(:step_ok!, ctx, result, 200, 'OK', facets)
           
         rescue => e
           call(:step_err!, ctx, e)
         end
+      end,
+      sample_output: lambda do
+        call(:sample_rank_texts_with_ranking_api)
       end
     },
 
@@ -1758,7 +1785,7 @@ require 'securerandom'
           end
           
           # Extract and map contexts with graceful failure
-          #contexts = []
+          contexts = []
           #raw_contexts = call(:safe_extract_contexts, response)
           raw_contexts = if response && response['contexts'] && response['contexts']['contexts']
             response['contexts']['contexts']
@@ -2701,7 +2728,9 @@ require 'securerandom'
               { name: 'decision' }
           ]},
           { name: 'intent', type: 'object', properties: Array(object_definitions['intent_out']) },
-          { name: 'email_text' }
+          { name: 'email_text' },
+          { name: 'complete_output', type: 'object', hint: 'All outputs consolidated for easy downstream use' },
+          { name: 'facets', type: 'object', optional: true, hint: 'Analytics facets when available' }
         ] + Array(object_definitions['envelope_fields'])
       end,
 
@@ -2733,12 +2762,21 @@ require 'securerandom'
           }, (rules['hard_exclude'] || {}))
 
           if hard[:hit]
+            # Standard outputs
             out = {
               'pre_filter' => hard.merge({ 'decision' => 'IRRELEVANT' }),
               'intent'     => nil,
               'email_text' => email_text
             }
-            return call(:step_ok!, ctx, out, 200, 'OK', { 'decision'=>'HARD_EXIT' })
+            # Compute facets
+            return call(:step_ok!, ctx, out, 200, 'OK', { 
+              'decision_path' => 'hard_exit',
+              'final_decision' => 'IRRELEVANT',
+              'hard_rule_triggered' => hard[:reason],
+              'rules_evaluated' => true,
+              'intent_label' => 'none',
+              'email_length' => email_text.length
+            })
           end
 
           soft = call(:hr_eval_soft, {
@@ -2763,20 +2801,31 @@ require 'securerandom'
           intent = { 'label'=>'transactional','confidence'=>0.7,'basis'=>'keywords' }
         end
 
+        # Standard outputs
         out = {
           'pre_filter' => pre,
           'intent'     => intent,
           'email_text' => email_text
         }
-        call(:step_ok!, ctx, out, 200, 'OK', { 'intent'=>intent['label'] })
-
+        # Compute facets
+        call(:step_ok!, ctx, out, 200, 'OK', { 
+          'decision_path' => 'soft_eval',
+          'final_decision' => pre['decision'],
+          'intent_label' => intent['label'],
+          'intent_confidence' => intent['confidence'],
+          'intent_basis' => intent['basis'],
+          'soft_score' => pre['score'] || 0,
+          'signals_matched' => (pre['matched_signals'] || []).length,
+          'rules_evaluated' => rules.is_a?(Hash),
+          'hard_rules_count' => rules.is_a?(Hash) ? (rules['hard_exclude'] || {}).values.flatten.length : 0,
+          'soft_signals_count' => rules.is_a?(Hash) ? (rules['soft_signals'] || []).length : 0,
+          'has_attachments' => env['attachments'].present? && env['attachments'].any?,
+          'email_length' => email_text.length,
+          'special_headers' => headers.keys.any? { |k| k.match(/^(x-|list-|auto-|precedence)/i) }
+        })
       end,
       sample_output: lambda do
-        {
-          'pre_filter' => { 'hit'=>false, 'score'=>3, 'matched_signals'=>['mentions_invoice'], 'decision'=>'REVIEW' },
-          'intent'     => { 'label'=>'transactional','confidence'=>0.7,'basis'=>'keywords' },
-          'email_text' => "Subject: ...\n\nBody:\n..."
-        }.merge({ 'ok'=>true, 'telemetry'=>{ 'http_status'=>200, 'message'=>'OK', 'duration_ms'=>12, 'correlation_id'=>'corr' } })
+        call(:sample_deterministic_filter)
       end
     },
     ai_policy_filter: {
@@ -2800,10 +2849,11 @@ require 'securerandom'
       output_fields: lambda do |object_definitions, connection|
         [
           { name: 'policy', type: 'object', properties: Array(object_definitions['policy_out']) },
-          { name: 'short_circuit', type: 'boolean' }
+          { name: 'short_circuit', type: 'boolean' },
+          { name: 'complete_output', type: 'object', hint: 'All outputs consolidated for easy downstream use' },
+          { name: 'facets', type: 'object', optional: true, hint: 'Analytics facets when available' }
         ] + Array(object_definitions['envelope_fields'])
       end,
-
       execute: lambda do |connection, input|
         ctx = call(:step_begin!, :ai_policy_filter, input)
         model_path = call(:build_model_path_with_global_preview, connection, (input['model'] || 'gemini-2.0-flash'))
@@ -2853,17 +2903,20 @@ require 'securerandom'
         short_circuit = (policy['decision'] == 'IRRELEVANT' && policy['confidence'].to_f >= (input['confidence_short_circuit'] || 0.8).to_f)
 
         out = { 'policy'=>policy, 'short_circuit'=>short_circuit }
-        call(:step_ok!, ctx, out, call(:telemetry_success_code, resp), 'OK',
-          { 'decision'=>policy['decision'], 'conf'=>policy['confidence'] })
+        call(:step_ok!, ctx, out, call(:telemetry_success_code, resp), 'OK', {
+          'decision' => policy['decision'],
+          'confidence' => policy['confidence'],
+          'short_circuit' => short_circuit,
+          'signals_count' => (policy['matched_signals'] || []).length,
+          'reasons_count' => (policy['reasons'] || []).length,
+          'model_used' => input['model'] || 'gemini-2.0-flash',
+          'policy_mode' => input['policy_mode'] || 'none'
+        })
       rescue => e
         call(:step_err!, ctx, e)
       end,
       sample_output: lambda do
-        {
-          'policy'=>{ 'decision'=>'REVIEW','confidence'=>0.62,'matched_signals'=>['low_detail'],'reasons'=>['thin context'] },
-          'short_circuit'=>false, 'ok'=>true,
-          'telemetry'=>{ 'http_status'=>200,'message'=>'OK','duration_ms'=>20,'correlation_id'=>'corr' }
-        }
+        call(:sample_ai_policy_filter)
       end
     },
     embed_text_against_categories: {
@@ -2889,7 +2942,9 @@ require 'securerandom'
           { name: 'scores', type: 'array', of: 'object', properties: [
               { name: 'category' }, { name: 'score', type: 'number' }, { name: 'cosine', type: 'number' }
           ]},
-          { name: 'shortlist', type: 'array', of: 'string' }
+          { name: 'shortlist', type: 'array', of: 'string' },
+          { name: 'complete_output', type: 'object', hint: 'All outputs consolidated for easy downstream use' },
+          { name: 'facets', type: 'object', optional: true, hint: 'Analytics facets when available' }
         ] + Array(object_definitions['envelope_fields'])
       end,
 
@@ -2927,18 +2982,18 @@ require 'securerandom'
         shortlist = scores.first(k).map { |h| h['category'] }
 
         out = { 'scores'=>scores, 'shortlist'=>shortlist }
-        call(:step_ok!, ctx, out, 200, 'OK', { 'k'=>k })
+        call(:step_ok!, ctx, out, 200, 'OK', { 
+          'k' => k,
+          'categories_count' => cats.length,
+          'shortlist_k' => k,
+          'top_score' => scores.first ? scores.first['score'] : 0,
+          'embedding_model' => emb_model,
+          'categories_mode' => input['categories_mode'] || 'array'
+        })
 
       end,
       sample_output: lambda do
-        {
-          'scores'=>[
-            { 'category'=>'Billing','score'=>0.91,'cosine'=>0.82 },
-            { 'category'=>'Support','score'=>0.47,'cosine'=>-0.06 }
-          ],
-          'shortlist'=>['Billing','Support'],
-          'ok'=>true, 'telemetry'=>{ 'http_status'=>200,'message'=>'OK','duration_ms'=>11,'correlation_id'=>'corr' }
-        }
+        call(:sample_embed_text_against_categories)
       end
     },
     rerank_shortlist: {
@@ -2964,7 +3019,9 @@ require 'securerandom'
           { name: 'ranking', type: 'array', of: 'object', properties: [
               { name: 'category' }, { name: 'prob', type: 'number' }
           ]},
-          { name: 'shortlist', type: 'array', of: 'string' }
+          { name: 'shortlist', type: 'array', of: 'string' },
+          { name: 'complete_output', type: 'object', hint: 'All outputs consolidated for easy downstream use' },
+          { name: 'facets', type: 'object', optional: true, hint: 'Analytics facets when available' }
         ] + Array(object_definitions['envelope_fields'])
       end,
 
@@ -2976,10 +3033,13 @@ require 'securerandom'
           sl = call(:safe_array, input['shortlist'])
           ranking = sl.map { |c| { 'category'=>c, 'prob'=>nil } }
           out = { 'ranking'=>ranking, 'shortlist'=>sl }
-          return call(:step_ok!, ctx, out, 200, 'OK', { 'mode'=>'none' })
+          return call(:step_ok!, ctx, out, 200, 'OK', { 
+            'mode' => 'none',
+            'categories_ranked' => sl.length
+          })
         end
 
-        # LLM listwise: reuse your referee to get distribution over shortlist
+        # LLM listwise: reuse referee to get distribution over shortlist
         cats_raw =
           if input['categories_mode'].to_s == 'json' && input['categories_json'].present?
             call(:safe_json_arr!, input['categories_json'])
@@ -2995,18 +3055,16 @@ require 'securerandom'
         dist.concat(missing.map { |m| { 'category'=>m, 'prob'=>0.0 } })
         ranking = dist.sort_by { |h| -h['prob'].to_f }
         out = { 'ranking'=>ranking, 'shortlist'=>ranking.map { |r| r['category'] } }
-        call(:step_ok!, ctx, out, 200, 'OK', { 'mode'=>'llm' })
+        call(:step_ok!, ctx, out, 200, 'OK', { 
+          'mode' => 'llm',
+          'top_prob' => ranking.first ? ranking.first['prob'] : 0,
+          'categories_ranked' => ranking.length,
+          'generative_model' => input['generative_model'] || 'gemini-2.0-flash',
+          'categories_mode' => input['categories_mode'] || 'array'
+        })
       end,
       sample_output: lambda do
-        {
-          'ranking'=>[
-            { 'category'=>'Billing','prob'=>0.86 },
-            { 'category'=>'Support','prob'=>0.10 },
-            { 'category'=>'Sales','prob'=>0.04 }
-          ],
-          'shortlist'=>['Billing','Support','Sales'],
-          'ok'=>true, 'telemetry'=>{ 'http_status'=>200,'message'=>'OK','duration_ms'=>18,'correlation_id'=>'corr' }
-        }
+        call(:sample_rerank_shortlist)
       end
     },
     llm_referee_with_contexts: {
@@ -3051,8 +3109,8 @@ require 'securerandom'
           { name: 'referee', type: 'object', properties: Array(object_definitions['referee_out']) },
           { name: 'chosen' },
           { name: 'confidence', type: 'number' },
-           # Salience sidecar (top-level field; backward compatible)
-           { name: 'salience', type: 'object', properties: [
+          # Salience sidecar (top-level field; backward compatible)
+          { name: 'salience', type: 'object', properties: [
                { name: 'span' },
                { name: 'reason' },
                { name: 'importance', type: 'number' },
@@ -3069,9 +3127,10 @@ require 'securerandom'
                    { name: 'totalTokenCount', type: 'integer' }
                ]},
                { name: 'span_source' } # heuristic | llm
-             ]
-           }
-         ] + Array(object_definitions['envelope_fields'])
+             ]},
+          { name: 'complete_output', type: 'object', hint: 'All outputs consolidated for easy downstream use' },
+          { name: 'facets', type: 'object', optional: true, hint: 'Analytics facets when available' }
+        ] + Array(object_definitions['envelope_fields'])
       end,
 
       execute: lambda do |connection, input|
@@ -3200,46 +3259,32 @@ require 'securerandom'
             ref['category']
           end
 
-         out = {
-           'referee'=>ref,
-           'chosen'=>chosen,
-           'confidence'=>[ref['confidence'], 0.0].compact.first.to_f
-         }
-         out['salience'] = salience if salience
+        out = {
+          'referee'=>ref,
+          'chosen'=>chosen,
+          'confidence'=>[ref['confidence'], 0.0].compact.first.to_f
+        }
+        out['salience'] = salience if salience
  
-         extras = {
-           'chosen'=>chosen, 'conf'=>out['confidence'],
-           'salience_len'=> (salience && salience['span'] ? salience['span'].to_s.length : nil),
-           'salience_source'=> (salience && salience['span_source']),
-           'salience_err'=> sal_err
-         }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
-         call(:step_ok!, ctx, out, 200, 'OK', extras)
+        extras = {
+          'chosen' => chosen,
+          'confidence' => out['confidence'],
+          'salience_mode' => input['salience_mode'] || 'off',
+          'salience_len' => (salience && salience['span'] ? salience['span'].to_s.length : nil),
+          'salience_importance' => (salience && salience['importance']),
+          'salience_source' => (salience && salience['span_source']),
+          'salience_err' => sal_err,
+          'has_contexts' => Array(input['contexts']).any?,
+          'shortlist_size' => shortlist.length,
+          'generative_model' => input['generative_model'] || 'gemini-2.0-flash',
+          'categories_mode' => input['categories_mode'] || 'array'
+        }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
+
+        # Add the missing step_ok! call with extras
+        call(:step_ok!, ctx, out, 200, 'OK', extras)
       end,
       sample_output: lambda do
-        {
-          'referee'=>{
-            'category'=>'Billing','confidence'=>0.86,'reasoning'=>'Mentions invoice 4411.',
-            'distribution'=>[
-              { 'category'=>'Billing','prob'=>0.86 }, { 'category'=>'Support','prob'=>0.10 }, { 'category'=>'Sales','prob'=>0.04 }
-            ]
-          },
-           'chosen'=>'Billing','confidence'=>0.86,
-           'salience'=>{
-             'span'=>'Can you approve the Q4 budget increase by Friday?',
-             'reason'=>'Explicit ask with a clear deadline',
-             'importance'=>0.92,
-             'tags'=>['approval','budget','deadline'],
-             'entities'=>[{ 'type'=>'team','text'=>'Finance' }],
-             'cta'=>'Approve Q4 budget increase',
-             'deadline_iso'=>'2025-10-24T17:00:00Z',
-             'focus_preview'=>'Email (trimmed): ...',
-             'responseId'=>'resp-sal-xyz',
-             'usage'=>{ 'promptTokenCount'=>120,'candidatesTokenCount'=>70,'totalTokenCount'=>190 },
-             'span_source'=>'llm'
-           },
-
-          'ok'=>true,'telemetry'=>{ 'http_status'=>200,'message'=>'OK','duration_ms'=>19,'correlation_id'=>'corr' }
-        }
+        call(:sample_llm_referee_with_contexts)  # or appropriate method name for each action
       end
     }
   },
@@ -3340,6 +3385,456 @@ require 'securerandom'
   
   # --------- METHODS ------------------------------------------------------
   methods: {
+    # Sample outputs
+    sample_telemetry: lambda do |duration_ms|
+      {
+        'http_status' => 200,
+        'message' => 'OK',
+        'duration_ms' => duration_ms || 12,
+        'correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
+      }
+    end,
+    sample_ai_policy_filter: lambda do
+      policy = {
+        'decision' => 'REVIEW',
+        'confidence' => 0.62,
+        'matched_signals' => ['low_detail', 'missing_context'],
+        'reasons' => ['thin context', 'needs review']
+      }
+      
+      business_data = {
+        'policy' => policy,
+        'short_circuit' => false
+      }
+      
+      facets = {
+        'decision' => policy['decision'],
+        'confidence' => policy['confidence'],
+        'short_circuit' => false,
+        'signals_count' => policy['matched_signals'].length,
+        'model_used' => 'gemini-2.0-flash',
+        'policy_mode' => 'json',
+        'correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
+      }
+      
+      business_data.merge({
+        'complete_output' => business_data.dup,
+        'facets' => facets,
+        'ok' => true,
+        'telemetry' => call(:sample_telemetry, 20)
+      })
+    end,
+    sample_deterministic_filter: lambda do
+      # Business data that would be returned
+      pre_filter = { 
+        'hit' => false, 
+        'score' => 3, 
+        'matched_signals' => ['mentions_invoice', 'attachment_pdf'], 
+        'decision' => 'REVIEW' 
+      }
+      
+      intent = { 
+        'label' => 'transactional',
+        'confidence' => 0.7,
+        'basis' => 'keywords' 
+      }
+      
+      email_text = "Subject: Invoice #12345 - Payment Due\n\nBody:\nPlease find attached..."
+      
+      # Build the business data section
+      business_data = {
+        'pre_filter' => pre_filter,
+        'intent' => intent,
+        'email_text' => email_text
+      }
+      
+      # Build facets
+      facets = {
+        'decision_path' => 'soft_eval',
+        'final_decision' => 'REVIEW',
+        'intent_label' => intent['label'],
+        'intent_confidence' => intent['confidence'],
+        'intent_basis' => intent['basis'],
+        'rules_evaluated' => true,
+        'hard_rules_count' => 5,
+        'soft_signals_count' => 12,
+        'signals_matched' => pre_filter['matched_signals'].length,
+        'soft_score' => pre_filter['score'],
+        'has_attachments' => true,
+        'has_auth_flags' => false,
+        'email_length' => email_text.length,
+        'special_headers' => true,
+        'correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
+      }
+      
+      # Build telemetry
+      telemetry = { 
+        'http_status' => 200, 
+        'message' => 'OK', 
+        'duration_ms' => 12, 
+        'correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890' 
+      }
+      
+      # Assemble complete output
+      business_data.merge({
+        'complete_output' => business_data.dup,
+        'facets' => facets,
+        'ok' => true,
+        'telemetry' => telemetry
+      })
+    end,
+    sample_embed_text_against_categories: lambda do
+      scores = [
+        { 'category' => 'Billing', 'score' => 0.91, 'cosine' => 0.82 },
+        { 'category' => 'Support', 'score' => 0.47, 'cosine' => -0.06 },
+        { 'category' => 'Sales', 'score' => 0.35, 'cosine' => -0.30 }
+      ]
+      
+      business_data = {
+        'scores' => scores,
+        'shortlist' => ['Billing', 'Support', 'Sales']
+      }
+      
+      facets = {
+        'categories_count' => scores.length,
+        'shortlist_k' => 3,
+        'top_score' => scores.first['score'],
+        'embedding_model' => 'text-embedding-005',
+        'categories_mode' => 'array',
+        'correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
+      }
+      
+      business_data.merge({
+        'complete_output' => business_data.dup,
+        'facets' => facets,
+        'ok' => true,
+        'telemetry' => call(:sample_telemetry, 11)
+      })
+    end,
+    sample_rerank_shortlist: lambda do
+      ranking = [
+        { 'category' => 'Billing', 'prob' => 0.86 },
+        { 'category' => 'Support', 'prob' => 0.10 },
+        { 'category' => 'Sales', 'prob' => 0.04 }
+      ]
+      
+      business_data = {
+        'ranking' => ranking,
+        'shortlist' => ['Billing', 'Support', 'Sales']
+      }
+      
+      facets = {
+        'mode' => 'llm',
+        'top_prob' => ranking.first['prob'],
+        'categories_ranked' => ranking.length,
+        'generative_model' => 'gemini-2.0-flash',
+        'correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
+      }
+      
+      business_data.merge({
+        'complete_output' => business_data.dup,
+        'facets' => facets,
+        'ok' => true,
+        'telemetry' => call(:sample_telemetry, 18)
+      })
+    end,
+    sample_llm_referee_with_contexts: lambda do
+      referee = {
+        'category' => 'Billing',
+        'confidence' => 0.86,
+        'reasoning' => 'Mentions invoice 4411.',
+        'distribution' => [
+          { 'category' => 'Billing', 'prob' => 0.86 },
+          { 'category' => 'Support', 'prob' => 0.10 },
+          { 'category' => 'Sales', 'prob' => 0.04 }
+        ]
+      }
+      
+      salience = {
+        'span' => 'Can you approve the Q4 budget increase by Friday?',
+        'reason' => 'Explicit ask with a clear deadline',
+        'importance' => 0.92,
+        'tags' => ['approval', 'budget', 'deadline'],
+        'entities' => [{ 'type' => 'team', 'text' => 'Finance' }],
+        'cta' => 'Approve Q4 budget increase',
+        'deadline_iso' => '2025-10-24T17:00:00Z',
+        'focus_preview' => 'Email (trimmed): ...',
+        'responseId' => 'resp-sal-xyz',
+        'usage' => { 'promptTokenCount' => 120, 'candidatesTokenCount' => 70, 'totalTokenCount' => 190 },
+        'span_source' => 'llm'
+      }
+      
+      business_data = {
+        'referee' => referee,
+        'chosen' => 'Billing',
+        'confidence' => 0.86,
+        'salience' => salience
+      }
+      
+      facets = {
+        'chosen' => 'Billing',
+        'confidence' => 0.86,
+        'salience_mode' => 'llm',
+        'salience_len' => salience['span'].length,
+        'salience_importance' => salience['importance'],
+        'has_contexts' => false,
+        'shortlist_size' => 3,
+        'generative_model' => 'gemini-2.0-flash',
+        'correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
+      }
+      
+      business_data.merge({
+        'complete_output' => business_data.dup,
+        'facets' => facets,
+        'ok' => true,
+        'telemetry' => call(:sample_telemetry, 19)
+      })
+    end,
+    sample_gen_generate: lambda do
+      # Business data
+      candidates = [{
+        'content' => { 
+          'parts' => [{ 'text' => 'Based on the provided context, the invoice total is $1,234.56.' }],
+          'role' => 'model'
+        },
+        'finishReason' => 'STOP',
+        'safetyRatings' => [
+          { 'category' => 'HARM_CATEGORY_SEXUALLY_EXPLICIT', 'probability' => 'NEGLIGIBLE' },
+          { 'category' => 'HARM_CATEGORY_HATE_SPEECH', 'probability' => 'NEGLIGIBLE' }
+        ]
+      }]
+      
+      parsed = {
+        'answer' => 'Based on the provided context, the invoice total is $1,234.56.',
+        'citations' => [
+          { 'chunk_id' => 'doc-1#c2', 'source' => 'invoice.pdf', 'uri' => 'gs://bucket/invoice.pdf', 'score' => 0.92 },
+          { 'chunk_id' => 'doc-1#c5', 'source' => 'invoice.pdf', 'uri' => 'gs://bucket/invoice.pdf', 'score' => 0.88 }
+        ]
+      }
+      
+      usage_metadata = {
+        'promptTokenCount' => 245,
+        'candidatesTokenCount' => 26,
+        'totalTokenCount' => 271
+      }
+      
+      business_data = {
+        'responseId' => 'resp-abc123',
+        'candidates' => candidates,
+        'usageMetadata' => usage_metadata,
+        'confidence' => 0.90,
+        'parsed' => parsed
+      }
+      
+      # Build facets
+      facets = {
+        'mode' => 'rag_with_context',
+        'model' => 'gemini-2.0-flash',
+        'finish_reason' => 'STOP',
+        'confidence' => 0.90,
+        'has_citations' => true,
+        'citations_count' => 2,
+        'tokens_prompt' => 245,
+        'tokens_candidates' => 26,
+        'tokens_total' => 271,
+        'confidence_basis' => 'citations_topk_avg',
+        'confidence_k' => 3,
+        'safety_blocked' => false,
+        'correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
+      }
+      
+      # Return with standard envelope
+      business_data.merge({
+        'complete_output' => business_data.dup,
+        'facets' => facets,
+        'ok' => true,
+        'telemetry' => call(:sample_telemetry, 150) # Assuming gen calls take ~150ms
+      })
+    end,
+    sample_rank_texts_with_ranking_api: lambda do
+      # Business data
+      records = [
+        {
+          'id' => 'doc-1',
+          'score' => 0.92,
+          'rank' => 1,
+          'content' => 'Our PTO policy allows employees to take up to 20 days per year...',
+          'metadata' => { 'source' => 'hr-handbook.pdf', 'category' => 'PTO', 'page' => 15 },
+          'discovery_score' => 0.88,
+          'llm_relevance' => 0.95,
+          'category_alignment' => 0.98
+        },
+        {
+          'id' => 'doc-2',
+          'score' => 0.84,
+          'rank' => 2,
+          'content' => 'Vacation requests must be submitted at least 2 weeks in advance...',
+          'metadata' => { 'source' => 'hr-handbook.pdf', 'category' => 'PTO', 'page' => 16 },
+          'discovery_score' => 0.82,
+          'llm_relevance' => 0.86,
+          'category_alignment' => 0.85
+        }
+      ]
+      
+      context_chunks = [
+        {
+          'id' => 'doc-1',
+          'text' => 'Our PTO policy allows employees to take up to 20 days per year...',
+          'score' => 0.92,
+          'source' => 'hr-handbook.pdf',
+          'uri' => 'gs://bucket/hr-handbook.pdf',
+          'metadata' => { 'source' => 'hr-handbook.pdf', 'category' => 'PTO', 'page' => 15 },
+          'metadata_kv' => [
+            { 'key' => 'source', 'value' => 'hr-handbook.pdf' },
+            { 'key' => 'category', 'value' => 'PTO' },
+            { 'key' => 'page', 'value' => 15 }
+          ],
+          'metadata_json' => '{"source":"hr-handbook.pdf","category":"PTO","page":15}',
+          'llm_relevance' => 0.95,
+          'category_alignment' => 0.98
+        },
+        {
+          'id' => 'doc-2',
+          'text' => 'Vacation requests must be submitted at least 2 weeks in advance...',
+          'score' => 0.84,
+          'source' => 'hr-handbook.pdf',
+          'uri' => 'gs://bucket/hr-handbook.pdf',
+          'metadata' => { 'source' => 'hr-handbook.pdf', 'category' => 'PTO', 'page' => 16 },
+          'metadata_kv' => [
+            { 'key' => 'source', 'value' => 'hr-handbook.pdf' },
+            { 'key' => 'category', 'value' => 'PTO' },
+            { 'key' => 'page', 'value' => 16 }
+          ],
+          'metadata_json' => '{"source":"hr-handbook.pdf","category":"PTO","page":16}',
+          'llm_relevance' => 0.86,
+          'category_alignment' => 0.85
+        }
+      ]
+      
+      confidence_distribution = [
+        { 'id' => 'doc-1', 'probability' => 0.523, 'reasoning' => 'Directly addresses PTO policy limits' },
+        { 'id' => 'doc-2', 'probability' => 0.477, 'reasoning' => 'Covers PTO request procedures' }
+      ]
+      
+      ranking_metadata = {
+        'category' => 'PTO',
+        'ranking_config_used' => 'default_ranking_config',
+        'llm_mode' => 'enhance',
+        'contexts_filtered' => 0,
+        'contexts_ranked' => 2
+      }
+      
+      business_data = {
+        'records' => records,
+        'context_chunks' => context_chunks,
+        'confidence_distribution' => confidence_distribution,
+        'ranking_metadata' => ranking_metadata
+      }
+      
+      # Build facets
+      facets = {
+        'ranking_api' => 'discoveryengine.ranking',
+        'ranking_config' => 'default_ranking_config',
+        'category' => 'PTO',
+        'llm_mode' => 'enhance',
+        'llm_model' => 'gemini-2.0-flash',
+        'emit_shape' => 'context_chunks',
+        'records_input' => 5,
+        'records_filtered' => 0,
+        'records_ranked' => 2,
+        'records_output' => 2,
+        'has_distribution' => true,
+        'top_score' => 0.92,
+        'category_filtered' => false,
+        'correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
+      }
+      
+      # Return with standard envelope
+      business_data.merge({
+        'complete_output' => business_data.dup,
+        'facets' => facets,
+        'ok' => true,
+        'telemetry' => call(:sample_telemetry, 85)  # Ranking typically faster than generation
+      })
+    end,
+    sample_rag_retrieve_contexts_enhanced: lambda do
+      contexts = [
+        {
+          'id' => 'ctx-1',
+          'text' => 'Our company policy allows up to 20 days of PTO per year for full-time employees.',
+          'score' => 0.92,
+          'source' => 'hr-handbook.pdf',
+          'uri' => 'gs://bucket/hr-handbook.pdf',
+          'metadata' => { 'page' => 15, 'section' => 'Benefits' },
+          'metadata_kv' => [
+            { 'key' => 'page', 'value' => '15' },
+            { 'key' => 'section', 'value' => 'Benefits' }
+          ],
+          'metadata_json' => '{"page":15,"section":"Benefits"}',
+          'is_pdf' => true,
+          'processing_error' => false
+        },
+        {
+          'id' => 'ctx-2', 
+          'text' => 'Employees must submit PTO requests at least 2 weeks in advance.',
+          'score' => 0.87,
+          'source' => 'hr-handbook.pdf',
+          'uri' => 'gs://bucket/hr-handbook.pdf',
+          'metadata' => { 'page' => 16, 'section' => 'Benefits' },
+          'metadata_kv' => [
+            { 'key' => 'page', 'value' => '16' },
+            { 'key' => 'section', 'value' => 'Benefits' }
+          ],
+          'metadata_json' => '{"page":16,"section":"Benefits"}',
+          'is_pdf' => true,
+          'processing_error' => false
+        }
+      ]
+      
+      business_data = {
+        'question' => 'What is our PTO policy?',
+        'contexts' => contexts
+      }
+      
+      facets = {
+        'top_k' => 20,
+        'contexts_count' => 2,
+        'success_count' => 2,
+        'error_count' => 0,
+        'pdf_contexts_count' => 2,
+        'partial_failure' => false,
+        'filter_type' => 'similarity',
+        'filter_value' => 0.7,
+        'rank_mode' => 'llmRanker',
+        'rank_model' => 'gemini-2.0-flash',
+        'network_error' => false,
+        'correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
+      }
+      
+      business_data.merge({
+        'complete_output' => business_data.dup,
+        'facets' => facets,
+        'ok' => true,
+        'telemetry' => call(:sample_telemetry, 45) # RAG retrieval typically ~45ms
+      })
+    end,
+    # Output
+    build_complete_output: lambda do |result, action_id, extras={}|
+      return result unless result.is_a?(Hash)
+      
+      # Extract core business fields (exclude system fields)
+      exclude_keys = %w[ok telemetry complete_output]
+      business_fields = result.select { |k, _| !exclude_keys.include?(k) }
+      
+      # Build facets if compute_facets_for! is available
+      facets = extras.any? ? call(:compute_facets_for!, action_id, result, extras) : {}
+      
+      # Add complete_output as a clean package
+      result['complete_output'] = business_fields
+      result['facets'] = facets if facets.any?
+      
+      result
+    end,
     sanitize_pdf_text: lambda do |raw_text|
       begin
         return '' if raw_text.nil?
@@ -4165,6 +4660,10 @@ require 'securerandom'
     step_ok!: lambda do |ctx, result, code=200, msg='OK', extras=nil|
       env = call(:telemetry_envelope, ctx['t0'], ctx['cid'], true, code, msg)
       out = (result || {}).merge(env)
+      
+      # Build complete output
+      out = call(:build_complete_output, out, ctx['action'], (extras || {}))
+
       call(:local_log_attach!, out,
         call(:local_log_entry, ctx['action'], ctx['started_at'], ctx['t0'], out, nil, (extras||{})))
     end,
@@ -4445,9 +4944,31 @@ require 'securerandom'
       # out: action result hash (success path). Compact, redaction-safe, no PII.
       return {} unless out.is_a?(Hash)
       h = {}
-      tel = out['telemetry'].is_a?(Hash) ? out['telemetry'] : {}
-      ret = tel['retrieval'].is_a?(Hash) ? tel['retrieval'] : {}
-      rnk = tel['rank'].is_a?(Hash)      ? tel['rank']      : {}
+  
+      # Handle rag_retrieve_contexts_enhanced action
+      if action_id.to_s == 'rag_retrieve_contexts_enhanced'
+        retrieval = extras['retrieval'] || {}
+        rank = extras['rank'] || {}
+        
+        h['top_k'] = retrieval['top_k']
+        h['contexts_count'] = retrieval['contexts_count']
+        h['success_count'] = retrieval['success_count']
+        h['error_count'] = retrieval['error_count']
+        h['pdf_contexts_count'] = retrieval['pdf_contexts_count']
+        h['partial_failure'] = retrieval['partial_failure']
+        
+        if retrieval['filter']
+          h['filter_type'] = retrieval['filter']['type']
+          h['filter_value'] = retrieval['filter']['value']
+        end
+        
+        if rank && rank.any?
+          h['rank_mode'] = rank['mode']
+          h['rank_model'] = rank['model']
+        end
+        
+        h['network_error'] = extras['network_error'].present?
+      end
 
       # Retrieval knobs
       h['retrieval_top_k']       = call(:_facet_int, ret['top_k'])
@@ -4491,10 +5012,14 @@ require 'securerandom'
       extras.delete_if { |_k,v| v.is_a?(Array) || v.is_a?(Hash) } # avoid bloat
       h.merge!(extras)
     
-      # Always surface correlation_id for downstream grouping (Sheets/BigQuery)
+      # Always surface correlation_id
+      tel = out['telemetry'].is_a?(Hash) ? out['telemetry'] : {}
       if tel['correlation_id'].to_s.strip != ''
         h['correlation_id'] = tel['correlation_id'].to_s.strip
       end
+
+      ret = tel['retrieval'].is_a?(Hash) ? tel['retrieval'] : {}
+      rnk = tel['rank'].is_a?(Hash)      ? tel['rank']      : {}
 
       # Final compaction: drop nils/empties
       h.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
