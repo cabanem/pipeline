@@ -1893,10 +1893,7 @@ require 'securerandom'
       display_priority: 120,
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
-      help: lambda do |_|
-        { body: 'Retrieve relevant contexts from a Vertex RAG corpus/store. Toggle advanced options to expose thresholds and rankers.' }
-      end,
-
+      
       config_fields: [
         { name: 'show_advanced', label: 'Show advanced options',
           type: 'boolean', control_type: 'checkbox',
@@ -1906,200 +1903,153 @@ require 'securerandom'
       
       input_fields: lambda do |od, connection, cfg|
         show_adv = (cfg['show_advanced'] == true)
-
         base = [
           { name: 'query_text', label: 'Query text', optional: false },
           { name: 'rag_corpus', optional: true,
-            hint: 'Full or short ID. Example short ID: my-corpus. Will auto-expand using connection project/location.' },
-          { name: 'rag_file_ids', type: 'array', of: 'string', optional: true,
-            hint: 'Optional: limit to these file IDs (must belong to the same corpus).' },
-          { name: 'top_k', type: 'integer', optional: true, default: 20, hint: 'Max contexts to return.' },
-          { name: 'project', optional: true, hint: 'Defaults to connection project.' },
-          { name: 'location', optional: true, hint: 'Defaults to connection location (e.g., us-central1).' }
+            hint: 'Full or short ID. Example short ID: my-corpus.' },
+          { name: 'rag_file_ids', type: 'array', of: 'string', optional: true },
+          { name: 'top_k', type: 'integer', optional: true, default: 20 },
+          { name: 'project', optional: true },
+          { name: 'location', optional: true }
         ]
-
         adv = [
-          { name: 'vector_distance_threshold', type: 'number', optional: true,
-            hint: 'Return contexts with distance ≤ threshold. For COSINE, lower is better.' },
-          { name: 'vector_similarity_threshold', type: 'number', optional: true,
-            hint: 'Return contexts with similarity ≥ threshold. Do NOT set both thresholds.' },
-          { name: 'rank_service_model', optional: true,
-            hint: 'Vertex Ranking model, e.g. semantic-ranker-512@latest.' },
-          { name: 'llm_ranker_model', optional: true,
-            hint: 'LLM ranker, e.g. gemini-2.5-flash.' }
+          { name: 'vector_distance_threshold', type: 'number', optional: true },
+          { name: 'vector_similarity_threshold', type: 'number', optional: true },
+          { name: 'rank_service_model', optional: true },
+          { name: 'llm_ranker_model', optional: true }
         ]
-
         base + (show_adv ? adv : []) + Array(od['observability_input_fields'])
       end,
       
       output_fields: lambda do |object_definitions, connection|
         [
           { name: 'question' },
-          { name: 'contexts', type: 'array', of: 'object', properties: [
-              { name: 'id' },
-              { name: 'text' },
-              { name: 'score', type: 'number' },
-              { name: 'source' },
-              { name: 'uri' },
-              { name: 'metadata', type: 'object' },
-              { name: 'page_span', type: 'object', properties: [
-                  { name: 'first_page', type: 'integer' },
-                  { name: 'last_page', type: 'integer' }
-              ]}
-            ]
-          },
+          { name: 'contexts', type: 'array', of: 'object' },
+          { name: 'debug', type: 'object' },
           { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object', properties: [
-              { name: 'http_status', type: 'integer' },
-              { name: 'message' },
-              { name: 'duration_ms', type: 'integer' },
-              { name: 'correlation_id' }
-            ]}
+          { name: 'telemetry', type: 'object' }
         ]
       end,
       
       execute: lambda do |connection, input|
-        ctx = call(:step_begin!, :rag_retrieve_contexts, input)
+        debug_info = { 'steps' => [] }
         
-        # Build request
-        project  = (input['project'].presence  || connection['project_id']).to_s
-        location = (input['location'].presence || connection['location']).to_s
-        error('Project is required (connection or input).')  if project.blank?
-        error('Location is required (connection or input).') if location.blank?
-        call(:ensure_regional_location!, { 'location' => location })
-        parent = "projects/#{project}/locations/#{location}"
-
-        corpus = (input['rag_corpus'] || '').to_s.strip
-        if corpus.present? && !corpus.start_with?('projects/')
-          corpus = "#{parent}/ragCorpora/#{corpus}"
-        end
-
-        # Validation
-        if input['vector_distance_threshold'].present? && input['vector_similarity_threshold'].present?
-          error('Set ONLY one of: vector_distance_threshold OR vector_similarity_threshold.')
-        end
-        if input['rank_service_model'].present? && input['llm_ranker_model'].present?
-          error('Choose ONE ranker: rank_service_model OR llm_ranker_model.')
-        end
-
-        # Build ragResources
-        rag_resources = {}
-        rag_resources['ragCorpus']  = corpus if corpus.present?
-        file_ids = Array(input['rag_file_ids']).map { |v| v.to_s.strip }.reject(&:empty?)
-        rag_resources['ragFileIds'] = file_ids if file_ids.any?
-        if rag_resources.empty?
-          error('Provide rag_corpus and/or rag_file_ids (vertexRagStore.ragResources is required).')
-        end
-
-        # Build retrieval config
-        retrieval_cfg = {}
-        retrieval_cfg['topK'] = (input['top_k'].presence || 50).to_i
-
-        filter = {}
-        if input['vector_distance_threshold'].present?
-          filter['vectorDistanceThreshold'] = input['vector_distance_threshold'].to_f
-        elsif input['vector_similarity_threshold'].present?
-          filter['vectorSimilarityThreshold'] = input['vector_similarity_threshold'].to_f
-        end
-        retrieval_cfg['filter'] = filter unless filter.empty?
-
-        ranking = {}
-        if input['rank_service_model'].present?
-          ranking['rankService'] = { 'modelName' => input['rank_service_model'] }
-        elsif input['llm_ranker_model'].present?
-          ranking['llmRanker'] = { 'modelName' => input['llm_ranker_model'] }
-        end
-        retrieval_cfg['ranking'] = ranking unless ranking.empty?
-
-        # Build request body
-        body = { 'query' => { 'text' => input['query_text'] } }
-        body['query']['ragRetrievalConfig'] = retrieval_cfg unless retrieval_cfg.empty?
-        body['vertexRagStore'] = { 'ragResources' => [rag_resources] }
-
-        # Make request
-        host = "#{location}-aiplatform.googleapis.com"
-        url  = "https://#{host}/v1/#{parent}:retrieveContexts"
-        cid  = (input['correlation_id'] || (ctx && ctx['cid']))
-        headers = call(:headers_rag, connection, cid, "parent=#{parent}")
-        
-        t_net = Time.now
-        resp = post(url).headers(headers).payload(body)
-        net_ms = (((Time.now - t_net) * 1000.0).ceil rescue 1)
-        
-        # Helper to clean text of problematic Unicode characters
-        clean_text = lambda do |text|
-          return '' unless text
-          text.to_s
-            .encode('UTF-8', invalid: :replace, undef: :replace, replace: '')
-            .gsub(/[\u2022\u007C\u0023]/, ' ')  # Replace bullet, pipe, hash with space
-            .gsub(/[^\x20-\x7E\n\r\t]+/, ' ')   # Keep only printable ASCII + newlines
-            .gsub(/\s+/, ' ')                    # Collapse whitespace
-            .strip
-        end
-        
-        # Extract contexts from nested structure: resp['contexts']['contexts']
-        raw_contexts = []
-        if resp.is_a?(Hash) && resp['contexts'].is_a?(Hash) && resp['contexts']['contexts'].is_a?(Array)
-          raw_contexts = resp['contexts']['contexts']
-        elsif resp.is_a?(Hash) && resp['contexts'].is_a?(Array)
-          # Fallback if structure changes
-          raw_contexts = resp['contexts']
-        end
-        
-        # Map contexts to our output format
-        mapped_contexts = raw_contexts.map.with_index do |ctx_obj, idx|
-          {
-            'id' => "ctx-#{idx + 1}",
-            'text' => clean_text.call(ctx_obj['text'] || ctx_obj.dig('chunk', 'text')),
-            'score' => (ctx_obj['score'] || 0.0).to_f,
-            'source' => ctx_obj['sourceDisplayName'] || ctx_obj['sourceUri']&.split('/')&.last,
-            'uri' => ctx_obj['sourceUri'],
-            'metadata' => ctx_obj['metadata'] || {},
-            'page_span' => if ctx_obj.dig('chunk', 'pageSpan')
-              {
-                'first_page' => ctx_obj.dig('chunk', 'pageSpan', 'firstPage'),
-                'last_page' => ctx_obj.dig('chunk', 'pageSpan', 'lastPage')
-              }
-            end
-          }.compact
-        end
-        
-        # Build output
-        out = {
-          'question' => input['query_text'],
-          'contexts' => mapped_contexts
-        }
-        
-        # Add telemetry
-        call(:step_ok!, ctx, out, 200, "Retrieved #{mapped_contexts.length} contexts", 
-            { 'count' => mapped_contexts.length, 'net_ms' => net_ms })
-      end,
-      
-      sample_output: lambda do
-        {
-          'question' => 'What is the expense report policy?',
-          'contexts' => [
-            {
-              'id' => 'ctx-1',
-              'text' => 'All expense reports must be submitted within 30 days of the expense being incurred.',
-              'score' => 0.82,
-              'source' => 'Bench Policy - May 2024.pdf',
-              'uri' => 'gs://content-library/SOPs/Bench Policy - May 2024.pdf',
-              'metadata' => {},
-              'page_span' => {
-                'first_page' => 1,
-                'last_page' => 1
-              }
-            }
-          ],
-          'ok' => true,
-          'telemetry' => {
-            'http_status' => 200,
-            'message' => 'Retrieved 1 contexts',
-            'duration_ms' => 250,
-            'correlation_id' => 'corr-123'
+        begin
+          # Step 1: Setup
+          debug_info['steps'] << 'Starting setup'
+          project  = (input['project'].presence || connection['project_id']).to_s
+          location = (input['location'].presence || connection['location']).to_s
+          
+          if project.blank? || location.blank?
+            debug_info['error'] = 'Missing project or location'
+            return { 'debug' => debug_info, 'contexts' => [] }
+          end
+          
+          parent = "projects/#{project}/locations/#{location}"
+          debug_info['parent'] = parent
+          
+          # Step 2: Build corpus
+          corpus = input['rag_corpus'].to_s.strip
+          if corpus.present? && !corpus.start_with?('projects/')
+            corpus = "#{parent}/ragCorpora/#{corpus}"
+          end
+          debug_info['corpus'] = corpus
+          
+          # Step 3: Build request
+          rag_resources = {}
+          rag_resources['ragCorpus'] = corpus if corpus.present?
+          
+          body = {
+            'query' => { 
+              'text' => input['query_text'],
+              'ragRetrievalConfig' => { 'topK' => (input['top_k'] || 20).to_i }
+            },
+            'vertexRagStore' => { 'ragResources' => [rag_resources] }
           }
-        }
+          debug_info['request_body'] = body
+          
+          # Step 4: Build URL and headers
+          url = "https://#{location}-aiplatform.googleapis.com/v1/#{parent}:retrieveContexts"
+          debug_info['url'] = url
+          
+          headers = {
+            'Authorization' => "Bearer #{connection['access_token']}",
+            'Content-Type' => 'application/json',
+            'x-goog-request-params' => "parent=#{parent}"
+          }
+          debug_info['has_token'] = !connection['access_token'].to_s.empty?
+          
+          # Step 5: Make request
+          debug_info['steps'] << 'Making request'
+          resp = post(url).headers(headers).payload(body)
+          debug_info['steps'] << 'Request completed'
+          
+          # Step 6: Check response structure
+          debug_info['response_type'] = resp.class.name
+          debug_info['response_keys'] = resp.is_a?(Hash) ? resp.keys : []
+          
+          # Step 7: Extract contexts - try multiple paths
+          contexts_array = nil
+          
+          if resp.is_a?(Hash)
+            if resp['contexts'].is_a?(Hash) && resp['contexts']['contexts'].is_a?(Array)
+              contexts_array = resp['contexts']['contexts']
+              debug_info['found_at'] = 'contexts.contexts'
+            elsif resp['contexts'].is_a?(Array)
+              contexts_array = resp['contexts']
+              debug_info['found_at'] = 'contexts'
+            end
+          end
+          
+          debug_info['contexts_found'] = contexts_array ? contexts_array.length : 0
+          
+          # Step 8: Map contexts (without text cleaning for now)
+          mapped = []
+          if contexts_array
+            contexts_array.each_with_index do |ctx, idx|
+              begin
+                mapped << {
+                  'id' => "ctx-#{idx + 1}",
+                  'text' => (ctx['text'] || ctx.dig('chunk', 'text') || '').to_s,
+                  'score' => (ctx['score'] || 0.0).to_f,
+                  'source' => ctx['sourceDisplayName'] || 'unknown',
+                  'uri' => ctx['sourceUri']
+                }
+              rescue => e
+                debug_info["context_#{idx}_error"] = e.message
+              end
+            end
+          end
+          
+          debug_info['mapped_count'] = mapped.length
+          
+          {
+            'question' => input['query_text'],
+            'contexts' => mapped,
+            'debug' => debug_info,
+            'ok' => true,
+            'telemetry' => {
+              'http_status' => 200,
+              'message' => "Retrieved #{mapped.length} contexts"
+            }
+          }
+          
+        rescue => e
+          debug_info['error'] = e.message
+          debug_info['error_class'] = e.class.name
+          debug_info['error_trace'] = e.backtrace ? e.backtrace.first(3) : []
+          
+          {
+            'question' => input['query_text'],
+            'contexts' => [],
+            'debug' => debug_info,
+            'ok' => false,
+            'telemetry' => {
+              'http_status' => 500,
+              'message' => "Error: #{e.message}"
+            }
+          }
+        end
       end
     },
     rag_retrieve_contexts_simple_debug: {
