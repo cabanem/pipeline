@@ -3250,6 +3250,7 @@ require 'securerandom'
         .gsub(/\.\.+$/, '...')         # Normalize ellipsis at end
         
       # Final encoding cleanup
+      text = text[0..10000] + '...[truncated]' if text.length > 10000 # safety
       text.encode('UTF-8', invalid: :replace, undef: :replace, replace: ' ')
           .strip
     end,
