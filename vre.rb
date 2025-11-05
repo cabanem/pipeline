@@ -1597,6 +1597,7 @@ require 'securerandom'
           default: false, sticky: true, extends_schema: true,
           hint: 'Toggle to reveal threshold/ranker controls.' }
       ],
+      
       input_fields: lambda do |od, connection, cfg|
         show_adv = (cfg['show_advanced'] == true)
         
@@ -1612,7 +1613,16 @@ require 'securerandom'
             type: 'boolean', 
             control_type: 'checkbox',
             default: true,
-            hint: 'Clean PDF extraction artifacts when detected (recommended)' }
+            hint: 'Clean PDF extraction artifacts when detected (recommended)' },
+          { name: 'on_error_behavior', 
+            control_type: 'select',
+            pick_list: [
+              ['Skip failed contexts', 'skip'],
+              ['Include error placeholders', 'include'],
+              ['Fail entire request', 'fail']
+            ],
+            default: 'skip',
+            hint: 'How to handle individual context processing errors' }
         ]
         
         adv = [
@@ -1628,6 +1638,7 @@ require 'securerandom'
         
         show_adv ? (base + adv) : base
       end,
+      
       output_fields: lambda do |object_definitions, connection|
         [
           { name: 'question' },
@@ -1639,7 +1650,9 @@ require 'securerandom'
               { name: 'uri' },
               { name: 'metadata', type: 'object' },
               { name: 'metadata_kv', type: 'array', of: 'object' },
-              { name: 'metadata_json' }
+              { name: 'metadata_json' },
+              { name: 'is_pdf', type: 'boolean' },
+              { name: 'processing_error', type: 'boolean' }
             ]
           },
           { name: 'ok', type: 'boolean' },
@@ -1648,10 +1661,14 @@ require 'securerandom'
               { name: 'message' },
               { name: 'duration_ms', type: 'integer' },
               { name: 'correlation_id' },
+              { name: 'success_count', type: 'integer' },
+              { name: 'error_count', type: 'integer' },
+              { name: 'partial_failure', type: 'boolean' },
               { name: 'local_logs', type: 'array', of: 'object', optional: true }
             ]}
         ]
-      end,     
+      end,
+      
       execute: lambda do |connection, input|
         # Initialize tracking context
         ctx = call(:step_begin!, :rag_retrieve_contexts_enhanced, input)
@@ -1725,56 +1742,128 @@ require 'securerandom'
             'x-goog-request-params' => "parent=projects/#{project}/locations/#{location}"
           }
           
-          # Make request
-          response = post(url).headers(headers).payload(body)
-          
-          # Extract and map contexts
-          contexts = []
-          if response && response['contexts'] && response['contexts']['contexts']
-            raw_contexts = response['contexts']['contexts']
-            
-            raw_contexts.each_with_index do |ctx_item, idx|
-              # Extract metadata
-              md = ctx_item['metadata'] || {}
-              
-              # Get source URI for PDF detection
-              source_uri = ctx_item['sourceUri'] || ctx_item['uri']
-              
-              # Extract text
-              raw_text = (ctx_item['text'] || ctx_item.dig('chunk', 'text') || '').to_s
-              
-              # Apply PDF-specific cleaning ONLY for PDF sources
-              text = if call(:is_pdf_source?, source_uri, md)
-                call(:sanitize_pdf_text, raw_text)
-              else
-                # Regular cleaning for non-PDF content
-                raw_text.encode('UTF-8', invalid: :replace, undef: :replace, replace: ' ')
-                        .gsub(/\s+/, ' ')
-                        .strip
-              end
-              
-              contexts << {
-                'id' => ctx_item['chunkId'] || ctx_item['id'] || "ctx-#{idx + 1}",
-                'text' => text,
-                'score' => (ctx_item['score'] || ctx_item['relevanceScore'] || 0.0).to_f,
-                'source' => ctx_item['sourceDisplayName'] || ctx_item['sourceUri']&.split('/')&.last,
-                'uri' => source_uri,
-                'metadata' => md,
-                'metadata_kv' => md.map { |k, v| { 'key' => k.to_s, 'value' => v } },
-                'metadata_json' => md.empty? ? nil : md.to_json,
-                'is_pdf' => call(:is_pdf_source?, source_uri, md)  # Optional: track PDF sources
+          # Make request with error handling
+          response = begin
+            post(url).headers(headers).payload(body)
+          rescue => e
+            if e.message.include?('timeout') || e.message.include?('connection')
+              # Return empty but valid response for network issues
+              {
+                'contexts' => { 'contexts' => [] },
+                '_network_error' => "Network error: #{e.message[0..200]}"
               }
+            else
+              raise e  # Re-raise non-network errors
             end
           end
           
-          # Build output using standard helper
+          # Extract and map contexts with graceful failure
+          contexts = []
+          raw_contexts = call(:safe_extract_contexts, response)
+          
+          if raw_contexts.empty? && !response['_network_error']
+            # Add informational context for empty responses
+            contexts << {
+              'id' => 'no-results',
+              'text' => 'No contexts were returned for this query.',
+              'score' => 0.0,
+              'source' => 'system',
+              'uri' => nil,
+              'metadata' => { 'info' => 'empty_response' },
+              'metadata_kv' => [{ 'key' => 'info', 'value' => 'empty_response' }],
+              'metadata_json' => '{"info":"empty_response"}',
+              'is_pdf' => false,
+              'processing_error' => false
+            }
+          else
+            raw_contexts.each_with_index do |ctx_item, idx|
+              begin
+                # Extract metadata
+                md = ctx_item['metadata'] || {}
+                
+                # Get source URI for PDF detection
+                source_uri = ctx_item['sourceUri'] || ctx_item['uri']
+                
+                # Extract text
+                raw_text = (ctx_item['text'] || ctx_item.dig('chunk', 'text') || '').to_s
+                
+                # Apply PDF-specific cleaning based on preference and detection
+                text = if input['sanitize_pdf_content'] != false && 
+                          call(:is_pdf_source?, source_uri, md)
+                  call(:sanitize_pdf_text, raw_text)
+                else
+                  # Regular cleaning for non-PDF content
+                  raw_text.encode('UTF-8', invalid: :replace, undef: :replace, replace: ' ')
+                          .gsub(/\s+/, ' ')
+                          .strip
+                end
+                
+                # Try JSON serialization with fallback
+                metadata_json = begin
+                  md.empty? ? nil : md.to_json
+                rescue => json_err
+                  { error: 'metadata_serialization_failed', keys: md.keys.take(10) }.to_json
+                end
+                
+                contexts << {
+                  'id' => ctx_item['chunkId'] || ctx_item['id'] || "ctx-#{idx + 1}",
+                  'text' => text,
+                  'score' => (ctx_item['score'] || ctx_item['relevanceScore'] || 0.0).to_f,
+                  'source' => ctx_item['sourceDisplayName'] || source_uri&.split('/')&.last,
+                  'uri' => source_uri,
+                  'metadata' => md,
+                  'metadata_kv' => md.map { |k, v| { 'key' => k.to_s, 'value' => v.to_s[0..1000] } }, # Limit value size
+                  'metadata_json' => metadata_json,
+                  'is_pdf' => call(:is_pdf_source?, source_uri, md),
+                  'processing_error' => false
+                }
+                
+              rescue => e
+                # Handle individual context errors based on configuration
+                case input['on_error_behavior']
+                when 'fail'
+                  raise e  # Re-raise to fail entire action
+                when 'include'
+                  # Add error placeholder context
+                  contexts << {
+                    'id' => "ctx-#{idx + 1}-error",
+                    'text' => "[Error processing context: #{e.message[0..200]}]",
+                    'score' => 0.0,
+                    'source' => 'error',
+                    'uri' => nil,
+                    'metadata' => { 
+                      'error' => e.message[0..500], 
+                      'error_class' => e.class.name,
+                      'original_id' => ctx_item['chunkId'] || ctx_item['id'] 
+                    },
+                    'metadata_kv' => [
+                      { 'key' => 'error', 'value' => e.message[0..500] },
+                      { 'key' => 'error_class', 'value' => e.class.name }
+                    ],
+                    'metadata_json' => nil,
+                    'is_pdf' => false,
+                    'processing_error' => true
+                  }
+                when 'skip', nil
+                  # Skip this context, continue processing
+                  next
+                end
+              end
+            end
+          end
+          
+          # Calculate success metrics
+          error_count = contexts.count { |c| c['processing_error'] == true }
+          pdf_count = contexts.count { |c| c['is_pdf'] && !c['processing_error'] }
+          success_count = contexts.count { |c| !c['processing_error'] }
+          
+          # Build output
           out = {
             'question' => input['query_text'],
             'contexts' => contexts
           }
           
-          # Add extra telemetry data about the retrieval config
-          pdf_count = contexts.count { |c| c['is_pdf'] }
+          # Add telemetry with success tracking
           extras = {
             'retrieval' => {
               'top_k' => retrieval_cfg['topK'],
@@ -1783,16 +1872,29 @@ require 'securerandom'
                 'value' => retrieval_cfg['filter'].values.first
               } : nil,
               'contexts_count' => contexts.length,
+              'success_count' => success_count,
+              'error_count' => error_count,
               'pdf_contexts_count' => pdf_count,
+              'partial_failure' => error_count > 0
             }.compact,
             'rank' => retrieval_cfg['ranking'] ? {
               'mode' => retrieval_cfg['ranking'].keys.first,
               'model' => retrieval_cfg['ranking'].values.first['modelName']
-            } : nil
+            } : nil,
+            'network_error' => response['_network_error']
           }.compact
           
+          # Build appropriate message
+          message = if response['_network_error']
+            "Retrieved #{contexts.length} contexts (network issues detected)"
+          elsif error_count > 0
+            "Retrieved #{success_count} contexts (#{error_count} failed)"
+          else
+            "Retrieved #{contexts.length} contexts"
+          end
+          
           # Return success with telemetry
-          call(:step_ok!, ctx, out, 200, "Retrieved #{contexts.length} contexts", extras)
+          call(:step_ok!, ctx, out, 200, message, extras)
           
         rescue => e
           # Handle errors with telemetry
@@ -3218,67 +3320,109 @@ require 'securerandom'
   # --------- METHODS ------------------------------------------------------
   methods: {
     sanitize_pdf_text: lambda do |raw_text|
-      return '' if raw_text.nil?
-      
-      text = raw_text.to_s
-      
-      # Fix common PDF extraction artifacts
-      text = text
-        # Handle double-escaped sequences first
-        .gsub(/\\\\n/, "\n")        # Convert \\n to actual newline
-        .gsub(/\\\\t/, " ")         # Convert \\t to space
-        .gsub(/\\\\r/, "")          # Remove \\r
-        .gsub(/\\\\"/, '"')         # Convert \\" to "
-        .gsub(/\\\\'/, "'")         # Convert \\' to '
-        .gsub(/\\\\/, "\\")         # Cleanup remaining double backslashes
-      
-      # Remove control characters except tab, newline, carriage return
-      # Using delete with ranges (more Workato-friendly)
-      control_chars = (0..31).map { |i| i.chr }.join
-      keep_chars = "\t\n\r"
-      chars_to_remove = control_chars.delete(keep_chars)
-      text = text.delete(chars_to_remove)
-      
-      # Continue with other transformations
-      text = text
-        .gsub(/(\w)-\n(\w)/, '\1\2')  # Rejoin hyphenated words
-        .gsub(/\r\n|\r/, "\n")         # Normalize line endings
-        .gsub(/\n{3,}/, "\n\n")        # Collapse excessive newlines
-        .gsub(/[ \t]+/, ' ')           # Collapse spaces and tabs
-        .gsub(/^[ \t]+|[ \t]+$/, '')   # Trim line starts/ends
-        .gsub(/##(\w)/, '## \1')       # Add space after ## headers
-        .gsub(/\.\.+$/, '...')         # Normalize ellipsis at end
+      begin
+        return '' if raw_text.nil?
         
-      # Final encoding cleanup
-      text = text[0..10000] + '...[truncated]' if text.length > 10000 # safety
-      text.encode('UTF-8', invalid: :replace, undef: :replace, replace: ' ')
-          .strip
+        text = raw_text.to_s
+        
+        # Limit input size upfront
+        if text.length > 50000
+          text = text[0..50000] + '...[truncated]'
+        end
+        
+        # Fix common PDF extraction artifacts
+        text = text
+          # Handle double-escaped sequences first
+          .gsub(/\\\\n/, "\n")        # Convert \\n to actual newline
+          .gsub(/\\\\t/, " ")         # Convert \\t to space
+          .gsub(/\\\\r/, "")          # Remove \\r
+          .gsub(/\\\\"/, '"')         # Convert \\" to "
+          .gsub(/\\\\'/, "'")         # Convert \\' to '
+          .gsub(/\\\\/, "\\")         # Cleanup remaining double backslashes
+        
+        # Remove control characters except tab, newline, carriage return
+        control_chars = (0..31).map { |i| i.chr }.join
+        keep_chars = "\t\n\r"
+        chars_to_remove = control_chars.delete(keep_chars)
+        text = text.delete(chars_to_remove)
+        
+        # Continue with other transformations
+        text = text
+          .gsub(/(\w)-\n(\w)/, '\1\2')  # Rejoin hyphenated words
+          .gsub(/\r\n|\r/, "\n")         # Normalize line endings
+          .gsub(/\n{3,}/, "\n\n")        # Collapse excessive newlines
+          .gsub(/[ \t]+/, ' ')           # Collapse spaces and tabs
+          .gsub(/^[ \t]+|[ \t]+$/, '')   # Trim line starts/ends
+          .gsub(/##(\w)/, '## \1')       # Add space after ## headers
+          .gsub(/\.\.+$/, '...')         # Normalize ellipsis at end
+        
+        # Truncate if still too long after cleaning
+        text = text[0..10000] + '...[truncated]' if text.length > 10000
+        
+        # Final encoding cleanup with fallback
+        begin
+          text.encode('UTF-8', invalid: :replace, undef: :replace, replace: ' ')
+              .strip
+        rescue Encoding::UndefinedConversionError => e
+          # Last resort: ASCII-safe version
+          text.encode('ASCII', invalid: :replace, undef: :replace, replace: '?')
+              .encode('UTF-8')
+        end
+        
+      rescue => e
+        # Return sanitized error message if all else fails
+        "[PDF processing error: #{e.message[0..100]}]"
+      end
     end,
-
     is_pdf_source?: lambda do |source_uri, metadata|
-      # Check if this context comes from a PDF
-      return false if source_uri.nil? && metadata.nil?
-      
-      # Check source URI extension
-      if source_uri.to_s.downcase.end_with?('.pdf')
-        return true
-      end
-      
-      # Check metadata for file type indicators
-      if metadata.is_a?(Hash)
-        file_type = metadata['file_type'] || 
-                    metadata['fileType'] || 
-                    metadata['mimeType'] || 
-                    metadata['mime_type'] || ''
+      begin
+        # Check if this context comes from a PDF
+        return false if source_uri.nil? && metadata.nil?
         
-        return true if file_type.to_s.downcase.include?('pdf')
+        # Check source URI extension
+        if source_uri.to_s.downcase.end_with?('.pdf')
+          return true
+        end
         
-        # Check source/filename in metadata
-        source = metadata['source'] || metadata['filename'] || ''
-        return true if source.to_s.downcase.end_with?('.pdf')
+        # Check metadata for file type indicators
+        if metadata.is_a?(Hash)
+          file_type = metadata['file_type'] || 
+                      metadata['fileType'] || 
+                      metadata['mimeType'] || 
+                      metadata['mime_type'] || ''
+          
+          return true if file_type.to_s.downcase.include?('pdf')
+          
+          # Check source/filename in metadata
+          source = metadata['source'] || metadata['filename'] || ''
+          return true if source.to_s.downcase.end_with?('.pdf')
+        end
+        
+        false
+      rescue => e
+        # Default to false if detection fails
+        false
       end
-      
-      false
+    end,
+    safe_extract_contexts: lambda do |response|
+      begin
+        return [] unless response.is_a?(Hash)
+        
+        # Try multiple possible paths for contexts
+        contexts = response.dig('contexts', 'contexts') ||
+                  response['contexts'] ||
+                  response.dig('results', 'contexts') ||
+                  response.dig('contextChunks') ||
+                  []
+        
+        # Ensure it's an array
+        contexts = [contexts] unless contexts.is_a?(Array)
+        
+        # Filter out non-hash elements
+        contexts.select { |c| c.is_a?(Hash) }
+      rescue => e
+        []
+      end
     end,
     llm_category_aware_ranker: lambda do |connection, model, query, category, category_context, contexts, corr=nil|
       model_path = call(:build_model_path_with_global_preview, connection, model)
