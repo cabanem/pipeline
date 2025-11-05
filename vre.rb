@@ -1324,20 +1324,6 @@ require 'securerandom'
             enhanced_query = query
           end
           
-          # Determine ranking config based on category
-          config_id = 'default_ranking_config'
-          
-          if input['ranking_config_name'].present?
-            config_id = input['ranking_config_name'].to_s.split('/').last
-          elsif category.present? && input['category_ranking_configs'].present?
-            # Use category-specific config if mapped
-            config_map = call(:safe_json, input['category_ranking_configs']) || {}
-            if config_map.is_a?(Hash)
-              mapped = config_map[category] || config_map[category.downcase]
-              config_id = mapped.to_s.split('/').last if mapped.present?
-            end
-          end
-          
           # Pre-filter contexts by category metadata if requested
           records_in = call(:safe_array, input['records'])
           
@@ -1363,77 +1349,104 @@ require 'securerandom'
               when Array
                 cat_value.any? { |v| v.to_s.downcase.include?(cat_lower) }
               else
-                false  # No category metadata, exclude
+                false
               end
             end
             
-            # Warn if filtering removed all records
             if records_to_rank.empty? && records_in.any?
               error("Category filtering removed all #{records_in.length} records. Check category metadata key '#{meta_key}' and value '#{category}'")
             end
           end
           
-          # === Phase 1: Discovery Engine Ranking ===
-          ver = (connection['discovery_api_version'].presence || 'v1alpha').to_s
-          
-          # FIX: Use parent= instead of ranking_config= for request params
-          req_params = "parent=projects/#{connection['project_id']}/locations/#{loc}"
-          
-          url = call(:discovery_url, connection, loc,
-                    "projects/#{connection['project_id']}/locations/#{loc}/rankingConfigs/#{config_id}:rank", ver)
-          
-          # Limit batch size to Discovery Engine's limits (typically 100-200 records)
-          max_batch_size = 100
-          if records_to_rank.length > max_batch_size
-            records_to_rank = records_to_rank.first(max_batch_size)
-            # Note: Should probably warn user or handle pagination
-          end
-          
-          discovery_body = {
-            'query' => enhanced_query,
-            'records' => records_to_rank.map { |r|
-              {
-                'id' => r['id'].to_s,
-                'content' => r['content'].to_s,
-                'metadata' => (r['metadata'].is_a?(Hash) ? r['metadata'] : nil)
-              }.compact
-            },
-            'model' => input['rank_model'].presence,
-            'topN' => input['top_n'].presence&.to_i,
-            'ignoreRecordDetailsInResponse' => false  # We need details for enrichment
-          }.compact
-          
-          discovery_resp = post(url)
-                            .headers(call(:request_headers_auth_1, connection, ctx['cid'], 
-                                        connection['user_project'], req_params))
-                            .payload(call(:json_compact, discovery_body))
-          
-          # Process Discovery results
-          discovery_scores = {}
-          Array(discovery_resp['records']).each_with_index do |r, i|
-            discovery_scores[r['id'].to_s] = {
-              'score' => r['score'].to_f,
-              'rank' => i + 1
-            }
-          end
-          
-          # Enrich with original content
-          enriched = records_in.map do |orig|
-            id = orig['id'].to_s
-            disc = discovery_scores[id] || { 'score' => 0.0, 'rank' => 999 }
-            
-            orig.merge(
-              'discovery_score' => disc['score'],
-              'score' => disc['score'],  # Initial score
-              'rank' => disc['rank']
-            )
-          end
-          
-          # === Phase 2: LLM Category-Aware Reranking ===
+          # Determine LLM mode early to decide if we need Discovery Engine
           llm_mode = input['llm_rerank_mode'] || 'none'
           distribution = nil
           llm_model_used = nil
+          enriched = []
           
+          # === DECISION POINT: Skip Discovery Engine if LLM override mode ===
+          if llm_mode == 'override' && category.present?
+            # Skip Discovery Engine entirely, go straight to LLM ranking
+            
+            # Initialize all records with default scores for LLM to override
+            enriched = records_in.map do |orig|
+              orig.merge(
+                'discovery_score' => 0.0,  # No Discovery score
+                'score' => 0.0,  # Will be set by LLM
+                'rank' => 999    # Will be recalculated
+              )
+            end
+            
+          else
+            # === Phase 1: Discovery Engine Ranking (for 'none' and 'enhance' modes) ===
+            
+            # Determine ranking config based on category
+            config_id = 'default_ranking_config'
+            
+            if input['ranking_config_name'].present?
+              config_id = input['ranking_config_name'].to_s.split('/').last
+            elsif category.present? && input['category_ranking_configs'].present?
+              config_map = call(:safe_json, input['category_ranking_configs']) || {}
+              if config_map.is_a?(Hash)
+                mapped = config_map[category] || config_map[category.downcase]
+                config_id = mapped.to_s.split('/').last if mapped.present?
+              end
+            end
+            
+            ver = (connection['discovery_api_version'].presence || 'v1alpha').to_s
+            req_params = "parent=projects/#{connection['project_id']}/locations/#{loc}"
+            url = call(:discovery_url, connection, loc,
+                      "projects/#{connection['project_id']}/locations/#{loc}/rankingConfigs/#{config_id}:rank", ver)
+            
+            # Limit batch size
+            max_batch_size = 100
+            records_for_discovery = records_to_rank
+            if records_for_discovery.length > max_batch_size
+              records_for_discovery = records_for_discovery.first(max_batch_size)
+            end
+            
+            discovery_body = {
+              'query' => enhanced_query,
+              'records' => records_for_discovery.map { |r|
+                {
+                  'id' => r['id'].to_s,
+                  'content' => r['content'].to_s,
+                  'metadata' => (r['metadata'].is_a?(Hash) ? r['metadata'] : nil)
+                }.compact
+              },
+              'model' => input['rank_model'].presence,
+              'topN' => input['top_n'].presence&.to_i,
+              'ignoreRecordDetailsInResponse' => false
+            }.compact
+            
+            discovery_resp = post(url)
+                              .headers(call(:request_headers_auth_1, connection, ctx['cid'], 
+                                          connection['user_project'], req_params))
+                              .payload(call(:json_compact, discovery_body))
+            
+            # Process Discovery results
+            discovery_scores = {}
+            Array(discovery_resp['records']).each_with_index do |r, i|
+              discovery_scores[r['id'].to_s] = {
+                'score' => r['score'].to_f,
+                'rank' => i + 1
+              }
+            end
+            
+            # Enrich with Discovery scores
+            enriched = records_in.map do |orig|
+              id = orig['id'].to_s
+              disc = discovery_scores[id] || { 'score' => 0.0, 'rank' => 999 }
+              
+              orig.merge(
+                'discovery_score' => disc['score'],
+                'score' => disc['score'],  # Initial score (may be overridden by LLM)
+                'rank' => disc['rank']
+              )
+            end
+          end
+          
+          # === Phase 2: LLM Reranking (for 'enhance' and 'override' modes) ===
           if llm_mode != 'none' && category.present?
             llm_model_used = input['llm_model'] || 'gemini-2.0-flash'
             
@@ -1443,16 +1456,17 @@ require 'securerandom'
                                 k = (input['llm_top_k'] || 10).to_i
                                 enriched.sort_by { |r| -r['discovery_score'].to_f }.first(k)
                               else  # override mode
-                                # Rerank all contexts (but limit to prevent timeout)
+                                # Rerank all contexts (limited to prevent timeout)
                                 max_llm_contexts = 50
                                 if enriched.length > max_llm_contexts
-                                  enriched.sort_by { |r| -r['discovery_score'].to_f }.first(max_llm_contexts)
+                                  # Even in override mode, prioritize by any existing metadata if available
+                                  enriched.first(max_llm_contexts)
                                 else
                                   enriched
                                 end
                               end
             
-            # Call category-aware LLM ranker
+            # Call LLM ranker
             llm_result = call(:llm_category_aware_ranker,
                             connection,
                             llm_model_used,
@@ -1473,7 +1487,7 @@ require 'securerandom'
                 }
               end
               
-              # Apply LLM scores
+              # Apply LLM scores based on mode
               if llm_mode == 'enhance'
                 # Blend Discovery and LLM scores
                 weight = (input['llm_score_weight'] || 0.4).to_f.clamp(0, 1)
@@ -1483,20 +1497,19 @@ require 'securerandom'
                     rec['llm_relevance'] = llm_data['relevance']
                     rec['category_alignment'] = llm_data['category_alignment']
                     
-                    # Weighted blend: Discovery + LLM relevance + category alignment
+                    # Weighted blend
                     rec['score'] = (1 - weight) * rec['discovery_score'].to_f +
                                   weight * 0.7 * llm_data['relevance'] +
                                   weight * 0.3 * llm_data['category_alignment']
                   end
                 end
               else  # override mode
-                # Use LLM scores as primary ranking
+                # Replace scores entirely with LLM scores
                 enriched.each do |rec|
                   if llm_data = llm_scores[rec['id']]
                     rec['llm_relevance'] = llm_data['relevance']
                     rec['category_alignment'] = llm_data['category_alignment']
-                    
-                    # Combine relevance and category alignment
+                    # Pure LLM scoring
                     rec['score'] = 0.8 * llm_data['relevance'] + 0.2 * llm_data['category_alignment']
                   else
                     rec['score'] = 0.0  # Not evaluated by LLM
@@ -1507,7 +1520,7 @@ require 'securerandom'
               # Build confidence distribution if requested
               if input['include_confidence_distribution'] == true
                 total_score = enriched.sum { |x| x['score'].to_f }
-                total_score = 0.001 if total_score <= 0  # Prevent division by zero
+                total_score = 0.001 if total_score <= 0
                 
                 distribution = enriched.map { |r|
                   llm_data = llm_scores[r['id']] || {}
@@ -1525,7 +1538,7 @@ require 'securerandom'
                               .each_with_index { |r, i| r['rank'] = i + 1 }
           end
           
-          # === Phase 3: Shape Output ===
+          # === Phase 3: Shape Output (same for all modes) ===
           shape = input['emit_shape'] || 'context_chunks'
           
           # Apply top_n limit if specified
@@ -1537,15 +1550,12 @@ require 'securerandom'
           
           case shape
           when 'records_only'
-            # Minimal output
             result['records'] = enriched.map { |r|
               { 'id' => r['id'], 'score' => r['score'], 'rank' => r['rank'] }
             }
           when 'enriched_records'
-            # Full records with all scores
             result['records'] = enriched
           else  # context_chunks
-            # RAG-ready chunks
             chunks = enriched.map { |r|
               md = r['metadata'] || {}
               source_key = input['source_key'] || 'source'
@@ -1562,32 +1572,30 @@ require 'securerandom'
                 'metadata_json' => md.empty? ? nil : md.to_json
               }
               
-              # Add LLM scores if available
               chunk['llm_relevance'] = r['llm_relevance'] if r['llm_relevance']
               chunk['category_alignment'] = r['category_alignment'] if r['category_alignment']
               
               chunk
             }
             result['context_chunks'] = chunks
-            result['records'] = enriched  # Also include full records
+            result['records'] = enriched
           end
           
-          # Add distribution if generated
           result['confidence_distribution'] = distribution if distribution
           
-          # Add ranking metadata
           result['ranking_metadata'] = {
             'category' => category.presence,
-            'ranking_config_used' => config_id,
+            'ranking_config_used' => (llm_mode == 'override' ? nil : config_id),
             'llm_mode' => (llm_mode != 'none' ? llm_mode : nil),
             'contexts_filtered' => records_in.length - records_to_rank.length,
-            'contexts_ranked' => records_to_rank.length
+            'contexts_ranked' => records_to_rank.length,
+            'used_discovery' => (llm_mode != 'override')
           }.compact
           
           # Build facets
           facets = {
-            'ranking_api' => 'discoveryengine.ranking',
-            'ranking_config' => config_id,
+            'ranking_api' => (llm_mode == 'override' ? 'llm.only' : 'discoveryengine.ranking'),
+            'ranking_config' => (llm_mode == 'override' ? nil : config_id),
             'category' => category.presence,
             'llm_mode' => (llm_mode != 'none' ? llm_mode : nil),
             'llm_model' => llm_model_used,
@@ -1598,10 +1606,10 @@ require 'securerandom'
             'records_output' => enriched.length,
             'has_distribution' => distribution.present?,
             'top_score' => enriched.first&.dig('score'),
-            'category_filtered' => input['filter_by_category_metadata'] == true
+            'category_filtered' => input['filter_by_category_metadata'] == true,
+            'used_discovery' => (llm_mode != 'override')
           }.compact
           
-          # Use step_ok! for consistent telemetry and output structure
           call(:step_ok!, ctx, result, 200, 'OK', facets)
           
         rescue => e
