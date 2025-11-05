@@ -1887,8 +1887,8 @@ require 'securerandom'
       end
 
     },
-    rag_retrieve_contexts_debug: {
-      title: 'RAG: Retrieve contexts (plain)',
+    rag_retrieve_contexts_fixed: {
+      title: 'RAG: Retrieve contexts (fixed)',
       subtitle: 'projects.locations:retrieveContexts (Vertex RAG Engine, v1)',
       display_priority: 120,
       retry_on_response: [408, 429, 500, 502, 503, 504],
@@ -1903,6 +1903,7 @@ require 'securerandom'
           default: false, sticky: true, extends_schema: true,
           hint: 'Toggle to reveal threshold/ranker controls.' }
       ],
+      
       input_fields: lambda do |od, connection, cfg|
         show_adv = (cfg['show_advanced'] == true)
 
@@ -1930,20 +1931,37 @@ require 'securerandom'
 
         base + (show_adv ? adv : []) + Array(od['observability_input_fields'])
       end,
+      
       output_fields: lambda do |object_definitions, connection|
         [
-          # Keep everything as generic objects/strings to see raw structure
-          { name: 'raw_response_body', type: 'string' },
-          { name: 'parsed_json', type: 'object' },
-          { name: 'contexts_raw', type: 'object' },
-          { name: 'http_status', type: 'integer' },
-          { name: 'debug_info', type: 'object' }
+          { name: 'question' },
+          { name: 'contexts', type: 'array', of: 'object', properties: [
+              { name: 'id' },
+              { name: 'text' },
+              { name: 'score', type: 'number' },
+              { name: 'source' },
+              { name: 'uri' },
+              { name: 'metadata', type: 'object' },
+              { name: 'page_span', type: 'object', properties: [
+                  { name: 'first_page', type: 'integer' },
+                  { name: 'last_page', type: 'integer' }
+              ]}
+            ]
+          },
+          { name: 'ok', type: 'boolean' },
+          { name: 'telemetry', type: 'object', properties: [
+              { name: 'http_status', type: 'integer' },
+              { name: 'message' },
+              { name: 'duration_ms', type: 'integer' },
+              { name: 'correlation_id' }
+            ]}
         ]
       end,
+      
       execute: lambda do |connection, input|
         ctx = call(:step_begin!, :rag_retrieve_contexts, input)
-
-        # Build request (same as before)
+        
+        # Build request
         project  = (input['project'].presence  || connection['project_id']).to_s
         location = (input['location'].presence || connection['location']).to_s
         error('Project is required (connection or input).')  if project.blank?
@@ -1956,6 +1974,7 @@ require 'securerandom'
           corpus = "#{parent}/ragCorpora/#{corpus}"
         end
 
+        # Validation
         if input['vector_distance_threshold'].present? && input['vector_similarity_threshold'].present?
           error('Set ONLY one of: vector_distance_threshold OR vector_similarity_threshold.')
         end
@@ -1963,6 +1982,7 @@ require 'securerandom'
           error('Choose ONE ranker: rank_service_model OR llm_ranker_model.')
         end
 
+        # Build ragResources
         rag_resources = {}
         rag_resources['ragCorpus']  = corpus if corpus.present?
         file_ids = Array(input['rag_file_ids']).map { |v| v.to_s.strip }.reject(&:empty?)
@@ -1971,6 +1991,7 @@ require 'securerandom'
           error('Provide rag_corpus and/or rag_file_ids (vertexRagStore.ragResources is required).')
         end
 
+        # Build retrieval config
         retrieval_cfg = {}
         retrieval_cfg['topK'] = (input['top_k'].presence || 50).to_i
 
@@ -1990,55 +2011,93 @@ require 'securerandom'
         end
         retrieval_cfg['ranking'] = ranking unless ranking.empty?
 
+        # Build request body
         body = { 'query' => { 'text' => input['query_text'] } }
         body['query']['ragRetrievalConfig'] = retrieval_cfg unless retrieval_cfg.empty?
         body['vertexRagStore'] = { 'ragResources' => [rag_resources] }
 
+        # Make request
         host = "#{location}-aiplatform.googleapis.com"
         url  = "https://#{host}/v1/#{parent}:retrieveContexts"
         cid  = (input['correlation_id'] || (ctx && ctx['cid']))
-        headers = call(:headers_rag, connection, cid, "parent=#{parent}") || {
-          'Content-Type' => 'application/json',
-          'Accept'       => 'application/json',
-          'x-goog-request-params' => "parent=#{parent}"
-        }
-
-        # Make the API call
+        headers = call(:headers_rag, connection, cid, "parent=#{parent}")
+        
         t_net = Time.now
-        wire = post(url)
-                .headers(headers)
-                .request_format_json
-                .payload(body)
-                .response_format_raw
-
-        net_ms = (((Time.now - t_net) * 1000.0).ceil rescue 0)
-        code = (wire['status'] || wire['status_code'] || 200).to_i
-        raw_body = (wire['body'].to_s rescue '')
-
-        # Try to parse JSON
-        parsed = nil
-        parse_error = nil
-        begin
-          parsed = JSON.parse(raw_body)
-        rescue => e
-          parse_error = e.message
+        resp = post(url).headers(headers).payload(body)
+        net_ms = (((Time.now - t_net) * 1000.0).ceil rescue 1)
+        
+        # Helper to clean text of problematic Unicode characters
+        clean_text = lambda do |text|
+          return '' unless text
+          text.to_s
+            .encode('UTF-8', invalid: :replace, undef: :replace, replace: '')
+            .gsub(/[\u2022\u007C\u0023]/, ' ')  # Replace bullet, pipe, hash with space
+            .gsub(/[^\x20-\x7E\n\r\t]+/, ' ')   # Keep only printable ASCII + newlines
+            .gsub(/\s+/, ' ')                    # Collapse whitespace
+            .strip
         end
-
-        # Return EVERYTHING raw for debugging
+        
+        # Extract contexts from nested structure: resp['contexts']['contexts']
+        raw_contexts = []
+        if resp.is_a?(Hash) && resp['contexts'].is_a?(Hash) && resp['contexts']['contexts'].is_a?(Array)
+          raw_contexts = resp['contexts']['contexts']
+        elsif resp.is_a?(Hash) && resp['contexts'].is_a?(Array)
+          # Fallback if structure changes
+          raw_contexts = resp['contexts']
+        end
+        
+        # Map contexts to our output format
+        mapped_contexts = raw_contexts.map.with_index do |ctx_obj, idx|
+          {
+            'id' => "ctx-#{idx + 1}",
+            'text' => clean_text.call(ctx_obj['text'] || ctx_obj.dig('chunk', 'text')),
+            'score' => (ctx_obj['score'] || 0.0).to_f,
+            'source' => ctx_obj['sourceDisplayName'] || ctx_obj['sourceUri']&.split('/')&.last,
+            'uri' => ctx_obj['sourceUri'],
+            'metadata' => ctx_obj['metadata'] || {},
+            'page_span' => if ctx_obj.dig('chunk', 'pageSpan')
+              {
+                'first_page' => ctx_obj.dig('chunk', 'pageSpan', 'firstPage'),
+                'last_page' => ctx_obj.dig('chunk', 'pageSpan', 'lastPage')
+              }
+            end
+          }.compact
+        end
+        
+        # Build output
+        out = {
+          'question' => input['query_text'],
+          'contexts' => mapped_contexts
+        }
+        
+        # Add telemetry
+        call(:step_ok!, ctx, out, 200, "Retrieved #{mapped_contexts.length} contexts", 
+            { 'count' => mapped_contexts.length, 'net_ms' => net_ms })
+      end,
+      
+      sample_output: lambda do
         {
-          'raw_response_body' => raw_body[0..10000], # Truncate if huge
-          'parsed_json' => parsed,
-          'contexts_raw' => parsed.is_a?(Hash) ? parsed['contexts'] : nil,
-          'http_status' => code,
-          'debug_info' => {
-            'response_length' => raw_body.length,
-            'parse_error' => parse_error,
-            'wire_object_class' => wire.class.name,
-            'wire_keys' => wire.is_a?(Hash) ? wire.keys : [],
-            'parsed_type' => parsed.class.name,
-            'parsed_keys' => parsed.is_a?(Hash) ? parsed.keys : [],
-            'contexts_type' => (parsed.is_a?(Hash) && parsed['contexts']) ? parsed['contexts'].class.name : 'not_found',
-            'first_context' => (parsed.is_a?(Hash) && parsed['contexts'].is_a?(Array) && parsed['contexts'].first) ? parsed['contexts'].first : nil
+          'question' => 'What is the expense report policy?',
+          'contexts' => [
+            {
+              'id' => 'ctx-1',
+              'text' => 'All expense reports must be submitted within 30 days of the expense being incurred.',
+              'score' => 0.82,
+              'source' => 'Bench Policy - May 2024.pdf',
+              'uri' => 'gs://content-library/SOPs/Bench Policy - May 2024.pdf',
+              'metadata' => {},
+              'page_span' => {
+                'first_page' => 1,
+                'last_page' => 1
+              }
+            }
+          ],
+          'ok' => true,
+          'telemetry' => {
+            'http_status' => 200,
+            'message' => 'Retrieved 1 contexts',
+            'duration_ms' => 250,
+            'correlation_id' => 'corr-123'
           }
         }
       end
