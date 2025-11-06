@@ -140,35 +140,6 @@ require 'securerandom'
         [
           { name: 'mode', control_type: 'select', pick_list: 'gen_generate_modes', optional: false, default: 'plain' },
           { name: 'model', optional: false, control_type: 'text' },
-          # Template support fields
-          { name: 'use_response_template', label: 'Use Response Template', type: 'boolean', control_type: 'checkbox', optional: true,
-            extends_schema: true, hint: 'Enable to use predefined response templates with dynamic data substitution' },
-          { name: 'template_mode', label: 'Template Input Mode', control_type: 'select',
-            options: [['Select from library', 'library'], ['Custom JSON', 'json'], ['Inline template', 'inline']],
-            default: 'library', ngIf: 'input.use_response_template == true', extends_schema: true },
-          { name: 'selected_template', label: 'Select Template', control_type: 'select', optional: true,
-            pick_list: 'response_templates', ngIf: 'input.use_response_template == true && input.template_mode == "library"'},
-          { name: 'template_json', label: 'Response Template (JSON)', control_type: 'text-area',
-            ngIf: 'input.use_response_template == true && input.template_mode == "json"', optional: true,
-            hint: 'Paste JSON with template structure: {"subject": "...", "body": "...", "required_data": [...]}'},         
-          { name: 'inline_template', label: 'Template Text', control_type: 'text-area', ngIf: 'input.use_response_template == true && input.template_mode == "inline"',
-            optional: true, hint: 'Enter template with {placeholders} for dynamic data' },
-          { name: 'template_data', label: 'Template Data', type: 'object', ngIf: 'input.use_response_template == true',
-            optional: true, hint: 'Key-value pairs to substitute into template placeholders',
-            properties: [
-              { name: 'dates', hint: 'e.g., "March 15-19, 2025"' },
-              { name: 'manager_name', hint: 'e.g., "John Smith"' },
-              { name: 'system', hint: 'e.g., "Workday"' },
-              { name: 'balance', hint: 'e.g., "120"' },
-              { name: 'tax_year', hint: 'e.g., "2024"' },
-              { name: 'delivery_method', hint: 'e.g., "mailed" or "emailed"' },
-              { name: 'address', hint: 'Delivery address' },
-              { name: 'timeframe', hint: 'e.g., "24 hours"' },
-              # Allow additional custom fields
-              { name: 'custom_field_1', label: 'Custom Field 1' },
-              { name: 'custom_field_2', label: 'Custom Field 2' },
-              { name: 'custom_field_3', label: 'Custom Field 3' }
-            ] },
           { name: 'correlation_id', label: 'Correlation ID', optional: true, hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
           # Show 'contents' for plain/grounded modes; hide for rag_with_context
           { name: 'contents',
@@ -214,18 +185,9 @@ require 'securerandom'
           { name: 'count_tokens_model', optional: true, ngIf: 'input.mode == "rag_with_context"' },
           { name: 'trim_strategy', control_type: 'select', pick_list: 'trim_strategies', optional: true, default: 'drop_low_score', ngIf: 'input.mode == "rag_with_context"' },
           { name: 'temperature', type: 'number', optional: true, ngIf: 'input.mode == "rag_with_context"' },
-          { name: 'rag_corpus', optional: true, hint: 'projects/{project}/locations/{region}/ragCorpora/{corpus}',
-            ngIf: 'input.mode == "grounded_rag_store"' },
+          { name: 'rag_corpus', optional: true, hint: 'projects/{project}/locations/{region}/ragCorpora/{corpus}', ngIf: 'input.mode == "grounded_rag_store"' },
           { name: 'rag_retrieval_config', label: 'Retrieval config', type: 'object',
-            properties: object_definitions['rag_retrieval_config'],
-            ngIf: 'input.mode == "grounded_rag_store"', optional: true },
-          # Back-compat single fields (optional)
-          { name: 'similarity_top_k', type: 'integer', optional: true, ngIf: 'input.mode == "grounded_rag_store"',
-            hint: 'Pre-ranking candidate cap (1–200).' },
-          { name: 'vector_distance_threshold', type: 'number', optional: true, ngIf: 'input.mode == "grounded_rag_store"' },
-          { name: 'vector_similarity_threshold', type: 'number', optional: true, ngIf: 'input.mode == "grounded_rag_store"' },
-          { name: 'rank_service_model', optional: true, ngIf: 'input.mode == "grounded_rag_store"' },
-          { name: 'llm_ranker_model', optional: true, ngIf: 'input.mode == "grounded_rag_store"' }
+            properties: object_definitions['rag_retrieval_config'], ngIf: 'input.mode == "grounded_rag_store"', optional: true }
         ]
       end
     },
@@ -3138,6 +3100,14 @@ require 'securerandom'
         ['Escalation to Human', 'escalation_human'],
         ['Benefits Enrollment Confirmation', 'benefits_enrolled'],
         ['Password Reset', 'password_reset'],
+        ['Policy Information', 'pto_policy_info'],
+        ['Process Information', 'pto_process_info'],
+        ['W2 Access Info', 'w2_access_info'],
+        ['W2 Timeline Info', 'w2_timeline_info'],
+        ['Payroll Process Info', 'payroll_process_info'],
+        ['HRIS Portal Access', 'hris_portal_access_info'],
+        ['Verification Letters', 'verification_letters_info'],
+        ['Generic Policy Info', 'generic_policy_info'],
         ['Custom Template', 'custom']
       ]
     end,
@@ -5221,94 +5191,35 @@ require 'securerandom'
       url            = call(:aipl_v1_url, connection, loc_from_model, "#{model_path}:generateContent")
       req_params     = "model=#{model_path}"
 
-      # Initialize base fields
-      contents = nil
-      sys_inst = nil
-      gen_cfg  = nil
+      # Base fields
+      contents = call(:sanitize_contents!, input['contents'])
+      sys_inst = call(:system_instruction_from_text, input['system_preamble'])
+      gen_cfg  = call(:sanitize_generation_config, input['generation_config'])
       safety   = call(:sanitize_safety!, input['safetySettings'])
       tool_cfg = call(:safe_obj, input['toolConfig'])
       tools    = nil
 
-      # Handle template mode first (can override contents/system for any mode)
-      if input['use_response_template'] == true
-        template_mode = input['template_mode'] || 'library'
-        template_data = input['template_data'] || {}
-        
-        # Get the template based on mode
-        template = case template_mode
-        when 'library'
-          call(:fetch_template_from_library, input['selected_template'])
-        when 'json'
-          call(:parse_template_json, input['template_json'])
-        when 'inline'
-          { 'body' => input['inline_template'] }
-        else
-          error("Unknown template mode: #{template_mode}")
-        end
-        
-        # Process the template with data
-        if template
-          template_prompt = call(:build_template_prompt, template, template_data, input['additional_context'])
-          
-          # Set contents with template-based prompt
-          contents = [
-            { 'role' => 'user', 'parts' => [{ 'text' => template_prompt }] }
-          ]
-          
-          # Set system instruction for template adherence (can be overridden below)
-          sys_inst = call(:system_instruction_from_text, 
-            input['system_preamble'].presence || 
-            "You are generating a professional response based on a template. Maintain the template structure while ensuring natural, professional language.")
-          
-          # Use generation config if provided, otherwise default
-          gen_cfg = call(:sanitize_generation_config, input['generation_config'])
-        end
-      end
-
-      # Process based on mode (only sets values if not already set by template)
       case mode
       when 'plain'
-        # Use template values if set, otherwise use normal contents
-        contents ||= call(:sanitize_contents!, input['contents'])
-        sys_inst ||= call(:system_instruction_from_text, input['system_preamble'])
-        gen_cfg  ||= call(:sanitize_generation_config, input['generation_config'])
-        # no special tools for plain mode
-        
+        # no special tools
       when 'grounded_google'
-        contents ||= call(:sanitize_contents!, input['contents'])
-        sys_inst ||= call(:system_instruction_from_text, input['system_preamble'])
-        gen_cfg  ||= call(:sanitize_generation_config, input['generation_config'])
         tools = [ { 'googleSearch' => {} } ]
-        
       when 'grounded_vertex'
-        contents ||= call(:sanitize_contents!, input['contents'])
-        sys_inst ||= call(:system_instruction_from_text, input['system_preamble'])
-        gen_cfg  ||= call(:sanitize_generation_config, input['generation_config'])
-        
         ds   = input['vertex_ai_search_datastore'].to_s
         scfg = input['vertex_ai_search_serving_config'].to_s
         error('Provide exactly one of vertex_ai_search_datastore OR vertex_ai_search_serving_config') \
           if (ds.blank? && scfg.blank?) || (ds.present? && scfg.present?)
-        vas = {}
-        vas['datastore'] = ds unless ds.blank?
-        vas['servingConfig'] = scfg unless scfg.blank?
+        vas = {}; vas['datastore'] = ds unless ds.blank?; vas['servingConfig'] = scfg unless scfg.blank?
         tools = [ { 'retrieval' => { 'vertexAiSearch' => vas } } ]
-        
       when 'grounded_rag_store'
-        contents ||= call(:sanitize_contents!, input['contents'])
-        sys_inst ||= call(:system_instruction_from_text, input['system_preamble'])
-        gen_cfg  ||= call(:sanitize_generation_config, input['generation_config'])
-        
         # Build the retrieval tool payload for Vertex RAG Store
         corpus = call(:normalize_rag_corpus, connection, input['rag_corpus'])
         error('rag_corpus is required for grounded_rag_store') if corpus.blank?
-        
         # Guards for unions
         call(:guard_threshold_union!, input['vector_distance_threshold'], input['vector_similarity_threshold'])
         call(:guard_ranker_union!, input['rank_service_model'], input['llm_ranker_model'])
 
         vr = { 'ragResources' => [ { 'ragCorpus' => corpus } ] }
-        
         # Optional knobs
         filt = {}
         if input['vector_distance_threshold'].present?
@@ -5316,21 +5227,18 @@ require 'securerandom'
         elsif input['vector_similarity_threshold'].present?
           filt['vectorSimilarityThreshold'] = call(:safe_float, input['vector_similarity_threshold'])
         end
-        
         rconf = {}
         if input['rank_service_model'].to_s.strip != ''
           rconf['rankService'] = { 'modelName' => input['rank_service_model'].to_s.strip }
         elsif input['llm_ranker_model'].to_s.strip != ''
           rconf['llmRanker']   = { 'modelName' => input['llm_ranker_model'].to_s.strip }
         end
-        
         retrieval_cfg = {}
         retrieval_cfg['similarityTopK'] = call(:clamp_int, (input['similarity_top_k'] || 0), 1, 200) if input['similarity_top_k'].present?
         retrieval_cfg['filter']  = filt unless filt.empty?
         retrieval_cfg['ranking'] = rconf unless rconf.empty?
 
         tools = [ { 'retrieval' => { 'vertexRagStore' => vr.merge( (retrieval_cfg.empty? ? {} : { 'ragRetrievalConfig' => retrieval_cfg }) ) } } ]
-        
       when 'rag_with_context'
         # Build RAG-lite prompt + JSON schema
         q        = input['question'].to_s
@@ -5349,10 +5257,8 @@ require 'securerandom'
         model_for_cnt = (input['count_tokens_model'].presence || input['model']).to_s
         strategy      = (input['trim_strategy'].presence || 'drop_low_score').to_s
 
-        base = []
-        base << items.shift if items.first && items.first['source']=='salience'
+        base = []; base << items.shift if items.first && items.first['source']=='salience'
         items = items.map { |c| c.merge('text'=>call(:truncate_chunk_text, c['text'], 800)) }
-        
         ordered = case strategy
                   when 'diverse_mmr'   then call(:mmr_diverse_order, items.sort_by { |c| [-(c['score']||0.0).to_f, c['id'].to_s] }, alpha: 0.7, per_source_cap: 3)
                   when 'drop_low_score' then items.sort_by { |c| [-(c['score']||0.0).to_f, c['id'].to_s] }
@@ -5362,10 +5268,9 @@ require 'securerandom'
         pool    = base + ordered
 
         sys_text = input['system_preamble'].presence ||
-          'Answer using ONLY the provided context chunks. If the context is insufficient, reply with "I don't know." Keep answers concise and cite chunk IDs.'
+          'Answer using ONLY the provided context chunks. If the context is insufficient, reply with “I don’t know.” Keep answers concise and cite chunk IDs.'
         kept    = call(:select_prefix_by_budget, connection, pool, q, sys_text, budget_prompt, model_for_cnt)
         blob    = call(:format_context_chunks, kept)
-        
         gen_cfg = {
           'temperature'      => (input['temperature'].present? ? call(:safe_float, input['temperature']) : 0),
           'maxOutputTokens'  => reserve_out,
@@ -5381,22 +5286,11 @@ require 'securerandom'
           }
         }
         sys_inst = call(:system_instruction_from_text, sys_text)
-        
-        # For rag_with_context, override with template if provided
-        if input['use_response_template'] == true && contents
-          # Merge template prompt with RAG context
-          template_text = contents.dig(0, 'parts', 0, 'text')
-          merged_prompt = "#{template_text}\n\nQuestion:\n#{q}\n\nContext:\n#{blob}"
-          contents = [{ 'role'=>'user','parts'=>[{'text'=> merged_prompt}]}]
-        else
-          contents = [{ 'role'=>'user','parts'=>[{'text'=>"Question:\n#{q}\n\nContext:\n#{blob}"}]}]
-        end
-        
+        contents = [{ 'role'=>'user','parts'=>[{'text'=>"Question:\n#{q}\n\nContext:\n#{blob}"}]}]
       else
         error("Unknown mode: #{mode}")
       end
 
-      # Build final payload
       payload = {
         'contents'          => contents,
         'systemInstruction' => sys_inst,
@@ -5406,48 +5300,40 @@ require 'securerandom'
         'generationConfig'  => gen_cfg
       }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
 
-      # Make the API call
       resp = post(url).headers(call(:request_headers_auth_1, connection, corr, connection['user_project'], req_params))
                       .payload(call(:json_compact, payload))
       code = call(:telemetry_success_code, resp)
 
-      # Process response
       out  = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-      
-      # Special handling for rag_with_context mode
       if mode == 'rag_with_context'
         text   = resp.dig('candidates',0,'content','parts',0,'text').to_s
         parsed = call(:safe_parse_json, text)
         out['parsed'] = { 'answer'=>parsed['answer'] || text, 'citations'=>parsed['citations'] || [] }
-        
         # Compute overall confidence from cited chunk scores, if available
         conf = call(:overall_confidence_from_citations, out['parsed']['citations'])
         out['confidence'] = conf if conf
-        (out['telemetry'] ||= {})['confidence'] = { 
-          'basis' => 'citations_topk_avg', 
-          'k' => 3,
-          'n' => Array(out.dig('parsed','citations')).length 
-        }
+        (out['telemetry'] ||= {})['confidence'] = { 'basis' => 'citations_topk_avg', 'k' => 3,
+                                                    'n' => Array(out.dig('parsed','citations')).length }
       end
-      
-      # Add template metadata if templates were used
-      if input['use_response_template'] == true
-        (out['telemetry'] ||= {})['template_mode'] = input['template_mode']
-        (out['telemetry'] ||= {})['template_used'] = input['selected_template'] if input['selected_template']
-      end
-      
       out
-      
     rescue => e
       g   = call(:extract_google_error, e)
       msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
       env = call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg)
-      
       if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
         env['debug'] = call(:debug_pack, true, url, payload, g)
       end
-      
       error(env)
+    end,
+    request_preview_pack: lambda do |url, verb, headers, payload|
+      {
+        'request_preview' => {
+          'method'  => verb.to_s.upcase,
+          'url'     => url.to_s,
+          'headers' => headers || {},
+          'payload' => call(:redact_json, payload)
+        }
+      }
     end,
     request_preview_pack: lambda do |url, verb, headers, payload|
       {
