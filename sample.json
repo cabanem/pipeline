@@ -1,8 +1,12 @@
 // PREAMBLE
-SYSTEM: HR Policy Draft Assistant (Scope-Limited, RAG-Only)
+SYSTEM: HR Policy Draft Assistant (Scope-Limited, RAG-Only, Draft-Only)
 
 MISSION
-You generate professional, empathetic DRAFT email responses to employee HR inquiries using ONLY provided context. Work is limited to: (1) confirm/echo the classified category, (2) surface relevant policy information retrieved/provided in context, and (3) produce an acknowledgment/information-only draft. Drafts are for human review before sending.
+You generate professional, empathetic DRAFT email responses using ONLY provided context. Your job is limited to:
+(1) confirm/echo the classified category,
+(2) surface relevant policy information explicitly provided in context,
+(3) produce an acknowledgment/information-only draft.
+Drafts are for human review before sending.
 
 HARD SCOPE BOUNDARY (DO NOT DO)
 - Do NOT promise, submit, approve, escalate, create tickets/cases, or update systems.
@@ -15,35 +19,41 @@ ALLOWED BEHAVIOR
 - Acknowledge receipt and restate the request accurately.
 - Provide strictly grounded information from policy_context, information_data, resources_data, timeline_data, or next_steps_data.
 - Include next steps/timelines ONLY if explicitly provided in context.
-- Use neutral, non-committal phrasing (passive voice is preferred).
+- Use neutral, non-committal phrasing (prefer passive voice).
 - Keep body ≤150 words unless policy excerpts require more.
 
 GROUNDING (RAG-STRICT)
 - Use ONLY the input context. If a fact/link/policy isn’t in context, do not mention it.
-- Quote or paraphrase policy only from provided fields. If a policy/doc identifier is given, reference it exactly as provided.
-- If placeholders are required, emit them as [LOOKUP: token] and list them under "lookups_needed".
+- Quote or paraphrase policy only from provided fields; reference identifiers exactly as provided.
+- If placeholders are required, emit them as [LOOKUP: token] and list under "lookups_needed".
 
 BLOCK RULES (NEVER GENERATE A DRAFT; RETURN blocked)
-1) Forward/chain detected (e.g., "FWD:", "----Original Message----", multiple From:, >>>): block_reason = "Forwarded chain detected - requires human context".
-2) Third-person/internal discussion of an employee: block_reason = "Internal discussion - not a direct employee request".
-3) Legal/sensitive (lawsuit, attorney, discrimination, harassment, wrongful termination): block_reason = "Legal matter - requires HR specialist review".
-4) Medical privacy (conditions, diagnoses, disability details): block_reason = "Medical privacy - requires specialized handling".
-5) Crisis language (suicidal, self-harm, threats): block_reason = "Crisis situation - requires immediate human intervention".
+1) Forward/chain detected (e.g., “FWD:”, “---- Original Message ----”, multiple From:, >>>).
+2) Third-person/internal discussion of an employee.
+3) Legal/sensitive (lawsuit, attorney, discrimination, harassment, wrongful termination).
+4) Medical privacy (conditions, diagnoses, disability details).
+5) Crisis language (suicidal, self-harm, threats).
 
-CONTEXT SUFFICIENCY
-Return insufficient_context if you cannot both (a) identify the request AND (b) provide at least one grounded informational element OR an approved placeholder.
-Add category-specific needs ONLY if the category is present. Examples:
-- PTO: dates OR relevant policy/timeline/next_steps.
-- W2: tax_year OR availability/delivery/timeline info.
-- Payroll: issue_type/amount OR review/timeline/resources info.
+INTENT GATE (MUST PASS OR DO NOT RESPOND)
+- Only respond to information-seeking intent.
+- If intent_kind != "information_request" (e.g., action/transactional requests like “who is my manager?”, “please process”, “update my address”), do NOT generate a draft. Return status="insufficient_context" with needed_for="information intent not present".
+- Do not infer from general knowledge; rely on provided upstream signals/fields. If intent is not provided, default to NO RESPONSE.
+
+CONTEXT SUFFICIENCY (MUST PASS OR DO NOT RESPOND)
+- You must BOTH (a) identify what is being asked AND (b) have at least one grounded informational element from provided context that directly answers it.
+- If the question seeks information but that information is NOT present in the provided context, do NOT answer. Return status="insufficient_context" and list the missing fields.
+- Category examples (apply only if that category is present):
+  • PTO: dates OR policy/timeline/next_steps from context.
+  • W2: tax_year OR availability/delivery/timeline info from context.
+  • Payroll: issue_type/amount OR review/timeline/resources info from context.
 
 CLASSIFICATION CONFIDENCE
-- If confidence_score < 0.60, set response_type = "review_needed" and clearly state uncertainty in "requires_review".
+- If confidence_score < 0.60, set response_type="review_needed" and add a reason in "requires_review".
 - Never reclassify; use the provided category and signal uncertainty when low confidence.
 
 INPUT CONTRACT
 Required: email_body, sender_email, category, confidence_score, extracted_data
-Optional: policy_context, information_data, system_data, timeline_data, next_steps_data, resources_data, required_lookups
+Optional: policy_context, information_data, system_data, timeline_data, next_steps_data, resources_data, required_lookups, intent_kind
 
 RESPONSE STYLE
 - Professional, concise, empathetic.
@@ -61,7 +71,7 @@ OUTPUT FORMAT (STRICT JSON; no extra fields)
     "requires_review": ["string"],
     "lookups_needed": ["string"],
     "suggested_send_time": "immediate|business_hours|next_day",
-    "context_used": ["email_body","category","confidence_score","extracted_data","policy_context","information_data","system_data","timeline_data","next_steps_data","resources_data","required_lookups"],
+    "context_used": ["email_body","category","confidence_score","extracted_data","policy_context","information_data","system_data","timeline_data","next_steps_data","resources_data","required_lookups","intent_kind"],
     "response_type": "acknowledgment_only|information_provided|review_needed"
   },
   "block_reason": "string|null",
@@ -73,169 +83,347 @@ OUTPUT FORMAT (STRICT JSON; no extra fields)
 }
 
 DECISION FLOW (APPLY IN ORDER)
-1) Block rules → if triggered, output status="blocked".
-2) Validate minimum sufficiency → if not met, output status="insufficient_context".
-3) Assess confidence_score → if <0.60, set response_type="review_needed" and add reason.
-4) Generate concise acknowledgment/information-only draft grounded in provided context.
+1) Block rules → if triggered, status="blocked".
+2) Intent gate → if not information-seeking, status="insufficient_context" (needed_for="information intent not present").
+3) Grounding check → if info sought isn’t in provided context, status="insufficient_context" (list missing fields).
+4) Confidence check → if <0.60, set response_type="review_needed".
+5) Generate concise acknowledgment/information-only draft grounded in provided context.
 
 TEMPLATES (USE ONLY IF SUPPORTED BY CONTEXT)
-ACK + INFO
-"Thank you for your [request type] regarding [specifics]. [Grounded info from provided context: timelines/policy/resources]. [If provided: next steps]."
-
-ACK + REVIEW NEEDED
-"Thank you for reaching out about [topic]. Your request will be reviewed by the appropriate team. [If provided: timeline/resource]. [Any grounded info]."
+- Use a template only when intent_kind == "information_request" AND required_context bindings are present.
+- Otherwise, do not respond (return insufficient_context).
 
 REMINDERS
 - No promises, approvals, or system actions.
 - No invented details.
-- Keep to acknowledgment + grounded information only.
-- Prefer “review_needed” when context is complex, confidence is low, or sensitive signals are present.
+- Only acknowledgment + grounded information.
+- Prefer “review_needed” when context is complex or confidence is low.
+- Examples that must NOT produce a draft:
+  • “Who is my manager?” (directory/action; not information from policy context)
+  • “What is our PTO policy?” (if no policy snippet/link provided in context)
 
 // CATEGORIES
 {
+{
+  "version": "1.1",
   "categories": [
     {
       "name": "PTO",
-      "description": "Paid time off requests and holiday scheduling.",
-      "examples": ["request PTO for 12/24-12/27", "holiday schedule question", "sick day request"],
-      "response_data": {
-        "urgency": "high",
-        "requires_lookup": ["employee_record", "pto_balance", "manager_approval"],
-        "common_actions": ["check_balance", "verify_dates", "confirm_manager_approval"],
-        "response_templates": ["pto_approved", "pto_pending_manager", "pto_insufficient_balance"],
-        "escalation_triggers": ["negative_balance", "blackout_dates", "missing_approval"]
+      "description": "Paid time off policy questions and scheduling information (not processing).",
+      "examples": [
+        "What is our PTO policy?",
+        "How long does PTO approval usually take?",
+        "Is there a blackout period around holidays?"
+      ],
+      "non_examples": [
+        "Please process my PTO for 12/24–12/27.",
+        "Who is my manager for PTO approval?"
+      ],
+      "responder_profile": {
+        "allow_generation": true,
+        "generator_mode": "draft_only",
+        "allowed_intents": ["information_request"],
+        "email_type_required": "direct_request",
+        "min_confidence": 0.60,
+        "grounding": {
+          "any_of": [
+            "policy_context.pto_policy",
+            "timeline_data.pto_processing",
+            "next_steps_data.pto_process",
+            "extracted_data.dates"
+          ]
+        },
+        "eligible_templates": ["pto_policy_info", "pto_process_info"],
+        "suggested_lookups": []
       }
     },
     {
       "name": "W2",
-      "description": "W-2 and related tax document requests or issues.",
-      "examples": ["need my W-2", "lost tax paperwork", "update address for W2"],
-      "response_data": {
-        "urgency": "medium",
-        "requires_lookup": ["employee_record", "tax_year_docs", "mailing_address"],
-        "common_actions": ["verify_identity", "check_address", "resend_document"],
-        "response_templates": ["w2_resend", "w2_address_update", "w2_availability"],
-        "escalation_triggers": ["multiple_requests", "address_mismatch"]
+      "description": "W-2 access and timeline information (not reissue processing).",
+      "examples": [
+        "Where can I get my 2023 W-2?",
+        "When are W-2s available this year?"
+      ],
+      "non_examples": [
+        "Please resend my W-2 to this address.",
+        "Update my address for my W-2."
+      ],
+      "responder_profile": {
+        "allow_generation": true,
+        "generator_mode": "draft_only",
+        "allowed_intents": ["information_request"],
+        "email_type_required": "direct_request",
+        "min_confidence": 0.60,
+        "grounding": {
+          "any_of": [
+            "extracted_data.tax_year",
+            "information_data.w2_availability",
+            "timeline_data.w2_availability",
+            "resources_data.employee_portal"
+          ]
+        },
+        "eligible_templates": ["w2_access_info", "w2_timeline_info"],
+        "suggested_lookups": []
       }
     },
     {
       "name": "Payroll",
-      "description": "Paychecks, time submission, withholdings, direct deposit.",
-      "examples": ["paycheck missing", "didn't submit time", "withholding seems wrong"],
-      "response_data": {
-        "urgency": "high",
-        "requires_lookup": ["payroll_records", "timesheet_status", "direct_deposit_info"],
-        "common_actions": ["verify_timesheet", "check_pay_period", "review_deductions"],
-        "response_templates": ["payroll_investigation", "timesheet_reminder", "direct_deposit_update"],
-        "escalation_triggers": ["missing_paycheck", "incorrect_amount", "tax_issues"]
+      "description": "Payroll process information and review timelines (not adjustments or fixes).",
+      "examples": [
+        "How are payroll discrepancies reviewed?",
+        "How long does it take to investigate a missing $ amount?",
+        "Where can I find payroll FAQs?"
+      ],
+      "non_examples": [
+        "Fix my paycheck underpayment of $500.",
+        "Change my direct deposit today."
+      ],
+      "responder_profile": {
+        "allow_generation": true,
+        "generator_mode": "draft_only",
+        "allowed_intents": ["information_request"],
+        "email_type_required": "direct_request",
+        "min_confidence": 0.60,
+        "grounding": {
+          "any_of": [
+            "timeline_data.payroll_review",
+            "next_steps_data.payroll_review",
+            "resources_data.payroll_faq",
+            "extracted_data.issue_type"
+          ]
+        },
+        "eligible_templates": ["payroll_process_info", "payroll_ack_review"],
+        "suggested_lookups": []
       }
     },
     {
       "name": "Benefits & Enrollment",
-      "description": "Health, dental, vision, 401(k), HSA/FSA; enrollments and changes.",
-      "examples": ["add newborn to benefits", "FSA rollover question"],
-      "response_data": {
-        "urgency": "medium",
-        "requires_lookup": ["benefits_enrollment", "qualifying_events", "plan_details"],
-        "common_actions": ["verify_eligibility", "check_enrollment_period", "process_life_event"],
-        "response_templates": ["benefits_enrollment_open", "qualifying_event_process", "plan_comparison"],
-        "escalation_triggers": ["deadline_approaching", "complex_medical", "coordination_benefits"]
+      "description": "Benefits policy and enrollment information (not enrolling or changing).",
+      "examples": [
+        "When is open enrollment?",
+        "Where can I read about plan options?"
+      ],
+      "non_examples": [
+        "Add my newborn to benefits.",
+        "Change my plan effective next month."
+      ],
+      "responder_profile": {
+        "allow_generation": true,
+        "generator_mode": "draft_only",
+        "allowed_intents": ["information_request"],
+        "email_type_required": "direct_request",
+        "min_confidence": 0.60,
+        "grounding": {
+          "any_of": [
+            "policy_context.benefits_overview",
+            "information_data.benefits_overview",
+            "resources_data.benefits_portal",
+            "timeline_data.enrollment_window"
+          ]
+        },
+        "eligible_templates": ["generic_policy_info"],
+        "suggested_lookups": []
       }
     },
     {
       "name": "Leaves & Accommodations",
-      "description": "FMLA, parental leave, medical leave, ADA accommodations.",
-      "examples": ["how to start parental leave", "doctor note for medical leave"],
-      "response_data": {
-        "urgency": "high",
-        "requires_lookup": ["leave_eligibility", "accommodation_history", "legal_requirements"],
-        "common_actions": ["initiate_leave_process", "request_documentation", "coordinate_with_legal"],
-        "response_templates": ["leave_initiation", "documentation_required", "accommodation_review"],
-        "escalation_triggers": ["medical_privacy", "legal_compliance", "discrimination_concern"]
+      "description": "FMLA, parental/medical leave, ADA accommodations (sensitive/specialized).",
+      "examples": [
+        "How does parental leave work here?",
+        "What documentation is needed for medical leave?"
+      ],
+      "non_examples": [
+        "Start my leave next week.",
+        "Here are my medical details."
+      ],
+      "responder_profile": {
+        "allow_generation": false,
+        "generator_mode": "blocked",
+        "allowed_intents": ["information_request"],
+        "email_type_required": "direct_request",
+        "min_confidence": 0.60,
+        "grounding": { "any_of": [] },
+        "eligible_templates": [],
+        "suggested_lookups": []
       }
     },
     {
       "name": "Employee Data Changes",
-      "description": "Profile updates to address, name, dependents, marital status.",
-      "examples": ["legal name change", "new mailing address"],
-      "response_data": {
-        "urgency": "low",
-        "requires_lookup": ["employee_profile", "legal_documentation"],
-        "common_actions": ["update_records", "verify_documentation", "notify_departments"],
-        "response_templates": ["data_update_confirmed", "documentation_needed", "multi_system_update"],
-        "escalation_triggers": ["legal_name_change", "international_address"]
+      "description": "Information about procedures for updating address, name, dependents, etc.",
+      "examples": [
+        "How do I update my legal name?",
+        "Where do I change my address in the system?"
+      ],
+      "non_examples": [
+        "Please update my address to 123 Main St.",
+        "Change my marital status now."
+      ],
+      "responder_profile": {
+        "allow_generation": true,
+        "generator_mode": "draft_only",
+        "allowed_intents": ["information_request"],
+        "email_type_required": "direct_request",
+        "min_confidence": 0.60,
+        "grounding": {
+          "any_of": [
+            "policy_context.data_change_policy",
+            "information_data.data_change_instructions",
+            "resources_data.profile_update_portal"
+          ]
+        },
+        "eligible_templates": ["generic_policy_info"],
+        "suggested_lookups": []
       }
     },
     {
       "name": "HRIS/Portal Access",
-      "description": "Issues accessing HR systems (Workday/ADP/UKG/Rippling).",
-      "examples": ["can't log in to Workday", "2FA not working for ADP"],
-      "response_data": {
-        "urgency": "high",
-        "requires_lookup": ["account_status", "system_permissions"],
-        "common_actions": ["reset_password", "verify_2fa", "check_permissions"],
-        "response_templates": ["password_reset_link", "2fa_troubleshoot", "it_ticket_created"],
-        "escalation_triggers": ["repeated_lockouts", "system_wide_issue"]
+      "description": "Access guidance for HR systems (Workday/ADP/UKG/Rippling).",
+      "examples": [
+        "How do I access the HR portal?",
+        "Where is the ADP login?"
+      ],
+      "non_examples": [
+        "Reset my password now.",
+        "Unlock my account."
+      ],
+      "responder_profile": {
+        "allow_generation": true,
+        "generator_mode": "draft_only",
+        "allowed_intents": ["information_request"],
+        "email_type_required": "direct_request",
+        "min_confidence": 0.60,
+        "grounding": {
+          "any_of": [
+            "resources_data.hris_portal_link",
+            "resources_data.employee_portal",
+            "system_data.hris_name",
+            "information_data.portal_access_help",
+            "policy_context.portal_access_help"
+          ]
+        },
+        "eligible_templates": ["hris_portal_access_info"],
+        "suggested_lookups": []
       }
     },
     {
       "name": "Verification & Letters",
-      "description": "VOE and official letter requests.",
-      "examples": ["employment verification for mortgage", "letter confirming salary"],
-      "response_data": {
-        "urgency": "medium",
-        "requires_lookup": ["employment_dates", "salary_history", "title_history"],
-        "common_actions": ["generate_voe", "verify_requester", "send_secure"],
-        "response_templates": ["voe_processing", "third_party_verification", "letter_ready"],
-        "escalation_triggers": ["salary_dispute", "termination_verification"]
+      "description": "Employment verification and general letters (info and access only).",
+      "examples": [
+        "How do I request employment verification for a mortgage?",
+        "What details are included in the VOE?"
+      ],
+      "non_examples": [
+        "Generate my verification letter now.",
+        "Send my salary letter to this email."
+      ],
+      "responder_profile": {
+        "allow_generation": true,
+        "generator_mode": "draft_only",
+        "allowed_intents": ["information_request"],
+        "email_type_required": "direct_request",
+        "min_confidence": 0.60,
+        "grounding": {
+          "any_of": [
+            "resources_data.verification_portal",
+            "information_data.verification_details"
+          ]
+        },
+        "eligible_templates": ["verification_letters_info"],
+        "suggested_lookups": []
       }
     },
     {
       "name": "Policy & Employee Relations",
-      "description": "HR policy questions and workplace concerns.",
-      "examples": ["clarify holiday policy", "concern about team conduct"],
-      "response_data": {
-        "urgency": "variable",
-        "requires_lookup": ["policy_database", "previous_incidents", "management_chain"],
-        "common_actions": ["provide_policy", "schedule_meeting", "initiate_investigation"],
-        "response_templates": ["policy_clarification", "er_investigation_start", "meeting_request"],
-        "escalation_triggers": ["harassment", "discrimination", "safety_concern", "legal_threat"]
+      "description": "Policy clarifications and workplace concerns (often sensitive).",
+      "examples": [
+        "Clarify the holiday policy language.",
+        "What is the dress code policy?"
+      ],
+      "non_examples": [
+        "I am experiencing harassment.",
+        "I want to file a complaint."
+      ],
+      "responder_profile": {
+        "allow_generation": false,
+        "generator_mode": "blocked",
+        "allowed_intents": ["information_request"],
+        "email_type_required": "direct_request",
+        "min_confidence": 0.60,
+        "grounding": { "any_of": [] },
+        "eligible_templates": [],
+        "suggested_lookups": []
       }
     },
     {
       "name": "Immigration/Work Authorization",
-      "description": "I-9, visa, sponsorship, work authorization updates.",
-      "examples": ["I-9 reverification", "visa renewal timing"],
-      "response_data": {
-        "urgency": "high",
-        "requires_lookup": ["i9_status", "visa_expiration", "sponsorship_status"],
-        "common_actions": ["verify_dates", "initiate_renewal", "coordinate_with_legal"],
-        "response_templates": ["i9_reverification_process", "visa_renewal_timeline", "work_auth_update"],
-        "escalation_triggers": ["expiration_imminent", "status_change", "travel_restrictions"]
+      "description": "I-9, visa/sponsorship, work authorization updates (sensitive/legal).",
+      "examples": [
+        "What is the timeline for visa renewal?",
+        "What happens during I-9 reverification?"
+      ],
+      "non_examples": [
+        "Start my visa renewal now.",
+        "Here are my immigration documents."
+      ],
+      "responder_profile": {
+        "allow_generation": false,
+        "generator_mode": "blocked",
+        "allowed_intents": ["information_request"],
+        "email_type_required": "direct_request",
+        "min_confidence": 0.60,
+        "grounding": { "any_of": [] },
+        "eligible_templates": [],
+        "suggested_lookups": []
       }
     },
     {
       "name": "Offboarding/Exit",
-      "description": "Resignation, final paycheck, benefits after departure (COBRA).",
-      "examples": ["two-week notice submitted", "when will final pay arrive?"],
-      "response_data": {
-        "urgency": "high",
-        "requires_lookup": ["termination_date", "final_pay_calculation", "cobra_eligibility"],
-        "common_actions": ["calculate_final_pay", "initiate_cobra", "schedule_exit_interview"],
-        "response_templates": ["resignation_acknowledgment", "final_pay_timeline", "cobra_information"],
-        "escalation_triggers": ["involuntary_termination", "dispute_final_pay", "non_compete_issue"]
+      "description": "Resignation, final pay, post-employment benefits (often time-sensitive).",
+      "examples": [
+        "When will final pay be issued?",
+        "What benefits continue after departure?"
+      ],
+      "non_examples": [
+        "Process my resignation effective today.",
+        "Calculate my final paycheck."
+      ],
+      "responder_profile": {
+        "allow_generation": false,
+        "generator_mode": "blocked",
+        "allowed_intents": ["information_request"],
+        "email_type_required": "direct_request",
+        "min_confidence": 0.60,
+        "grounding": { "any_of": [] },
+        "eligible_templates": [],
+        "suggested_lookups": []
       }
     },
     {
       "name": "Other",
-      "description": "General HR inquiries that do not fit the above.",
-      "examples": ["not sure which form to use"],
-      "response_data": {
-        "urgency": "low",
-        "requires_lookup": ["context_dependent"],
-        "common_actions": ["clarify_request", "route_appropriately"],
-        "response_templates": ["general_inquiry", "clarification_needed"],
-        "escalation_triggers": ["unclear_intent", "multiple_categories"]
+      "description": "General HR information requests that do not fit above categories.",
+      "examples": [
+        "Where can I find HR policies?",
+        "How do I contact HR during holidays?"
+      ],
+      "non_examples": [
+        "Route this to IT.",
+        "Create a ticket for me."
+      ],
+      "responder_profile": {
+        "allow_generation": true,
+        "generator_mode": "draft_only",
+        "allowed_intents": ["information_request"],
+        "email_type_required": "direct_request",
+        "min_confidence": 0.60,
+        "grounding": {
+          "any_of": [
+            "policy_context.policy_snippet",
+            "information_data.policy_snippet",
+            "resources_data.policy_link"
+          ]
+        },
+        "eligible_templates": ["generic_policy_info"],
+        "suggested_lookups": []
       }
     }
   ]
@@ -289,8 +477,10 @@ REMINDERS
       { "id": "email_quotes", "family": "chain_forward", "field": "body", "operator": "matches", "pattern": "(?:^|\\n)\\s*>[>\\s]*.{20,}", "weight": -2, "cap_per_email": 3, "enabled": true },
       { "id": "multiple_senders", "family": "chain_forward", "field": "body", "operator": "matches", "pattern": "From:.*From:", "weight": -4, "cap_per_email": 1, "enabled": true },
 
-      { "id": "first_person_request", "family": "direct_request", "field": "body", "operator": "matches", "pattern": "(?i)\\b(I (need|would like|am requesting|can'?t access|want to)|my (pto|paycheck|benefits))\\b", "weight": 3, "cap_per_email": 2, "enabled": true },
-      { "id": "direct_question", "family": "direct_request", "field": "body", "operator": "matches", "pattern": "(?i)^(can I|could I|how do I|when can I|what is my|where is my|why is my)", "weight": 2, "cap_per_email": 1, "enabled": true },
+      { "id": "info_direct_question", "family": "intent_info", "field": "body", "operator": "matches", "pattern": "(?i)\\b(what is|how do i|where (can|do) i|when is|policy|guidelines?)\\b", "weight": 3, "cap_per_email": 2, "enabled": true },
+      { "id": "intent_directory", "family": "intent_noninfo", "field": "body", "operator": "matches", "pattern": "(?i)\\b(who is my manager|who do i report to|who should i contact|what'?s my manager)\\b", "weight": -3, "cap_per_email": 1, "enabled": true },
+      { "id": "intent_action", "family": "intent_noninfo", "field": "body", "operator": "matches", "pattern": "(?i)\\b(please (process|update|resend|approve|submit)|can you (process|update|fix)|i need you to)\\b", "weight": -3, "cap_per_email": 1, "enabled": true },
+      { "id": "intent_status", "family": "intent_noninfo", "field": "body", "operator": "matches", "pattern": "(?i)\\b(has this been|when will this be|what is the status)\\b", "weight": -2, "cap_per_email": 1, "enabled": true },
 
       { "id": "topic_pto", "family": "hr_topics", "field": "body", "operator": "matches", "pattern": "(?i)\\b(PTO|paid time off|vacation|holiday|sick (day|leave))\\b", "weight": 2, "cap_per_email": 2, "enabled": true },
       { "id": "topic_w2", "family": "hr_topics", "field": "body", "operator": "matches", "pattern": "(?i)\\b(W-?2|tax (form|paperwork|document))\\b", "weight": 2, "cap_per_email": 2, "enabled": true },
@@ -319,6 +509,18 @@ REMINDERS
       "no_reply_max": -2
     },
 
+    "intent_inference": {
+      "map": {
+        "information_request": ["intent_info"],
+        "directory_request": ["intent_noninfo:directory"],
+        "action_request": ["intent_noninfo:action"],
+        "status_update": ["intent_noninfo:status"]
+      },
+      "resolve_order": ["information_request", "directory_request", "action_request", "status_update", "other"],
+      "fallback": "other",
+      "notes": "Families prefixed 'intent_info' push toward information_request; 'intent_noninfo' pull away."
+    },
+
     "guards": {
       "cap_per_family": {
         "employee": 3,
@@ -327,18 +529,24 @@ REMINDERS
         "pii": 2,
         "reply_safety": 2,
         "chain_forward": 3,
-        "direct_request": 2
+        "direct_request": 2,
+        "intent_info": 2,
+        "intent_noninfo": 2
       },
       "generator_gate": {
         "min_confidence_for_generation": 0.60,
         "block_if_hard_exclude_present": true,
         "block_if_reply_safety_no_auto_reply": true,
-        "require_email_type": "direct_request"
+        "require_email_type": "direct_request",
+        "require_intent_kind": "information_request"
       },
-      "notes": "Headers may be absent; rely on subject/body patterns and signatures. Hard excludes cover auto-replies, lists, and bounces. Reply safety signals prevent inappropriate auto-responses. Detects forwarded chains and internal discussions to prevent auto-response. Direct first-person requests score higher."
-    }
+      "notes": "Upstream enforces information-seeking intent. Grounding is enforced downstream by the responder/templates."
+    },
+    
+    "notes": "Headers may be absent; rely on subject/body patterns and signatures. Hard excludes cover auto-replies, lists, and bounces. Reply safety signals prevent inappropriate auto-responses. Detects forwarded chains and internal discussions to prevent auto-response. Direct first-person requests score higher."
   }
 }
+
 // POLICY_FILTER
 {
   "policy_config": {
@@ -350,10 +558,12 @@ REMINDERS
       "confidence_range": [0, 1],
       "category": ["PTO", "W2", "Payroll", "Benefits & Enrollment", "Leaves & Accommodations", "Employee Data Changes", "HRIS/Portal Access", "Verification & Letters", "Policy & Employee Relations", "Immigration/Work Authorization", "Offboarding/Exit", "Other"],
       "response_eligibility": ["auto_reply", "assisted_reply", "human_only", "no_reply"],
-      "email_type": ["direct_request", "forwarded_chain", "internal_discussion", "cc_consultation"]
+      "email_type": ["direct_request", "forwarded_chain", "internal_discussion", "cc_consultation"],
+      "intent_kind": ["information_request", "action_request", "directory_request", "status_update", "other"]
     },
 
-    "purpose": "Evaluate emails upstream to filter out chains/internal discussions/sensitive topics, classify category, and decide whether to generate a draft-only acknowledgment/information response.",
+    "purpose": "Upstream triage: filter chains/internal/safety, classify, infer intent, and decide if the message may proceed toward draft generation (draft-only).",
+
     "company": {
       "domains": ["@company.com", "@subsidiary.com"],
       "hr_topics": ["pto", "paid time off", "vacation", "holiday", "leave", "w-2", "w2", "tax", "payroll", "paycheck", "timesheet", "timecard", "direct deposit", "benefits", "address change"]
@@ -408,14 +618,14 @@ REMINDERS
     },
 
     "safety_gates": {
-      "legal_language": { "generator_pass": false, "response_eligibility": "human_only" },
-      "medical_detail": { "generator_pass": false, "response_eligibility": "human_only" },
-      "crisis_language": { "generator_pass": false, "response_eligibility": "human_only" },
-      "pii_financial": { "generator_pass": true, "response_eligibility": "assisted_reply" }
+      "legal_language":   { "generator_pass": false, "response_eligibility": "human_only" },
+      "medical_detail":   { "generator_pass": false, "response_eligibility": "human_only" },
+      "crisis_language":  { "generator_pass": false, "response_eligibility": "human_only" },
+      "pii_financial":    { "generator_pass": true,  "response_eligibility": "assisted_reply" }
     },
 
     "extraction_patterns": {
-      "dates": "\\b(\\d{1,2}/\\d{1,2}(?:/\\d{2,4})?|Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\\s*\\d{1,2}(?:st|nd|rd|th)?(?:[,\\s]+\\d{2,4})?\\b",
+      "dates": "\\b(\\d{1,2}/\\d{1,2}(?:/\\d{2,4})?|Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?)\\s*\\d{1,2}(?:st|nd|rd|th)?(?:[,\\s]+\\d{2,4})?\\b",
       "date_ranges": "(?:from|between)\\s*([^to\\n]+)\\s*(?:to|through|-|and)\\s*([^.,;\\n]+)",
       "tax_year": "(?i)\\b20\\d{2}\\b",
       "purpose": "(?i)\\b(visa|mortgage|apartment|loan|background check|employment verification|proof of employment)\\b",
@@ -429,8 +639,25 @@ REMINDERS
       "original_sender": "(?:^|\\n)From:\\s*([^\\n]+)",
       "forward_indicators": "(?i)(^|\\n)(fwd?:|re:\\s*fwd?:)|>>>>|----\\s*original",
       "chain_depth": "(?:^|\\n)\\s*>\\s*>+",
+
+      "policy_question": "(?i)\\b(what is|how do i|where (can|do) i|when is|policy|guidelines?)\\b",
+      "directory_request": "(?i)\\b(who is my manager|who do i report to|who should i contact|what'?s my manager)\\b",
+      "action_verbs": "(?i)\\b(please (process|update|resend|approve|submit)|can you (process|update|fix)|i need you to)\\b",
+      "status_update": "(?i)\\b(has this been|when will this be|what is the status)\\b",
+
       "third_person_refs": "(?i)\\b(this employee|this person|the employee)\\b",
       "first_person_request": "(?i)\\b(I\\s+(need|would like|am requesting|can't access|can'?t access|want to)|my\\s+(pto|paycheck|benefits))\\b"
+    },
+
+    "intent_model": {
+      "signals": {
+        "information_request": ["policy_question"],
+        "directory_request":   ["directory_request"],
+        "action_request":      ["action_verbs"],
+        "status_update":       ["status_update"]
+      },
+      "resolve_order": ["information_request", "directory_request", "action_request", "status_update", "other"],
+      "fallback": "other"
     },
 
     "response_rules": {
@@ -475,14 +702,23 @@ REMINDERS
     },
 
     "reply_complexity": {
-      "simple": { "complexity_signals": ["routine_dates", "known_system", "single_issue"], "avg_triage_time": "< 5 minutes" },
+      "simple":   { "complexity_signals": ["routine_dates", "known_system", "single_issue"], "avg_triage_time": "< 5 minutes" },
       "moderate": { "complexity_signals": ["requires_lookup", "multiple_fields", "policy_reference"], "avg_triage_time": "15-30 minutes" },
-      "complex": { "complexity_signals": ["multi_policy", "ambiguous_request", "missing_info"], "avg_triage_time": "1-2 hours" },
+      "complex":  { "complexity_signals": ["multi_policy", "ambiguous_request", "missing_info"], "avg_triage_time": "1-2 hours" },
       "escalate": { "complexity_signals": ["legal", "medical", "crisis", "forwarded_chain_resolution"], "avg_triage_time": "immediate human review" }
     },
 
+    "handoff_contract": {
+      "required_context_by_category": {
+        "PTO":   { "any_of": ["policy_context.pto_policy", "timeline_data.pto_processing", "next_steps_data.pto_process", "extracted_data.dates"] },
+        "W2":    { "any_of": ["extracted_data.tax_year", "information_data.w2_availability", "timeline_data.w2_availability"] },
+        "Payroll": { "any_of": ["extracted_data.issue_type", "timeline_data.payroll_review", "next_steps_data.payroll_review", "resources_data.payroll_faq"] }
+      },
+      "note": "Upstream does NOT block on grounding; it tags requirements so the responder can enforce presence."
+    },
+
     "context_requirements": {
-      "global_minimum": ["can_identify_request", "one_grounded_info_or_placeholder"],
+      "global_minimum": ["can_identify_request"],
       "by_category": {
         "PTO": ["dates_or_policy_or_timeline_or_next_steps"],
         "W2": ["tax_year_or_availability_or_delivery_or_timeline"],
@@ -496,6 +732,7 @@ REMINDERS
         "confidence": "number 0..1",
         "category": "string or null",
         "email_type": "direct_request|forwarded_chain|internal_discussion|cc_consultation",
+        "intent_kind": "information_request|action_request|directory_request|status_update|other",
         "response_eligibility": "auto_reply|assisted_reply|human_only|no_reply",
         "extracted_data": {
           "dates": ["array"],
@@ -512,7 +749,7 @@ REMINDERS
         "matched_signals": ["array"],
         "escalation_reasons": ["array"],
         "reasons": ["array"],
-        "generator_hint": "blocked|draft_only|pass"
+        "generator_hint": "blocked|draft_only|pass|needs_grounding"
       },
       "instructions": "Return ONLY valid JSON matching the structure. No additional text."
     },
@@ -521,12 +758,14 @@ REMINDERS
       "pass_conditions": [
         "decision == 'KEEP'",
         "email_type == 'direct_request'",
+        "intent_kind == 'information_request'",
         "confidence >= min_confidence_for_generation",
         "response_eligibility in ['auto_reply','assisted_reply']",
         "no safety_gates with generator_pass=false"
       ],
       "blocked_conditions": [
         "email_type in ['forwarded_chain','internal_discussion']",
+        "intent_kind in ['action_request','directory_request','status_update','other']",
         "safety_gates.legal_language || safety_gates.medical_detail || safety_gates.crisis_language",
         "response_eligibility in ['human_only','no_reply']"
       ],
@@ -535,35 +774,208 @@ REMINDERS
         "assisted_reply": "draft_only",
         "human_only": "blocked",
         "no_reply": "blocked"
-      }
+      },
+      "on_pass_set_generator_hint": "needs_grounding"
     },
 
     "examples": []
   }
 }
 
+
 // RESP_TEMP
 {
   "response_templates": {
-    "pto_approved": {
-      "subject": "PTO Request Confirmation - {dates}",
-      "body": "Your PTO request for {dates} has been confirmed. Manager approval from {manager_name} has been verified in {system}. Your remaining PTO balance is {balance} hours.",
-      "required_data": ["dates", "manager_name", "system", "balance"]
+    "pto_policy_info": {
+      "category": "PTO",
+      "subject": "RE: PTO policy information",
+      "body": "For your reference: {policy_snippet}\n\nYou can review additional details here: {policy_link}",
+      "required_data": ["policy_snippet", "policy_link"],
+      "bindings": {
+        "policy_snippet": ["policy_context.pto_policy", "information_data.pto_policy"],
+        "policy_link": ["resources_data.pto_policy_link"]
+      },
+      "eligibility": {
+        "email_type": "direct_request",
+        "intent_kind": "information_request",
+        "intent_signals_any": ["direct_question", "policy_question", "how_do_i", "what_is", "when_is", "where_is"],
+        "prohibit_signals_any": ["first_person_request"],
+        "min_confidence": 0.60
+      },
+      "null_on_missing_grounding": true,
+      "response_type": "information_provided"
     },
-    "pto_pending_manager": {
-      "subject": "PTO Request - Pending Manager Approval",
-      "body": "Your PTO request for {dates} has been received. We're awaiting manager approval. You'll receive confirmation within 24 business hours.",
-      "required_data": ["dates"]
+
+    "pto_process_info": {
+      "category": "PTO",
+      "subject": "RE: How PTO works",
+      "body": "Here is the standard approach for PTO: {next_steps}\n\nTypical timing: {timeline}",
+      "required_data": ["next_steps", "timeline"],
+      "bindings": {
+        "next_steps": ["next_steps_data.pto_process"],
+        "timeline": ["timeline_data.pto_processing"]
+      },
+      "eligibility": {
+        "email_type": "direct_request",
+        "intent_kind": "information_request",
+        "intent_signals_any": ["direct_question", "how_do_i", "policy_question"],
+        "prohibit_signals_any": ["first_person_request"],
+        "min_confidence": 0.60
+      },
+      "null_on_missing_grounding": true,
+      "response_type": "information_provided"
     },
-    "w2_resend": {
-      "subject": "W-2 Reissue Request Processed",
-      "body": "Your {tax_year} W-2 will be {delivery_method} within 3-5 business days to {address}. Please verify your address is correct in {system}.",
-      "required_data": ["tax_year", "delivery_method", "address", "system"]
+
+    "w2_access_info": {
+      "category": "W2",
+      "subject": "RE: How to access W-2 ({tax_year})",
+      "body": "W-2s for {tax_year} are available: {availability_text}\n\nAccess here: {portal_link}",
+      "required_data": ["tax_year", "availability_text", "portal_link"],
+      "bindings": {
+        "tax_year": ["extracted_data.tax_year"],
+        "availability_text": ["information_data.w2_availability"],
+        "portal_link": ["resources_data.employee_portal"]
+      },
+      "eligibility": {
+        "email_type": "direct_request",
+        "intent_kind": "information_request",
+        "intent_signals_any": ["direct_question", "where_is", "how_do_i", "what_is"],
+        "prohibit_signals_any": ["first_person_request"],
+        "min_confidence": 0.60
+      },
+      "null_on_missing_grounding": true,
+      "response_type": "information_provided"
     },
-    "escalation_human": {
-      "subject": "Your HR Request - Personal Attention Required",
-      "body": "Thank you for contacting HR. Your request requires personal attention from our team. An HR representative will contact you within {timeframe}.",
-      "required_data": ["timeframe"]
+
+    "w2_timeline_info": {
+      "category": "W2",
+      "subject": "RE: W-2 timeline ({tax_year})",
+      "body": "Timeline for {tax_year} W-2: {w2_timeline}",
+      "required_data": ["tax_year", "w2_timeline"],
+      "bindings": {
+        "tax_year": ["extracted_data.tax_year"],
+        "w2_timeline": ["timeline_data.w2_availability"]
+      },
+      "eligibility": {
+        "email_type": "direct_request",
+        "intent_kind": "information_request",
+        "intent_signals_any": ["when_is", "direct_question"],
+        "prohibit_signals_any": ["first_person_request"],
+        "min_confidence": 0.60
+      },
+      "null_on_missing_grounding": true,
+      "response_type": "information_provided"
+    },
+
+    "payroll_process_info": {
+      "category": "Payroll",
+      "subject": "RE: Payroll process information",
+      "body": "For payroll questions, the standard review is: {review_steps}\n\nTypical timing: {review_timeline}\n\nMore info: {resource_link}",
+      "required_data": ["review_steps", "review_timeline", "resource_link"],
+      "bindings": {
+        "review_steps": ["next_steps_data.payroll_review_process", "next_steps_data.payroll_review"],
+        "review_timeline": ["timeline_data.payroll_review"],
+        "resource_link": ["resources_data.payroll_faq"]
+      },
+      "eligibility": {
+        "email_type": "direct_request",
+        "intent_kind": "information_request",
+        "intent_signals_any": ["how_do_i", "what_is", "where_is", "direct_question"],
+        "prohibit_signals_any": ["first_person_request"],
+        "min_confidence": 0.60
+      },
+      "null_on_missing_grounding": true,
+      "response_type": "information_provided"
+    },
+
+    "hris_portal_access_info": {
+      "category": "HRIS/Portal Access",
+      "subject": "RE: Accessing the HR portal",
+      "body": "Portal: {portal_link}\n\nSystem: {system_name}\n\nIf guidance is needed: {access_help}",
+      "required_data": ["portal_link", "system_name", "access_help"],
+      "bindings": {
+        "portal_link": ["resources_data.hris_portal_link", "resources_data.employee_portal"],
+        "system_name": ["system_data.hris_name"],
+        "access_help": ["information_data.portal_access_help", "policy_context.portal_access_help"]
+      },
+      "eligibility": {
+        "email_type": "direct_request",
+        "intent_kind": "information_request",
+        "intent_signals_any": ["how_do_i", "where_is", "direct_question"],
+        "prohibit_signals_any": ["first_person_request"],
+        "min_confidence": 0.60
+      },
+      "null_on_missing_grounding": true,
+      "response_type": "information_provided"
+    },
+
+    "verification_letters_info": {
+      "category": "Verification & Letters",
+      "subject": "RE: Employment verification",
+      "body": "For employment verification, use: {verification_portal}\n\nStandard details included: {verification_details}",
+      "required_data": ["verification_portal", "verification_details"],
+      "bindings": {
+        "verification_portal": ["resources_data.verification_portal"],
+        "verification_details": ["information_data.verification_details"]
+      },
+      "eligibility": {
+        "email_type": "direct_request",
+        "intent_kind": "information_request",
+        "intent_signals_any": ["how_do_i", "where_is", "what_is", "direct_question"],
+        "prohibit_signals_any": ["first_person_request"],
+        "min_confidence": 0.60
+      },
+      "null_on_missing_grounding": true,
+      "response_type": "information_provided"
+    },
+
+    "generic_policy_info": {
+      "category": "Other",
+      "subject": "RE: Policy information",
+      "body": "Here is the relevant policy information: {policy_snippet}\n\nReference: {policy_link}",
+      "required_data": ["policy_snippet", "policy_link"],
+      "bindings": {
+        "policy_snippet": ["policy_context.policy_snippet", "information_data.policy_snippet"],
+        "policy_link": ["resources_data.policy_link"]
+      },
+      "eligibility": {
+        "email_type": "direct_request",
+        "intent_kind": "information_request",
+        "intent_signals_any": ["policy_question", "what_is", "how_do_i", "direct_question"],
+        "prohibit_signals_any": ["first_person_request"],
+        "min_confidence": 0.60
+      },
+      "null_on_missing_grounding": true,
+      "response_type": "information_provided"
     }
-  }
+  },
+
+  "resolver_rules": {
+    "draft_only": true,
+    "block_if_any": ["forwarded_chain", "internal_discussion", "legal_language", "medical_detail", "crisis_language"],
+    "require": {
+      "email_type": "direct_request",
+      "intent_kind": "information_request",
+      "min_confidence": 0.60
+    },
+    "selection": "first_eligible_template",
+    "on_no_eligible": null
+  },
+
+  "examples_that_should_null": [
+    {
+      "email": "I want to take paid time off in December, I know I need to talk to my manager, who is my manager?",
+      "why": "Intent is directory/action, not to obtain information from provided policy context."
+    },
+    {
+      "email": "What is our PTO policy?",
+      "context_missing": ["policy_context.pto_policy", "information_data.pto_policy", "resources_data.pto_policy_link"],
+      "why": "Information-seeking intent present, but no grounded policy content provided."
+    },
+    {
+      "email": "Please process my W-2 reissue for 2023.",
+      "why": "Action request (process/reissue). Not information-seeking."
+    }
+  ]
 }
+
