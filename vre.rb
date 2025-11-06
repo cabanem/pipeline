@@ -9,7 +9,7 @@ require 'securerandom'
 {
   title: 'Vertex RAG Engine',
   subtitle: 'RAG Engine',
-  version: '0.9.9',
+  version: '1.0.0',
   description: 'RAG engine via service account (JWT)',
   help: lambda do |input, picklist_label|
     {
@@ -140,13 +140,43 @@ require 'securerandom'
         [
           { name: 'mode', control_type: 'select', pick_list: 'gen_generate_modes', optional: false, default: 'plain' },
           { name: 'model', optional: false, control_type: 'text' },
+          # Template support fields
+          { name: 'use_response_template', label: 'Use Response Template', type: 'boolean', control_type: 'checkbox', optional: true,
+            extends_schema: true, hint: 'Enable to use predefined response templates with dynamic data substitution' },
+          { name: 'template_mode', label: 'Template Input Mode', control_type: 'select',
+            options: [['Select from library', 'library'], ['Custom JSON', 'json'], ['Inline template', 'inline']],
+            default: 'library', ngIf: 'input.use_response_template == true', extends_schema: true },
+          { name: 'selected_template', label: 'Select Template', control_type: 'select', optional: true,
+            pick_list: 'response_templates', ngIf: 'input.use_response_template == true && input.template_mode == "library"'},
+          { name: 'template_json', label: 'Response Template (JSON)', control_type: 'text-area',
+            ngIf: 'input.use_response_template == true && input.template_mode == "json"', optional: true,
+            hint: 'Paste JSON with template structure: {"subject": "...", "body": "...", "required_data": [...]}'},         
+          { name: 'inline_template', label: 'Template Text', control_type: 'text-area', ngIf: 'input.use_response_template == true && input.template_mode == "inline"',
+            optional: true, hint: 'Enter template with {placeholders} for dynamic data' },
+          { name: 'template_data', label: 'Template Data', type: 'object', ngIf: 'input.use_response_template == true',
+            optional: true, hint: 'Key-value pairs to substitute into template placeholders',
+            properties: [
+              { name: 'dates', hint: 'e.g., "March 15-19, 2025"' },
+              { name: 'manager_name', hint: 'e.g., "John Smith"' },
+              { name: 'system', hint: 'e.g., "Workday"' },
+              { name: 'balance', hint: 'e.g., "120"' },
+              { name: 'tax_year', hint: 'e.g., "2024"' },
+              { name: 'delivery_method', hint: 'e.g., "mailed" or "emailed"' },
+              { name: 'address', hint: 'Delivery address' },
+              { name: 'timeframe', hint: 'e.g., "24 hours"' },
+              # Allow additional custom fields
+              { name: 'custom_field_1', label: 'Custom Field 1' },
+              { name: 'custom_field_2', label: 'Custom Field 2' },
+              { name: 'custom_field_3', label: 'Custom Field 3' }
+            ] },
           { name: 'correlation_id', label: 'Correlation ID', optional: true, hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
           # Show 'contents' for plain/grounded modes; hide for rag_with_context
           { name: 'contents',
             type: 'array', of: 'object', properties: object_definitions['content'], optional: true,
             ngIf: 'input.mode != "rag_with_context"' },
 
-          { name: 'system_preamble', optional: true },
+          { name: 'system_preamble', label: 'System Instructions', control_type: 'text-area', extends_schema: false,
+            optional: true, hint: 'Provide system-level instructions to guide the model\'s behavior (e.g., tone, role, constraints). This becomes the systemInstruction for the model.'},
           { name: 'generation_config', type: 'object', properties: object_definitions['generation_config'] },
           { name: 'safetySettings', type: 'array', of: 'object', properties: object_definitions['safety_setting'] },
           { name: 'toolConfig', type: 'object' },
@@ -506,7 +536,6 @@ require 'securerandom'
 
   # --------- ACTIONS ------------------------------------------------------
   actions: {
-    # 1) Email categorization
     gen_categorize_email: {
       title: 'Email: Categorize email',
       subtitle: 'Classify an email into a category',
@@ -1513,8 +1542,6 @@ require 'securerandom'
         call(:sample_rank_texts_with_ranking_api)
       end
     },
-
-    # RAG store engine
     rag_retrieve_contexts_enhanced: {
       title: 'RAG: Retrieve contexts (enhanced)',
       subtitle: 'projects.locations:retrieveContexts (Vertex RAG Engine, v1)',
@@ -2137,8 +2164,6 @@ require 'securerandom'
         }
       end
     },
-
-    # Utility
     embed_text: {
       title: 'Embed text',
       subtitle: 'Get embeddings from a publisher embedding model',
@@ -2451,8 +2476,6 @@ require 'securerandom'
         }
       end
     },
-
-    # NEW
     deterministic_filter: {
       title: 'Filter: Deterministic (with intent)',
       subtitle: 'Hard/soft rules + lightweight intent inference',
@@ -3107,6 +3130,17 @@ require 'securerandom'
   
   # --------- PICK LISTS ---------------------------------------------------
   pick_lists: {
+    response_templates: lambda do |_connection|
+      [
+        ['PTO Approved', 'pto_approved'],
+        ['PTO Pending Manager', 'pto_pending_manager'],
+        ['W-2 Resend', 'w2_resend'],
+        ['Escalation to Human', 'escalation_human'],
+        ['Benefits Enrollment Confirmation', 'benefits_enrolled'],
+        ['Password Reset', 'password_reset'],
+        ['Custom Template', 'custom']
+      ]
+    end,
     modes_classification: lambda do |_connection|
       [ ['Embedding (deterministic)', 'embedding'],
         ['Generative (LLM only)',     'generative'],
@@ -3646,6 +3680,239 @@ require 'securerandom'
       
       result
     end,
+    # Template processing helpers
+    process_template: lambda do |template_str, data|
+      return template_str if template_str.blank? || data.blank?
+      
+      result = template_str.dup
+      data.each do |key, value|
+        next if value.nil? || value.to_s.strip.empty?
+        # Handle both {key} and {{key}} formats
+        result.gsub!(/\{\{?\s*#{Regexp.escape(key.to_s)}\s*\}?\}/, value.to_s)
+      end
+      
+      # Warn about missing placeholders (optional)
+      missing = result.scan(/\{[^}]+\}/)
+      if missing.any?
+        # Could log or handle missing placeholders
+        result += "\n\n[Note: Missing data for: #{missing.join(', ')}]"
+      end
+      
+      result
+    end,
+    build_template_prompt: lambda do |template, data, additional_context = nil|
+      # Build a prompt that instructs the model to use the template
+      prompt = "Generate a response using the following template:\n\n"
+      
+      if template.is_a?(Hash)
+        prompt += "Subject: #{template['subject']}\n" if template['subject']
+        prompt += "Body: #{template['body']}\n\n" if template['body']
+        prompt += "Required data fields: #{template['required_data'].join(', ')}\n" if template['required_data']
+      else
+        prompt += template.to_s + "\n\n"
+      end
+      
+      prompt += "\nData to use for placeholders:\n"
+      data.each do |key, value|
+        prompt += "- #{key}: #{value}\n" if value.present?
+      end
+      
+      prompt += "\n#{additional_context}" if additional_context.present?
+      prompt += "\n\nPlease fill in the template with the provided data and ensure the response is professional and complete."
+      
+      prompt
+    end,
+    parse_template_json: lambda do |json_str|
+      return nil if json_str.blank?
+      begin
+        parsed = JSON.parse(json_str)
+        # Validate template structure
+        unless parsed.is_a?(Hash) && (parsed['subject'] || parsed['body'])
+          error('Invalid template JSON: must contain "subject" and/or "body" fields')
+        end
+        parsed
+      rescue JSON::ParserError => e
+        error("Invalid template JSON: #{e.message}")
+      end
+    end,
+    fetch_template_from_library: lambda do |template_id|
+      templates = {
+        'pto_policy_info' => {
+          'id' => 'pto_policy_info',
+          'category' => 'PTO',
+          'subject' => 'RE: PTO policy information',
+          'body' => "For your reference: {policy_snippet}\n\nYou can review additional details here: {policy_link}",
+          'required_data' => ['policy_snippet', 'policy_link'],
+          'bindings' => {
+            'policy_snippet' => ['policy_context.pto_policy', 'information_data.pto_policy'],
+            'policy_link' => ['resources_data.pto_policy_link']
+          },
+          'eligibility' => {
+            'email_type' => 'direct_request',
+            'intent_kind' => 'information_request',
+            'intent_signals_any' => ['direct_question', 'policy_question', 'how_do_i', 'what_is', 'when_is', 'where_is'],
+            'prohibit_signals_any' => ['first_person_request'],
+            'min_confidence' => 0.60
+          },
+          'null_on_missing_grounding' => true,
+          'response_type' => 'information_provided'
+        },
+
+        'pto_process_info' => {
+          'id' => 'pto_process_info',
+          'category' => 'PTO',
+          'subject' => 'RE: How PTO works',
+          'body' => "Here is the standard approach for PTO: {next_steps}\n\nTypical timing: {timeline}",
+          'required_data' => ['next_steps', 'timeline'],
+          'bindings' => {
+            'next_steps' => ['next_steps_data.pto_process'],
+            'timeline' => ['timeline_data.pto_processing']
+          },
+          'eligibility' => {
+            'email_type' => 'direct_request',
+            'intent_kind' => 'information_request',
+            'intent_signals_any' => ['direct_question', 'how_do_i', 'policy_question'],
+            'prohibit_signals_any' => ['first_person_request'],
+            'min_confidence' => 0.60
+          },
+          'null_on_missing_grounding' => true,
+          'response_type' => 'information_provided'
+        },
+
+        'w2_access_info' => {
+          'id' => 'w2_access_info',
+          'category' => 'W2',
+          'subject' => 'RE: How to access W-2 ({tax_year})',
+          'body' => "W-2s for {tax_year} are available: {availability_text}\n\nAccess here: {portal_link}",
+          'required_data' => ['tax_year', 'availability_text', 'portal_link'],
+          'bindings' => {
+            'tax_year' => ['extracted_data.tax_year'],
+            'availability_text' => ['information_data.w2_availability'],
+            'portal_link' => ['resources_data.employee_portal']
+          },
+          'eligibility' => {
+            'email_type' => 'direct_request',
+            'intent_kind' => 'information_request',
+            'intent_signals_any' => ['direct_question', 'where_is', 'how_do_i', 'what_is'],
+            'prohibit_signals_any' => ['first_person_request'],
+            'min_confidence' => 0.60
+          },
+          'null_on_missing_grounding' => true,
+          'response_type' => 'information_provided'
+        },
+
+        'w2_timeline_info' => {
+          'id' => 'w2_timeline_info',
+          'category' => 'W2',
+          'subject' => 'RE: W-2 timeline ({tax_year})',
+          'body' => 'Timeline for {tax_year} W-2: {w2_timeline}',
+          'required_data' => ['tax_year', 'w2_timeline'],
+          'bindings' => {
+            'tax_year' => ['extracted_data.tax_year'],
+            'w2_timeline' => ['timeline_data.w2_availability']
+          },
+          'eligibility' => {
+            'email_type' => 'direct_request',
+            'intent_kind' => 'information_request',
+            'intent_signals_any' => ['when_is', 'direct_question'],
+            'prohibit_signals_any' => ['first_person_request'],
+            'min_confidence' => 0.60
+          },
+          'null_on_missing_grounding' => true,
+          'response_type' => 'information_provided'
+        },
+
+        'payroll_process_info' => {
+          'id' => 'payroll_process_info',
+          'category' => 'Payroll',
+          'subject' => 'RE: Payroll process information',
+          'body' => "For payroll questions, the standard review is: {review_steps}\n\nTypical timing: {review_timeline}\n\nMore info: {resource_link}",
+          'required_data' => ['review_steps', 'review_timeline', 'resource_link'],
+          'bindings' => {
+            'review_steps' => ['next_steps_data.payroll_review_process', 'next_steps_data.payroll_review'],
+            'review_timeline' => ['timeline_data.payroll_review'],
+            'resource_link' => ['resources_data.payroll_faq']
+          },
+          'eligibility' => {
+            'email_type' => 'direct_request',
+            'intent_kind' => 'information_request',
+            'intent_signals_any' => ['how_do_i', 'what_is', 'where_is', 'direct_question'],
+            'prohibit_signals_any' => ['first_person_request'],
+            'min_confidence' => 0.60
+          },
+          'null_on_missing_grounding' => true,
+          'response_type' => 'information_provided'
+        },
+
+        'hris_portal_access_info' => {
+          'id' => 'hris_portal_access_info',
+          'category' => 'HRIS/Portal Access',
+          'subject' => 'RE: Accessing the HR portal',
+          'body' => "Portal: {portal_link}\n\nSystem: {system_name}\n\nIf guidance is needed: {access_help}",
+          'required_data' => ['portal_link', 'system_name', 'access_help'],
+          'bindings' => {
+            'portal_link' => ['resources_data.hris_portal_link', 'resources_data.employee_portal'],
+            'system_name' => ['system_data.hris_name'],
+            'access_help' => ['information_data.portal_access_help', 'policy_context.portal_access_help']
+          },
+          'eligibility' => {
+            'email_type' => 'direct_request',
+            'intent_kind' => 'information_request',
+            'intent_signals_any' => ['how_do_i', 'where_is', 'direct_question'],
+            'prohibit_signals_any' => ['first_person_request'],
+            'min_confidence' => 0.60
+          },
+          'null_on_missing_grounding' => true,
+          'response_type' => 'information_provided'
+        },
+
+        'verification_letters_info' => {
+          'id' => 'verification_letters_info',
+          'category' => 'Verification & Letters',
+          'subject' => 'RE: Employment verification',
+          'body' => "For employment verification, use: {verification_portal}\n\nStandard details included: {verification_details}",
+          'required_data' => ['verification_portal', 'verification_details'],
+          'bindings' => {
+            'verification_portal' => ['resources_data.verification_portal'],
+            'verification_details' => ['information_data.verification_details']
+          },
+          'eligibility' => {
+            'email_type' => 'direct_request',
+            'intent_kind' => 'information_request',
+            'intent_signals_any' => ['how_do_i', 'where_is', 'what_is', 'direct_question'],
+            'prohibit_signals_any' => ['first_person_request'],
+            'min_confidence' => 0.60
+          },
+          'null_on_missing_grounding' => true,
+          'response_type' => 'information_provided'
+        },
+
+        'generic_policy_info' => {
+          'id' => 'generic_policy_info',
+          'category' => 'Other',
+          'subject' => 'RE: Policy information',
+          'body' => "Here is the relevant policy information: {policy_snippet}\n\nReference: {policy_link}",
+          'required_data' => ['policy_snippet', 'policy_link'],
+          'bindings' => {
+            'policy_snippet' => ['policy_context.policy_snippet', 'information_data.policy_snippet'],
+            'policy_link' => ['resources_data.policy_link']
+          },
+          'eligibility' => {
+            'email_type' => 'direct_request',
+            'intent_kind' => 'information_request',
+            'intent_signals_any' => ['policy_question', 'what_is', 'how_do_i', 'direct_question'],
+            'prohibit_signals_any' => ['first_person_request'],
+            'min_confidence' => 0.60
+          },
+          'null_on_missing_grounding' => true,
+          'response_type' => 'information_provided'
+        }
+      }
+
+      templates[template_id] || error("Template '#{template_id}' not found")
+    end,
+
+    # PDF handling
     sanitize_pdf_text: lambda do |raw_text|
       begin
         return '' if raw_text.nil?
@@ -4401,7 +4668,13 @@ require 'securerandom'
     end,
     safe_json_arr!: lambda do |raw|
       v = call(:json_parse_gently!, raw)
-      error('Invalid JSON for categories: expected array') unless v.is_a?(Array)
+      
+      # Handle object with "categories" key (common wrapper format)
+      if v.is_a?(Hash) && v['categories'].is_a?(Array)
+        return v['categories']
+      end
+      
+      error('Invalid JSON for categories: expected array or object with "categories" array') unless v.is_a?(Array)
       v
     end,
     # UI assembly helpers (schema-by-config)
@@ -4948,35 +5221,94 @@ require 'securerandom'
       url            = call(:aipl_v1_url, connection, loc_from_model, "#{model_path}:generateContent")
       req_params     = "model=#{model_path}"
 
-      # Base fields
-      contents = call(:sanitize_contents!, input['contents'])
-      sys_inst = call(:system_instruction_from_text, input['system_preamble'])
-      gen_cfg  = call(:sanitize_generation_config, input['generation_config'])
+      # Initialize base fields
+      contents = nil
+      sys_inst = nil
+      gen_cfg  = nil
       safety   = call(:sanitize_safety!, input['safetySettings'])
       tool_cfg = call(:safe_obj, input['toolConfig'])
       tools    = nil
 
+      # Handle template mode first (can override contents/system for any mode)
+      if input['use_response_template'] == true
+        template_mode = input['template_mode'] || 'library'
+        template_data = input['template_data'] || {}
+        
+        # Get the template based on mode
+        template = case template_mode
+        when 'library'
+          call(:fetch_template_from_library, input['selected_template'])
+        when 'json'
+          call(:parse_template_json, input['template_json'])
+        when 'inline'
+          { 'body' => input['inline_template'] }
+        else
+          error("Unknown template mode: #{template_mode}")
+        end
+        
+        # Process the template with data
+        if template
+          template_prompt = call(:build_template_prompt, template, template_data, input['additional_context'])
+          
+          # Set contents with template-based prompt
+          contents = [
+            { 'role' => 'user', 'parts' => [{ 'text' => template_prompt }] }
+          ]
+          
+          # Set system instruction for template adherence (can be overridden below)
+          sys_inst = call(:system_instruction_from_text, 
+            input['system_preamble'].presence || 
+            "You are generating a professional response based on a template. Maintain the template structure while ensuring natural, professional language.")
+          
+          # Use generation config if provided, otherwise default
+          gen_cfg = call(:sanitize_generation_config, input['generation_config'])
+        end
+      end
+
+      # Process based on mode (only sets values if not already set by template)
       case mode
       when 'plain'
-        # no special tools
+        # Use template values if set, otherwise use normal contents
+        contents ||= call(:sanitize_contents!, input['contents'])
+        sys_inst ||= call(:system_instruction_from_text, input['system_preamble'])
+        gen_cfg  ||= call(:sanitize_generation_config, input['generation_config'])
+        # no special tools for plain mode
+        
       when 'grounded_google'
+        contents ||= call(:sanitize_contents!, input['contents'])
+        sys_inst ||= call(:system_instruction_from_text, input['system_preamble'])
+        gen_cfg  ||= call(:sanitize_generation_config, input['generation_config'])
         tools = [ { 'googleSearch' => {} } ]
+        
       when 'grounded_vertex'
+        contents ||= call(:sanitize_contents!, input['contents'])
+        sys_inst ||= call(:system_instruction_from_text, input['system_preamble'])
+        gen_cfg  ||= call(:sanitize_generation_config, input['generation_config'])
+        
         ds   = input['vertex_ai_search_datastore'].to_s
         scfg = input['vertex_ai_search_serving_config'].to_s
         error('Provide exactly one of vertex_ai_search_datastore OR vertex_ai_search_serving_config') \
           if (ds.blank? && scfg.blank?) || (ds.present? && scfg.present?)
-        vas = {}; vas['datastore'] = ds unless ds.blank?; vas['servingConfig'] = scfg unless scfg.blank?
+        vas = {}
+        vas['datastore'] = ds unless ds.blank?
+        vas['servingConfig'] = scfg unless scfg.blank?
         tools = [ { 'retrieval' => { 'vertexAiSearch' => vas } } ]
+        
       when 'grounded_rag_store'
+        contents ||= call(:sanitize_contents!, input['contents'])
+        sys_inst ||= call(:system_instruction_from_text, input['system_preamble'])
+        gen_cfg  ||= call(:sanitize_generation_config, input['generation_config'])
+        
         # Build the retrieval tool payload for Vertex RAG Store
         corpus = call(:normalize_rag_corpus, connection, input['rag_corpus'])
         error('rag_corpus is required for grounded_rag_store') if corpus.blank?
+        
         # Guards for unions
         call(:guard_threshold_union!, input['vector_distance_threshold'], input['vector_similarity_threshold'])
         call(:guard_ranker_union!, input['rank_service_model'], input['llm_ranker_model'])
 
         vr = { 'ragResources' => [ { 'ragCorpus' => corpus } ] }
+        
         # Optional knobs
         filt = {}
         if input['vector_distance_threshold'].present?
@@ -4984,18 +5316,21 @@ require 'securerandom'
         elsif input['vector_similarity_threshold'].present?
           filt['vectorSimilarityThreshold'] = call(:safe_float, input['vector_similarity_threshold'])
         end
+        
         rconf = {}
         if input['rank_service_model'].to_s.strip != ''
           rconf['rankService'] = { 'modelName' => input['rank_service_model'].to_s.strip }
         elsif input['llm_ranker_model'].to_s.strip != ''
           rconf['llmRanker']   = { 'modelName' => input['llm_ranker_model'].to_s.strip }
         end
+        
         retrieval_cfg = {}
         retrieval_cfg['similarityTopK'] = call(:clamp_int, (input['similarity_top_k'] || 0), 1, 200) if input['similarity_top_k'].present?
         retrieval_cfg['filter']  = filt unless filt.empty?
         retrieval_cfg['ranking'] = rconf unless rconf.empty?
 
         tools = [ { 'retrieval' => { 'vertexRagStore' => vr.merge( (retrieval_cfg.empty? ? {} : { 'ragRetrievalConfig' => retrieval_cfg }) ) } } ]
+        
       when 'rag_with_context'
         # Build RAG-lite prompt + JSON schema
         q        = input['question'].to_s
@@ -5014,8 +5349,10 @@ require 'securerandom'
         model_for_cnt = (input['count_tokens_model'].presence || input['model']).to_s
         strategy      = (input['trim_strategy'].presence || 'drop_low_score').to_s
 
-        base = []; base << items.shift if items.first && items.first['source']=='salience'
+        base = []
+        base << items.shift if items.first && items.first['source']=='salience'
         items = items.map { |c| c.merge('text'=>call(:truncate_chunk_text, c['text'], 800)) }
+        
         ordered = case strategy
                   when 'diverse_mmr'   then call(:mmr_diverse_order, items.sort_by { |c| [-(c['score']||0.0).to_f, c['id'].to_s] }, alpha: 0.7, per_source_cap: 3)
                   when 'drop_low_score' then items.sort_by { |c| [-(c['score']||0.0).to_f, c['id'].to_s] }
@@ -5025,9 +5362,10 @@ require 'securerandom'
         pool    = base + ordered
 
         sys_text = input['system_preamble'].presence ||
-          'Answer using ONLY the provided context chunks. If the context is insufficient, reply with “I don’t know.” Keep answers concise and cite chunk IDs.'
+          'Answer using ONLY the provided context chunks. If the context is insufficient, reply with "I don't know." Keep answers concise and cite chunk IDs.'
         kept    = call(:select_prefix_by_budget, connection, pool, q, sys_text, budget_prompt, model_for_cnt)
         blob    = call(:format_context_chunks, kept)
+        
         gen_cfg = {
           'temperature'      => (input['temperature'].present? ? call(:safe_float, input['temperature']) : 0),
           'maxOutputTokens'  => reserve_out,
@@ -5043,11 +5381,22 @@ require 'securerandom'
           }
         }
         sys_inst = call(:system_instruction_from_text, sys_text)
-        contents = [{ 'role'=>'user','parts'=>[{'text'=>"Question:\n#{q}\n\nContext:\n#{blob}"}]}]
+        
+        # For rag_with_context, override with template if provided
+        if input['use_response_template'] == true && contents
+          # Merge template prompt with RAG context
+          template_text = contents.dig(0, 'parts', 0, 'text')
+          merged_prompt = "#{template_text}\n\nQuestion:\n#{q}\n\nContext:\n#{blob}"
+          contents = [{ 'role'=>'user','parts'=>[{'text'=> merged_prompt}]}]
+        else
+          contents = [{ 'role'=>'user','parts'=>[{'text'=>"Question:\n#{q}\n\nContext:\n#{blob}"}]}]
+        end
+        
       else
         error("Unknown mode: #{mode}")
       end
 
+      # Build final payload
       payload = {
         'contents'          => contents,
         'systemInstruction' => sys_inst,
@@ -5057,29 +5406,47 @@ require 'securerandom'
         'generationConfig'  => gen_cfg
       }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
 
+      # Make the API call
       resp = post(url).headers(call(:request_headers_auth_1, connection, corr, connection['user_project'], req_params))
                       .payload(call(:json_compact, payload))
       code = call(:telemetry_success_code, resp)
 
+      # Process response
       out  = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+      
+      # Special handling for rag_with_context mode
       if mode == 'rag_with_context'
         text   = resp.dig('candidates',0,'content','parts',0,'text').to_s
         parsed = call(:safe_parse_json, text)
         out['parsed'] = { 'answer'=>parsed['answer'] || text, 'citations'=>parsed['citations'] || [] }
+        
         # Compute overall confidence from cited chunk scores, if available
         conf = call(:overall_confidence_from_citations, out['parsed']['citations'])
         out['confidence'] = conf if conf
-        (out['telemetry'] ||= {})['confidence'] = { 'basis' => 'citations_topk_avg', 'k' => 3,
-                                                    'n' => Array(out.dig('parsed','citations')).length }
+        (out['telemetry'] ||= {})['confidence'] = { 
+          'basis' => 'citations_topk_avg', 
+          'k' => 3,
+          'n' => Array(out.dig('parsed','citations')).length 
+        }
       end
+      
+      # Add template metadata if templates were used
+      if input['use_response_template'] == true
+        (out['telemetry'] ||= {})['template_mode'] = input['template_mode']
+        (out['telemetry'] ||= {})['template_used'] = input['selected_template'] if input['selected_template']
+      end
+      
       out
+      
     rescue => e
       g   = call(:extract_google_error, e)
       msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
       env = call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, e), msg)
+      
       if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
         env['debug'] = call(:debug_pack, true, url, payload, g)
       end
+      
       error(env)
     end,
     request_preview_pack: lambda do |url, verb, headers, payload|
