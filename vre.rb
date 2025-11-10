@@ -11,6 +11,7 @@ require 'securerandom'
   subtitle: 'RAG Engine',
   version: '1.0.0',
   description: 'RAG engine via service account (JWT)',
+  author: 'Emily Cabaniss',
   help: lambda do |input, picklist_label|
     {
       body: 'The Vertex AI RAG Engine is a component of the Vertex AI platform, which facilitates Retrieval-Augmented-Generation (RAG).' \
@@ -498,6 +499,1993 @@ require 'securerandom'
 
   # --------- ACTIONS ------------------------------------------------------
   actions: {
+    deterministic_filter: {
+      title: 'Filter: Deterministic (with intent)',
+      subtitle: 'Hard/soft rules + lightweight intent inference',
+      display_priority: 510,
+      help: lambda do |_|
+        { body: 'Runs hard/soft rules and infers coarse intent from headers/auth/keywords.' }
+      end,
+
+      config_fields: [
+        { name: 'show_advanced', label: 'Show advanced options',
+          type: 'boolean', control_type: 'checkbox',
+          default: false, sticky: true, extends_schema: true,
+          hint: 'Toggle to reveal advanced parameters.' }
+      ],
+      input_fields: lambda do |object_definitions, connection, config_fields|
+        call(:ui_df_inputs, object_definitions, config_fields) +
+          Array(object_definitions['observability_input_fields'])
+      end,
+      output_fields: lambda do |object_definitions, connection|
+        [
+          { name: 'pre_filter', type: 'object', properties: [
+              { name: 'hit', type: 'boolean' }, { name: 'action' }, { name: 'reason' },
+              { name: 'score', type: 'integer' }, { name: 'matched_signals', type: 'array', of: 'string' },
+              { name: 'decision' }
+          ]},
+          { name: 'intent', type: 'object', properties: Array(object_definitions['intent_out']) },
+          { name: 'email_text' },
+          { name: 'email_type' },
+          { name: 'gate', type: 'object', properties: [
+              { name: 'prelim_pass', type: 'boolean' }, { name: 'hard_block', type: 'boolean' },
+              { name: 'hard_reason' }, { name: 'soft_score', type: 'integer' }, { name: 'decision' }, { name: 'generator_hint' }
+            ]},
+          { name: 'complete_output', type: 'object', hint: 'All outputs consolidated for easy downstream use' },
+          { name: 'facets', type: 'object', optional: true, hint: 'Analytics facets when available' }
+        ] + Array(object_definitions['envelope_fields'])
+      end,
+
+      execute: lambda do |connection, input|
+        ctx = call(:step_begin!, :deterministic_filter, input)
+
+        env = call(:norm_email_envelope!, (input['email'] || input))
+        subj, body, email_text = env['subject'], env['body'], env['email_text']
+        #subj = (input['subject'] || '').to_s.strip
+        #body = (input['body']    || '').to_s.strip
+        #error('Provide subject and/or body') if subj.empty? && body.empty?
+        #email_text = call(:build_email_text, subj, body)
+
+        # Build/choose rulepack
+        rules =
+          if input['rules_mode'] == 'json' && input['rules_json'].present?
+            call(:safe_json, input['rules_json'])
+          elsif input['rules_mode'] == 'rows' && Array(input['rules_rows']).any?
+            call(:hr_compile_rulepack_from_rows!, input['rules_rows'])
+          else
+            nil
+          end
+
+        pre = { 'hit' => false }
+        email_type = 'direct_request'
+        hard_block = false
+        hard_reason = nil
+        if rules.is_a?(Hash)
+          hard = call(:hr_eval_hard?, {
+            'subject'=>subj, 'body'=>body, 'from'=>env['from'],
+            'headers'=>env['headers'], 'attachments'=>env['attachments'], 'auth'=>env['auth']
+          }, (rules['hard_exclude'] || {}))
+
+          if hard[:hit]
+            hard_reason = hard[:reason] # e.g., forwarded_chain | internal_discussion | mailing_list | bounce | safety_block
+            # Map hard reasons to a deterministic decision and email_type
+            decision_map = {
+              'forwarded_chain'     => 'REVIEW',
+              'internal_discussion' => 'REVIEW',
+              'mailing_list'        => 'IRRELEVANT',
+              'bounce'              => 'IRRELEVANT',
+              'safety_block'        => 'REVIEW'
+            }
+            email_type = 'forwarded_chain'     if hard_reason == 'forwarded_chain'
+            email_type = 'internal_discussion' if hard_reason == 'internal_discussion'
+            hard_block = %w[forwarded_chain internal_discussion safety_block mailing_list bounce].include?(hard_reason)
+            dec = (decision_map[hard_reason] || 'IRRELEVANT')
+            gate = { 'prelim_pass'=>false, 'hard_block'=>hard_block, 'hard_reason'=>hard_reason, 'soft_score'=>0, 'decision'=>dec, 'generator_hint'=>'blocked' }
+            out = {
+              'pre_filter' => hard.merge({ 'decision' => dec }),
+              'intent'     => nil,
+              'email_text' => email_text,
+              'email_type' => email_type,
+              'gate'       => gate
+            }
+            # Compute facets
+            return call(:step_ok!, ctx, out, 200, 'OK', { 
+              'decision_path' => 'hard_exit',
+              'final_decision' => dec,
+              'hard_rule_triggered' => hard[:reason],
+              'rules_evaluated' => true,
+              'intent_label' => 'none',
+              'email_length' => email_text.length
+            })
+          end
+
+          soft = call(:hr_eval_soft, {
+            'subject'=>subj, 'body'=>body, 'from'=>env['from'],
+            'headers'=>env['headers'], 'attachments'=>env['attachments']
+          }, (rules['soft_signals'] || []))
+          decision = call(:hr_eval_decide, soft[:score], (rules['thresholds'] || {}))
+          pre = { 'hit'=>false, 'score'=>soft[:score], 'matched_signals'=>soft[:matched], 'decision'=>decision }
+        end
+
+        # Lightweight intent (deterministic)
+        headers = (env['headers'] || {}).transform_keys(&:to_s)
+        s = "#{subj}\n\n#{body}".downcase
+        intent = { 'label' => 'unknown', 'confidence' => 0.0, 'basis' => 'deterministic' }
+        if headers['auto-submitted'].to_s.downcase != '' && headers['auto-submitted'].to_s.downcase != 'no'
+          intent = { 'label'=>'auto_reply','confidence'=>0.95,'basis'=>'header:auto-submitted' }
+        elsif headers.key?('x-autoreply') || s =~ /(out of office|auto.?reply|automatic reply)/
+          intent = { 'label'=>'auto_reply','confidence'=>0.9,'basis'=>'header/subject' }
+        elsif headers.key?('list-unsubscribe') || headers.key?('list-id') || headers['precedence'].to_s =~ /(bulk|list)/i
+          intent = { 'label'=>'marketing','confidence'=>0.8,'basis'=>'list-headers' }
+        elsif s =~ /(invoice|receipt|order\s?#|shipment|ticket\s?#)/i
+          intent = { 'label'=>'transactional','confidence'=>0.7,'basis'=>'keywords' }
+        end
+
+        # Preliminary generator gate (upstream of policy): block if any hard_block; require direct_request; disallow IRRELEVANT
+        prelim_pass = (!hard_block) && (email_type == 'direct_request') && (pre['decision'] != 'IRRELEVANT')
+        gate = {
+          'prelim_pass'    => prelim_pass,
+          'hard_block'     => hard_block,
+          'hard_reason'    => hard_reason,
+          'soft_score'     => pre['score'] || 0,
+          'decision'       => pre['decision'],
+          'generator_hint' => (prelim_pass ? 'pass' : 'blocked')
+        }
+
+        # Standard outputs
+        out = {
+          'pre_filter' => pre,
+          'intent'     => intent,
+          'email_text' => email_text,
+          'email_type' => email_type,
+          'gate'       => gate
+        }
+        # Compute facets
+        call(:step_ok!, ctx, out, 200, 'OK', { 
+          'decision_path' => 'soft_eval',
+          'final_decision' => pre['decision'],
+          'intent_label' => intent['label'],
+          'intent_confidence' => intent['confidence'],
+          'intent_basis' => intent['basis'],
+          'soft_score' => pre['score'] || 0,
+          'signals_matched' => (pre['matched_signals'] || []).length,
+          'rules_evaluated' => rules.is_a?(Hash),
+          'hard_rules_count' => rules.is_a?(Hash) ? (rules['hard_exclude'] || {}).values.flatten.length : 0,
+          'soft_signals_count' => rules.is_a?(Hash) ? (rules['soft_signals'] || []).length : 0,
+          'has_attachments' => env['attachments'].present? && env['attachments'].any?,
+          'email_length' => email_text.length,
+          'special_headers' => headers.keys.any? { |k| k.match(/^(x-|list-|auto-|precedence)/i) },
+          'email_type' => email_type,
+          'generator_hint' => gate['generator_hint']
+        })
+      end,
+      sample_output: lambda do
+        call(:sample_deterministic_filter)
+      end
+    },
+    ai_policy_filter: {
+      title: 'Filter: AI policy',
+      subtitle: 'Fuzzy triage via LLM under a strict JSON schema',
+      display_priority: 501,
+      help: lambda do |_|
+        { body: 'Constrained LLM decides IRRELEVANT/REVIEW/KEEP. Short-circuits only if confident.' }
+      end,
+
+      config_fields: [
+        { name: 'show_advanced', label: 'Show advanced options',
+          type: 'boolean', control_type: 'checkbox',
+          default: false, sticky: true, extends_schema: true,
+          hint: 'Toggle to reveal advanced parameters.' }
+      ],
+      input_fields: lambda do |object_definitions, connection, config_fields|
+        call(:ui_policy_inputs, object_definitions, config_fields) +
+          Array(object_definitions['observability_input_fields'])
+      end,
+      output_fields: lambda do |object_definitions, connection|
+        [
+          { name: 'policy', type: 'object', properties: Array(object_definitions['policy_out']) },
+          { name: 'short_circuit', type: 'boolean' },
+          { name: 'email_type' },
+          { name: 'generator_gate', type: 'object', properties: [
+              { name: 'pass_to_responder', type: 'boolean' }, { name: 'reason' }, { name: 'generator_hint' }
+            ]},
+          { name: 'complete_output', type: 'object', hint: 'All outputs consolidated for easy downstream use' },
+          { name: 'facets', type: 'object', optional: true, hint: 'Analytics facets when available' }
+        ] + Array(object_definitions['envelope_fields'])
+      end,
+      execute: lambda do |connection, input|
+        ctx = call(:step_begin!, :ai_policy_filter, input)
+        
+        # Build model path
+        model_path = call(:build_model_path_with_global_preview, connection, (input['model'] || 'gemini-2.0-flash'))
+        loc = (model_path[/\/locations\/([^\/]+)/,1] || (connection['location'].presence || 'global')).to_s.downcase
+        url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
+        req_params = "model=#{model_path}"
+
+        # Parse policy specification and extract schema if present
+        policy_spec = nil
+        output_format = nil
+        
+        if input['policy_mode'].to_s == 'json' && input['policy_json'].present?
+          parsed_policy = call(:safe_json_obj!, input['policy_json'])
+          
+          # Handle both direct policy spec and nested policy_config
+          if parsed_policy['policy_config'].is_a?(Hash)
+            policy_spec = parsed_policy['policy_config']
+            output_format = policy_spec['output_format']
+          else
+            policy_spec = parsed_policy
+            output_format = parsed_policy['output_format']
+          end
+        end
+
+        # Build LLM configuration from schema if available
+        llm_config = output_format ? call(:build_llm_config_from_schema, output_format) : {}
+        
+        # Build system text - combine base instructions with schema instructions
+        system_text = <<~SYS
+          You are a strict email policy triage. Output JSON only.
+          decision ∈ {IRRELEVANT, REVIEW, KEEP}. confidence ∈ [0,1].
+          matched_signals is a short list of strings; reasons ≤ 2 brief strings.
+        SYS
+        
+        # Add schema-specific instructions if available
+        if output_format && output_format['instructions']
+          system_text += "\n\n#{output_format['instructions']}"
+        end
+        
+        # Add example if provided by schema
+        if llm_config['prompt_addition']
+          system_text += llm_config['prompt_addition']
+        end
+        
+        # Add policy spec to system text if present
+        if policy_spec
+          system_text += "\n\nPolicy spec JSON:\n#{call(:json_compact, policy_spec)}"
+        end
+
+        # Build generation config - use schema-derived or fallback to default
+        if llm_config['response_schema']
+          gen_config = {
+            'temperature' => 0,
+            'maxOutputTokens' => 256,
+            'responseMimeType' => 'application/json',
+            'responseSchema' => llm_config['response_schema']
+          }
+        else
+          # Fallback to original hardcoded schema
+          gen_config = {
+            'temperature' => 0, 
+            'maxOutputTokens' => 256,
+            'responseMimeType' => 'application/json',
+            'responseSchema' => {
+              'type' => 'object',
+              'additionalProperties' => false,
+              'properties' => {
+                'decision' => {'type' => 'string'},
+                'confidence' => {'type' => 'number'},
+                'matched_signals' => {'type' => 'array','items' => {'type' => 'string'}},
+                'reasons' => {'type' => 'array','items' => {'type' => 'string'}}
+              }, 
+              'required' => ['decision']
+            }
+          }
+        end
+
+        # Build the request payload
+        payload = {
+          'systemInstruction' => { 'role' => 'system','parts' => [{'text' => system_text}] },
+          'contents' => [ { 'role' => 'user', 'parts' => [ { 'text' => "Email:\n#{input['email_text']}" } ] } ],
+          'generationConfig' => gen_config
+        }
+
+        # Make the API request
+        resp = post(url).headers(call(:request_headers_auth, connection, ctx['cid'], connection['user_project'], req_params))
+                        .payload(call(:json_compact, payload))
+        
+        # Extract and parse the response
+        text = resp.dig('candidates',0,'content','parts',0,'text').to_s
+        policy = call(:safe_parse_json, text)
+        
+        # Validate and correct response against schema if available
+        if output_format
+          policy = call(:validate_against_schema, policy, output_format, true)
+        end
+        
+        # Ensure decision is valid (original logic preserved)
+        if !['IRRELEVANT', 'REVIEW', 'KEEP'].include?(policy['decision'])
+          policy['decision'] = 'REVIEW'  # Safe default
+        end
+        
+        # Calculate short circuit (original logic preserved)
+        short_circuit = (policy['decision'] == 'IRRELEVANT' && 
+                        policy['confidence'].to_f >= (input['confidence_short_circuit'] || 0.8).to_f)
+
+        # Generator gate logic (original logic preserved)
+        email_type = (input['email_type'].presence || 'direct_request')
+        min_conf = (input['min_confidence_for_generation'].presence || 0.60).to_f
+        decision = policy['decision'].to_s.upcase
+        conf = policy['confidence'].to_f
+        
+        block_reasons = []
+        block_reasons << 'non_direct_request' if email_type != 'direct_request'
+        block_reasons << 'policy_irrelevant' if decision == 'IRRELEVANT'
+        block_reasons << 'low_confidence' if conf < min_conf
+        
+        pass_to_responder = block_reasons.empty?
+        generator_hint = pass_to_responder ? 'pass' : 'blocked'
+
+        # Build output (original structure preserved)
+        out = {
+          'policy' => policy,
+          'short_circuit' => short_circuit,
+          'email_type' => email_type,
+          'generator_gate' => {
+            'pass_to_responder' => pass_to_responder,
+            'reason' => (block_reasons.any? ? block_reasons.join(',') : 'meets_minimums'),
+            'generator_hint' => generator_hint
+          }
+        }
+        
+        # Build facets and complete output (original logic preserved)
+        call(:step_ok!, ctx, out, call(:telemetry_success_code, resp), 'OK', {
+          'decision' => policy['decision'],
+          'confidence' => policy['confidence'],
+          'short_circuit' => short_circuit,
+          'email_type' => email_type,
+          'generator_hint' => generator_hint,
+          'signals_count' => (policy['matched_signals'] || []).length,
+          'reasons_count' => (policy['reasons'] || []).length,
+          'model_used' => input['model'] || 'gemini-2.0-flash',
+          'policy_mode' => input['policy_mode'] || 'none',
+          'schema_enhanced' => output_format.present?  # New facet to track schema usage
+        })
+        
+      rescue => e
+        call(:step_err!, ctx, e)
+      end,
+      sample_output: lambda do
+        call(:sample_ai_policy_filter)
+      end
+    },
+    embed_text_against_categories: {
+      title: 'Categorize: Embed email vs categories',
+      subtitle: 'Cosine similarity → scores + shortlist',
+      display_priority: 499,
+      help: lambda do |_|
+        { body: 'Embeds email and categories, returns similarity scores and a top-K shortlist.' }
+      end,
+
+      config_fields: [
+        { name: 'show_advanced', label: 'Show advanced options',
+          type: 'boolean', control_type: 'checkbox',
+          default: false, sticky: true, extends_schema: true,
+          hint: 'Toggle to reveal advanced parameters.' }
+      ],
+      input_fields: lambda do |object_definitions, connection, config_fields|
+        call(:ui_embed_inputs, object_definitions, config_fields) +
+          Array(object_definitions['observability_input_fields'])
+      end,
+      output_fields: lambda do |object_definitions, _conn|
+        [
+          { name: 'scores', type: 'array', of: 'object', properties: [
+              { name: 'category' }, { name: 'score', type: 'number' }, { name: 'cosine', type: 'number' }
+          ]},
+          { name: 'shortlist', type: 'array', of: 'string' },
+          { name: 'complete_output', type: 'object', hint: 'All outputs consolidated for easy downstream use' },
+          { name: 'facets', type: 'object', optional: true, hint: 'Analytics facets when available' }
+        ] + Array(object_definitions['envelope_fields'])
+      end,
+
+      execute: lambda do |connection, input|
+        ctx = call(:step_begin!, :embed_text_against_categories, input)
+        # Select categories source (array vs JSON)
+        cats_raw =
+          if input['categories_mode'].to_s == 'json' && input['categories_json'].present?
+            call(:safe_json_arr!, input['categories_json'])
+          else
+            input['categories']
+          end
+        cats = call(:norm_categories!, cats_raw)
+
+        emb_model      = (input['embedding_model'].presence || 'text-embedding-005')
+        model_path     = call(:build_embedding_model_path, connection, emb_model)
+
+        email_inst = { 'content'=>input['email_text'].to_s, 'task_type'=>'RETRIEVAL_QUERY' }
+        cat_insts  = cats.map do |c|
+          { 'content'=>[c['name'], c['description'], *call(:safe_array,c['examples'])].compact.join("\n"),
+            'task_type'=>'RETRIEVAL_DOCUMENT' }
+        end
+
+        emb_resp = call(:predict_embeddings, connection, model_path, [email_inst] + cat_insts, {}, ctx['cid'])
+        preds    = call(:safe_array, emb_resp && emb_resp['predictions'])
+        error('Embedding model returned no predictions') if preds.empty?
+
+        email_vec = call(:extract_embedding_vector, preds.first)
+        cat_vecs  = preds.drop(1).map { |p| call(:extract_embedding_vector, p) }
+        sims = cat_vecs.each_with_index.map { |v, i| [i, call(:vector_cosine_similarity, email_vec, v)] }
+        sims.sort_by! { |(_i, s)| -s }
+
+        scores = sims.map { |(i,s)| { 'category'=>cats[i]['name'], 'score'=>(((s+1.0)/2.0).round(6)), 'cosine'=>s.round(6) } }
+        k = [[(input['shortlist_k'] || 3).to_i, 1].max, cats.length].min
+        shortlist = scores.first(k).map { |h| h['category'] }
+
+        out = { 'scores'=>scores, 'shortlist'=>shortlist }
+        call(:step_ok!, ctx, out, 200, 'OK', { 
+          'k' => k,
+          'categories_count' => cats.length,
+          'shortlist_k' => k,
+          'top_score' => scores.first ? scores.first['score'] : 0,
+          'embedding_model' => emb_model,
+          'categories_mode' => input['categories_mode'] || 'array'
+        })
+
+      end,
+      sample_output: lambda do
+        call(:sample_embed_text_against_categories)
+      end
+    },
+    rerank_shortlist: {
+      title: 'Categorize: Re-rank shortlist',
+      subtitle: 'Optional LLM listwise re-ordering of categories',
+      display_priority: 498,
+      help: lambda do |_|
+        { body: 'Uses LLM to produce a probability distribution over the shortlist and re-orders it.' }
+      end,
+
+      config_fields: [
+        { name: 'show_advanced', label: 'Show advanced options',
+          type: 'boolean', control_type: 'checkbox',
+          default: false, sticky: true, extends_schema: true,
+          hint: 'Toggle to reveal advanced parameters.' }
+      ],  
+      input_fields: lambda do |object_definitions, connection, config_fields|
+        call(:ui_rerank_inputs, object_definitions, config_fields) +
+          Array(object_definitions['observability_input_fields'])
+      end,
+      output_fields: lambda do |object_definitions, connection|
+        [
+          { name: 'ranking', type: 'array', of: 'object', properties: [
+              { name: 'category' }, { name: 'prob', type: 'number' }
+          ]},
+          { name: 'shortlist', type: 'array', of: 'string' },
+          { name: 'complete_output', type: 'object', hint: 'All outputs consolidated for easy downstream use' },
+          { name: 'facets', type: 'object', optional: true, hint: 'Analytics facets when available' }
+        ] + Array(object_definitions['envelope_fields'])
+      end,
+
+      execute: lambda do |connection, input|
+        ctx = call(:step_begin!, :rerank_shortlist, input)
+        mode = (input['mode'] || 'none').to_s
+
+        if mode == 'none'
+          sl = call(:safe_array, input['shortlist'])
+          ranking = sl.map { |c| { 'category'=>c, 'prob'=>nil } }
+          out = { 'ranking'=>ranking, 'shortlist'=>sl }
+          return call(:step_ok!, ctx, out, 200, 'OK', { 
+            'mode' => 'none',
+            'categories_ranked' => sl.length
+          })
+        end
+
+        # LLM listwise: reuse referee to get distribution over shortlist
+        cats_raw =
+          if input['categories_mode'].to_s == 'json' && input['categories_json'].present?
+            call(:safe_json_arr!, input['categories_json'])
+          else
+            input['categories']
+          end
+        cats = call(:norm_categories!, cats_raw)
+        ref  = call(:llm_referee, connection, (input['generative_model'] || 'gemini-2.0-flash'),
+                    input['email_text'], call(:safe_array, input['shortlist']), cats, nil, ctx['cid'], nil)
+        dist = call(:safe_array, ref['distribution']).map { |d| { 'category'=>d['category'], 'prob'=>d['prob'].to_f } }
+        # Ensure all shortlist items present
+        missing = call(:safe_array, input['shortlist']) - dist.map { |d| d['category'] }
+        dist.concat(missing.map { |m| { 'category'=>m, 'prob'=>0.0 } })
+        ranking = dist.sort_by { |h| -h['prob'].to_f }
+        out = { 'ranking'=>ranking, 'shortlist'=>ranking.map { |r| r['category'] } }
+        call(:step_ok!, ctx, out, 200, 'OK', { 
+          'mode' => 'llm',
+          'top_prob' => ranking.first ? ranking.first['prob'] : 0,
+          'categories_ranked' => ranking.length,
+          'generative_model' => input['generative_model'] || 'gemini-2.0-flash',
+          'categories_mode' => input['categories_mode'] || 'array'
+        })
+      end,
+      sample_output: lambda do
+        call(:sample_rerank_shortlist)
+      end
+    },
+    rag_retrieve_contexts_enhanced: {
+      title: 'RAG: Retrieve contexts (enhanced)',
+      subtitle: 'projects.locations:retrieveContexts (Vertex RAG Engine, v1)',
+      display_priority: 489,
+      retry_on_response: [408, 429, 500, 502, 503, 504],
+      max_retries: 3,
+      
+      config_fields: [
+        { name: 'show_advanced', label: 'Show advanced options',
+          type: 'boolean', control_type: 'checkbox',
+          default: false, sticky: true, extends_schema: true,
+          hint: 'Toggle to reveal threshold/ranker controls.' }
+      ],    
+      input_fields: lambda do |od, connection, cfg|
+        show_adv = (cfg['show_advanced'] == true)
+        
+        base = [
+          { name: 'query_text', label: 'Query text', optional: false },
+          { name: 'rag_corpus', optional: true,
+            hint: 'Full or short ID. Example: my-corpus. Will auto-expand using connection project/location.' },
+          { name: 'rag_file_ids', type: 'array', of: 'string', optional: true,
+            hint: 'Optional: limit to these file IDs (must belong to the same corpus).' },
+          { name: 'top_k', type: 'integer', optional: true, default: 20, hint: 'Max contexts to return.' },
+          { name: 'correlation_id', optional: true, hint: 'For tracking related requests.' },
+          { name: 'sanitize_pdf_content', 
+            type: 'boolean', 
+            control_type: 'checkbox',
+            default: true,
+            hint: 'Clean PDF extraction artifacts when detected (recommended)' },
+          { name: 'on_error_behavior', 
+            control_type: 'select',
+            pick_list: [
+              ['Skip failed contexts', 'skip'],
+              ['Include error placeholders', 'include'],
+              ['Fail entire request', 'fail']
+            ],
+            default: 'skip',
+            hint: 'How to handle individual context processing errors' }
+        ]
+        
+        adv = [
+          { name: 'vector_distance_threshold', type: 'number', optional: true,
+            hint: 'Return contexts with distance ≤ threshold. For COSINE, lower is better.' },
+          { name: 'vector_similarity_threshold', type: 'number', optional: true,
+            hint: 'Return contexts with similarity ≥ threshold. Do NOT set both thresholds.' },
+          { name: 'rank_service_model', optional: true,
+            hint: 'Vertex Ranking model, e.g. semantic-ranker-512@latest.' },
+          { name: 'llm_ranker_model', optional: true,
+            hint: 'LLM ranker, e.g. gemini-2.5-flash.' }
+        ]
+        
+        show_adv ? (base + adv) : base
+      end,
+      output_fields: lambda do |object_definitions, connection|
+        [
+          { name: 'question' },
+          { name: 'contexts', type: 'array', of: 'object', properties: [
+              { name: 'id' },
+              { name: 'text' },
+              { name: 'score', type: 'number' },
+              { name: 'source' },
+              { name: 'uri' },
+              { name: 'metadata', type: 'object' },
+              { name: 'metadata_kv', type: 'array', of: 'object' },
+              { name: 'metadata_json' },
+              { name: 'is_pdf', type: 'boolean' },
+              { name: 'processing_error', type: 'boolean' }
+            ]
+          },
+          { name: 'ok', type: 'boolean' },
+          { name: 'telemetry', type: 'object', properties: [
+              { name: 'http_status', type: 'integer' },
+              { name: 'message' },
+              { name: 'duration_ms', type: 'integer' },
+              { name: 'correlation_id' },
+              { name: 'success_count', type: 'integer' },
+              { name: 'error_count', type: 'integer' },
+              { name: 'partial_failure', type: 'boolean' },
+              { name: 'local_logs', type: 'array', of: 'object', optional: true }
+            ]}
+        ]
+      end,
+      execute: lambda do |connection, input|
+        # Initialize tracking context
+        ctx = call(:step_begin!, :rag_retrieve_contexts_enhanced, input)
+        
+        begin
+          # Extract project/location from connection
+          sa_key = JSON.parse(connection['service_account_key_json'] || '{}') rescue {}
+          project = connection['project_id'] || sa_key['project_id']
+          location = connection['location'] || 'us-central1'
+          
+          error('Project is required') if project.nil? || project.empty?
+          error('Location is required') if location.nil? || location.empty?
+          error('Location cannot be global for RAG retrieval') if location.downcase == 'global'
+          
+          # Build corpus path
+          corpus = input['rag_corpus'].to_s.strip
+          if corpus.present? && !corpus.start_with?('projects/')
+            corpus = "projects/#{project}/locations/#{location}/ragCorpora/#{corpus}"
+          end
+          
+          # Validate threshold parameters
+          if input['vector_distance_threshold'].present? && input['vector_similarity_threshold'].present?
+            error('Set ONLY one of: vector_distance_threshold OR vector_similarity_threshold.')
+          end
+          if input['rank_service_model'].present? && input['llm_ranker_model'].present?
+            error('Choose ONE ranker: rank_service_model OR llm_ranker_model.')
+          end
+          
+          # Build ragResources
+          rag_resources = {}
+          rag_resources['ragCorpus'] = corpus if corpus.present?
+          file_ids = Array(input['rag_file_ids']).map(&:to_s).map(&:strip).reject(&:empty?)
+          rag_resources['ragFileIds'] = file_ids if file_ids.any?
+          
+          error('Provide rag_corpus and/or rag_file_ids') if rag_resources.empty?
+          
+          # Build retrieval config
+          retrieval_cfg = { 'topK' => (input['top_k'] || 20).to_i }
+          
+          # Add filter if specified
+          if input['vector_distance_threshold'].present?
+            retrieval_cfg['filter'] = { 'vectorDistanceThreshold' => input['vector_distance_threshold'].to_f }
+          elsif input['vector_similarity_threshold'].present?
+            retrieval_cfg['filter'] = { 'vectorSimilarityThreshold' => input['vector_similarity_threshold'].to_f }
+          end
+          
+          # Add ranking if specified
+          if input['rank_service_model'].present?
+            retrieval_cfg['ranking'] = { 'rankService' => { 'modelName' => input['rank_service_model'] } }
+          elsif input['llm_ranker_model'].present?
+            retrieval_cfg['ranking'] = { 'llmRanker' => { 'modelName' => input['llm_ranker_model'] } }
+          end
+          
+          # Build request
+          url = "https://#{location}-aiplatform.googleapis.com/v1/projects/#{project}/locations/#{location}:retrieveContexts"
+          
+          body = {
+            'query' => {
+              'text' => input['query_text'],
+              'ragRetrievalConfig' => retrieval_cfg
+            },
+            'vertexRagStore' => {
+              'ragResources' => [rag_resources]
+            }
+          }
+          
+          headers = {
+            'Authorization' => "Bearer #{connection['access_token']}",
+            'Content-Type' => 'application/json',
+            'X-Correlation-Id' => ctx['cid'],
+            'x-goog-request-params' => "parent=projects/#{project}/locations/#{location}"
+          }
+          
+          # Make request with error handling
+          response = begin
+            post(url).headers(headers).payload(body)
+          rescue => e
+            if e.message.include?('timeout') || e.message.include?('connection')
+              # Return empty but valid response for network issues
+              {
+                'contexts' => { 'contexts' => [] },
+                '_network_error' => "Network error: #{e.message[0..200]}"
+              }
+            else
+              raise e  # Re-raise non-network errors
+            end
+          end
+          
+          # Extract and map contexts with graceful failure
+          contexts = []
+          #raw_contexts = call(:safe_extract_contexts, response)
+          raw_contexts = if response && response['contexts'] && response['contexts']['contexts']
+            response['contexts']['contexts']
+          else
+            []
+          end
+          
+          if raw_contexts.empty? && !response['_network_error']
+            # Add informational context for empty responses
+            contexts << {
+              'id' => 'no-results',
+              'text' => 'No contexts were returned for this query.',
+              'score' => 0.0,
+              'source' => 'system',
+              'uri' => nil,
+              'metadata' => { 'info' => 'empty_response' },
+              'metadata_kv' => [{ 'key' => 'info', 'value' => 'empty_response' }],
+              'metadata_json' => '{"info":"empty_response"}',
+              'is_pdf' => false,
+              'processing_error' => false
+            }
+          else
+            raw_contexts.each_with_index do |ctx_item, idx|
+              begin
+                # Extract metadata
+                md = ctx_item['metadata'] || {}
+                
+                # Get source URI for PDF detection
+                source_uri = ctx_item['sourceUri'] || ctx_item['uri']
+                
+                # DEBUGGING: Log what we're seeing
+                is_pdf = call(:is_pdf_source?, source_uri, md)
+                sanitize_enabled = input['sanitize_pdf_content'] != false
+                
+                # Extract text
+                raw_text = (ctx_item['text'] || ctx_item.dig('chunk', 'text') || '').to_s
+                
+                # DEBUGGING: Check for PDF indicators
+                has_double_escapes = raw_text.include?('\\\\n') || raw_text.include?('\\\\t')
+                
+                # Log for debugging (remove after fixing)
+                if has_double_escapes || is_pdf
+                  puts "DEBUG Context #{idx}: is_pdf=#{is_pdf}, sanitize=#{sanitize_enabled}, has_escapes=#{has_double_escapes}, uri=#{source_uri}"
+                end
+                
+                # Apply PDF-specific cleaning based on preference and detection
+                text = if sanitize_enabled && is_pdf
+                  puts "DEBUG: Sanitizing PDF context #{idx}"
+                  call(:sanitize_pdf_text, raw_text)
+                elsif has_double_escapes && sanitize_enabled
+                  # FALLBACK: Even if not detected as PDF, clean obvious PDF artifacts
+                  puts "DEBUG: Cleaning escaped content in context #{idx}"
+                  call(:sanitize_pdf_text, raw_text)
+                else
+                  # Regular cleaning for non-PDF content
+                  raw_text.encode('UTF-8', invalid: :replace, undef: :replace, replace: ' ')
+                          .gsub(/\s+/, ' ')
+                          .strip
+                end
+                
+                # Try JSON serialization with fallback
+                metadata_json = begin
+                  md.empty? ? nil : md.to_json
+                rescue => json_err
+                  { error: 'metadata_serialization_failed', keys: md.keys.take(10) }.to_json
+                end
+                
+                contexts << {
+                  'id' => ctx_item['chunkId'] || ctx_item['id'] || "ctx-#{idx + 1}",
+                  'text' => text,
+                  'score' => (ctx_item['score'] || ctx_item['relevanceScore'] || 0.0).to_f,
+                  'source' => ctx_item['sourceDisplayName'] || source_uri&.split('/')&.last,
+                  'uri' => source_uri,
+                  'metadata' => md,
+                  'metadata_kv' => md.map { |k, v| { 'key' => k.to_s, 'value' => v.to_s[0..1000] } }, # Limit value size
+                  'metadata_json' => metadata_json,
+                  'is_pdf' => call(:is_pdf_source?, source_uri, md),
+                  'processing_error' => false
+                }
+                
+              rescue => e
+                # Handle individual context errors based on configuration
+                case input['on_error_behavior']
+                when 'fail'
+                  raise e  # Re-raise to fail entire action
+                when 'include'
+                  # Add error placeholder context
+                  contexts << {
+                    'id' => "ctx-#{idx + 1}-error",
+                    'text' => "[Error processing context: #{e.message[0..200]}]",
+                    'score' => 0.0,
+                    'source' => 'error',
+                    'uri' => nil,
+                    'metadata' => { 
+                      'error' => e.message[0..500], 
+                      'error_class' => e.class.name,
+                      'original_id' => ctx_item['chunkId'] || ctx_item['id'] 
+                    },
+                    'metadata_kv' => [
+                      { 'key' => 'error', 'value' => e.message[0..500] },
+                      { 'key' => 'error_class', 'value' => e.class.name }
+                    ],
+                    'metadata_json' => nil,
+                    'is_pdf' => false,
+                    'processing_error' => true
+                  }
+                when 'skip', nil
+                  # Skip this context, continue processing
+                  next
+                end
+              end
+            end
+          end
+          
+          # Calculate success metrics
+          error_count = contexts.count { |c| c['processing_error'] == true }
+          pdf_count = contexts.count { |c| c['is_pdf'] && !c['processing_error'] }
+          success_count = contexts.count { |c| !c['processing_error'] }
+          
+          # Build output
+          out = {
+            'question' => input['query_text'],
+            'contexts' => contexts
+          }
+          
+          # Add telemetry with success tracking
+          extras = {
+            'retrieval' => {
+              'top_k' => retrieval_cfg['topK'],
+              'filter' => retrieval_cfg['filter'] ? {
+                'type' => retrieval_cfg['filter'].keys.first.to_s.sub('vector', '').sub('Threshold', ''),
+                'value' => retrieval_cfg['filter'].values.first
+              } : nil,
+              'contexts_count' => contexts.length,
+              'success_count' => success_count,
+              'error_count' => error_count,
+              'pdf_contexts_count' => pdf_count,
+              'partial_failure' => error_count > 0
+            }.compact,
+            'rank' => retrieval_cfg['ranking'] ? {
+              'mode' => retrieval_cfg['ranking'].keys.first,
+              'model' => retrieval_cfg['ranking'].values.first['modelName']
+            } : nil,
+            'network_error' => response['_network_error']
+          }.compact
+          
+          # Build appropriate message
+          message = if response['_network_error']
+            "Retrieved #{contexts.length} contexts (network issues detected)"
+          elsif error_count > 0
+            "Retrieved #{success_count} contexts (#{error_count} failed)"
+          else
+            "Retrieved #{contexts.length} contexts"
+          end
+          
+          # Return success with telemetry
+          call(:step_ok!, ctx, out, 200, message, extras)
+          
+        rescue => e
+          # Handle errors with telemetry
+          call(:step_err!, ctx, e)
+        end
+      end,
+      sample_output: lambda do
+        call(:sample_rag_retrieve_contexts_enhanced)
+      end,
+    },
+    rank_texts_with_ranking_api: {
+      title: 'Rerank contexts',
+      subtitle: 'projects.locations.rankingConfigs:rank',
+      description: '',
+      help: lambda do |input, picklist_label|
+        {
+          body: 'Rerank retrieved contexts for a query within a known category using LLM-based ranking with category awareness.',
+          learn_more_url: 'https://cloud.google.com/vertex-ai/generative-ai/docs/rag-engine/retrieval-and-ranking',
+          learn_more_text: 'Check out Google docs for retrieval and ranking'
+        }
+      end,
+      display_priority: 488,
+      retry_on_request: ['GET','HEAD'],
+      retry_on_response: [408,429,500,502,503,504],
+      max_retries: 3,
+
+      input_fields: lambda do |_object_definitions, _connection, _config_fields|
+        [
+          { name: 'query_text', optional: false, hint: 'The user query to rank contexts against' },
+          { name: 'records', type: 'array', of: 'object', optional: false, properties: [
+              { name: 'id', optional: false }, 
+              { name: 'content', optional: false }, 
+              { name: 'metadata', type: 'object' }
+            ], hint: 'Retrieved contexts to rank (id + content required)' },
+          { name: 'category', optional: true, 
+            hint: 'Pre-determined category (e.g., PTO, Billing, Support) to inform ranking' },
+          { name: 'category_context', optional: true,
+            hint: 'Additional context about the category to guide ranking (description, scope, etc.)' },
+          { name: 'include_category_in_query', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+            hint: 'Include category context in ranking query for better relevance' },
+          { name: 'correlation_id', label: 'Correlation ID', optional: true, 
+            hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
+          
+          # LLM ranking options (no longer conditional)
+          { name: 'llm_model', optional: true, default: 'gemini-2.0-flash',
+            hint: 'LLM model for semantic ranking' },
+          { name: 'top_n', type: 'integer', optional: true, hint: 'Max contexts to return (default: all)' },
+          
+          # Advanced options toggle
+          { name: 'show_advanced', label: 'Show advanced options', type: 'boolean', control_type: 'checkbox',
+            default: false, sticky: true, extends_schema: true },
+          
+          # Context filtering
+          { name: 'filter_by_category_metadata', type: 'boolean', control_type: 'checkbox', optional: true, default: false,
+            ngIf: 'input.show_advanced', 
+            hint: 'Pre-filter contexts by category match in metadata before ranking' },
+          { name: 'category_metadata_key', optional: true, default: 'category',
+            ngIf: 'input.show_advanced && input.filter_by_category_metadata', 
+            hint: 'Metadata field containing category tags' },
+          
+          # LLM processing limits
+          { name: 'llm_max_contexts', type: 'integer', optional: true, default: 50,
+            ngIf: 'input.show_advanced',
+            hint: 'Maximum number of contexts to process with LLM (for cost/performance)' },
+          { name: 'include_confidence_distribution', type: 'boolean', control_type: 'checkbox', optional: true, default: false,
+            ngIf: 'input.show_advanced',
+            hint: 'Return probability distribution across contexts' },
+          
+          # Output shape control
+          { name: 'emit_shape', control_type: 'select', pick_list: 'rerank_emit_shapes', 
+            optional: true, default: 'context_chunks',
+            hint: 'Output format: minimal records, enriched records, or RAG-ready context_chunks' },
+          { name: 'source_key', optional: true, default: 'source',
+            hint: 'Metadata key for document source' },
+          { name: 'uri_key', optional: true, default: 'uri',
+            hint: 'Metadata key for document URI' },
+          
+          # Location override
+          { name: 'ai_apps_location', label: 'AI-Apps location (override)', control_type: 'select', 
+            pick_list: 'ai_apps_locations', optional: true,
+            hint: 'Force specific multi-region (global/us/eu). Usually auto-detected.' }
+        ]
+      end,
+      output_fields: lambda do |object_definitions, _connection|
+        [
+          { name: 'records', type: 'array', of: 'object', properties: [
+              { name: 'id' }, 
+              { name: 'score', type: 'number' }, 
+              { name: 'rank', type: 'integer' },
+              { name: 'content' }, 
+              { name: 'metadata', type: 'object' },
+              { name: 'llm_relevance', type: 'number' },
+              { name: 'category_alignment', type: 'number' }
+            ] },
+          { name: 'context_chunks', type: 'array', of: 'object', properties: [
+              { name: 'id' }, 
+              { name: 'text' }, 
+              { name: 'score', type: 'number' },
+              { name: 'source' }, 
+              { name: 'uri' },
+              { name: 'metadata', type: 'object' },
+              { name: 'metadata_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] },
+              { name: 'metadata_json' },
+              { name: 'llm_relevance', type: 'number' },
+              { name: 'category_alignment', type: 'number' }
+            ] },
+          { name: 'confidence_distribution', type: 'array', of: 'object', properties: [
+              { name: 'id' }, 
+              { name: 'probability', type: 'number' },
+              { name: 'reasoning' }
+            ] },
+          { name: 'ranking_metadata', type: 'object', properties: [
+              { name: 'category' },
+              { name: 'llm_model' },
+              { name: 'contexts_filtered', type: 'integer' },
+              { name: 'contexts_ranked', type: 'integer' }
+            ] },
+          { name: 'complete_output', type: 'object', hint: 'All outputs consolidated for easy downstream use' },
+          { name: 'facets', type: 'object', optional: true, hint: 'Analytics facets when available' }
+        ] + Array(object_definitions['envelope_fields_1'])
+      end,
+      execute: lambda do |connection, input|
+        ctx = call(:step_begin!, :rank_texts_with_ranking_api, input)
+        
+        begin
+          call(:ensure_project_id!, connection)
+          loc = call(:aiapps_loc_resolve, connection, input['ai_apps_location'])
+          
+          # Extract category and prepare query
+          category = input['category'].to_s.strip
+          category_ctx = input['category_context'].to_s.strip
+          query = input['query_text'].to_s
+          
+          # Enhance query with category context if requested
+          if category.present? && input['include_category_in_query'] == true
+            query_prefix = "Category: #{category}"
+            query_prefix += " (#{category_ctx})" if category_ctx.present?
+            enhanced_query = "#{query_prefix}\n\n#{query}"
+          else
+            enhanced_query = query
+          end
+          
+          # Pre-filter contexts by category metadata if requested
+          records_in = call(:safe_array, input['records'])
+          
+          # Validate that records have required fields
+          records_in.each_with_index do |r, i|
+            error("Record at index #{i} missing required 'id' field") unless r['id'].present?
+            error("Record at index #{i} missing required 'content' field") unless r['content'].present?
+          end
+          
+          records_to_rank = records_in
+          
+          if category.present? && input['filter_by_category_metadata'] == true
+            meta_key = input['category_metadata_key'] || 'category'
+            cat_lower = category.downcase
+            
+            records_to_rank = records_in.select do |r|
+              md = r['metadata'].is_a?(Hash) ? r['metadata'] : {}
+              cat_value = md[meta_key]
+              
+              case cat_value
+              when String
+                cat_value.downcase.include?(cat_lower)
+              when Array
+                cat_value.any? { |v| v.to_s.downcase.include?(cat_lower) }
+              else
+                false
+              end
+            end
+            
+            if records_to_rank.empty? && records_in.any?
+              error("Category filtering removed all #{records_in.length} records. Check category metadata key '#{meta_key}' and value '#{category}'")
+            end
+          end
+          
+          # LLM-based ranking
+          llm_model = input['llm_model'] || 'gemini-2.0-flash'
+          distribution = nil
+          enriched = []
+          
+          # Initialize all records with base scores
+          enriched = records_to_rank.map do |orig|
+            orig.merge(
+              'score' => 0.0,
+              'rank' => 999
+            )
+          end
+          
+          # Perform LLM ranking if category is present
+          if category.present?
+            # Limit contexts for LLM processing
+            max_llm_contexts = (input['llm_max_contexts'] || 50).to_i
+            contexts_for_llm = enriched.first(max_llm_contexts)
+            
+            # Call LLM ranker
+            llm_result = call(:llm_category_aware_ranker,
+                            connection,
+                            llm_model,
+                            enhanced_query,
+                            category,
+                            category_ctx,
+                            contexts_for_llm,
+                            ctx['cid'])
+            
+            if llm_result && llm_result['rankings']
+              # Process LLM rankings
+              llm_scores = {}
+              llm_result['rankings'].each do |r|
+                llm_scores[r['id']] = {
+                  'relevance' => r['relevance'].to_f,
+                  'category_alignment' => r['category_alignment'].to_f,
+                  'reasoning' => r['reasoning']
+                }
+              end
+              
+              # Apply LLM scores
+              enriched.each do |rec|
+                if llm_data = llm_scores[rec['id']]
+                  rec['llm_relevance'] = llm_data['relevance']
+                  rec['category_alignment'] = llm_data['category_alignment']
+                  # Score is weighted combination of relevance and category alignment
+                  rec['score'] = 0.8 * llm_data['relevance'] + 0.2 * llm_data['category_alignment']
+                else
+                  # Records not evaluated by LLM get zero score
+                  rec['score'] = 0.0
+                end
+              end
+              
+              # Build confidence distribution if requested
+              if input['include_confidence_distribution'] == true
+                total_score = enriched.sum { |x| x['score'].to_f }
+                total_score = 0.001 if total_score <= 0
+                
+                distribution = enriched.map { |r|
+                  llm_data = llm_scores[r['id']] || {}
+                  {
+                    'id' => r['id'],
+                    'probability' => r['score'].to_f / total_score,
+                    'reasoning' => llm_data['reasoning']
+                  }
+                }.sort_by { |d| -d['probability'] }
+              end
+            end
+          else
+            # If no category provided, use simple query-based relevance scoring
+            contexts_for_llm = enriched.first((input['llm_max_contexts'] || 50).to_i)
+            
+            # Simplified LLM ranking without category
+            llm_result = call(:llm_category_aware_ranker,
+                            connection,
+                            llm_model,
+                            enhanced_query,
+                            '',  # No category
+                            '',  # No category context
+                            contexts_for_llm,
+                            ctx['cid'])
+            
+            if llm_result && llm_result['rankings']
+              llm_result['rankings'].each do |r|
+                matching_record = enriched.find { |rec| rec['id'] == r['id'] }
+                if matching_record
+                  matching_record['llm_relevance'] = r['relevance'].to_f
+                  matching_record['score'] = r['relevance'].to_f
+                end
+              end
+            end
+          end
+          
+          # Re-rank by final scores
+          enriched = enriched.sort_by { |r| [-r['score'].to_f, r['id']] }
+                            .each_with_index { |r, i| r['rank'] = i + 1 }
+          
+          # Apply top_n limit if specified
+          if input['top_n'].present?
+            enriched = enriched.first(input['top_n'].to_i)
+          end
+          
+          # Shape Output
+          shape = input['emit_shape'] || 'context_chunks'
+          result = {}
+          
+          case shape
+          when 'records_only'
+            result['records'] = enriched.map { |r|
+              { 'id' => r['id'], 'score' => r['score'], 'rank' => r['rank'] }
+            }
+          when 'enriched_records'
+            result['records'] = enriched
+          else  # context_chunks
+            chunks = enriched.map { |r|
+              md = r['metadata'] || {}
+              source_key = input['source_key'] || 'source'
+              uri_key = input['uri_key'] || 'uri'
+              
+              chunk = {
+                'id' => r['id'],
+                'text' => r['content'].to_s,
+                'score' => r['score'].to_f,
+                'source' => md[source_key],
+                'uri' => md[uri_key],
+                'metadata' => md,
+                'metadata_kv' => md.map { |k, v| { 'key' => k, 'value' => v } },
+                'metadata_json' => md.empty? ? nil : md.to_json
+              }
+              
+              chunk['llm_relevance'] = r['llm_relevance'] if r['llm_relevance']
+              chunk['category_alignment'] = r['category_alignment'] if r['category_alignment']
+              
+              chunk
+            }
+            result['context_chunks'] = chunks
+            result['records'] = enriched
+          end
+          
+          result['confidence_distribution'] = distribution if distribution
+          
+          result['ranking_metadata'] = {
+            'category' => category.presence,
+            'llm_model' => llm_model,
+            'contexts_filtered' => records_in.length - records_to_rank.length,
+            'contexts_ranked' => records_to_rank.length
+          }.compact
+          
+          # Build facets
+          facets = {
+            'ranking_api' => 'llm.category_ranker',
+            'category' => category.presence,
+            'llm_model' => llm_model,
+            'emit_shape' => shape,
+            'records_input' => records_in.length,
+            'records_filtered' => records_in.length - records_to_rank.length,
+            'records_ranked' => records_to_rank.length,
+            'records_output' => enriched.length,
+            'has_distribution' => distribution.present?,
+            'top_score' => enriched.first&.dig('score'),
+            'category_filtered' => input['filter_by_category_metadata'] == true
+          }.compact
+          
+          call(:step_ok!, ctx, result, 200, 'OK', facets)
+          
+        rescue => e
+          call(:step_err!, ctx, e)
+        end
+      end,
+      sample_output: lambda do
+        call(:sample_rank_texts_with_ranking_api)
+      end
+    },
+    llm_referee_with_contexts: {
+      title: 'Categorize: LLM as referee',
+      subtitle: 'Adjudicate among shortlist; accepts ranked categories',
+      display_priority: 487,
+      help: lambda do |_|
+        { body: 'Chooses final category using shortlist + category metadata; can append ranked contexts to the email text.' }
+      end,
+      config_fields: [
+        { name: 'show_advanced', label: 'Show advanced options',
+          type: 'boolean', control_type: 'checkbox',
+          default: false, sticky: true, extends_schema: true,
+          hint: 'Toggle to reveal advanced parameters.' }
+      ], 
+      input_fields: lambda do |object_definitions, connection, config_fields|
+         call(:ui_ref_inputs, object_definitions, config_fields) + [
+           # --- Salience sidecar (disabled by default; 2-call flow when LLM) ---
+           { name: 'salience_mode', label: 'Salience extraction',
+             control_type: 'select', optional: true, default: 'off', extends_schema: true,
+             options: [['Off','off'], ['Heuristic (no LLM)','heuristic'], ['LLM (extra API call)','llm']],
+             hint: 'Extract a salient sentence/paragraph before refereeing. LLM mode makes a separate API call.' },
+           { name: 'salience_append_to_prompt', label: 'Append salience to prompt',
+             type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+             ngIf: 'input.salience_mode != "off"',
+             hint: 'If enabled, the salient span (and light metadata) is appended to the email text shown to the referee.' },
+           { name: 'salience_max_chars', label: 'Salience max chars', type: 'integer',
+             optional: true, default: 500, ngIf: 'input.salience_mode != "off"' },
+           { name: 'salience_include_entities', label: 'Salience: include entities',
+             type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+             ngIf: 'input.salience_mode == "llm"' },
+           { name: 'salience_model', label: 'Salience model',
+             control_type: 'text', optional: true, default: 'gemini-2.0-flash',
+             ngIf: 'input.salience_mode == "llm"' },
+           { name: 'salience_temperature', label: 'Salience temperature',
+             type: 'number', optional: true, default: 0,
+             ngIf: 'input.salience_mode == "llm"' }
+         ] + Array(object_definitions['observability_input_fields'])
+      end,
+      output_fields: lambda do |object_definitions, connection|
+        [
+          { name: 'referee', type: 'object', properties: Array(object_definitions['referee_out']) },
+          { name: 'chosen' },
+          { name: 'confidence', type: 'number' },
+          # Salience sidecar (top-level field; backward compatible)
+          { name: 'salience', type: 'object', properties: [
+               { name: 'span' },
+               { name: 'reason' },
+               { name: 'importance', type: 'number' },
+               { name: 'tags', type: 'array', of: 'string' },
+               { name: 'entities', type: 'array', of: 'object',
+                 properties: [{ name: 'type' }, { name: 'text' }] },
+               { name: 'cta' },
+               { name: 'deadline_iso' },
+               { name: 'focus_preview' },
+               { name: 'responseId' },
+               { name: 'usage', type: 'object', properties: [
+                   { name: 'promptTokenCount', type: 'integer' },
+                   { name: 'candidatesTokenCount', type: 'integer' },
+                   { name: 'totalTokenCount', type: 'integer' }
+               ]},
+               { name: 'span_source' } # heuristic | llm
+             ]},
+          { name: 'complete_output', type: 'object', hint: 'All outputs consolidated for easy downstream use' },
+          { name: 'facets', type: 'object', optional: true, hint: 'Analytics facets when available' }
+        ] + Array(object_definitions['envelope_fields'])
+      end,
+      execute: lambda do |connection, input|
+        ctx = call(:step_begin!, :llm_referee_with_contexts, input)
+        # Select categories source (array vs JSON)
+        cats_raw =
+          if input['categories_mode'].to_s == 'json' && input['categories_json'].present?
+            call(:safe_json_arr!, input['categories_json'])
+          else
+            input['categories']
+          end
+        cats = call(:norm_categories!, cats_raw)
+
+        # Optionally append ranked contexts to the email text for better decisions
+        email_text = input['email_text'].to_s
+        if Array(input['contexts']).any?
+          blob = call(:format_context_chunks, input['contexts'])
+          email_text = "#{email_text}\n\nContext:\n#{blob}"
+        end
+         salience = nil
+         sal_err  = nil
+         mode     = (input['salience_mode'] || 'off').to_s
+         if mode != 'off'
+           begin
+             max_span = (input['salience_max_chars'].to_i rescue 500); max_span = [[max_span,80].max,2000].min
+             # Heuristic extraction (no extra API call)
+             if mode == 'heuristic'
+               focus = email_text.to_s[0, 8000]
+               # drop greetings
+               focus = focus.sub(/\A\s*(subject:\s*[^\n]+\n+)?\s*(hi|hello|hey)[^a-z0-9]*\n+/i, '')
+               cand = focus.split(/(?<=[.!?])\s+/).find { |s| s.strip.length >= 12 && s !~ /\A(hi|hello|hey)\b/i } || focus[0, max_span]
+               span = cand.to_s.strip[0, max_span]
+               salience = {
+                 'span'=>span, 'reason'=>nil, 'importance'=>nil, 'tags'=>nil,
+                 'entities'=>nil, 'cta'=>nil, 'deadline_iso'=>nil,
+                 'focus_preview'=>focus, 'responseId'=>nil, 'usage'=>nil, 'span_source'=>'heuristic'
+               }
+             elsif mode == 'llm'
+               # LLM extraction (separate API call)
+               model = (input['salience_model'].presence || 'gemini-2.0-flash').to_s
+               model_path = call(:build_model_path_with_global_preview, connection, model)
+               loc = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
+               url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
+               req_params = "model=#{model_path}"
+ 
+               schema_props = {
+                 'salient_span'=>{'type'=>'string','minLength'=>12},
+                 'reason'=>{'type'=>'string'},
+                 'importance'=>{'type'=>'number'},
+                 'tags'=>{'type'=>'array','items'=>{'type'=>'string'}},
+                 'call_to_action'=>{'type'=>'string'},
+                 'deadline_iso'=>{'type'=>'string'}
+               }
+               schema_props['entities'] = {
+                 'type'=>'array',
+                 'items'=>{'type'=>'object','additionalProperties'=>false,
+                   'properties'=>{'type'=>{'type'=>'string'},'text'=>{'type'=>'string'}},
+                   'required'=>['text']}
+               } if call(:normalize_boolean, input['salience_include_entities'])
+ 
+               system_text = "You extract the single most important sentence or short paragraph from an email. " \
+                             "Rules: (1) Return VALID JSON only. (2) Do NOT output greetings, signatures, legal footers, " \
+                             "auto-replies, or vague pleasantries. (3) Keep under #{max_span} characters; do not truncate mid-sentence. " \
+                             "(4) importance is in [0,1]; set call_to_action/deadline_iso when clearly present."
+ 
+               gen_cfg = {
+                 'temperature'=> (input['salience_temperature'].present? ? input['salience_temperature'].to_f : 0),
+                 'maxOutputTokens'=>512,
+                 'responseMimeType'=>'application/json',
+                 'responseSchema'=>{
+                   'type'=>'object','additionalProperties'=>false,'properties'=>schema_props,
+                   'required'=>['salient_span']
+                 }
+               }
+               contents = [{ 'role'=>'user', 'parts'=>[{ 'text'=>"Email (trimmed):\n#{email_text.to_s[0,8000]}" }]}]
+               payload = {
+                 'contents'=>contents,
+                 'systemInstruction'=>{ 'role'=>'system', 'parts'=>[{ 'text'=>system_text }]},
+                 'generationConfig'=>gen_cfg
+               }
+               req_body = call(:json_compact, payload)
+               resp = post(url).headers(call(:request_headers_auth, connection, ctx['cid'], connection['user_project'], req_params))
+                              .payload(req_body)
+ 
+               txt = resp.dig('candidates',0,'content','parts',0,'text').to_s
+               parsed = call(:json_parse_gently!, txt)
+               span = parsed['salient_span'].to_s.strip
+               if span.empty? || span =~ /\A(hi|hello|hey)\b[:,\s]*\z/i || span.length < 8
+                 focus = email_text.to_s[0, 8000]
+                 focus = focus.sub(/\A\s*(subject:\s*[^\n]+\n+)?\s*(hi|hello|hey)[^a-z0-9]*\n+/i, '')
+                 cand = focus.split(/(?<=[.!?])\s+/).find { |s| s.strip.length >= 12 && s !~ /\A(hi|hello|hey)\b/i } || focus[0, max_span]
+                 span = cand.to_s.strip[0, max_span]
+               end
+               salience = {
+                 'span'=>span,
+                 'reason'=>parsed['reason'],
+                 'importance'=>parsed['importance'],
+                 'tags'=>parsed['tags'],
+                 'entities'=>parsed['entities'],
+                 'cta'=>parsed['call_to_action'],
+                 'deadline_iso'=>parsed['deadline_iso'],
+                 'focus_preview'=>email_text.to_s[0,8000],
+                 'responseId'=>resp['responseId'],
+                 'usage'=>resp['usageMetadata'],
+                 'span_source'=>'llm'
+               }
+             end
+           rescue => e
+             sal_err = e.to_s
+             salience = nil
+           end
+         end
+         # Optionally append salience to the prompt sent to the referee
+         if salience && call(:normalize_boolean, input['salience_append_to_prompt'])
+           email_text = call(:maybe_append_salience, email_text, salience, salience['importance'])
+         end
+        shortlist = call(:safe_array, input['shortlist'])
+        ref = call(:llm_referee, connection, (input['generative_model'] || 'gemini-2.0-flash'),
+                  email_text, (shortlist.any? ? shortlist : nil), cats, input['fallback_category'], ctx['cid'], nil)
+
+        min_conf = (input['min_confidence'].presence || 0.25).to_f
+        chosen =
+          if ref['confidence'].to_f < min_conf && input['fallback_category'].present?
+            input['fallback_category']
+          else
+            ref['category']
+          end
+
+        out = {
+          'referee'=>ref,
+          'chosen'=>chosen,
+          'confidence'=>[ref['confidence'], 0.0].compact.first.to_f
+        }
+        out['salience'] = salience if salience
+ 
+        extras = {
+          'chosen' => chosen,
+          'confidence' => out['confidence'],
+          'salience_mode' => input['salience_mode'] || 'off',
+          'salience_len' => (salience && salience['span'] ? salience['span'].to_s.length : nil),
+          'salience_importance' => (salience && salience['importance']),
+          'salience_source' => (salience && salience['span_source']),
+          'salience_err' => sal_err,
+          'has_contexts' => Array(input['contexts']).any?,
+          'shortlist_size' => shortlist.length,
+          'generative_model' => input['generative_model'] || 'gemini-2.0-flash',
+          'categories_mode' => input['categories_mode'] || 'array'
+        }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
+
+        # Add the missing step_ok! call with extras
+        call(:step_ok!, ctx, out, 200, 'OK', extras)
+      end,
+      sample_output: lambda do
+        call(:sample_llm_referee_with_contexts)  # or appropriate method name for each action
+      end
+    },
+    gen_generate: {
+      title: 'Query a generative endpoint (configurable)',
+      subtitle: 'Plain / Grounded / RAG-lite',
+      help: lambda do |_|
+        {
+          body: "Select an option from the `Mode` field, then fill only the fields rendered by the recipe builder. "\
+                "Required fields per mode: `RAG-LITE`: [question, context_chunks, max_chunks, salience_text, " \
+                'salience_id, salience_score, max_prompt_tokens, reserve_output_tokens, count_tokens_model, ' \
+                'trim_strategy, temperature].  ' \
+                '`VERTEX-SEARCH ONLY`: [vertex_ai_search_datastore, vertex_ai_search_serving_config].   ' \
+                '`RAG-STORE ONLY`: [rag_corpus, rag_retrieval_config, similarity_top_k, vector_distance_threshold,'\
+                'vector_similarity_threshold, rank_service_model, llm_ranker_model]. ',
+          learn_more_url: 'https://ai.google.dev/gemini-api/docs/models',
+          learn_more_text: 'Find a current list of available Gemini models'
+        }
+      end,
+      display_priority: 470,
+      retry_on_request: ['GET','HEAD'],
+      retry_on_response: [408,429,500,502,503,504],
+      max_retries: 3,
+      input_fields:  lambda { |od, c, cf| od['gen_generate_input'] },
+      output_fields: lambda do |od, c|
+        Array(od['generate_content_output']) + [
+          { name: 'confidence', type: 'number' },
+          { name: 'parsed', type: 'object', properties: [
+              { name: 'answer' },
+              { name: 'citations', type: 'array', of: 'object', properties: [
+                  { name: 'chunk_id' }, { name: 'source' }, { name: 'uri' }, { name: 'score', type: 'number' }
+              ]}
+          ]},
+          { name: 'complete_output', type: 'object', hint: 'All outputs consolidated for easy downstream use' },
+          { name: 'facets', type: 'object', optional: true, hint: 'Analytics facets when available' }
+        ] + Array(od['envelope_fields_1'])
+      end,
+      execute: lambda do |connection, raw_input|
+        ctx = call(:step_begin!, :gen_generate, raw_input)
+        
+        begin
+          input = call(:normalize_input_keys, raw_input)
+          result = call(:gen_generate_core!, connection, input, ctx['cid'])
+          
+          # Extract key metrics for facets
+          mode = (input['mode'] || 'plain').to_s
+          model = input['model']
+          finish_reason = call(:_facet_finish_reason, result) rescue result.dig('candidates', 0, 'finishReason')
+          
+          # Standard facets from compute_facets_for! plus action-specific ones
+          facets = {
+            'mode' => mode,
+            'model' => model,
+            'finish_reason' => finish_reason,
+            'confidence' => result['confidence'],
+            'has_citations' => result.dig('parsed', 'citations').is_a?(Array) && result.dig('parsed', 'citations').any?
+          }.compact
+          
+          call(:step_ok!, ctx, result, 200, 'OK', facets)
+        rescue => e
+          call(:step_err!, ctx, e)
+        end
+      end,
+      sample_output: lambda do
+        call(:sample_gen_generate)
+      end
+    },
+
+    # Unused/deprecated
+    embed_text: {
+      title: 'Embed text',
+      subtitle: 'Get embeddings from a publisher embedding model',
+      help: lambda do |_|
+        {
+          body: 'POST :predict on a publisher embedding model',
+          learn_more_url: 'https://docs.cloud.google.com/vertex-ai/generative-ai/docs/model-reference/text-embeddings-api',
+          learn_more_text: 'Find more information about the Text embeddings API'
+        }
+      end,
+      display_priority: 7,
+      retry_on_request: ['GET', 'HEAD'],
+      retry_on_response: [408, 429, 500, 502, 503, 504],
+      max_retries: 3,
+
+      input_fields: lambda do |_object_definitions, _connection, _config_fields|
+        [
+          { name: 'correlation_id', label: 'Correlation ID', optional: true, hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
+          { name: 'model', label: 'Embedding model', optional: false, control_type: 'text', default: 'text-embedding-005' },
+          { name: 'texts', type: 'array', of: 'string', optional: false },
+          { name: 'task', hint: 'Optional: RETRIEVAL_QUERY or RETRIEVAL_DOCUMENT' },
+          { name: 'autoTruncate', type: 'boolean', hint: 'Truncate long inputs automatically' },
+          { name: 'outputDimensionality', type: 'integer', optional: true, convert_input: 'integer_conversion',
+            hint: 'Optional dimensionality reduction (see model docs).' }
+        ]
+      end,
+      output_fields: lambda do |object_definitions, _connection|
+        Array(object_definitions['embed_output']) + Array(object_definitions['envelope_fields'])
+      end,
+      execute: lambda do |connection, input|
+        # Correlation id and duration for logs / analytics
+        started_at = Time.now.utc.iso8601
+        t0 = Time.now
+        cid = call(:ensure_correlation_id!, input)
+        url = nil; req_body = nil
+
+        begin
+          model_path = call(:build_embedding_model_path, connection, input['model'])
+
+          # Guard: texts length cannot exceed model batch limit (friendly message)
+          max_per_call = call(:embedding_max_instances, model_path)
+          texts = call(:safe_array, input['texts'])
+          error("Too many texts (#{texts.length}). Max per request for this model is #{max_per_call}. Chunk upstream.") if texts.length > 0 && texts.length > max_per_call
+
+          allowed_tasks = %w[
+            RETRIEVAL_QUERY RETRIEVAL_DOCUMENT SEMANTIC_SIMILARITY
+            CLASSIFICATION CLUSTERING QUESTION_ANSWERING FACT_VERIFICATION
+            CODE_RETRIEVAL_QUERY
+          ]
+          task = input['task'].to_s.strip
+          task = nil if task.blank?
+          error("Invalid task_type: #{task}. Allowed: #{allowed_tasks.join(', ')}") \
+            if task && !allowed_tasks.include?(task)
+
+          instances = call(:safe_array, input['texts']).map { |t|
+            h = { 'content' => t }
+            h['task_type'] = task if task
+            h
+          }
+
+          # Coerce/validate embedding parameters to correct JSON types
+          params = call(:sanitize_embedding_params, {
+            'autoTruncate'         => input['autoTruncate'],
+            'outputDimensionality' => input['outputDimensionality']
+          })
+
+          result = call(:predict_embeddings, connection, model_path, instances, params, cid)
+          result = result.merge(call(:telemetry_envelope, t0, cid, true, 200, 'OK'))
+
+          # Facets + local log
+          extras_for_facets = {
+            'n_texts' => Array(input['texts']).length,
+            'task'    => (task || nil),
+            'model'   => input['model']
+          }
+          facets = call(:compute_facets_for!, 'embed_text', result, extras_for_facets)
+          (result['telemetry'] ||= {})['facets'] = facets
+          call(:local_log_attach!, result,
+            call(:local_log_entry, :embed_text, started_at, t0, result, nil, {
+              'n_texts'        => Array(input['texts']).length,
+              'task'           => (task || nil),
+              'model'          => input['model'],
+              'billable_chars' => result.dig('metadata','billableCharacterCount'),
+              'facets'         => facets
+            }))
+          result
+        rescue => e
+          g   = call(:extract_google_error, e)
+          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
+          env = call(:telemetry_envelope, t0, cid, false, call(:telemetry_parse_error_code, e), msg)
+          # Optional debug attachment in non-prod:
+          if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
+            env['debug'] = call(:debug_pack, true, url, req_body, g)
+          end
+          # Local log (error path)
+          call(:local_log_attach!, env,
+            call(:local_log_entry, :embed_text, started_at, t0, nil, e, { 'google_error' => g }))
+          error(env)
+        end
+      end,
+      sample_output: lambda do
+        {
+          'predictions' => [
+            { 'embeddings' => { 'values' => [0.012, -0.034, 0.056],
+              'statistics' => { 'truncated' => false, 'token_count' => 21 } } },
+            { 'embeddings' => { 'values' => [0.023, -0.045, 0.067],
+              'statistics' => { 'truncated' => false, 'token_count' => 18 } } }
+          ],
+          'metadata' => { 'billableCharacterCount' => 230 },
+          'ok' => true,
+          'telemetry' => {
+            'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr',
+            'facets' => {
+              'model' => 'text-embedding-005',
+              'n_texts' => 2,
+              'task' => 'RETRIEVAL_QUERY'
+            }
+          }
+        }
+      end
+    },
+    count_tokens: {
+      title: 'Count tokens',
+      description: 'POST :countTokens on a publisher model',
+      help: lambda do |_|
+        {
+          learn_more_url: 'https://docs.cloud.google.com/vertex-ai/generative-ai/docs/model-reference/count-tokens',
+          learn_more_text: 'Check out Google docs for the CountTokens API'
+        }
+      end,
+      display_priority: 5,
+      retry_on_request: ['GET', 'HEAD'],
+      retry_on_response: [408, 429, 500, 502, 503, 504],
+      max_retries: 3,
+
+      input_fields: lambda do |object_definitions, connection, config_fields|
+        [
+          { name: 'correlation_id', label: 'Correlation ID', optional: true, hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
+          { name: 'model', label: 'Model', optional: false, control_type: 'text' },
+          { name: 'contents', type: 'array', of: 'object', properties: object_definitions['content'], optional: false },
+          { name: 'system_preamble', label: 'System preamble (text)', optional: true }
+        ]
+      end,
+      output_fields: lambda do |object_definitions, connection|
+        [
+          { name: 'totalTokens', type: 'integer' },
+          { name: 'totalBillableCharacters', type: 'integer' },
+          { name: 'promptTokensDetails', type: 'array', of: 'object' }
+        ] + Array(object_definitions['envelope_fields_1'])
+      end,
+      execute:  lambda do |connection, input|
+        # Correlation id and duration for logs / analytics
+        started_at = Time.now.utc.iso8601
+        t0 = Time.now
+        cid = call(:ensure_correlation_id!, input)
+        url = nil; req_body = nil
+
+        # Compute model path
+        model_path = call(:build_model_path_with_global_preview, connection, input['model'])
+
+        # Build payload
+        contents   = call(:sanitize_contents_roles, input['contents'])
+        error('At least one non-system message is required in contents') if contents.blank?
+        sys_inst   = call(:system_instruction_from_text, input['system_preamble'])
+
+        loc_from_model = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
+        url = call(:aipl_v1_url, connection, loc_from_model, "#{model_path}:countTokens")
+
+        begin
+          req_body = call(:json_compact, {
+            'contents'          => contents,
+            'systemInstruction' => sys_inst
+          })
+          resp = post(url)
+                    .headers(call(:request_headers_auth_1, connection, cid, connection['user_project'], "model=#{model_path}"))
+                    .payload(req_body)
+          code = call(:telemetry_success_code, resp)
+          result = resp.merge(call(:telemetry_envelope, t0, cid, true, code, 'OK'))
+
+          # Facets + local log
+          extras_for_facets = {
+            'model'          => input['model'],
+            'tokens_total'   => result['totalTokens'],
+            'billable_chars' => result['totalBillableCharacters']
+          }
+          facets = call(:compute_facets_for!, 'count_tokens', result, extras_for_facets)
+          (result['telemetry'] ||= {})['facets'] = facets
+          call(:local_log_attach!, result,
+            call(:local_log_entry, :count_tokens, started_at, t0, result, nil, {
+              'model'            => input['model'],
+              'tokens_total'     => result['totalTokens'],
+              'billable_chars'   => result['totalBillableCharacters'],
+              'facets'           => facets
+            }))
+          result
+        rescue => e
+          g   = call(:extract_google_error, e)
+          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
+          env = call(:telemetry_envelope, t0, cid, false, call(:telemetry_parse_error_code, e), msg)
+          # Optional debug attachment in non-prod:
+          if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
+            env['debug'] = call(:debug_pack, true, url, req_body, g)
+          end
+          # Local log (error path)
+          call(:local_log_attach!, env,
+            call(:local_log_entry, :count_tokens, started_at, t0, nil, e, { 'google_error' => g }))
+          error(env) 
+        end
+      end,
+      sample_output: lambda do
+        {
+          'totalTokens' => 31,
+          'totalBillableCharacters' => 96,
+          'promptTokensDetails' => [ { 'modality' => 'TEXT', 'tokenCount' => 31 } ],
+          'ok' => true,
+          'telemetry' => {
+            'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr',
+            'facets' => {
+              'model' => 'gemini-2.0-flash',
+              'tokens_total' => 31,
+              'billable_chars' => 96
+            }
+          }
+        }
+      end
+    },
+    email_extract_salient_span: {
+      title: 'Email Extract salient span (deprecated)',
+      subtitle: 'Pull the most important sentence/paragraph from an email',
+      display_priority: 5,
+      help: lambda do |_|
+        { 
+          body: 'Heuristically trims boilerplate/quotes, then asks the model for the single most important span (<= 500 chars), with rationale, tags, and optional call-to-action metadata.',
+          learn_more_url: 'https://ai.google.dev/gemini-api/docs/models',
+          learn_more_text: 'Find a current list of available Gemini models'
+        }
+      end,
+      retry_on_request: ['GET','HEAD'],
+      retry_on_response: [408,429,500,502,503,504],
+      max_retries: 3,
+
+      input_fields: lambda do |object_definitions, connection, config_fields|
+        [
+          { name: 'subject', optional: true },
+          { name: 'body',    optional: false, hint: 'Raw email body (HTML or plain text). Quoted replies and signatures are pruned automatically.' },
+          { name: 'correlation_id', label: 'Correlation ID', optional: true, hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
+          { name: 'generative_model', label: 'Generative model', control_type: 'text', optional: true, default: 'gemini-2.0-flash' },
+          { name: 'max_span_chars', type: 'integer', optional: true, default: 500, hint: 'Hard cap for the extracted span.' },
+          { name: 'include_entities', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+            hint: 'Try to extract named people/teams/products mentioned in the salient span.' },
+          { name: 'temperature', type: 'number', optional: true, hint: 'Default 0 (deterministic).' },
+
+          # Debug
+          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
+        ]
+      end,
+      output_fields: lambda do |object_definitions, connection|
+        [
+          { name: 'salient_span' },
+          { name: 'reason' },
+          { name: 'importance', type: 'number' },
+          { name: 'tags', type: 'array', of: 'string' },
+          { name: 'call_to_action' },
+          { name: 'deadline_iso' },
+          { name: 'entities', type: 'array', of: 'object', properties: [
+              { name: 'type' }, { name: 'text' }
+            ]
+          },
+          { name: 'focus_preview' },   # the pruned text the model actually saw
+          { name: 'responseId' },
+          { name: 'usage', type: 'object', properties: [
+              { name: 'promptTokenCount', type: 'integer' },
+              { name: 'candidatesTokenCount', type: 'integer' },
+              { name: 'totalTokenCount', type: 'integer' }
+            ]
+          },
+          { name: 'ok', type: 'boolean' },
+          { name: 'telemetry', type: 'object', properties: [
+            { name: 'http_status', type: 'integer' },
+            { name: 'message' }, { name: 'duration_ms', type: 'integer' },
+            { name: 'correlation_id' }
+          ]},
+          { name: 'debug', type: 'object' }
+        ]
+      end,
+      execute: lambda do |connection, input|
+        started_at = Time.now.utc.iso8601 # for logging
+
+        t0   = Time.now
+        cid = call(:ensure_correlation_id!, input)
+        url = nil; req_body = nil; req_params = nil
+        begin
+          # 1) Heuristic focus text (strip quotes, signatures, legal footers, tracking junk)
+          subj  = (input['subject'] || '').to_s
+          body  = (input['body']    || '').to_s
+          error('body is required') if body.strip.empty?
+
+          plain = call(:email_minify, subj, body)               # HTML → text, whitespace/emoji control
+          focus = call(:email_focus_trim, plain, 8000)          # keep the meat; drop quoted chains & footers
+
+          # 2) Build schema-constrained prompt
+          max_span = call(:clamp_int, (input['max_span_chars'] || 500), 80, 2000)
+          want_entities = call(:normalize_boolean, input['include_entities'])
+
+          # System Prompt #
+          system_text = "You extract the single most important sentence or short paragraph from an email. " \
+                        "Rules: (1) Return VALID JSON only. (2) Do NOT output greetings, signatures, legal footers, " \
+                        "auto-replies, or vague pleasantries (e.g., 'Hello', 'Thanks', 'Please see below'). " \
+                        "(3) Keep under #{max_span} characters; do not truncate mid-sentence. " \
+                        "(4) importance is a calibrated score in [0,1]. If a clear action is requested, set call_to_action; " \
+                        "if a clear deadline exists, return ISO-8601 in deadline_iso; otherwise leave null."
+
+          schema_props = {
+            'salient_span'   => {
+              'type' => 'string',
+              'minLength' => 12
+            },
+            'reason'         => { 'type' => 'string' },
+            'importance'     => { 'type' => 'number' },
+            'tags'           => { 'type' => 'array', 'items' => { 'type' => 'string' } },
+            'call_to_action' => { 'type' => 'string' },
+            'deadline_iso'   => { 'type' => 'string' }
+          }
+          if want_entities
+            schema_props['entities'] = {
+              'type'  => 'array',
+              'items' => { 'type' => 'object', 'additionalProperties' => false,
+                'properties' => { 'type' => { 'type' => 'string' }, 'text' => { 'type' => 'string' } },
+                'required'   => ['text']
+              }
+            }
+          end
+
+          gen_cfg = {
+            'temperature'      => (input['temperature'].present? ? call(:safe_float, input['temperature']) : 0),
+            'maxOutputTokens'  => 512,
+            'responseMimeType' => 'application/json',
+            'responseSchema'   => {
+              'type'                 => 'object',
+              'additionalProperties' => false,
+              'properties'           => schema_props,
+              'required'             => ['salient_span','importance']
+            }
+          }
+
+          model = (input['generative_model'].presence || 'gemini-2.0-flash').to_s
+          model_path = call(:build_model_path_with_global_preview, connection, model)
+
+          contents = [
+            { 'role' => 'user', 'parts' => [
+                { 'text' => [
+                    ("Subject: #{subj}".strip unless subj.strip.empty?),
+                    "Email (trimmed):\n#{focus}"
+                  ].compact.join("\n\n")
+                }
+              ]
+            }
+          ]
+
+          payload = {
+            'contents'          => contents,
+            'systemInstruction' => { 'role' => 'system', 'parts' => [ { 'text' => system_text } ] },
+            'generationConfig'  => gen_cfg
+          }
+
+          loc = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
+          url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
+          req_params = "model=#{model_path}"
+          req_body = call(:json_compact, payload)
+          resp = post(url).headers(call(:request_headers_auth_1, connection, cid, connection['user_project'], req_params)).payload(req_body)
+
+          text   = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
+          parsed = call(:safe_parse_json, text)
+          # Post-parse repair: filter obvious salutations/low-content and enforce the cap
+          span = parsed['salient_span'].to_s.strip
+          if span.empty? || span =~ /\A(hi|hello|hey)\b[:,\s]*\z/i || span.length < 8
+            # Fallback: pick first substantive sentence from focus
+            head = (focus || '').to_s
+            # Drop leading greeting lines
+            head = head.sub(/\A\s*(subject:\s*[^\n]+\n+)?\s*(hi|hello|hey)[^a-z0-9]*\n+/i, '')
+            cand = head.split(/(?<=[.!?])\s+/).find { |s| s.strip.length >= 12 && s !~ /\A(hi|hello|hey)\b/i } || head[0, max_span]
+            span = cand[0, max_span].to_s.strip
+          else
+            span = span[0, max_span]
+          end
+
+          out = {
+            'salient_span'   => span,
+            'reason'         => parsed['reason'],
+            'importance'     => parsed['importance'],
+            'tags'           => parsed['tags'],
+            'call_to_action' => parsed['call_to_action'],
+            'deadline_iso'   => parsed['deadline_iso'],
+            'entities'       => parsed['entities'],
+            'focus_preview'  => focus,
+            'responseId'     => resp['responseId'],
+            'usage'          => resp['usageMetadata']
+          }.merge(call(:telemetry_envelope, t0, cid, true, 200, 'OK'))
+
+          unless call(:normalize_boolean, connection['prod_mode'])
+            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
+          end
+
+          # Compute facets (tokens_total, etc.) and attach a local log entry
+          facets = call(:compute_facets_for!, 'email_extract_salient_span', out)
+          call(:local_log_attach!, out,
+            call(:local_log_entry, :email_extract_salient_span, started_at, t0, out, nil, {
+              'importance' => out['importance'],
+              'facets'     => facets
+            }))
+          out
+        rescue => e
+          g   = call(:extract_google_error, e)
+          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
+          out = {}.merge(call(:telemetry_envelope, t0, cid, false, call(:telemetry_parse_error_code, e), msg))
+          unless call(:normalize_boolean, connection['prod_mode'])
+            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
+          end
+          # Log the error path locally too
+          call(:local_log_attach!, out,
+            call(:local_log_entry, :email_extract_salient_span, started_at, t0, nil, e, { 'google_error' => g }))
+          out
+        end
+      end,
+      sample_output: lambda do
+        {
+          'salient_span'   => 'Can you approve the Q4 budget increase by Friday, October 24?',
+          'reason'         => 'Explicit ask with a concrete deadline that blocks downstream work.',
+          'importance'     => 0.92,
+          'tags'           => ['approval','budget','deadline'],
+          'call_to_action' => 'Approve Q4 budget increase',
+          'deadline_iso'   => '2025-10-24T17:00:00Z',
+          'entities'       => [ { 'type' => 'team', 'text' => 'Finance' } ],
+          'focus_preview'  => 'Subject: Budget approval needed\n\nHi — we need your approval...',
+          'responseId'     => 'resp-xyz',
+          'usage'          => { 'promptTokenCount' => 175, 'candidatesTokenCount' => 96, 'totalTokenCount' => 271 },
+          'ok'             => true,
+          'telemetry'      => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 18, 'correlation_id' => 'sample' }
+        }
+      end
+    },
+    operations_get: {
+      title: 'Get (poll) long running operation',
+      subtitle: 'google.longrunning.operations.get',
+      help: lambda do |_|
+        {
+          learn_more_url: 'https://docs.cloud.google.com/vertex-ai/docs/general/long-running-operations',
+          learn_more_text: 'Find out more about Long running operations'
+        }
+      end,
+      display_priority: 4,
+      retry_on_request: ['GET','HEAD'],
+      retry_on_response: [408,429,500,502,503,504],
+      max_retries: 3,
+
+      input_fields: lambda do |_object_definitions, _connection, _config_fields|
+        [
+          { name: 'correlation_id', label: 'Correlation ID', optional: true, hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
+          { name: 'operation', optional: false,
+            hint: 'Operation name or full path, e.g., projects/{p}/locations/{l}/operations/{id}' }
+        ]
+      end,
+      output_fields: lambda do |_object_definitions, _connection|
+        [
+          { name: 'name' }, { name: 'done', type: 'boolean' },
+          { name: 'metadata', type: 'object' }, { name: 'error', type: 'object' }
+        ] + [
+          { name: 'ok', type: 'boolean' },
+          { name: 'telemetry', type: 'object', properties: [
+            { name: 'http_status', type: 'integer' }, { name: 'message' },
+            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
+          ]}
+        ]
+      end,
+      execute: lambda do |connection, input|
+        started_at = Time.now.utc.iso8601
+        t0 = Time.now
+        cid = call(:ensure_correlation_id!, input)
+        begin
+          call(:ensure_project_id!, connection)
+          # Accept either full /v1/... or name-only
+          op = input['operation'].to_s.sub(%r{^/v1/}, '')
+          loc = (connection['location'].presence || 'us-central1').to_s.downcase
+          url = call(:aipl_v1_url, connection, loc, op.start_with?('projects/') ? op : "projects/#{connection['project_id']}/locations/#{loc}/operations/#{op}")
+          resp = get(url).headers(call(:request_headers_auth_1, connection, cid, connection['user_project'], nil))
+          code = call(:telemetry_success_code, resp)
+          result = resp.merge(call(:telemetry_envelope, t0, cid, true, code, 'OK'))
+
+          # Facets + local log
+          extras_for_facets = {
+            'operation' => (result['name'] || input['operation']),
+            'done'      => result['done']
+          }
+          facets = call(:compute_facets_for!, 'operations_get', result, extras_for_facets)
+          (result['telemetry'] ||= {})['facets'] = facets
+
+          call(:local_log_attach!, result,
+            call(:local_log_entry, :operations_get, started_at, t0, result, nil, {
+              'operation' => (result['name'] || input['operation']),
+              'done'      => result['done'],
+              'facets'    => facets
+            }))
+          result
+        rescue => e
+          g   = call(:extract_google_error, e)
+          env = {}.merge(call(:telemetry_envelope, t0, cid, false, call(:telemetry_parse_error_code, e), e.to_s))
+          # Local log (error path)
+          call(:local_log_attach!, env,
+            call(:local_log_entry, :operations_get, started_at, t0, nil, e, { 'google_error' => g, 'operation' => input['operation'] }))
+          env
+        end
+      end,
+      sample_output: lambda do
+        {
+          'name' => 'projects/p/locations/us-central1/operations/123',
+          'done' => false,
+          'ok' => true,
+          'telemetry' => {
+            'http_status' => 200, 'message' => 'OK', 'duration_ms' => 8, 'correlation_id' => 'sample',
+            'facets' => {
+              'operation' => 'projects/p/locations/us-central1/operations/123',
+              'done' => false
+            }
+          }
+        }
+      end
+    },
     gen_categorize_email: {
       title: 'Email: Categorize email',
       subtitle: 'Classify an email into a category',
@@ -883,966 +2871,6 @@ require 'securerandom'
         }
       end
     },
-    email_extract_salient_span: {
-      title: 'Email Extract salient span (deprecated)',
-      subtitle: 'Pull the most important sentence/paragraph from an email',
-      display_priority: 0
-      help: lambda do |_|
-        { 
-          body: 'Heuristically trims boilerplate/quotes, then asks the model for the single most important span (<= 500 chars), with rationale, tags, and optional call-to-action metadata.',
-          learn_more_url: 'https://ai.google.dev/gemini-api/docs/models',
-          learn_more_text: 'Find a current list of available Gemini models'
-        }
-      end,
-      retry_on_request: ['GET','HEAD'],
-      retry_on_response: [408,429,500,502,503,504],
-      max_retries: 3,
-
-      input_fields: lambda do |object_definitions, connection, config_fields|
-        [
-          { name: 'subject', optional: true },
-          { name: 'body',    optional: false, hint: 'Raw email body (HTML or plain text). Quoted replies and signatures are pruned automatically.' },
-          { name: 'correlation_id', label: 'Correlation ID', optional: true, hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
-          { name: 'generative_model', label: 'Generative model', control_type: 'text', optional: true, default: 'gemini-2.0-flash' },
-          { name: 'max_span_chars', type: 'integer', optional: true, default: 500, hint: 'Hard cap for the extracted span.' },
-          { name: 'include_entities', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
-            hint: 'Try to extract named people/teams/products mentioned in the salient span.' },
-          { name: 'temperature', type: 'number', optional: true, hint: 'Default 0 (deterministic).' },
-
-          # Debug
-          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
-        ]
-      end,
-      output_fields: lambda do |object_definitions, connection|
-        [
-          { name: 'salient_span' },
-          { name: 'reason' },
-          { name: 'importance', type: 'number' },
-          { name: 'tags', type: 'array', of: 'string' },
-          { name: 'call_to_action' },
-          { name: 'deadline_iso' },
-          { name: 'entities', type: 'array', of: 'object', properties: [
-              { name: 'type' }, { name: 'text' }
-            ]
-          },
-          { name: 'focus_preview' },   # the pruned text the model actually saw
-          { name: 'responseId' },
-          { name: 'usage', type: 'object', properties: [
-              { name: 'promptTokenCount', type: 'integer' },
-              { name: 'candidatesTokenCount', type: 'integer' },
-              { name: 'totalTokenCount', type: 'integer' }
-            ]
-          },
-          { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object', properties: [
-            { name: 'http_status', type: 'integer' },
-            { name: 'message' }, { name: 'duration_ms', type: 'integer' },
-            { name: 'correlation_id' }
-          ]},
-          { name: 'debug', type: 'object' }
-        ]
-      end,
-      execute: lambda do |connection, input|
-        started_at = Time.now.utc.iso8601 # for logging
-
-        t0   = Time.now
-        cid = call(:ensure_correlation_id!, input)
-        url = nil; req_body = nil; req_params = nil
-        begin
-          # 1) Heuristic focus text (strip quotes, signatures, legal footers, tracking junk)
-          subj  = (input['subject'] || '').to_s
-          body  = (input['body']    || '').to_s
-          error('body is required') if body.strip.empty?
-
-          plain = call(:email_minify, subj, body)               # HTML → text, whitespace/emoji control
-          focus = call(:email_focus_trim, plain, 8000)          # keep the meat; drop quoted chains & footers
-
-          # 2) Build schema-constrained prompt
-          max_span = call(:clamp_int, (input['max_span_chars'] || 500), 80, 2000)
-          want_entities = call(:normalize_boolean, input['include_entities'])
-
-          # System Prompt #
-          system_text = "You extract the single most important sentence or short paragraph from an email. " \
-                        "Rules: (1) Return VALID JSON only. (2) Do NOT output greetings, signatures, legal footers, " \
-                        "auto-replies, or vague pleasantries (e.g., 'Hello', 'Thanks', 'Please see below'). " \
-                        "(3) Keep under #{max_span} characters; do not truncate mid-sentence. " \
-                        "(4) importance is a calibrated score in [0,1]. If a clear action is requested, set call_to_action; " \
-                        "if a clear deadline exists, return ISO-8601 in deadline_iso; otherwise leave null."
-
-          schema_props = {
-            'salient_span'   => {
-              'type' => 'string',
-              'minLength' => 12
-            },
-            'reason'         => { 'type' => 'string' },
-            'importance'     => { 'type' => 'number' },
-            'tags'           => { 'type' => 'array', 'items' => { 'type' => 'string' } },
-            'call_to_action' => { 'type' => 'string' },
-            'deadline_iso'   => { 'type' => 'string' }
-          }
-          if want_entities
-            schema_props['entities'] = {
-              'type'  => 'array',
-              'items' => { 'type' => 'object', 'additionalProperties' => false,
-                'properties' => { 'type' => { 'type' => 'string' }, 'text' => { 'type' => 'string' } },
-                'required'   => ['text']
-              }
-            }
-          end
-
-          gen_cfg = {
-            'temperature'      => (input['temperature'].present? ? call(:safe_float, input['temperature']) : 0),
-            'maxOutputTokens'  => 512,
-            'responseMimeType' => 'application/json',
-            'responseSchema'   => {
-              'type'                 => 'object',
-              'additionalProperties' => false,
-              'properties'           => schema_props,
-              'required'             => ['salient_span','importance']
-            }
-          }
-
-          model = (input['generative_model'].presence || 'gemini-2.0-flash').to_s
-          model_path = call(:build_model_path_with_global_preview, connection, model)
-
-          contents = [
-            { 'role' => 'user', 'parts' => [
-                { 'text' => [
-                    ("Subject: #{subj}".strip unless subj.strip.empty?),
-                    "Email (trimmed):\n#{focus}"
-                  ].compact.join("\n\n")
-                }
-              ]
-            }
-          ]
-
-          payload = {
-            'contents'          => contents,
-            'systemInstruction' => { 'role' => 'system', 'parts' => [ { 'text' => system_text } ] },
-            'generationConfig'  => gen_cfg
-          }
-
-          loc = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
-          url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
-          req_params = "model=#{model_path}"
-          req_body = call(:json_compact, payload)
-          resp = post(url).headers(call(:request_headers_auth_1, connection, cid, connection['user_project'], req_params)).payload(req_body)
-
-          text   = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
-          parsed = call(:safe_parse_json, text)
-          # Post-parse repair: filter obvious salutations/low-content and enforce the cap
-          span = parsed['salient_span'].to_s.strip
-          if span.empty? || span =~ /\A(hi|hello|hey)\b[:,\s]*\z/i || span.length < 8
-            # Fallback: pick first substantive sentence from focus
-            head = (focus || '').to_s
-            # Drop leading greeting lines
-            head = head.sub(/\A\s*(subject:\s*[^\n]+\n+)?\s*(hi|hello|hey)[^a-z0-9]*\n+/i, '')
-            cand = head.split(/(?<=[.!?])\s+/).find { |s| s.strip.length >= 12 && s !~ /\A(hi|hello|hey)\b/i } || head[0, max_span]
-            span = cand[0, max_span].to_s.strip
-          else
-            span = span[0, max_span]
-          end
-
-          out = {
-            'salient_span'   => span,
-            'reason'         => parsed['reason'],
-            'importance'     => parsed['importance'],
-            'tags'           => parsed['tags'],
-            'call_to_action' => parsed['call_to_action'],
-            'deadline_iso'   => parsed['deadline_iso'],
-            'entities'       => parsed['entities'],
-            'focus_preview'  => focus,
-            'responseId'     => resp['responseId'],
-            'usage'          => resp['usageMetadata']
-          }.merge(call(:telemetry_envelope, t0, cid, true, 200, 'OK'))
-
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
-          end
-
-          # Compute facets (tokens_total, etc.) and attach a local log entry
-          facets = call(:compute_facets_for!, 'email_extract_salient_span', out)
-          call(:local_log_attach!, out,
-            call(:local_log_entry, :email_extract_salient_span, started_at, t0, out, nil, {
-              'importance' => out['importance'],
-              'facets'     => facets
-            }))
-          out
-        rescue => e
-          g   = call(:extract_google_error, e)
-          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          out = {}.merge(call(:telemetry_envelope, t0, cid, false, call(:telemetry_parse_error_code, e), msg))
-          unless call(:normalize_boolean, connection['prod_mode'])
-            out['debug'] = call(:debug_pack, input['debug'], url, req_body, nil) if call(:normalize_boolean, input['debug'])
-          end
-          # Log the error path locally too
-          call(:local_log_attach!, out,
-            call(:local_log_entry, :email_extract_salient_span, started_at, t0, nil, e, { 'google_error' => g }))
-          out
-        end
-      end,
-      sample_output: lambda do
-        {
-          'salient_span'   => 'Can you approve the Q4 budget increase by Friday, October 24?',
-          'reason'         => 'Explicit ask with a concrete deadline that blocks downstream work.',
-          'importance'     => 0.92,
-          'tags'           => ['approval','budget','deadline'],
-          'call_to_action' => 'Approve Q4 budget increase',
-          'deadline_iso'   => '2025-10-24T17:00:00Z',
-          'entities'       => [ { 'type' => 'team', 'text' => 'Finance' } ],
-          'focus_preview'  => 'Subject: Budget approval needed\n\nHi — we need your approval...',
-          'responseId'     => 'resp-xyz',
-          'usage'          => { 'promptTokenCount' => 175, 'candidatesTokenCount' => 96, 'totalTokenCount' => 271 },
-          'ok'             => true,
-          'telemetry'      => { 'http_status' => 200, 'message' => 'OK', 'duration_ms' => 18, 'correlation_id' => 'sample' }
-        }
-      end
-    },
-    gen_generate: {
-      title: 'Query a generative endpoint (configurable)',
-      subtitle: 'Plain / Grounded / RAG-lite',
-      help: lambda do |_|
-        {
-          body: "Select an option from the `Mode` field, then fill only the fields rendered by the recipe builder. "\
-                "Required fields per mode: `RAG-LITE`: [question, context_chunks, max_chunks, salience_text, " \
-                'salience_id, salience_score, max_prompt_tokens, reserve_output_tokens, count_tokens_model, ' \
-                'trim_strategy, temperature].  ' \
-                '`VERTEX-SEARCH ONLY`: [vertex_ai_search_datastore, vertex_ai_search_serving_config].   ' \
-                '`RAG-STORE ONLY`: [rag_corpus, rag_retrieval_config, similarity_top_k, vector_distance_threshold,'\
-                'vector_similarity_threshold, rank_service_model, llm_ranker_model]. ',
-          learn_more_url: 'https://ai.google.dev/gemini-api/docs/models',
-          learn_more_text: 'Find a current list of available Gemini models'
-        }
-      end,
-      display_priority: 90,
-      retry_on_request: ['GET','HEAD'],
-      retry_on_response: [408,429,500,502,503,504],
-      max_retries: 3,
-      input_fields:  lambda { |od, c, cf| od['gen_generate_input'] },
-      output_fields: lambda do |od, c|
-        Array(od['generate_content_output']) + [
-          { name: 'confidence', type: 'number' },
-          { name: 'parsed', type: 'object', properties: [
-              { name: 'answer' },
-              { name: 'citations', type: 'array', of: 'object', properties: [
-                  { name: 'chunk_id' }, { name: 'source' }, { name: 'uri' }, { name: 'score', type: 'number' }
-              ]}
-          ]},
-          { name: 'complete_output', type: 'object', hint: 'All outputs consolidated for easy downstream use' },
-          { name: 'facets', type: 'object', optional: true, hint: 'Analytics facets when available' }
-        ] + Array(od['envelope_fields_1'])
-      end,
-      execute: lambda do |connection, raw_input|
-        ctx = call(:step_begin!, :gen_generate, raw_input)
-        
-        begin
-          input = call(:normalize_input_keys, raw_input)
-          result = call(:gen_generate_core!, connection, input, ctx['cid'])
-          
-          # Extract key metrics for facets
-          mode = (input['mode'] || 'plain').to_s
-          model = input['model']
-          finish_reason = call(:_facet_finish_reason, result) rescue result.dig('candidates', 0, 'finishReason')
-          
-          # Standard facets from compute_facets_for! plus action-specific ones
-          facets = {
-            'mode' => mode,
-            'model' => model,
-            'finish_reason' => finish_reason,
-            'confidence' => result['confidence'],
-            'has_citations' => result.dig('parsed', 'citations').is_a?(Array) && result.dig('parsed', 'citations').any?
-          }.compact
-          
-          call(:step_ok!, ctx, result, 200, 'OK', facets)
-        rescue => e
-          call(:step_err!, ctx, e)
-        end
-      end,
-      sample_output: lambda do
-        call(:sample_gen_generate)
-      end
-    },
-    rank_texts_with_ranking_api: {
-      title: 'Rerank contexts',
-      subtitle: 'projects.locations.rankingConfigs:rank',
-      description: '',
-      help: lambda do |input, picklist_label|
-        {
-          body: 'Rerank retrieved contexts for a query within a known category using LLM-based ranking with category awareness.',
-          learn_more_url: 'https://cloud.google.com/vertex-ai/generative-ai/docs/rag-engine/retrieval-and-ranking',
-          learn_more_text: 'Check out Google docs for retrieval and ranking'
-        }
-      end,
-      display_priority: 89,
-      retry_on_request: ['GET','HEAD'],
-      retry_on_response: [408,429,500,502,503,504],
-      max_retries: 3,
-
-      input_fields: lambda do |_object_definitions, _connection, _config_fields|
-        [
-          { name: 'query_text', optional: false, hint: 'The user query to rank contexts against' },
-          { name: 'records', type: 'array', of: 'object', optional: false, properties: [
-              { name: 'id', optional: false }, 
-              { name: 'content', optional: false }, 
-              { name: 'metadata', type: 'object' }
-            ], hint: 'Retrieved contexts to rank (id + content required)' },
-          { name: 'category', optional: true, 
-            hint: 'Pre-determined category (e.g., PTO, Billing, Support) to inform ranking' },
-          { name: 'category_context', optional: true,
-            hint: 'Additional context about the category to guide ranking (description, scope, etc.)' },
-          { name: 'include_category_in_query', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
-            hint: 'Include category context in ranking query for better relevance' },
-          { name: 'correlation_id', label: 'Correlation ID', optional: true, 
-            hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
-          
-          # LLM ranking options (no longer conditional)
-          { name: 'llm_model', optional: true, default: 'gemini-2.0-flash',
-            hint: 'LLM model for semantic ranking' },
-          { name: 'top_n', type: 'integer', optional: true, hint: 'Max contexts to return (default: all)' },
-          
-          # Advanced options toggle
-          { name: 'show_advanced', label: 'Show advanced options', type: 'boolean', control_type: 'checkbox',
-            default: false, sticky: true, extends_schema: true },
-          
-          # Context filtering
-          { name: 'filter_by_category_metadata', type: 'boolean', control_type: 'checkbox', optional: true, default: false,
-            ngIf: 'input.show_advanced', 
-            hint: 'Pre-filter contexts by category match in metadata before ranking' },
-          { name: 'category_metadata_key', optional: true, default: 'category',
-            ngIf: 'input.show_advanced && input.filter_by_category_metadata', 
-            hint: 'Metadata field containing category tags' },
-          
-          # LLM processing limits
-          { name: 'llm_max_contexts', type: 'integer', optional: true, default: 50,
-            ngIf: 'input.show_advanced',
-            hint: 'Maximum number of contexts to process with LLM (for cost/performance)' },
-          { name: 'include_confidence_distribution', type: 'boolean', control_type: 'checkbox', optional: true, default: false,
-            ngIf: 'input.show_advanced',
-            hint: 'Return probability distribution across contexts' },
-          
-          # Output shape control
-          { name: 'emit_shape', control_type: 'select', pick_list: 'rerank_emit_shapes', 
-            optional: true, default: 'context_chunks',
-            hint: 'Output format: minimal records, enriched records, or RAG-ready context_chunks' },
-          { name: 'source_key', optional: true, default: 'source',
-            hint: 'Metadata key for document source' },
-          { name: 'uri_key', optional: true, default: 'uri',
-            hint: 'Metadata key for document URI' },
-          
-          # Location override
-          { name: 'ai_apps_location', label: 'AI-Apps location (override)', control_type: 'select', 
-            pick_list: 'ai_apps_locations', optional: true,
-            hint: 'Force specific multi-region (global/us/eu). Usually auto-detected.' }
-        ]
-      end,
-      
-      output_fields: lambda do |object_definitions, _connection|
-        [
-          { name: 'records', type: 'array', of: 'object', properties: [
-              { name: 'id' }, 
-              { name: 'score', type: 'number' }, 
-              { name: 'rank', type: 'integer' },
-              { name: 'content' }, 
-              { name: 'metadata', type: 'object' },
-              { name: 'llm_relevance', type: 'number' },
-              { name: 'category_alignment', type: 'number' }
-            ] },
-          { name: 'context_chunks', type: 'array', of: 'object', properties: [
-              { name: 'id' }, 
-              { name: 'text' }, 
-              { name: 'score', type: 'number' },
-              { name: 'source' }, 
-              { name: 'uri' },
-              { name: 'metadata', type: 'object' },
-              { name: 'metadata_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] },
-              { name: 'metadata_json' },
-              { name: 'llm_relevance', type: 'number' },
-              { name: 'category_alignment', type: 'number' }
-            ] },
-          { name: 'confidence_distribution', type: 'array', of: 'object', properties: [
-              { name: 'id' }, 
-              { name: 'probability', type: 'number' },
-              { name: 'reasoning' }
-            ] },
-          { name: 'ranking_metadata', type: 'object', properties: [
-              { name: 'category' },
-              { name: 'llm_model' },
-              { name: 'contexts_filtered', type: 'integer' },
-              { name: 'contexts_ranked', type: 'integer' }
-            ] },
-          { name: 'complete_output', type: 'object', hint: 'All outputs consolidated for easy downstream use' },
-          { name: 'facets', type: 'object', optional: true, hint: 'Analytics facets when available' }
-        ] + Array(object_definitions['envelope_fields_1'])
-      end,
-      
-      execute: lambda do |connection, input|
-        ctx = call(:step_begin!, :rank_texts_with_ranking_api, input)
-        
-        begin
-          call(:ensure_project_id!, connection)
-          loc = call(:aiapps_loc_resolve, connection, input['ai_apps_location'])
-          
-          # Extract category and prepare query
-          category = input['category'].to_s.strip
-          category_ctx = input['category_context'].to_s.strip
-          query = input['query_text'].to_s
-          
-          # Enhance query with category context if requested
-          if category.present? && input['include_category_in_query'] == true
-            query_prefix = "Category: #{category}"
-            query_prefix += " (#{category_ctx})" if category_ctx.present?
-            enhanced_query = "#{query_prefix}\n\n#{query}"
-          else
-            enhanced_query = query
-          end
-          
-          # Pre-filter contexts by category metadata if requested
-          records_in = call(:safe_array, input['records'])
-          
-          # Validate that records have required fields
-          records_in.each_with_index do |r, i|
-            error("Record at index #{i} missing required 'id' field") unless r['id'].present?
-            error("Record at index #{i} missing required 'content' field") unless r['content'].present?
-          end
-          
-          records_to_rank = records_in
-          
-          if category.present? && input['filter_by_category_metadata'] == true
-            meta_key = input['category_metadata_key'] || 'category'
-            cat_lower = category.downcase
-            
-            records_to_rank = records_in.select do |r|
-              md = r['metadata'].is_a?(Hash) ? r['metadata'] : {}
-              cat_value = md[meta_key]
-              
-              case cat_value
-              when String
-                cat_value.downcase.include?(cat_lower)
-              when Array
-                cat_value.any? { |v| v.to_s.downcase.include?(cat_lower) }
-              else
-                false
-              end
-            end
-            
-            if records_to_rank.empty? && records_in.any?
-              error("Category filtering removed all #{records_in.length} records. Check category metadata key '#{meta_key}' and value '#{category}'")
-            end
-          end
-          
-          # LLM-based ranking
-          llm_model = input['llm_model'] || 'gemini-2.0-flash'
-          distribution = nil
-          enriched = []
-          
-          # Initialize all records with base scores
-          enriched = records_to_rank.map do |orig|
-            orig.merge(
-              'score' => 0.0,
-              'rank' => 999
-            )
-          end
-          
-          # Perform LLM ranking if category is present
-          if category.present?
-            # Limit contexts for LLM processing
-            max_llm_contexts = (input['llm_max_contexts'] || 50).to_i
-            contexts_for_llm = enriched.first(max_llm_contexts)
-            
-            # Call LLM ranker
-            llm_result = call(:llm_category_aware_ranker,
-                            connection,
-                            llm_model,
-                            enhanced_query,
-                            category,
-                            category_ctx,
-                            contexts_for_llm,
-                            ctx['cid'])
-            
-            if llm_result && llm_result['rankings']
-              # Process LLM rankings
-              llm_scores = {}
-              llm_result['rankings'].each do |r|
-                llm_scores[r['id']] = {
-                  'relevance' => r['relevance'].to_f,
-                  'category_alignment' => r['category_alignment'].to_f,
-                  'reasoning' => r['reasoning']
-                }
-              end
-              
-              # Apply LLM scores
-              enriched.each do |rec|
-                if llm_data = llm_scores[rec['id']]
-                  rec['llm_relevance'] = llm_data['relevance']
-                  rec['category_alignment'] = llm_data['category_alignment']
-                  # Score is weighted combination of relevance and category alignment
-                  rec['score'] = 0.8 * llm_data['relevance'] + 0.2 * llm_data['category_alignment']
-                else
-                  # Records not evaluated by LLM get zero score
-                  rec['score'] = 0.0
-                end
-              end
-              
-              # Build confidence distribution if requested
-              if input['include_confidence_distribution'] == true
-                total_score = enriched.sum { |x| x['score'].to_f }
-                total_score = 0.001 if total_score <= 0
-                
-                distribution = enriched.map { |r|
-                  llm_data = llm_scores[r['id']] || {}
-                  {
-                    'id' => r['id'],
-                    'probability' => r['score'].to_f / total_score,
-                    'reasoning' => llm_data['reasoning']
-                  }
-                }.sort_by { |d| -d['probability'] }
-              end
-            end
-          else
-            # If no category provided, use simple query-based relevance scoring
-            contexts_for_llm = enriched.first((input['llm_max_contexts'] || 50).to_i)
-            
-            # Simplified LLM ranking without category
-            llm_result = call(:llm_category_aware_ranker,
-                            connection,
-                            llm_model,
-                            enhanced_query,
-                            '',  # No category
-                            '',  # No category context
-                            contexts_for_llm,
-                            ctx['cid'])
-            
-            if llm_result && llm_result['rankings']
-              llm_result['rankings'].each do |r|
-                matching_record = enriched.find { |rec| rec['id'] == r['id'] }
-                if matching_record
-                  matching_record['llm_relevance'] = r['relevance'].to_f
-                  matching_record['score'] = r['relevance'].to_f
-                end
-              end
-            end
-          end
-          
-          # Re-rank by final scores
-          enriched = enriched.sort_by { |r| [-r['score'].to_f, r['id']] }
-                            .each_with_index { |r, i| r['rank'] = i + 1 }
-          
-          # Apply top_n limit if specified
-          if input['top_n'].present?
-            enriched = enriched.first(input['top_n'].to_i)
-          end
-          
-          # Shape Output
-          shape = input['emit_shape'] || 'context_chunks'
-          result = {}
-          
-          case shape
-          when 'records_only'
-            result['records'] = enriched.map { |r|
-              { 'id' => r['id'], 'score' => r['score'], 'rank' => r['rank'] }
-            }
-          when 'enriched_records'
-            result['records'] = enriched
-          else  # context_chunks
-            chunks = enriched.map { |r|
-              md = r['metadata'] || {}
-              source_key = input['source_key'] || 'source'
-              uri_key = input['uri_key'] || 'uri'
-              
-              chunk = {
-                'id' => r['id'],
-                'text' => r['content'].to_s,
-                'score' => r['score'].to_f,
-                'source' => md[source_key],
-                'uri' => md[uri_key],
-                'metadata' => md,
-                'metadata_kv' => md.map { |k, v| { 'key' => k, 'value' => v } },
-                'metadata_json' => md.empty? ? nil : md.to_json
-              }
-              
-              chunk['llm_relevance'] = r['llm_relevance'] if r['llm_relevance']
-              chunk['category_alignment'] = r['category_alignment'] if r['category_alignment']
-              
-              chunk
-            }
-            result['context_chunks'] = chunks
-            result['records'] = enriched
-          end
-          
-          result['confidence_distribution'] = distribution if distribution
-          
-          result['ranking_metadata'] = {
-            'category' => category.presence,
-            'llm_model' => llm_model,
-            'contexts_filtered' => records_in.length - records_to_rank.length,
-            'contexts_ranked' => records_to_rank.length
-          }.compact
-          
-          # Build facets
-          facets = {
-            'ranking_api' => 'llm.category_ranker',
-            'category' => category.presence,
-            'llm_model' => llm_model,
-            'emit_shape' => shape,
-            'records_input' => records_in.length,
-            'records_filtered' => records_in.length - records_to_rank.length,
-            'records_ranked' => records_to_rank.length,
-            'records_output' => enriched.length,
-            'has_distribution' => distribution.present?,
-            'top_score' => enriched.first&.dig('score'),
-            'category_filtered' => input['filter_by_category_metadata'] == true
-          }.compact
-          
-          call(:step_ok!, ctx, result, 200, 'OK', facets)
-          
-        rescue => e
-          call(:step_err!, ctx, e)
-        end
-      end,
-      
-      sample_output: lambda do
-        call(:sample_rank_texts_with_ranking_api)
-      end
-    },
-    rag_retrieve_contexts_enhanced: {
-      title: 'RAG: Retrieve contexts (enhanced)',
-      subtitle: 'projects.locations:retrieveContexts (Vertex RAG Engine, v1)',
-      display_priority: 120,
-      retry_on_response: [408, 429, 500, 502, 503, 504],
-      max_retries: 3,
-      
-      config_fields: [
-        { name: 'show_advanced', label: 'Show advanced options',
-          type: 'boolean', control_type: 'checkbox',
-          default: false, sticky: true, extends_schema: true,
-          hint: 'Toggle to reveal threshold/ranker controls.' }
-      ],    
-      input_fields: lambda do |od, connection, cfg|
-        show_adv = (cfg['show_advanced'] == true)
-        
-        base = [
-          { name: 'query_text', label: 'Query text', optional: false },
-          { name: 'rag_corpus', optional: true,
-            hint: 'Full or short ID. Example: my-corpus. Will auto-expand using connection project/location.' },
-          { name: 'rag_file_ids', type: 'array', of: 'string', optional: true,
-            hint: 'Optional: limit to these file IDs (must belong to the same corpus).' },
-          { name: 'top_k', type: 'integer', optional: true, default: 20, hint: 'Max contexts to return.' },
-          { name: 'correlation_id', optional: true, hint: 'For tracking related requests.' },
-          { name: 'sanitize_pdf_content', 
-            type: 'boolean', 
-            control_type: 'checkbox',
-            default: true,
-            hint: 'Clean PDF extraction artifacts when detected (recommended)' },
-          { name: 'on_error_behavior', 
-            control_type: 'select',
-            pick_list: [
-              ['Skip failed contexts', 'skip'],
-              ['Include error placeholders', 'include'],
-              ['Fail entire request', 'fail']
-            ],
-            default: 'skip',
-            hint: 'How to handle individual context processing errors' }
-        ]
-        
-        adv = [
-          { name: 'vector_distance_threshold', type: 'number', optional: true,
-            hint: 'Return contexts with distance ≤ threshold. For COSINE, lower is better.' },
-          { name: 'vector_similarity_threshold', type: 'number', optional: true,
-            hint: 'Return contexts with similarity ≥ threshold. Do NOT set both thresholds.' },
-          { name: 'rank_service_model', optional: true,
-            hint: 'Vertex Ranking model, e.g. semantic-ranker-512@latest.' },
-          { name: 'llm_ranker_model', optional: true,
-            hint: 'LLM ranker, e.g. gemini-2.5-flash.' }
-        ]
-        
-        show_adv ? (base + adv) : base
-      end,
-      output_fields: lambda do |object_definitions, connection|
-        [
-          { name: 'question' },
-          { name: 'contexts', type: 'array', of: 'object', properties: [
-              { name: 'id' },
-              { name: 'text' },
-              { name: 'score', type: 'number' },
-              { name: 'source' },
-              { name: 'uri' },
-              { name: 'metadata', type: 'object' },
-              { name: 'metadata_kv', type: 'array', of: 'object' },
-              { name: 'metadata_json' },
-              { name: 'is_pdf', type: 'boolean' },
-              { name: 'processing_error', type: 'boolean' }
-            ]
-          },
-          { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object', properties: [
-              { name: 'http_status', type: 'integer' },
-              { name: 'message' },
-              { name: 'duration_ms', type: 'integer' },
-              { name: 'correlation_id' },
-              { name: 'success_count', type: 'integer' },
-              { name: 'error_count', type: 'integer' },
-              { name: 'partial_failure', type: 'boolean' },
-              { name: 'local_logs', type: 'array', of: 'object', optional: true }
-            ]}
-        ]
-      end,
-      execute: lambda do |connection, input|
-        # Initialize tracking context
-        ctx = call(:step_begin!, :rag_retrieve_contexts_enhanced, input)
-        
-        begin
-          # Extract project/location from connection
-          sa_key = JSON.parse(connection['service_account_key_json'] || '{}') rescue {}
-          project = connection['project_id'] || sa_key['project_id']
-          location = connection['location'] || 'us-central1'
-          
-          error('Project is required') if project.nil? || project.empty?
-          error('Location is required') if location.nil? || location.empty?
-          error('Location cannot be global for RAG retrieval') if location.downcase == 'global'
-          
-          # Build corpus path
-          corpus = input['rag_corpus'].to_s.strip
-          if corpus.present? && !corpus.start_with?('projects/')
-            corpus = "projects/#{project}/locations/#{location}/ragCorpora/#{corpus}"
-          end
-          
-          # Validate threshold parameters
-          if input['vector_distance_threshold'].present? && input['vector_similarity_threshold'].present?
-            error('Set ONLY one of: vector_distance_threshold OR vector_similarity_threshold.')
-          end
-          if input['rank_service_model'].present? && input['llm_ranker_model'].present?
-            error('Choose ONE ranker: rank_service_model OR llm_ranker_model.')
-          end
-          
-          # Build ragResources
-          rag_resources = {}
-          rag_resources['ragCorpus'] = corpus if corpus.present?
-          file_ids = Array(input['rag_file_ids']).map(&:to_s).map(&:strip).reject(&:empty?)
-          rag_resources['ragFileIds'] = file_ids if file_ids.any?
-          
-          error('Provide rag_corpus and/or rag_file_ids') if rag_resources.empty?
-          
-          # Build retrieval config
-          retrieval_cfg = { 'topK' => (input['top_k'] || 20).to_i }
-          
-          # Add filter if specified
-          if input['vector_distance_threshold'].present?
-            retrieval_cfg['filter'] = { 'vectorDistanceThreshold' => input['vector_distance_threshold'].to_f }
-          elsif input['vector_similarity_threshold'].present?
-            retrieval_cfg['filter'] = { 'vectorSimilarityThreshold' => input['vector_similarity_threshold'].to_f }
-          end
-          
-          # Add ranking if specified
-          if input['rank_service_model'].present?
-            retrieval_cfg['ranking'] = { 'rankService' => { 'modelName' => input['rank_service_model'] } }
-          elsif input['llm_ranker_model'].present?
-            retrieval_cfg['ranking'] = { 'llmRanker' => { 'modelName' => input['llm_ranker_model'] } }
-          end
-          
-          # Build request
-          url = "https://#{location}-aiplatform.googleapis.com/v1/projects/#{project}/locations/#{location}:retrieveContexts"
-          
-          body = {
-            'query' => {
-              'text' => input['query_text'],
-              'ragRetrievalConfig' => retrieval_cfg
-            },
-            'vertexRagStore' => {
-              'ragResources' => [rag_resources]
-            }
-          }
-          
-          headers = {
-            'Authorization' => "Bearer #{connection['access_token']}",
-            'Content-Type' => 'application/json',
-            'X-Correlation-Id' => ctx['cid'],
-            'x-goog-request-params' => "parent=projects/#{project}/locations/#{location}"
-          }
-          
-          # Make request with error handling
-          response = begin
-            post(url).headers(headers).payload(body)
-          rescue => e
-            if e.message.include?('timeout') || e.message.include?('connection')
-              # Return empty but valid response for network issues
-              {
-                'contexts' => { 'contexts' => [] },
-                '_network_error' => "Network error: #{e.message[0..200]}"
-              }
-            else
-              raise e  # Re-raise non-network errors
-            end
-          end
-          
-          # Extract and map contexts with graceful failure
-          contexts = []
-          #raw_contexts = call(:safe_extract_contexts, response)
-          raw_contexts = if response && response['contexts'] && response['contexts']['contexts']
-            response['contexts']['contexts']
-          else
-            []
-          end
-          
-          if raw_contexts.empty? && !response['_network_error']
-            # Add informational context for empty responses
-            contexts << {
-              'id' => 'no-results',
-              'text' => 'No contexts were returned for this query.',
-              'score' => 0.0,
-              'source' => 'system',
-              'uri' => nil,
-              'metadata' => { 'info' => 'empty_response' },
-              'metadata_kv' => [{ 'key' => 'info', 'value' => 'empty_response' }],
-              'metadata_json' => '{"info":"empty_response"}',
-              'is_pdf' => false,
-              'processing_error' => false
-            }
-          else
-            raw_contexts.each_with_index do |ctx_item, idx|
-              begin
-                # Extract metadata
-                md = ctx_item['metadata'] || {}
-                
-                # Get source URI for PDF detection
-                source_uri = ctx_item['sourceUri'] || ctx_item['uri']
-                
-                # DEBUGGING: Log what we're seeing
-                is_pdf = call(:is_pdf_source?, source_uri, md)
-                sanitize_enabled = input['sanitize_pdf_content'] != false
-                
-                # Extract text
-                raw_text = (ctx_item['text'] || ctx_item.dig('chunk', 'text') || '').to_s
-                
-                # DEBUGGING: Check for PDF indicators
-                has_double_escapes = raw_text.include?('\\\\n') || raw_text.include?('\\\\t')
-                
-                # Log for debugging (remove after fixing)
-                if has_double_escapes || is_pdf
-                  puts "DEBUG Context #{idx}: is_pdf=#{is_pdf}, sanitize=#{sanitize_enabled}, has_escapes=#{has_double_escapes}, uri=#{source_uri}"
-                end
-                
-                # Apply PDF-specific cleaning based on preference and detection
-                text = if sanitize_enabled && is_pdf
-                  puts "DEBUG: Sanitizing PDF context #{idx}"
-                  call(:sanitize_pdf_text, raw_text)
-                elsif has_double_escapes && sanitize_enabled
-                  # FALLBACK: Even if not detected as PDF, clean obvious PDF artifacts
-                  puts "DEBUG: Cleaning escaped content in context #{idx}"
-                  call(:sanitize_pdf_text, raw_text)
-                else
-                  # Regular cleaning for non-PDF content
-                  raw_text.encode('UTF-8', invalid: :replace, undef: :replace, replace: ' ')
-                          .gsub(/\s+/, ' ')
-                          .strip
-                end
-                
-                # Try JSON serialization with fallback
-                metadata_json = begin
-                  md.empty? ? nil : md.to_json
-                rescue => json_err
-                  { error: 'metadata_serialization_failed', keys: md.keys.take(10) }.to_json
-                end
-                
-                contexts << {
-                  'id' => ctx_item['chunkId'] || ctx_item['id'] || "ctx-#{idx + 1}",
-                  'text' => text,
-                  'score' => (ctx_item['score'] || ctx_item['relevanceScore'] || 0.0).to_f,
-                  'source' => ctx_item['sourceDisplayName'] || source_uri&.split('/')&.last,
-                  'uri' => source_uri,
-                  'metadata' => md,
-                  'metadata_kv' => md.map { |k, v| { 'key' => k.to_s, 'value' => v.to_s[0..1000] } }, # Limit value size
-                  'metadata_json' => metadata_json,
-                  'is_pdf' => call(:is_pdf_source?, source_uri, md),
-                  'processing_error' => false
-                }
-                
-              rescue => e
-                # Handle individual context errors based on configuration
-                case input['on_error_behavior']
-                when 'fail'
-                  raise e  # Re-raise to fail entire action
-                when 'include'
-                  # Add error placeholder context
-                  contexts << {
-                    'id' => "ctx-#{idx + 1}-error",
-                    'text' => "[Error processing context: #{e.message[0..200]}]",
-                    'score' => 0.0,
-                    'source' => 'error',
-                    'uri' => nil,
-                    'metadata' => { 
-                      'error' => e.message[0..500], 
-                      'error_class' => e.class.name,
-                      'original_id' => ctx_item['chunkId'] || ctx_item['id'] 
-                    },
-                    'metadata_kv' => [
-                      { 'key' => 'error', 'value' => e.message[0..500] },
-                      { 'key' => 'error_class', 'value' => e.class.name }
-                    ],
-                    'metadata_json' => nil,
-                    'is_pdf' => false,
-                    'processing_error' => true
-                  }
-                when 'skip', nil
-                  # Skip this context, continue processing
-                  next
-                end
-              end
-            end
-          end
-          
-          # Calculate success metrics
-          error_count = contexts.count { |c| c['processing_error'] == true }
-          pdf_count = contexts.count { |c| c['is_pdf'] && !c['processing_error'] }
-          success_count = contexts.count { |c| !c['processing_error'] }
-          
-          # Build output
-          out = {
-            'question' => input['query_text'],
-            'contexts' => contexts
-          }
-          
-          # Add telemetry with success tracking
-          extras = {
-            'retrieval' => {
-              'top_k' => retrieval_cfg['topK'],
-              'filter' => retrieval_cfg['filter'] ? {
-                'type' => retrieval_cfg['filter'].keys.first.to_s.sub('vector', '').sub('Threshold', ''),
-                'value' => retrieval_cfg['filter'].values.first
-              } : nil,
-              'contexts_count' => contexts.length,
-              'success_count' => success_count,
-              'error_count' => error_count,
-              'pdf_contexts_count' => pdf_count,
-              'partial_failure' => error_count > 0
-            }.compact,
-            'rank' => retrieval_cfg['ranking'] ? {
-              'mode' => retrieval_cfg['ranking'].keys.first,
-              'model' => retrieval_cfg['ranking'].values.first['modelName']
-            } : nil,
-            'network_error' => response['_network_error']
-          }.compact
-          
-          # Build appropriate message
-          message = if response['_network_error']
-            "Retrieved #{contexts.length} contexts (network issues detected)"
-          elsif error_count > 0
-            "Retrieved #{success_count} contexts (#{error_count} failed)"
-          else
-            "Retrieved #{contexts.length} contexts"
-          end
-          
-          # Return success with telemetry
-          call(:step_ok!, ctx, out, 200, message, extras)
-          
-        rescue => e
-          # Handle errors with telemetry
-          call(:step_err!, ctx, e)
-        end
-      end,
-      sample_output: lambda do
-        call(:sample_rag_retrieve_contexts_enhanced)
-      end,
-    },
     rag_answer: {
       title: 'RAG Engine: Get grounded response (one-shot)',
       subtitle: 'Retrieve contexts from a corpus and generate a cited answer',
@@ -1856,7 +2884,7 @@ require 'securerandom'
           learn_more_text: 'Find out more about the RAG Engine API'
         }
       end,
-      display_priority: 86,
+      display_priority: 1,
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
 
@@ -2124,968 +3152,6 @@ require 'securerandom'
             }
           }
         }
-      end
-    },
-    embed_text: {
-      title: 'Embed text',
-      subtitle: 'Get embeddings from a publisher embedding model',
-      help: lambda do |_|
-        {
-          body: 'POST :predict on a publisher embedding model',
-          learn_more_url: 'https://docs.cloud.google.com/vertex-ai/generative-ai/docs/model-reference/text-embeddings-api',
-          learn_more_text: 'Find more information about the Text embeddings API'
-        }
-      end,
-      display_priority: 7,
-      retry_on_request: ['GET', 'HEAD'],
-      retry_on_response: [408, 429, 500, 502, 503, 504],
-      max_retries: 3,
-
-      input_fields: lambda do |_object_definitions, _connection, _config_fields|
-        [
-          { name: 'correlation_id', label: 'Correlation ID', optional: true, hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
-          { name: 'model', label: 'Embedding model', optional: false, control_type: 'text', default: 'text-embedding-005' },
-          { name: 'texts', type: 'array', of: 'string', optional: false },
-          { name: 'task', hint: 'Optional: RETRIEVAL_QUERY or RETRIEVAL_DOCUMENT' },
-          { name: 'autoTruncate', type: 'boolean', hint: 'Truncate long inputs automatically' },
-          { name: 'outputDimensionality', type: 'integer', optional: true, convert_input: 'integer_conversion',
-            hint: 'Optional dimensionality reduction (see model docs).' }
-        ]
-      end,
-      output_fields: lambda do |object_definitions, _connection|
-        Array(object_definitions['embed_output']) + Array(object_definitions['envelope_fields'])
-      end,
-      execute: lambda do |connection, input|
-        # Correlation id and duration for logs / analytics
-        started_at = Time.now.utc.iso8601
-        t0 = Time.now
-        cid = call(:ensure_correlation_id!, input)
-        url = nil; req_body = nil
-
-        begin
-          model_path = call(:build_embedding_model_path, connection, input['model'])
-
-          # Guard: texts length cannot exceed model batch limit (friendly message)
-          max_per_call = call(:embedding_max_instances, model_path)
-          texts = call(:safe_array, input['texts'])
-          error("Too many texts (#{texts.length}). Max per request for this model is #{max_per_call}. Chunk upstream.") if texts.length > 0 && texts.length > max_per_call
-
-          allowed_tasks = %w[
-            RETRIEVAL_QUERY RETRIEVAL_DOCUMENT SEMANTIC_SIMILARITY
-            CLASSIFICATION CLUSTERING QUESTION_ANSWERING FACT_VERIFICATION
-            CODE_RETRIEVAL_QUERY
-          ]
-          task = input['task'].to_s.strip
-          task = nil if task.blank?
-          error("Invalid task_type: #{task}. Allowed: #{allowed_tasks.join(', ')}") \
-            if task && !allowed_tasks.include?(task)
-
-          instances = call(:safe_array, input['texts']).map { |t|
-            h = { 'content' => t }
-            h['task_type'] = task if task
-            h
-          }
-
-          # Coerce/validate embedding parameters to correct JSON types
-          params = call(:sanitize_embedding_params, {
-            'autoTruncate'         => input['autoTruncate'],
-            'outputDimensionality' => input['outputDimensionality']
-          })
-
-          result = call(:predict_embeddings, connection, model_path, instances, params, cid)
-          result = result.merge(call(:telemetry_envelope, t0, cid, true, 200, 'OK'))
-
-          # Facets + local log
-          extras_for_facets = {
-            'n_texts' => Array(input['texts']).length,
-            'task'    => (task || nil),
-            'model'   => input['model']
-          }
-          facets = call(:compute_facets_for!, 'embed_text', result, extras_for_facets)
-          (result['telemetry'] ||= {})['facets'] = facets
-          call(:local_log_attach!, result,
-            call(:local_log_entry, :embed_text, started_at, t0, result, nil, {
-              'n_texts'        => Array(input['texts']).length,
-              'task'           => (task || nil),
-              'model'          => input['model'],
-              'billable_chars' => result.dig('metadata','billableCharacterCount'),
-              'facets'         => facets
-            }))
-          result
-        rescue => e
-          g   = call(:extract_google_error, e)
-          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          env = call(:telemetry_envelope, t0, cid, false, call(:telemetry_parse_error_code, e), msg)
-          # Optional debug attachment in non-prod:
-          if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
-            env['debug'] = call(:debug_pack, true, url, req_body, g)
-          end
-          # Local log (error path)
-          call(:local_log_attach!, env,
-            call(:local_log_entry, :embed_text, started_at, t0, nil, e, { 'google_error' => g }))
-          error(env)
-        end
-      end,
-      sample_output: lambda do
-        {
-          'predictions' => [
-            { 'embeddings' => { 'values' => [0.012, -0.034, 0.056],
-              'statistics' => { 'truncated' => false, 'token_count' => 21 } } },
-            { 'embeddings' => { 'values' => [0.023, -0.045, 0.067],
-              'statistics' => { 'truncated' => false, 'token_count' => 18 } } }
-          ],
-          'metadata' => { 'billableCharacterCount' => 230 },
-          'ok' => true,
-          'telemetry' => {
-            'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr',
-            'facets' => {
-              'model' => 'text-embedding-005',
-              'n_texts' => 2,
-              'task' => 'RETRIEVAL_QUERY'
-            }
-          }
-        }
-      end
-    },
-    count_tokens: {
-      title: 'Count tokens',
-      description: 'POST :countTokens on a publisher model',
-      help: lambda do |_|
-        {
-          learn_more_url: 'https://docs.cloud.google.com/vertex-ai/generative-ai/docs/model-reference/count-tokens',
-          learn_more_text: 'Check out Google docs for the CountTokens API'
-        }
-      end,
-      display_priority: 5,
-      retry_on_request: ['GET', 'HEAD'],
-      retry_on_response: [408, 429, 500, 502, 503, 504],
-      max_retries: 3,
-
-      input_fields: lambda do |object_definitions, connection, config_fields|
-        [
-          { name: 'correlation_id', label: 'Correlation ID', optional: true, hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
-          { name: 'model', label: 'Model', optional: false, control_type: 'text' },
-          { name: 'contents', type: 'array', of: 'object', properties: object_definitions['content'], optional: false },
-          { name: 'system_preamble', label: 'System preamble (text)', optional: true }
-        ]
-      end,
-      output_fields: lambda do |object_definitions, connection|
-        [
-          { name: 'totalTokens', type: 'integer' },
-          { name: 'totalBillableCharacters', type: 'integer' },
-          { name: 'promptTokensDetails', type: 'array', of: 'object' }
-        ] + Array(object_definitions['envelope_fields_1'])
-      end,
-      execute:  lambda do |connection, input|
-        # Correlation id and duration for logs / analytics
-        started_at = Time.now.utc.iso8601
-        t0 = Time.now
-        cid = call(:ensure_correlation_id!, input)
-        url = nil; req_body = nil
-
-        # Compute model path
-        model_path = call(:build_model_path_with_global_preview, connection, input['model'])
-
-        # Build payload
-        contents   = call(:sanitize_contents_roles, input['contents'])
-        error('At least one non-system message is required in contents') if contents.blank?
-        sys_inst   = call(:system_instruction_from_text, input['system_preamble'])
-
-        loc_from_model = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
-        url = call(:aipl_v1_url, connection, loc_from_model, "#{model_path}:countTokens")
-
-        begin
-          req_body = call(:json_compact, {
-            'contents'          => contents,
-            'systemInstruction' => sys_inst
-          })
-          resp = post(url)
-                    .headers(call(:request_headers_auth_1, connection, cid, connection['user_project'], "model=#{model_path}"))
-                    .payload(req_body)
-          code = call(:telemetry_success_code, resp)
-          result = resp.merge(call(:telemetry_envelope, t0, cid, true, code, 'OK'))
-
-          # Facets + local log
-          extras_for_facets = {
-            'model'          => input['model'],
-            'tokens_total'   => result['totalTokens'],
-            'billable_chars' => result['totalBillableCharacters']
-          }
-          facets = call(:compute_facets_for!, 'count_tokens', result, extras_for_facets)
-          (result['telemetry'] ||= {})['facets'] = facets
-          call(:local_log_attach!, result,
-            call(:local_log_entry, :count_tokens, started_at, t0, result, nil, {
-              'model'            => input['model'],
-              'tokens_total'     => result['totalTokens'],
-              'billable_chars'   => result['totalBillableCharacters'],
-              'facets'           => facets
-            }))
-          result
-        rescue => e
-          g   = call(:extract_google_error, e)
-          msg = [e.to_s, (g['message'] || nil)].compact.join(' | ')
-          env = call(:telemetry_envelope, t0, cid, false, call(:telemetry_parse_error_code, e), msg)
-          # Optional debug attachment in non-prod:
-          if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
-            env['debug'] = call(:debug_pack, true, url, req_body, g)
-          end
-          # Local log (error path)
-          call(:local_log_attach!, env,
-            call(:local_log_entry, :count_tokens, started_at, t0, nil, e, { 'google_error' => g }))
-          error(env) 
-        end
-      end,
-      sample_output: lambda do
-        {
-          'totalTokens' => 31,
-          'totalBillableCharacters' => 96,
-          'promptTokensDetails' => [ { 'modality' => 'TEXT', 'tokenCount' => 31 } ],
-          'ok' => true,
-          'telemetry' => {
-            'http_status' => 200, 'message' => 'OK', 'duration_ms' => 12, 'correlation_id' => 'sample-corr',
-            'facets' => {
-              'model' => 'gemini-2.0-flash',
-              'tokens_total' => 31,
-              'billable_chars' => 96
-            }
-          }
-        }
-      end
-    },
-    operations_get: {
-      title: 'Get (poll) long running operation',
-      subtitle: 'google.longrunning.operations.get',
-      help: lambda do |_|
-        {
-          learn_more_url: 'https://docs.cloud.google.com/vertex-ai/docs/general/long-running-operations',
-          learn_more_text: 'Find out more about Long running operations'
-        }
-      end,
-      display_priority: 5,
-      retry_on_request: ['GET','HEAD'],
-      retry_on_response: [408,429,500,502,503,504],
-      max_retries: 3,
-
-      input_fields: lambda do |_object_definitions, _connection, _config_fields|
-        [
-          { name: 'correlation_id', label: 'Correlation ID', optional: true, hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
-          { name: 'operation', optional: false,
-            hint: 'Operation name or full path, e.g., projects/{p}/locations/{l}/operations/{id}' }
-        ]
-      end,
-      output_fields: lambda do |_object_definitions, _connection|
-        [
-          { name: 'name' }, { name: 'done', type: 'boolean' },
-          { name: 'metadata', type: 'object' }, { name: 'error', type: 'object' }
-        ] + [
-          { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object', properties: [
-            { name: 'http_status', type: 'integer' }, { name: 'message' },
-            { name: 'duration_ms', type: 'integer' }, { name: 'correlation_id' }
-          ]}
-        ]
-      end,
-      execute: lambda do |connection, input|
-        started_at = Time.now.utc.iso8601
-        t0 = Time.now
-        cid = call(:ensure_correlation_id!, input)
-        begin
-          call(:ensure_project_id!, connection)
-          # Accept either full /v1/... or name-only
-          op = input['operation'].to_s.sub(%r{^/v1/}, '')
-          loc = (connection['location'].presence || 'us-central1').to_s.downcase
-          url = call(:aipl_v1_url, connection, loc, op.start_with?('projects/') ? op : "projects/#{connection['project_id']}/locations/#{loc}/operations/#{op}")
-          resp = get(url).headers(call(:request_headers_auth_1, connection, cid, connection['user_project'], nil))
-          code = call(:telemetry_success_code, resp)
-          result = resp.merge(call(:telemetry_envelope, t0, cid, true, code, 'OK'))
-
-          # Facets + local log
-          extras_for_facets = {
-            'operation' => (result['name'] || input['operation']),
-            'done'      => result['done']
-          }
-          facets = call(:compute_facets_for!, 'operations_get', result, extras_for_facets)
-          (result['telemetry'] ||= {})['facets'] = facets
-
-          call(:local_log_attach!, result,
-            call(:local_log_entry, :operations_get, started_at, t0, result, nil, {
-              'operation' => (result['name'] || input['operation']),
-              'done'      => result['done'],
-              'facets'    => facets
-            }))
-          result
-        rescue => e
-          g   = call(:extract_google_error, e)
-          env = {}.merge(call(:telemetry_envelope, t0, cid, false, call(:telemetry_parse_error_code, e), e.to_s))
-          # Local log (error path)
-          call(:local_log_attach!, env,
-            call(:local_log_entry, :operations_get, started_at, t0, nil, e, { 'google_error' => g, 'operation' => input['operation'] }))
-          env
-        end
-      end,
-      sample_output: lambda do
-        {
-          'name' => 'projects/p/locations/us-central1/operations/123',
-          'done' => false,
-          'ok' => true,
-          'telemetry' => {
-            'http_status' => 200, 'message' => 'OK', 'duration_ms' => 8, 'correlation_id' => 'sample',
-            'facets' => {
-              'operation' => 'projects/p/locations/us-central1/operations/123',
-              'done' => false
-            }
-          }
-        }
-      end
-    },
-    deterministic_filter: {
-      title: 'Filter: Deterministic (with intent)',
-      subtitle: 'Hard/soft rules + lightweight intent inference',
-      display_priority: 500,
-      help: lambda do |_|
-        { body: 'Runs hard/soft rules and infers coarse intent from headers/auth/keywords.' }
-      end,
-
-      config_fields: [
-        { name: 'show_advanced', label: 'Show advanced options',
-          type: 'boolean', control_type: 'checkbox',
-          default: false, sticky: true, extends_schema: true,
-          hint: 'Toggle to reveal advanced parameters.' }
-      ],
-      input_fields: lambda do |object_definitions, connection, config_fields|
-        call(:ui_df_inputs, object_definitions, config_fields) +
-          Array(object_definitions['observability_input_fields'])
-      end,
-      output_fields: lambda do |object_definitions, connection|
-        [
-          { name: 'pre_filter', type: 'object', properties: [
-              { name: 'hit', type: 'boolean' }, { name: 'action' }, { name: 'reason' },
-              { name: 'score', type: 'integer' }, { name: 'matched_signals', type: 'array', of: 'string' },
-              { name: 'decision' }
-          ]},
-          { name: 'intent', type: 'object', properties: Array(object_definitions['intent_out']) },
-          { name: 'email_text' },
-          { name: 'email_type' },
-          { name: 'gate', type: 'object', properties: [
-              { name: 'prelim_pass', type: 'boolean' }, { name: 'hard_block', type: 'boolean' },
-              { name: 'hard_reason' }, { name: 'soft_score', type: 'integer' }, { name: 'decision' }, { name: 'generator_hint' }
-            ]},
-          { name: 'complete_output', type: 'object', hint: 'All outputs consolidated for easy downstream use' },
-          { name: 'facets', type: 'object', optional: true, hint: 'Analytics facets when available' }
-        ] + Array(object_definitions['envelope_fields'])
-      end,
-
-      execute: lambda do |connection, input|
-        ctx = call(:step_begin!, :deterministic_filter, input)
-
-        env = call(:norm_email_envelope!, (input['email'] || input))
-        subj, body, email_text = env['subject'], env['body'], env['email_text']
-        #subj = (input['subject'] || '').to_s.strip
-        #body = (input['body']    || '').to_s.strip
-        #error('Provide subject and/or body') if subj.empty? && body.empty?
-        #email_text = call(:build_email_text, subj, body)
-
-        # Build/choose rulepack
-        rules =
-          if input['rules_mode'] == 'json' && input['rules_json'].present?
-            call(:safe_json, input['rules_json'])
-          elsif input['rules_mode'] == 'rows' && Array(input['rules_rows']).any?
-            call(:hr_compile_rulepack_from_rows!, input['rules_rows'])
-          else
-            nil
-          end
-
-        pre = { 'hit' => false }
-        email_type = 'direct_request'
-        hard_block = false
-        hard_reason = nil
-        if rules.is_a?(Hash)
-          hard = call(:hr_eval_hard?, {
-            'subject'=>subj, 'body'=>body, 'from'=>env['from'],
-            'headers'=>env['headers'], 'attachments'=>env['attachments'], 'auth'=>env['auth']
-          }, (rules['hard_exclude'] || {}))
-
-          if hard[:hit]
-            hard_reason = hard[:reason] # e.g., forwarded_chain | internal_discussion | mailing_list | bounce | safety_block
-            # Map hard reasons to a deterministic decision and email_type
-            decision_map = {
-              'forwarded_chain'     => 'REVIEW',
-              'internal_discussion' => 'REVIEW',
-              'mailing_list'        => 'IRRELEVANT',
-              'bounce'              => 'IRRELEVANT',
-              'safety_block'        => 'REVIEW'
-            }
-            email_type = 'forwarded_chain'     if hard_reason == 'forwarded_chain'
-            email_type = 'internal_discussion' if hard_reason == 'internal_discussion'
-            hard_block = %w[forwarded_chain internal_discussion safety_block mailing_list bounce].include?(hard_reason)
-            dec = (decision_map[hard_reason] || 'IRRELEVANT')
-            gate = { 'prelim_pass'=>false, 'hard_block'=>hard_block, 'hard_reason'=>hard_reason, 'soft_score'=>0, 'decision'=>dec, 'generator_hint'=>'blocked' }
-            out = {
-              'pre_filter' => hard.merge({ 'decision' => dec }),
-              'intent'     => nil,
-              'email_text' => email_text,
-              'email_type' => email_type,
-              'gate'       => gate
-            }
-            # Compute facets
-            return call(:step_ok!, ctx, out, 200, 'OK', { 
-              'decision_path' => 'hard_exit',
-              'final_decision' => dec,
-              'hard_rule_triggered' => hard[:reason],
-              'rules_evaluated' => true,
-              'intent_label' => 'none',
-              'email_length' => email_text.length
-            })
-          end
-
-          soft = call(:hr_eval_soft, {
-            'subject'=>subj, 'body'=>body, 'from'=>env['from'],
-            'headers'=>env['headers'], 'attachments'=>env['attachments']
-          }, (rules['soft_signals'] || []))
-          decision = call(:hr_eval_decide, soft[:score], (rules['thresholds'] || {}))
-          pre = { 'hit'=>false, 'score'=>soft[:score], 'matched_signals'=>soft[:matched], 'decision'=>decision }
-        end
-
-        # Lightweight intent (deterministic)
-        headers = (env['headers'] || {}).transform_keys(&:to_s)
-        s = "#{subj}\n\n#{body}".downcase
-        intent = { 'label' => 'unknown', 'confidence' => 0.0, 'basis' => 'deterministic' }
-        if headers['auto-submitted'].to_s.downcase != '' && headers['auto-submitted'].to_s.downcase != 'no'
-          intent = { 'label'=>'auto_reply','confidence'=>0.95,'basis'=>'header:auto-submitted' }
-        elsif headers.key?('x-autoreply') || s =~ /(out of office|auto.?reply|automatic reply)/
-          intent = { 'label'=>'auto_reply','confidence'=>0.9,'basis'=>'header/subject' }
-        elsif headers.key?('list-unsubscribe') || headers.key?('list-id') || headers['precedence'].to_s =~ /(bulk|list)/i
-          intent = { 'label'=>'marketing','confidence'=>0.8,'basis'=>'list-headers' }
-        elsif s =~ /(invoice|receipt|order\s?#|shipment|ticket\s?#)/i
-          intent = { 'label'=>'transactional','confidence'=>0.7,'basis'=>'keywords' }
-        end
-
-        # Preliminary generator gate (upstream of policy): block if any hard_block; require direct_request; disallow IRRELEVANT
-        prelim_pass = (!hard_block) && (email_type == 'direct_request') && (pre['decision'] != 'IRRELEVANT')
-        gate = {
-          'prelim_pass'    => prelim_pass,
-          'hard_block'     => hard_block,
-          'hard_reason'    => hard_reason,
-          'soft_score'     => pre['score'] || 0,
-          'decision'       => pre['decision'],
-          'generator_hint' => (prelim_pass ? 'pass' : 'blocked')
-        }
-
-        # Standard outputs
-        out = {
-          'pre_filter' => pre,
-          'intent'     => intent,
-          'email_text' => email_text,
-          'email_type' => email_type,
-          'gate'       => gate
-        }
-        # Compute facets
-        call(:step_ok!, ctx, out, 200, 'OK', { 
-          'decision_path' => 'soft_eval',
-          'final_decision' => pre['decision'],
-          'intent_label' => intent['label'],
-          'intent_confidence' => intent['confidence'],
-          'intent_basis' => intent['basis'],
-          'soft_score' => pre['score'] || 0,
-          'signals_matched' => (pre['matched_signals'] || []).length,
-          'rules_evaluated' => rules.is_a?(Hash),
-          'hard_rules_count' => rules.is_a?(Hash) ? (rules['hard_exclude'] || {}).values.flatten.length : 0,
-          'soft_signals_count' => rules.is_a?(Hash) ? (rules['soft_signals'] || []).length : 0,
-          'has_attachments' => env['attachments'].present? && env['attachments'].any?,
-          'email_length' => email_text.length,
-          'special_headers' => headers.keys.any? { |k| k.match(/^(x-|list-|auto-|precedence)/i) },
-          'email_type' => email_type,
-          'generator_hint' => gate['generator_hint']
-        })
-      end,
-      sample_output: lambda do
-        call(:sample_deterministic_filter)
-      end
-    },
-    ai_policy_filter: {
-      title: 'Filter: AI policy',
-      subtitle: 'Fuzzy triage via LLM under a strict JSON schema',
-      display_priority: 500,
-      help: lambda do |_|
-        { body: 'Constrained LLM decides IRRELEVANT/REVIEW/KEEP. Short-circuits only if confident.' }
-      end,
-
-      config_fields: [
-        { name: 'show_advanced', label: 'Show advanced options',
-          type: 'boolean', control_type: 'checkbox',
-          default: false, sticky: true, extends_schema: true,
-          hint: 'Toggle to reveal advanced parameters.' }
-      ],
-      input_fields: lambda do |object_definitions, connection, config_fields|
-        call(:ui_policy_inputs, object_definitions, config_fields) +
-          Array(object_definitions['observability_input_fields'])
-      end,
-      output_fields: lambda do |object_definitions, connection|
-        [
-          { name: 'policy', type: 'object', properties: Array(object_definitions['policy_out']) },
-          { name: 'short_circuit', type: 'boolean' },
-          { name: 'email_type' },
-          { name: 'generator_gate', type: 'object', properties: [
-              { name: 'pass_to_responder', type: 'boolean' }, { name: 'reason' }, { name: 'generator_hint' }
-            ]},
-          { name: 'complete_output', type: 'object', hint: 'All outputs consolidated for easy downstream use' },
-          { name: 'facets', type: 'object', optional: true, hint: 'Analytics facets when available' }
-        ] + Array(object_definitions['envelope_fields'])
-      end,
-      execute: lambda do |connection, input|
-        ctx = call(:step_begin!, :ai_policy_filter, input)
-        model_path = call(:build_model_path_with_global_preview, connection, (input['model'] || 'gemini-2.0-flash'))
-        loc  = (model_path[/\/locations\/([^\/]+)/,1] || (connection['location'].presence || 'global')).to_s.downcase
-        url  = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
-        req_params = "model=#{model_path}"
-
-        # Optional policy spec via JSON (testing path)
-        policy_spec = nil
-        if input['policy_mode'].to_s == 'json' && input['policy_json'].present?
-          policy_spec = call(:safe_json_obj!, input['policy_json'])
-        end
-
-        system_text = <<~SYS
-          You are a strict email policy triage. Output JSON only.
-          decision ∈ {IRRELEVANT, REVIEW, KEEP}. confidence ∈ [0,1].
-          matched_signals is a short list of strings; reasons ≤ 2 brief strings.
-        SYS
-
-        if policy_spec
-          system_text << "\n\nPolicy spec JSON:\n#{call(:json_compact, policy_spec)}"
-        end
-
-        payload = {
-          'systemInstruction' => { 'role'=>'system','parts'=>[{'text'=>system_text}] },
-          'contents' => [ { 'role'=>'user', 'parts'=>[ { 'text'=> "Email:\n#{input['email_text']}" } ] } ],
-          'generationConfig' => {
-            'temperature'=>0, 'maxOutputTokens'=>256,
-            'responseMimeType'=>'application/json',
-            'responseSchema'=>{
-              'type'=>'object','additionalProperties'=>false,
-              'properties'=>{
-                'decision'=>{'type'=>'string'},
-                'confidence'=>{'type'=>'number'},
-                'matched_signals'=>{'type'=>'array','items'=>{'type'=>'string'}},
-                'reasons'=>{'type'=>'array','items'=>{'type'=>'string'}}
-              }, 'required'=>['decision']
-            }
-          }
-        }
-
-        resp = post(url).headers(call(:request_headers_auth, connection, ctx['cid'], connection['user_project'], req_params))
-                        .payload(call(:json_compact, payload))
-        text = resp.dig('candidates',0,'content','parts',0,'text').to_s
-        policy = call(:safe_parse_json, text)
-
-        short_circuit = (policy['decision'] == 'IRRELEVANT' && policy['confidence'].to_f >= (input['confidence_short_circuit'] || 0.8).to_f)
-
-        # Generator gate (strict): require direct_request + ≥0.60 + not IRRELEVANT
-        email_type = (input['email_type'].presence || 'direct_request')
-        min_conf = (input['min_confidence_for_generation'].presence || 0.60).to_f
-        decision  = policy['decision'].to_s.upcase
-        conf      = policy['confidence'].to_f
-        block_reasons = []
-        block_reasons << 'non_direct_request' if email_type != 'direct_request'
-        block_reasons << 'policy_irrelevant'  if decision == 'IRRELEVANT'
-        block_reasons << 'low_confidence'     if conf < min_conf
-        pass_to_responder = block_reasons.empty?
-        generator_hint = pass_to_responder ? 'pass' : 'blocked'
-
-        out = {
-          'policy'=>policy,
-          'short_circuit'=>short_circuit,
-          'email_type'=>email_type,
-          'generator_gate'=>{
-            'pass_to_responder'=>pass_to_responder,
-            'reason'=> (block_reasons.any? ? block_reasons.join(',') : 'meets_minimums'),
-            'generator_hint'=>generator_hint
-          }
-        }
-        call(:step_ok!, ctx, out, call(:telemetry_success_code, resp), 'OK', {
-          'decision' => policy['decision'],
-          'confidence' => policy['confidence'],
-          'short_circuit' => short_circuit,
-          'email_type' => email_type,
-          'generator_hint' => generator_hint,
-          'signals_count' => (policy['matched_signals'] || []).length,
-          'reasons_count' => (policy['reasons'] || []).length,
-          'model_used' => input['model'] || 'gemini-2.0-flash',
-          'policy_mode' => input['policy_mode'] || 'none'
-        })
-      rescue => e
-        call(:step_err!, ctx, e)
-      end,
-      sample_output: lambda do
-        call(:sample_ai_policy_filter)
-      end
-    },
-    embed_text_against_categories: {
-      title: 'Categorize: Embed email vs categories',
-      subtitle: 'Cosine similarity → scores + shortlist',
-      display_priority: 500,
-      help: lambda do |_|
-        { body: 'Embeds email and categories, returns similarity scores and a top-K shortlist.' }
-      end,
-
-      config_fields: [
-        { name: 'show_advanced', label: 'Show advanced options',
-          type: 'boolean', control_type: 'checkbox',
-          default: false, sticky: true, extends_schema: true,
-          hint: 'Toggle to reveal advanced parameters.' }
-      ],
-      input_fields: lambda do |object_definitions, connection, config_fields|
-        call(:ui_embed_inputs, object_definitions, config_fields) +
-          Array(object_definitions['observability_input_fields'])
-      end,
-      output_fields: lambda do |object_definitions, _conn|
-        [
-          { name: 'scores', type: 'array', of: 'object', properties: [
-              { name: 'category' }, { name: 'score', type: 'number' }, { name: 'cosine', type: 'number' }
-          ]},
-          { name: 'shortlist', type: 'array', of: 'string' },
-          { name: 'complete_output', type: 'object', hint: 'All outputs consolidated for easy downstream use' },
-          { name: 'facets', type: 'object', optional: true, hint: 'Analytics facets when available' }
-        ] + Array(object_definitions['envelope_fields'])
-      end,
-
-      execute: lambda do |connection, input|
-        ctx = call(:step_begin!, :embed_text_against_categories, input)
-        # Select categories source (array vs JSON)
-        cats_raw =
-          if input['categories_mode'].to_s == 'json' && input['categories_json'].present?
-            call(:safe_json_arr!, input['categories_json'])
-          else
-            input['categories']
-          end
-        cats = call(:norm_categories!, cats_raw)
-
-        emb_model      = (input['embedding_model'].presence || 'text-embedding-005')
-        model_path     = call(:build_embedding_model_path, connection, emb_model)
-
-        email_inst = { 'content'=>input['email_text'].to_s, 'task_type'=>'RETRIEVAL_QUERY' }
-        cat_insts  = cats.map do |c|
-          { 'content'=>[c['name'], c['description'], *call(:safe_array,c['examples'])].compact.join("\n"),
-            'task_type'=>'RETRIEVAL_DOCUMENT' }
-        end
-
-        emb_resp = call(:predict_embeddings, connection, model_path, [email_inst] + cat_insts, {}, ctx['cid'])
-        preds    = call(:safe_array, emb_resp && emb_resp['predictions'])
-        error('Embedding model returned no predictions') if preds.empty?
-
-        email_vec = call(:extract_embedding_vector, preds.first)
-        cat_vecs  = preds.drop(1).map { |p| call(:extract_embedding_vector, p) }
-        sims = cat_vecs.each_with_index.map { |v, i| [i, call(:vector_cosine_similarity, email_vec, v)] }
-        sims.sort_by! { |(_i, s)| -s }
-
-        scores = sims.map { |(i,s)| { 'category'=>cats[i]['name'], 'score'=>(((s+1.0)/2.0).round(6)), 'cosine'=>s.round(6) } }
-        k = [[(input['shortlist_k'] || 3).to_i, 1].max, cats.length].min
-        shortlist = scores.first(k).map { |h| h['category'] }
-
-        out = { 'scores'=>scores, 'shortlist'=>shortlist }
-        call(:step_ok!, ctx, out, 200, 'OK', { 
-          'k' => k,
-          'categories_count' => cats.length,
-          'shortlist_k' => k,
-          'top_score' => scores.first ? scores.first['score'] : 0,
-          'embedding_model' => emb_model,
-          'categories_mode' => input['categories_mode'] || 'array'
-        })
-
-      end,
-      sample_output: lambda do
-        call(:sample_embed_text_against_categories)
-      end
-    },
-    rerank_shortlist: {
-      title: 'Categorize: Re-rank shortlist',
-      subtitle: 'Optional LLM listwise re-ordering of categories',
-      display_priority: 500,
-      help: lambda do |_|
-        { body: 'Uses LLM to produce a probability distribution over the shortlist and re-orders it.' }
-      end,
-
-      config_fields: [
-        { name: 'show_advanced', label: 'Show advanced options',
-          type: 'boolean', control_type: 'checkbox',
-          default: false, sticky: true, extends_schema: true,
-          hint: 'Toggle to reveal advanced parameters.' }
-      ],  
-      input_fields: lambda do |object_definitions, connection, config_fields|
-        call(:ui_rerank_inputs, object_definitions, config_fields) +
-          Array(object_definitions['observability_input_fields'])
-      end,
-      output_fields: lambda do |object_definitions, connection|
-        [
-          { name: 'ranking', type: 'array', of: 'object', properties: [
-              { name: 'category' }, { name: 'prob', type: 'number' }
-          ]},
-          { name: 'shortlist', type: 'array', of: 'string' },
-          { name: 'complete_output', type: 'object', hint: 'All outputs consolidated for easy downstream use' },
-          { name: 'facets', type: 'object', optional: true, hint: 'Analytics facets when available' }
-        ] + Array(object_definitions['envelope_fields'])
-      end,
-
-      execute: lambda do |connection, input|
-        ctx = call(:step_begin!, :rerank_shortlist, input)
-        mode = (input['mode'] || 'none').to_s
-
-        if mode == 'none'
-          sl = call(:safe_array, input['shortlist'])
-          ranking = sl.map { |c| { 'category'=>c, 'prob'=>nil } }
-          out = { 'ranking'=>ranking, 'shortlist'=>sl }
-          return call(:step_ok!, ctx, out, 200, 'OK', { 
-            'mode' => 'none',
-            'categories_ranked' => sl.length
-          })
-        end
-
-        # LLM listwise: reuse referee to get distribution over shortlist
-        cats_raw =
-          if input['categories_mode'].to_s == 'json' && input['categories_json'].present?
-            call(:safe_json_arr!, input['categories_json'])
-          else
-            input['categories']
-          end
-        cats = call(:norm_categories!, cats_raw)
-        ref  = call(:llm_referee, connection, (input['generative_model'] || 'gemini-2.0-flash'),
-                    input['email_text'], call(:safe_array, input['shortlist']), cats, nil, ctx['cid'], nil)
-        dist = call(:safe_array, ref['distribution']).map { |d| { 'category'=>d['category'], 'prob'=>d['prob'].to_f } }
-        # Ensure all shortlist items present
-        missing = call(:safe_array, input['shortlist']) - dist.map { |d| d['category'] }
-        dist.concat(missing.map { |m| { 'category'=>m, 'prob'=>0.0 } })
-        ranking = dist.sort_by { |h| -h['prob'].to_f }
-        out = { 'ranking'=>ranking, 'shortlist'=>ranking.map { |r| r['category'] } }
-        call(:step_ok!, ctx, out, 200, 'OK', { 
-          'mode' => 'llm',
-          'top_prob' => ranking.first ? ranking.first['prob'] : 0,
-          'categories_ranked' => ranking.length,
-          'generative_model' => input['generative_model'] || 'gemini-2.0-flash',
-          'categories_mode' => input['categories_mode'] || 'array'
-        })
-      end,
-      sample_output: lambda do
-        call(:sample_rerank_shortlist)
-      end
-    },
-    llm_referee_with_contexts: {
-      title: 'Categorize: LLM as referee',
-      subtitle: 'Adjudicate among shortlist; accepts ranked categories',
-      display_priority: 500,
-      help: lambda do |_|
-        { body: 'Chooses final category using shortlist + category metadata; can append ranked contexts to the email text.' }
-      end,
-      config_fields: [
-        { name: 'show_advanced', label: 'Show advanced options',
-          type: 'boolean', control_type: 'checkbox',
-          default: false, sticky: true, extends_schema: true,
-          hint: 'Toggle to reveal advanced parameters.' }
-      ], 
-      input_fields: lambda do |object_definitions, connection, config_fields|
-         call(:ui_ref_inputs, object_definitions, config_fields) + [
-           # --- Salience sidecar (disabled by default; 2-call flow when LLM) ---
-           { name: 'salience_mode', label: 'Salience extraction',
-             control_type: 'select', optional: true, default: 'off', extends_schema: true,
-             options: [['Off','off'], ['Heuristic (no LLM)','heuristic'], ['LLM (extra API call)','llm']],
-             hint: 'Extract a salient sentence/paragraph before refereeing. LLM mode makes a separate API call.' },
-           { name: 'salience_append_to_prompt', label: 'Append salience to prompt',
-             type: 'boolean', control_type: 'checkbox', optional: true, default: true,
-             ngIf: 'input.salience_mode != "off"',
-             hint: 'If enabled, the salient span (and light metadata) is appended to the email text shown to the referee.' },
-           { name: 'salience_max_chars', label: 'Salience max chars', type: 'integer',
-             optional: true, default: 500, ngIf: 'input.salience_mode != "off"' },
-           { name: 'salience_include_entities', label: 'Salience: include entities',
-             type: 'boolean', control_type: 'checkbox', optional: true, default: true,
-             ngIf: 'input.salience_mode == "llm"' },
-           { name: 'salience_model', label: 'Salience model',
-             control_type: 'text', optional: true, default: 'gemini-2.0-flash',
-             ngIf: 'input.salience_mode == "llm"' },
-           { name: 'salience_temperature', label: 'Salience temperature',
-             type: 'number', optional: true, default: 0,
-             ngIf: 'input.salience_mode == "llm"' }
-         ] + Array(object_definitions['observability_input_fields'])
-      end,
-      output_fields: lambda do |object_definitions, connection|
-        [
-          { name: 'referee', type: 'object', properties: Array(object_definitions['referee_out']) },
-          { name: 'chosen' },
-          { name: 'confidence', type: 'number' },
-          # Salience sidecar (top-level field; backward compatible)
-          { name: 'salience', type: 'object', properties: [
-               { name: 'span' },
-               { name: 'reason' },
-               { name: 'importance', type: 'number' },
-               { name: 'tags', type: 'array', of: 'string' },
-               { name: 'entities', type: 'array', of: 'object',
-                 properties: [{ name: 'type' }, { name: 'text' }] },
-               { name: 'cta' },
-               { name: 'deadline_iso' },
-               { name: 'focus_preview' },
-               { name: 'responseId' },
-               { name: 'usage', type: 'object', properties: [
-                   { name: 'promptTokenCount', type: 'integer' },
-                   { name: 'candidatesTokenCount', type: 'integer' },
-                   { name: 'totalTokenCount', type: 'integer' }
-               ]},
-               { name: 'span_source' } # heuristic | llm
-             ]},
-          { name: 'complete_output', type: 'object', hint: 'All outputs consolidated for easy downstream use' },
-          { name: 'facets', type: 'object', optional: true, hint: 'Analytics facets when available' }
-        ] + Array(object_definitions['envelope_fields'])
-      end,
-
-      execute: lambda do |connection, input|
-        ctx = call(:step_begin!, :llm_referee_with_contexts, input)
-        # Select categories source (array vs JSON)
-        cats_raw =
-          if input['categories_mode'].to_s == 'json' && input['categories_json'].present?
-            call(:safe_json_arr!, input['categories_json'])
-          else
-            input['categories']
-          end
-        cats = call(:norm_categories!, cats_raw)
-
-        # Optionally append ranked contexts to the email text for better decisions
-        email_text = input['email_text'].to_s
-        if Array(input['contexts']).any?
-          blob = call(:format_context_chunks, input['contexts'])
-          email_text = "#{email_text}\n\nContext:\n#{blob}"
-        end
-         salience = nil
-         sal_err  = nil
-         mode     = (input['salience_mode'] || 'off').to_s
-         if mode != 'off'
-           begin
-             max_span = (input['salience_max_chars'].to_i rescue 500); max_span = [[max_span,80].max,2000].min
-             # Heuristic extraction (no extra API call)
-             if mode == 'heuristic'
-               focus = email_text.to_s[0, 8000]
-               # drop greetings
-               focus = focus.sub(/\A\s*(subject:\s*[^\n]+\n+)?\s*(hi|hello|hey)[^a-z0-9]*\n+/i, '')
-               cand = focus.split(/(?<=[.!?])\s+/).find { |s| s.strip.length >= 12 && s !~ /\A(hi|hello|hey)\b/i } || focus[0, max_span]
-               span = cand.to_s.strip[0, max_span]
-               salience = {
-                 'span'=>span, 'reason'=>nil, 'importance'=>nil, 'tags'=>nil,
-                 'entities'=>nil, 'cta'=>nil, 'deadline_iso'=>nil,
-                 'focus_preview'=>focus, 'responseId'=>nil, 'usage'=>nil, 'span_source'=>'heuristic'
-               }
-             elsif mode == 'llm'
-               # LLM extraction (separate API call)
-               model = (input['salience_model'].presence || 'gemini-2.0-flash').to_s
-               model_path = call(:build_model_path_with_global_preview, connection, model)
-               loc = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
-               url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
-               req_params = "model=#{model_path}"
- 
-               schema_props = {
-                 'salient_span'=>{'type'=>'string','minLength'=>12},
-                 'reason'=>{'type'=>'string'},
-                 'importance'=>{'type'=>'number'},
-                 'tags'=>{'type'=>'array','items'=>{'type'=>'string'}},
-                 'call_to_action'=>{'type'=>'string'},
-                 'deadline_iso'=>{'type'=>'string'}
-               }
-               schema_props['entities'] = {
-                 'type'=>'array',
-                 'items'=>{'type'=>'object','additionalProperties'=>false,
-                   'properties'=>{'type'=>{'type'=>'string'},'text'=>{'type'=>'string'}},
-                   'required'=>['text']}
-               } if call(:normalize_boolean, input['salience_include_entities'])
- 
-               system_text = "You extract the single most important sentence or short paragraph from an email. " \
-                             "Rules: (1) Return VALID JSON only. (2) Do NOT output greetings, signatures, legal footers, " \
-                             "auto-replies, or vague pleasantries. (3) Keep under #{max_span} characters; do not truncate mid-sentence. " \
-                             "(4) importance is in [0,1]; set call_to_action/deadline_iso when clearly present."
- 
-               gen_cfg = {
-                 'temperature'=> (input['salience_temperature'].present? ? input['salience_temperature'].to_f : 0),
-                 'maxOutputTokens'=>512,
-                 'responseMimeType'=>'application/json',
-                 'responseSchema'=>{
-                   'type'=>'object','additionalProperties'=>false,'properties'=>schema_props,
-                   'required'=>['salient_span']
-                 }
-               }
-               contents = [{ 'role'=>'user', 'parts'=>[{ 'text'=>"Email (trimmed):\n#{email_text.to_s[0,8000]}" }]}]
-               payload = {
-                 'contents'=>contents,
-                 'systemInstruction'=>{ 'role'=>'system', 'parts'=>[{ 'text'=>system_text }]},
-                 'generationConfig'=>gen_cfg
-               }
-               req_body = call(:json_compact, payload)
-               resp = post(url).headers(call(:request_headers_auth, connection, ctx['cid'], connection['user_project'], req_params))
-                              .payload(req_body)
- 
-               txt = resp.dig('candidates',0,'content','parts',0,'text').to_s
-               parsed = call(:json_parse_gently!, txt)
-               span = parsed['salient_span'].to_s.strip
-               if span.empty? || span =~ /\A(hi|hello|hey)\b[:,\s]*\z/i || span.length < 8
-                 focus = email_text.to_s[0, 8000]
-                 focus = focus.sub(/\A\s*(subject:\s*[^\n]+\n+)?\s*(hi|hello|hey)[^a-z0-9]*\n+/i, '')
-                 cand = focus.split(/(?<=[.!?])\s+/).find { |s| s.strip.length >= 12 && s !~ /\A(hi|hello|hey)\b/i } || focus[0, max_span]
-                 span = cand.to_s.strip[0, max_span]
-               end
-               salience = {
-                 'span'=>span,
-                 'reason'=>parsed['reason'],
-                 'importance'=>parsed['importance'],
-                 'tags'=>parsed['tags'],
-                 'entities'=>parsed['entities'],
-                 'cta'=>parsed['call_to_action'],
-                 'deadline_iso'=>parsed['deadline_iso'],
-                 'focus_preview'=>email_text.to_s[0,8000],
-                 'responseId'=>resp['responseId'],
-                 'usage'=>resp['usageMetadata'],
-                 'span_source'=>'llm'
-               }
-             end
-           rescue => e
-             sal_err = e.to_s
-             salience = nil
-           end
-         end
-         # Optionally append salience to the prompt sent to the referee
-         if salience && call(:normalize_boolean, input['salience_append_to_prompt'])
-           email_text = call(:maybe_append_salience, email_text, salience, salience['importance'])
-         end
-        shortlist = call(:safe_array, input['shortlist'])
-        ref = call(:llm_referee, connection, (input['generative_model'] || 'gemini-2.0-flash'),
-                  email_text, (shortlist.any? ? shortlist : nil), cats, input['fallback_category'], ctx['cid'], nil)
-
-        min_conf = (input['min_confidence'].presence || 0.25).to_f
-        chosen =
-          if ref['confidence'].to_f < min_conf && input['fallback_category'].present?
-            input['fallback_category']
-          else
-            ref['category']
-          end
-
-        out = {
-          'referee'=>ref,
-          'chosen'=>chosen,
-          'confidence'=>[ref['confidence'], 0.0].compact.first.to_f
-        }
-        out['salience'] = salience if salience
- 
-        extras = {
-          'chosen' => chosen,
-          'confidence' => out['confidence'],
-          'salience_mode' => input['salience_mode'] || 'off',
-          'salience_len' => (salience && salience['span'] ? salience['span'].to_s.length : nil),
-          'salience_importance' => (salience && salience['importance']),
-          'salience_source' => (salience && salience['span_source']),
-          'salience_err' => sal_err,
-          'has_contexts' => Array(input['contexts']).any?,
-          'shortlist_size' => shortlist.length,
-          'generative_model' => input['generative_model'] || 'gemini-2.0-flash',
-          'categories_mode' => input['categories_mode'] || 'array'
-        }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
-
-        # Add the missing step_ok! call with extras
-        call(:step_ok!, ctx, out, 200, 'OK', extras)
-      end,
-      sample_output: lambda do
-        call(:sample_llm_referee_with_contexts)  # or appropriate method name for each action
       end
     }
   },
@@ -3881,7 +3947,102 @@ require 'securerandom'
 
       templates[template_id] || error("Template '#{template_id}' not found")
     end,
-
+    # Schema helpers
+    build_llm_config_from_schema: lambda do |schema_input|
+      return {} unless schema_input.is_a?(Hash)
+      
+      structure = schema_input['structure'] || {}
+      validation = schema_input['validation_rules'] || {}
+      
+      # Build responseSchema from structure
+      response_schema = {
+        'type' => 'object',
+        'additionalProperties' => false,
+        'properties' => {},
+        'required' => []
+      }
+      
+      structure.each do |field, spec|
+        prop = {
+          'type' => spec['type'] || 'string'
+        }
+        
+        # Apply constraints from schema
+        prop['enum'] = spec['enum'] if spec['enum'] && validation['strict_enum']
+        prop['minimum'] = spec['minimum'] if spec['minimum']
+        prop['maximum'] = spec['maximum'] if spec['maximum']
+        prop['minItems'] = spec['minItems'] if spec['minItems']
+        prop['maxItems'] = spec['maxItems'] if spec['maxItems']
+        prop['items'] = spec['items'] if spec['items']
+        
+        response_schema['properties'][field] = prop
+        response_schema['required'] << field if spec['required']
+      end
+      
+      # Build system prompt enhancement
+      prompt_addition = ""
+      if validation['provide_example']
+        example = {}
+        structure.each do |field, spec|
+          example[field] = spec['example'] || spec['default'] || 
+                          case spec['type']
+                          when 'string' then spec['enum'] ? spec['enum'].first : ""
+                          when 'number' then 0.5
+                          when 'array' then []
+                          when 'object' then {}
+                          else nil
+                          end
+        end
+        prompt_addition = "\n\nExample valid output:\n#{JSON.pretty_generate(example)}"
+      end
+      
+      {
+        'response_schema' => response_schema,
+        'prompt_addition' => prompt_addition,
+        'validation_rules' => validation
+      }
+    end,
+    validate_against_schema: lambda do |response, schema_input, apply_defaults = true|
+      structure = schema_input['structure'] || {}
+      
+      # Validate each field
+      structure.each do |field, spec|
+        value = response[field]
+        
+        # Apply defaults if missing
+        if value.nil? && apply_defaults && spec['default']
+          response[field] = spec['default']
+          value = spec['default']
+        end
+        
+        # Validate enums
+        if spec['enum'] && !spec['enum'].include?(value)
+          response[field] = spec['enum'].first # Coerce to valid value
+        end
+        
+        # Validate ranges
+        if spec['type'] == 'number' && value
+          value = value.to_f
+          value = spec['minimum'] if spec['minimum'] && value < spec['minimum']
+          value = spec['maximum'] if spec['maximum'] && value > spec['maximum']
+          response[field] = value
+        end
+      end
+      
+      response
+    end,
+    expand_schema_template: lambda do |template, variables = {}|
+      # Deep clone the template
+      expanded = JSON.parse(template.to_json)
+      
+      # Replace variables like $CATEGORIES
+      json_str = expanded.to_json
+      variables.each do |key, value|
+        json_str.gsub!("\"$#{key}\"", value.to_json)
+      end
+      
+      JSON.parse(json_str)
+    end,
     # PDF handling
     sanitize_pdf_text: lambda do |raw_text|
       begin
