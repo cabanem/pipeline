@@ -724,9 +724,20 @@ require 'securerandom'
         
         # Build system text - combine base instructions with schema instructions
         system_text = <<~SYS
-          You are a strict email policy triage. Output JSON only.
-          decision ∈ {IRRELEVANT, REVIEW, KEEP}. confidence ∈ [0,1].
-          matched_signals is a short list of strings; reasons ≤ 2 brief strings.
+          You are a strict email policy triage. Your ENTIRE response must be valid JSON.
+          
+          CRITICAL OUTPUT REQUIREMENTS:
+          1. Output ONLY valid JSON - no text before or after
+          2. DO NOT include markdown formatting or code blocks
+          3. Use EXACTLY these field names (case-sensitive):
+             - decision: must be exactly one of: "IRRELEVANT", "REVIEW", "KEEP"
+             - confidence: number between 0 and 1
+             - matched_signals: array of strings (max 10 items)
+             - reasons: array of strings (max 5 items)
+          4. ALL fields are required
+          
+          Example valid response:
+          {"decision":"KEEP","confidence":0.85,"matched_signals":["direct_question"],"reasons":["Clear PTO request"]}
         SYS
         
         # Add schema-specific instructions if available
@@ -785,11 +796,25 @@ require 'securerandom'
         
         # Extract and parse the response
         text = resp.dig('candidates',0,'content','parts',0,'text').to_s
-        policy = call(:safe_parse_json, text)
+        # Strict JSON extraction and validation
+        clean_text = text.gsub(/```json\n?/, '').gsub(/```\n?/, '').strip
+        
+        # Ensure it looks like JSON
+        unless clean_text.start_with?('{') && clean_text.end_with?('}')
+          # Try to extract JSON from the text
+          json_match = clean_text.match(/\{[^{}]*\}/)
+          clean_text = json_match ? json_match[0] : '{"decision":"REVIEW","confidence":0.0,"matched_signals":[],"reasons":["Parse error"]}'
+        end
+        
+        policy = begin
+          JSON.parse(clean_text)
+        rescue => e
+          { 'decision' => 'REVIEW', 'confidence' => 0.0, 'matched_signals' => [], 'reasons' => ['JSON parse failed'] }
+        end
         
         # Validate and correct response against schema if available
         if output_format
-          policy = call(:validate_against_schema, policy, output_format, true)
+          policy = call(:validate_policy_schema!, policy, output_format)
         end
         
         # Ensure decision is valid (original logic preserved)
@@ -1741,6 +1766,27 @@ require 'securerandom'
       end,
       execute: lambda do |connection, input|
         ctx = call(:step_begin!, :llm_referee_with_contexts, input)
+
+        # Add intent gate check
+        if input['intent_kind'].present? && input['intent_kind'] != 'information_request'
+          out = {
+            'referee' => { 
+              'category' => input['fallback_category'] || 'Other',
+              'confidence' => 0.0,
+              'reasoning' => 'Non-information intent blocked',
+              'distribution' => []
+            },
+            'chosen' => input['fallback_category'] || 'Other',
+            'confidence' => 0.0,
+            'generator_gate' => {
+              'pass_to_responder' => false,
+              'reason' => 'non_information_intent',
+              'generator_hint' => 'blocked'
+            }
+          }
+          return call(:step_ok!, ctx, out, 200, 'OK', { 'blocked_reason' => 'non_information_intent' })
+        end
+
         # Select categories source (array vs JSON)
         cats_raw =
           if input['categories_mode'].to_s == 'json' && input['categories_json'].present?
@@ -4043,6 +4089,140 @@ require 'securerandom'
       
       JSON.parse(json_str)
     end,
+    validate_grounding!: lambda do |category, context_data, categories_config|
+      # Find category configuration
+      cat_config = categories_config.find { |c| c['name'] == category } || {}
+      grounding_req = cat_config.dig('responder_profile', 'grounding', 'any_of') || []
+      
+      return { 'valid' => true, 'has_grounding' => false } if grounding_req.empty?
+      
+      # Check if any required grounding is present
+      found_fields = []
+      grounding_req.each do |path|
+        parts = path.split('.')
+        value = parts.reduce(context_data) { |data, part| data.is_a?(Hash) ? data[part] : nil }
+        found_fields << path if value.present?
+      end
+      
+      if found_fields.empty?
+        {
+          'valid' => false,
+          'has_grounding' => false,
+          'missing' => grounding_req,
+          'message' => "Missing required grounding for #{category}: need one of #{grounding_req.join(' OR ')}"
+        }
+      else
+        {
+          'valid' => true,
+          'has_grounding' => true,
+          'found' => found_fields,
+          'message' => "Found grounding: #{found_fields.join(', ')}"
+        }
+      end
+    end,
+    validate_policy_schema!: lambda do |response, schema|
+      structure = schema['structure'] || {}
+      
+      # Check required fields
+      required_fields = structure.select { |k,v| v['required'] == true }.keys
+      missing = required_fields - response.keys
+      error("Policy missing required fields: #{missing.join(', ')}") unless missing.empty?
+      
+      # Validate decision enum strictly
+      if response['decision']
+        valid_decisions = structure.dig('decision', 'enum') || ['IRRELEVANT', 'REVIEW', 'KEEP']
+        unless valid_decisions.include?(response['decision'])
+          response['decision'] = 'REVIEW' # Safe default
+          response['_validation_warnings'] ||= []
+          response['_validation_warnings'] << "Invalid decision corrected to REVIEW"
+        end
+      end
+      
+      # Validate confidence range
+      if response['confidence']
+        conf = response['confidence'].to_f
+        response['confidence'] = [[conf, 0.0].max, 1.0].min
+      end
+      
+      # Validate arrays have correct types
+      ['matched_signals', 'reasons', 'escalation_reasons'].each do |field|
+        if response[field] && !response[field].is_a?(Array)
+          response[field] = [response[field].to_s]
+        end
+      end
+      
+      response
+    end,
+    pre_generation_gate!: lambda do |input|
+      # Check all requirements for generation
+      checks = {
+        'email_type' => input['email_type'] == 'direct_request',
+        'intent' => input['intent_kind'] == 'information_request',
+        'confidence' => (input['confidence'].to_f || 0) >= 0.60,
+        'category_valid' => input['category'].present?,
+        'no_chain_detected' => input['chain_detected'] != true,
+        'no_safety_flags' => input['safety_blocked'] != true,
+        'has_email_text' => input['email_text'].present?
+      }
+      
+      failed = checks.select { |k,v| !v }.keys
+      if failed.any?
+        return {
+          'gate_passed' => false,
+          'failed_checks' => failed,
+          'should_generate' => false,
+          'reason' => case failed.first
+            when 'email_type' then 'Not a direct request'
+            when 'intent' then 'Not an information request'
+            when 'confidence' then 'Confidence below threshold'
+            when 'no_chain_detected' then 'Email chain detected'
+            when 'no_safety_flags' then 'Safety concerns detected'
+            else 'Missing required fields'
+          end
+        }
+      end
+      
+      { 'gate_passed' => true, 'should_generate' => true }
+    end,
+    validate_config_alignment!: lambda do |policy_config, semantic_config, categories|
+      issues = []
+      warnings = []
+      
+      # Check category alignment
+      policy_cats = policy_config.dig('schema', 'category') || []
+      defined_cats = categories.map { |c| c['name'] }
+      
+      missing_in_defs = policy_cats - defined_cats
+      missing_in_policy = defined_cats - policy_cats
+      
+      issues << "Categories in policy but not defined: #{missing_in_defs.join(', ')}" if missing_in_defs.any?
+      warnings << "Categories defined but not in policy: #{missing_in_policy.join(', ')}" if missing_in_policy.any?
+      
+      # Check confidence threshold alignment
+      policy_gen_min = policy_config['min_confidence_for_generation'].to_f
+      semantic_keep_min = (semantic_config.dig('thresholds', 'keep_min').to_f / 10.0) rescue 0.0
+      
+      if (policy_gen_min - semantic_keep_min).abs > 0.1
+        warnings << "Confidence threshold mismatch: policy=#{policy_gen_min}, semantic≈#{semantic_keep_min}"
+      end
+      
+      # Check email type requirements
+      policy_types = policy_config.dig('schema', 'email_type') || []
+      semantic_excludes = semantic_config.dig('hard_exclude', 'forwarded_chain') ? ['forwarded_chain'] : []
+      
+      # Check intent alignment
+      policy_intents = policy_config.dig('schema', 'intent_kind') || []
+      if !policy_intents.include?('information_request')
+        issues << "Policy must include 'information_request' as an intent_kind for generation"
+      end
+      
+      {
+        'valid' => issues.empty?,
+        'issues' => issues,
+        'warnings' => warnings,
+        'message' => issues.any? ? "Config issues: #{issues.join('; ')}" : "Configuration aligned"
+      }
+    end,
     # PDF handling
     sanitize_pdf_text: lambda do |raw_text|
       begin
@@ -5346,6 +5526,21 @@ require 'securerandom'
       corr = (corr.to_s.strip.empty? ? call(:build_correlation_id) : corr.to_s.strip)
       mode = (input['mode'] || 'plain').to_s
 
+      # Pre-generation validation for RAG mode
+      if mode == 'rag_with_context'
+        gate_check = call(:pre_generation_gate!, input)
+        unless gate_check['gate_passed']
+          return {
+            'status' => 'blocked',
+            'gate_check' => gate_check,
+            'responseId' => nil,
+            'candidates' => [],
+            'confidence' => 0.0,
+            'telemetry' => call(:telemetry_envelope, t0, corr, false, 200, gate_check['reason'])
+          }
+        end
+      end
+
       # Model + location
       model_path     = call(:build_model_path_with_global_preview, connection, input['model'])
       loc_from_model = (model_path[/\/locations\/([^\/]+)/,1] || (connection['location'].presence || 'global')).to_s.downcase
@@ -5429,7 +5624,18 @@ require 'securerandom'
         pool    = base + ordered
 
         sys_text = input['system_preamble'].presence ||
-          'Answer using ONLY the provided context chunks. If the context is insufficient, reply with “I don’t know.” Keep answers concise and cite chunk IDs.'
+          <<~SYSPROMPT
+            CRITICAL OUTPUT REQUIREMENTS:
+            1. Your ENTIRE response must be valid JSON - no text before or after
+            2. Use EXACTLY the schema provided - no extra fields
+            3. DO NOT include markdown formatting, code blocks, or backticks
+            4. If context is insufficient, set status to "insufficient_context"
+            
+            Answer using ONLY the provided context chunks. Keep answers concise and cite chunk IDs.
+            
+            Example structure:
+            {"answer":"Based on context...", "citations":[{"chunk_id":"c1","source":"doc.pdf"}]}
+          SYSPROMPT
         kept    = call(:select_prefix_by_budget, connection, pool, q, sys_text, budget_prompt, model_for_cnt)
         blob    = call(:format_context_chunks, kept)
         gen_cfg = {
