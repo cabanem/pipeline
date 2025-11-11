@@ -9,7 +9,7 @@ require 'securerandom'
 {
   title: 'Vertex RAG Engine',
   subtitle: 'RAG Engine',
-  version: '1.0.0',
+  version: '1.0.1',
   description: 'RAG engine via service account (JWT)',
   author: 'Emily Cabaniss',
   help: lambda do |input, picklist_label|
@@ -2181,7 +2181,7 @@ require 'securerandom'
             'systemInstruction' => sys_inst
           })
           resp = post(url)
-                    .headers(call(:request_headers_auth_1, connection, cid, connection['user_project'], "model=#{model_path}"))
+                    .headers(call(:request_headers_auth, connection, cid, connection['user_project'], "model=#{model_path}"))
                     .payload(req_body)
           code = call(:telemetry_success_code, resp)
           result = resp.merge(call(:telemetry_envelope, t0, cid, true, code, 'OK'))
@@ -2377,7 +2377,7 @@ require 'securerandom'
           url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
           req_params = "model=#{model_path}"
           req_body = call(:json_compact, payload)
-          resp = post(url).headers(call(:request_headers_auth_1, connection, cid, connection['user_project'], req_params)).payload(req_body)
+          resp = post(url).headers(call(:request_headers_auth, connection, cid, connection['user_project'], req_params)).payload(req_body)
 
           text   = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
           parsed = call(:safe_parse_json, text)
@@ -2492,7 +2492,7 @@ require 'securerandom'
           op = input['operation'].to_s.sub(%r{^/v1/}, '')
           loc = (connection['location'].presence || 'us-central1').to_s.downcase
           url = call(:aipl_v1_url, connection, loc, op.start_with?('projects/') ? op : "projects/#{connection['project_id']}/locations/#{loc}/operations/#{op}")
-          resp = get(url).headers(call(:request_headers_auth_1, connection, cid, connection['user_project'], nil))
+          resp = get(url).headers(call(:request_headers_auth, connection, cid, connection['user_project'], nil))
           code = call(:telemetry_success_code, resp)
           result = resp.merge(call(:telemetry_envelope, t0, cid, true, code, 'OK'))
 
@@ -3029,7 +3029,7 @@ require 'securerandom'
         retr_url      = call(:aipl_v1_url, connection, loc, "#{parent}:retrieveContexts")
         retr_req_body = call(:json_compact, retrieve_payload)
         retr_resp = post(retr_url)
-                      .headers(call(:request_headers_auth_1, connection, cid, nil, req_params_re))
+                      .headers(call(:request_headers_auth, connection, cid, nil, req_params_re))
                       .payload(retr_req_body)
         raw_ctxs = call(:normalize_retrieve_contexts!, retr_resp)
 
@@ -3091,7 +3091,7 @@ require 'securerandom'
         gen_req_body = call(:json_compact, gen_payload)
         req_params_g = "model=#{model_path}"
         gen_resp = post(gen_url)
-                    .headers(call(:request_headers_auth_1, connection, corr, connection['user_project'], req_params_g))
+                    .headers(call(:request_headers_auth, connection, corr, connection['user_project'], req_params_g))
                     .payload(gen_req_body)
         text   = gen_resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
         parsed = call(:safe_parse_json, text)
@@ -3147,7 +3147,7 @@ require 'securerandom'
         unless call(:normalize_boolean, connection['prod_mode'])
           if call(:normalize_boolean, input['debug'])
             out = out.merge(call(:request_preview_pack, gen_url, 'POST',
-                                call(:request_headers_auth_1, connection, cid, connection['user_project'], req_params_g),
+                                call(:request_headers_auth, connection, cid, connection['user_project'], req_params_g),
                                 gen_req_body))
           end
         end
@@ -4514,7 +4514,7 @@ require 'securerandom'
       url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
       
       resp = post(url)
-              .headers(call(:request_headers_auth_1, connection, corr || call(:build_correlation_id), 
+              .headers(call(:request_headers_auth, connection, corr || call(:build_correlation_id), 
                             connection['user_project'], "model=#{model_path}"))
               .payload(call(:json_compact, payload))
       
@@ -4579,18 +4579,6 @@ require 'securerandom'
         'rankServiceModel'          => rsm,
         'llmRankerModel'            => llm
       }.delete_if { |_k, v| v.nil? || v == '' }
-    end,
-    request_headers_auth_0: lambda do |_connection, correlation_id, user_project=nil, request_params=nil|
-      h = {
-        'X-Correlation-Id' => correlation_id.to_s,
-        'Content-Type'     => 'application/json',
-        'Accept'           => 'application/json'
-      }
-      up = user_project.to_s.strip
-      h['x-goog-user-project']   = up unless up.empty?
-      rp = request_params.to_s.strip
-      h['x-goog-request-params'] = rp unless rp.empty?
-      h
     end,
     aipl_service_host_0: lambda do |connection, loc=nil|
       l = (loc || connection['location']).to_s.downcase
@@ -5176,15 +5164,72 @@ require 'securerandom'
     end,
 
     # --- Header helper (auth + routing) -----------------------------------------
-    request_headers_auth: lambda do |connection, correlation_id=nil, user_project=nil, req_params=nil|
-      h = {
-        'Authorization'      => "Bearer #{connection['access_token']}",
-        'Content-Type'       => 'application/json; charset=UTF-8',
-        'X-Client-Cid'       => (correlation_id.to_s if correlation_id.to_s != '')
-      }.compact
-      h['x-goog-user-project']  = user_project if user_project.to_s != ''
-      h['x-goog-request-params'] = req_params if req_params.to_s != ''
-      h
+    # Unified auth+header builder.
+    request_headers_auth: lambda do |connection, correlation_id=nil, user_project=nil, request_params=nil, opts=nil|
+      # Backward-compatible signature; final arg `opts` is optional:
+      #   opts = {
+      #     scopes:        Array|String (default: cloud-platform),
+      #     force_remint:  true|false   (default: false),
+      #     cache_salt:    String       (optional logical namespace for token cache)
+      #   }
+      opts ||= {}
+      begin
+        # Resolve scopes and whether to bypass cache for this call
+        scopes = opts.key?(:scopes) ? call(:auth_normalize_scopes, opts[:scopes]) : call(:const_default_scopes)
+        force  = (opts[:force_remint] == true)
+        salt   = opts[:cache_salt].to_s.strip
+        on_error = opts[:on_error]
+
+        token =
+          if force
+            # Explicit per-call remint (does NOT raise here; callers handle errors)
+            fresh = call(:auth_issue_token!, connection, scopes)
+            connection['access_token'] = fresh['access_token'].to_s
+            fresh['access_token'].to_s
+          else
+            # Normal path: reuse cached token or mint if missing/expired
+            t = connection['access_token'].to_s
+            if t.empty?
+              t = call(:auth_build_access_token!, connection, scopes: scopes)
+              connection['access_token'] = t
+            end
+            t.to_s
+          end
+
+        h = {
+          'X-Correlation-Id' => correlation_id.to_s,
+          'Content-Type'     => 'application/json',
+          'Accept'           => 'application/json'
+        }
+        # FIX: use the actual token variable; only set when non-empty.
+        h['Authorization'] = "Bearer #{token}" unless token.to_s.empty?
+
+        up = user_project.to_s.strip
+        h['x-goog-user-project']   = up unless up.empty?
+
+        rp = request_params.to_s.strip
+        h['x-goog-request-params'] = rp unless rp.empty?
+
+        h
+      rescue => e
+        # Harden behavior: optionally return nil so callers (e.g., logger) can skip the call.
+        # Also drop a breadcrumb for debugging (non-prod).
+        begin
+          unless call(:normalize_boolean, connection['prod_mode'])
+            connection['__last_tail_log_error'] = {
+              timestamp: Time.now.utc.iso8601,
+              method: 'request_headers_auth',
+              message: e.message.to_s[0,512],
+              class: e.class.to_s
+            }
+          end
+        rescue; end
+        return nil if on_error == :return_nil
+        # Fallback: minimal headers (legacy behavior)
+        { 'X-Correlation-Id' => correlation_id.to_s,
+          'Content-Type'     => 'application/json',
+          'Accept'           => 'application/json' }
+      end
     end,
     # --- Salience blending (no extraction) --------------------------------------
     maybe_append_salience: lambda do |email_text, salience, importance|
@@ -5671,7 +5716,7 @@ require 'securerandom'
         'generationConfig'  => gen_cfg
       }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
 
-      resp = post(url).headers(call(:request_headers_auth_1, connection, corr, connection['user_project'], req_params))
+      resp = post(url).headers(call(:request_headers_auth, connection, corr, connection['user_project'], req_params))
                       .payload(call(:json_compact, payload))
       code = call(:telemetry_success_code, resp)
 
@@ -5953,76 +5998,8 @@ require 'securerandom'
     # --- Purpose-specific header helpers ---------------------------------
     headers_rag: lambda do |connection, correlation_id, request_params=nil|
       # Retrieval calls: NEVER send x-goog-user-project
-      call(:request_headers_auth_1, connection, correlation_id, nil, request_params)
+      call(:request_headers_auth, connection, correlation_id, nil, request_params)
     end,
-    # Unified auth+header builder.
-    request_headers_auth_1: lambda do |connection, correlation_id, user_project=nil, request_params=nil, opts=nil|
-      # Backward-compatible signature; final arg `opts` is optional:
-      #   opts = {
-      #     scopes:        Array|String (default: cloud-platform),
-      #     force_remint:  true|false   (default: false),
-      #     cache_salt:    String       (optional logical namespace for token cache)
-      #   }
-      opts ||= {}
-      begin
-        # Resolve scopes and whether to bypass cache for this call
-        scopes = opts.key?(:scopes) ? call(:auth_normalize_scopes, opts[:scopes]) : call(:const_default_scopes)
-        force  = (opts[:force_remint] == true)
-        salt   = opts[:cache_salt].to_s.strip
-        on_error = opts[:on_error]
-
-        token =
-          if force
-            # Explicit per-call remint (does NOT raise here; callers handle errors)
-            fresh = call(:auth_issue_token!, connection, scopes)
-            connection['access_token'] = fresh['access_token'].to_s
-            fresh['access_token'].to_s
-          else
-            # Normal path: reuse cached token or mint if missing/expired
-            t = connection['access_token'].to_s
-            if t.empty?
-              t = call(:auth_build_access_token!, connection, scopes: scopes)
-              connection['access_token'] = t
-            end
-            t.to_s
-          end
-
-        h = {
-          'X-Correlation-Id' => correlation_id.to_s,
-          'Content-Type'     => 'application/json',
-          'Accept'           => 'application/json'
-        }
-        # FIX: use the actual token variable; only set when non-empty.
-        h['Authorization'] = "Bearer #{token}" unless token.to_s.empty?
-
-        up = user_project.to_s.strip
-        h['x-goog-user-project']   = up unless up.empty?
-
-        rp = request_params.to_s.strip
-        h['x-goog-request-params'] = rp unless rp.empty?
-
-        h
-      rescue => e
-        # Harden behavior: optionally return nil so callers (e.g., logger) can skip the call.
-        # Also drop a breadcrumb for debugging (non-prod).
-        begin
-          unless call(:normalize_boolean, connection['prod_mode'])
-            connection['__last_tail_log_error'] = {
-              timestamp: Time.now.utc.iso8601,
-              method: 'request_headers_auth_1',
-              message: e.message.to_s[0,512],
-              class: e.class.to_s
-            }
-          end
-        rescue; end
-        return nil if on_error == :return_nil
-        # Fallback: minimal headers (legacy behavior)
-        { 'X-Correlation-Id' => correlation_id.to_s,
-          'Content-Type'     => 'application/json',
-          'Accept'           => 'application/json' }
-      end
-    end,
-
     # --- URL and resource building ----------------------------------------
     # Map a Vertex "region" (e.g., us-central1, europe-west1) to AI-Apps multi-region (global|us|eu)
     region_to_aiapps_loc: lambda do |raw|
@@ -6419,7 +6396,7 @@ require 'securerandom'
       (instances || []).each_slice(max) do |slice|
         url  = call(:aipl_v1_url, connection, loc, "#{model_path}:predict")
         resp = post(url)
-                .headers(call(:request_headers_auth_1, connection, (corr || call(:build_correlation_id)), connection['user_project'], req_params))
+                .headers(call(:request_headers_auth, connection, (corr || call(:build_correlation_id)), connection['user_project'], req_params))
                 .payload({
                   'instances'  => slice,
                   'parameters' => (params.presence || {})
@@ -6532,7 +6509,7 @@ require 'securerandom'
       loc  = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
       url  = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
       resp = post(url)
-               .headers(call(:request_headers_auth_1, connection, (corr || call(:build_correlation_id)), connection['user_project'], req_params))
+               .headers(call(:request_headers_auth, connection, (corr || call(:build_correlation_id)), connection['user_project'], req_params))
                .payload(call(:json_compact, payload))
 
       text   = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s.strip
@@ -6735,7 +6712,7 @@ require 'securerandom'
       loc = (connection['location'].presence || 'global').to_s.downcase
       url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
       resp = post(url)
-               .headers(call(:request_headers_auth_1, connection, (corr || call(:build_correlation_id)), nil, req_params))
+               .headers(call(:request_headers_auth, connection, (corr || call(:build_correlation_id)), nil, req_params))
                .payload({
                   'contents' => contents,
                   'systemInstruction' => { 'role' => 'system', 'parts' => [ { 'text' => system_text } ] },
@@ -6764,7 +6741,7 @@ require 'securerandom'
       }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
 
       begin
-        post(url).headers(call(:request_headers_auth_1, connection, (corr || call(:build_correlation_id)), connection['user_project'], req_params))
+        post(url).headers(call(:request_headers_auth, connection, (corr || call(:build_correlation_id)), connection['user_project'], req_params))
                  .payload(call(:json_compact, payload))
 
       rescue
