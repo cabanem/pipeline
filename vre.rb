@@ -2019,6 +2019,7 @@ require 'securerandom'
       retry_on_request: ['GET', 'HEAD'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
+      deprecated: true,
 
       input_fields: lambda do |_object_definitions, _connection, _config_fields|
         [
@@ -2127,7 +2128,7 @@ require 'securerandom'
       end
     },
     count_tokens: {
-      title: 'Count tokens',
+      title: '[DEPRECATED] Count tokens',
       description: 'POST :countTokens on a publisher model',
       help: lambda do |_|
         {
@@ -2136,6 +2137,7 @@ require 'securerandom'
         }
       end,
       display_priority: 5,
+      deprecated: true,
       retry_on_request: ['GET', 'HEAD'],
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
@@ -2232,7 +2234,7 @@ require 'securerandom'
       end
     },
     email_extract_salient_span: {
-      title: 'Email Extract salient span (deprecated)',
+      title: '[DEPRECATED] Email Extract salient span',
       subtitle: 'Pull the most important sentence/paragraph from an email',
       display_priority: 5,
       help: lambda do |_|
@@ -2245,6 +2247,7 @@ require 'securerandom'
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
+      deprecated: true,
 
       input_fields: lambda do |object_definitions, connection, config_fields|
         [
@@ -2533,7 +2536,7 @@ require 'securerandom'
       end
     },
     gen_categorize_email: {
-      title: 'Email: Categorize email',
+      title: 'Deprecated: Categorize email',
       subtitle: 'Classify an email into a category',
       deprecated: true,
       help: lambda do |input, picklist_label|
@@ -2918,7 +2921,7 @@ require 'securerandom'
       end
     },
     rag_answer: {
-      title: 'RAG Engine: Get grounded response (one-shot)',
+      title: '[DEPRECATED] RAG Engine: Get grounded response (one-shot)',
       subtitle: 'Retrieve contexts from a corpus and generate a cited answer',
       help: lambda do |input, _picklist_label|
         { body:
@@ -2933,6 +2936,7 @@ require 'securerandom'
       display_priority: 1,
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
+      deprecated: true,
 
       input_fields: lambda do |object_definitions, _connection, _config_fields|
         [
