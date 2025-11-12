@@ -26,24 +26,33 @@ require 'securerandom'
   # --------- CONNECTION ---------------------------------------------------
   connection: {
     fields: [
-      # Prod/Dev toggle
-      { name: 'prod_mode',                  optional: true,   control_type: 'checkbox', label: 'Production mode',
-        type: 'boolean',  default: true, extends_schema: true, hint: 'When enabled, suppresses debug echoes and enforces strict idempotency/retry rules.' },
-      # Service account details
-      { name: 'service_account_key_json',   optional: false,  control_type: 'text-area', 
-        hint: 'Paste full JSON key' },
-      { name: 'location',                   optional: false,  control_type: 'text', hint: 'e.g., global, us-central1, us-east4' },
-      { name: 'project_id',                 optional: false,   control_type: 'text',
-        hint: 'GCP project ID (inferred from key if blank)' },
-      { name: 'user_project',               optional: true,   control_type: 'text',      label: 'User project for quota/billing',
-        extends_schema: true, hint: 'Sets x-goog-user-project for billing/quota. Service account must have roles/serviceusage.serviceUsageConsumer on this project.' },
-      { name: 'discovery_api_version', label: 'Discovery API version', control_type: 'select', optional: true, default: 'v1alpha',
-        options: [['v1alpha','v1alpha'], ['v1beta','v1beta'], ['v1','v1']], hint: 'v1alpha for AI Applications; switch to v1beta/v1 if/when you migrate.' },
-      # Facets logging feature-flag (on by default)
-      { name: 'enable_facets_logging', label: 'Enable facets in tail logs',
-        type: 'boolean', control_type: 'checkbox', optional: true, default: true,
-        hint: 'Adds a compact jsonPayload.facets block (retrieval/ranking/generation metrics). No effect on action outputs.' }
+      # Always visible - Core fields needed to connect
+      { name: 'service_account_key_json',  label: 'Service Account Key', optional: false, control_type: 'text-area', hint: 'Paste full JSON key from GCP' },
+      { name: 'project_id', label: 'GCP Project ID', optional: false,  control_type: 'text', hint: 'GCP project ID (inferred from key if blank)' },
+      { name: 'location', label: 'Location', optional: false,  control_type: 'text', hint: 'e.g., us-central1, us-east4' },  
+      { name: 'discovery_api_version', label: 'Discovery API version',  control_type: 'select',  optional: true,  default: 'v1alpha',
+        options: [['v1alpha','v1alpha'], ['v1beta','v1beta'], ['v1','v1']] },
+      
+      # Toggle for advanced options
+      { name: 'show_advanced', label: 'Show advanced options', type: 'boolean', control_type: 'checkbox', optional: true,
+        extends_schema: true, int: 'Enable production mode settings and monitoring options' }
     ],
+    
+    extended_fields: lambda do |connection|
+      # Only show these fields when user checks "Show advanced options"
+      if connection['show_advanced'] == 'true'
+        [
+          { name: 'prod_mode', label: 'Production mode', optional: true, control_type: 'checkbox', type: 'boolean', default: true,
+            hint: 'When enabled, suppresses debug echoes and enforces strict idempotency/retry rules.' },
+          { name: 'user_project', label: 'User project for quota/billing', optional: true, control_type: 'text',
+            hint: 'Sets x-goog-user-project for billing/quota. Service account must have roles/serviceusage.serviceUsageConsumer on this project.' },
+          { name: 'enable_facets_logging', label: 'Enable facets in tail logs', type: 'boolean', control_type: 'checkbox', optional: true, 
+            default: true, hint: 'Adds a compact jsonPayload.facets block (retrieval/ranking/generation metrics). No effect on action outputs.' }
+        ]
+      else
+        []
+      end
+    end,
 
     authorization: {
       # Custom JWT-bearer --> OAuth access token exchange
