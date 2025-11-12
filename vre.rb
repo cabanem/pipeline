@@ -29,7 +29,7 @@ require 'securerandom'
       # Always visible - Core fields needed to connect
       { name: 'service_account_key_json',  label: 'Service Account Key', optional: false, control_type: 'text-area', hint: 'Paste full JSON key from GCP' },
       { name: 'project_id', label: 'GCP Project ID', optional: false,  control_type: 'text', hint: 'GCP project ID (inferred from key if blank)' },
-      { name: 'location', label: 'Location', optional: false,  control_type: 'text', hint: 'e.g., us-central1, us-east4' },  
+      { name: 'location', label: 'GCP Region', optional: false,  control_type: 'text', hint: 'e.g., us-central1, us-east4' },  
       { name: 'discovery_api_version', label: 'Discovery API version',  control_type: 'select',  optional: true,  default: 'v1alpha',
         options: [['v1alpha','v1alpha'], ['v1beta','v1beta'], ['v1','v1']] },
       
@@ -707,178 +707,228 @@ require 'securerandom'
       execute: lambda do |connection, input|
         ctx = call(:step_begin!, :ai_policy_filter, input)
         
-        # Build model path
-        model_path = call(:build_model_path_with_global_preview, connection, (input['model'] || 'gemini-2.0-flash'))
-        loc = (model_path[/\/locations\/([^\/]+)/,1] || (connection['location'].presence || 'global')).to_s.downcase
-        url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
-        req_params = "model=#{model_path}"
+        begin
+          # Build model path
+          model_path = call(:build_model_path_with_global_preview, connection, (input['model'] || 'gemini-2.0-flash'))
+          loc = (model_path[/\/locations\/([^\/]+)/,1] || (connection['location'].presence || 'global')).to_s.downcase
+          url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
+          req_params = "model=#{model_path}"
 
-        # Parse policy specification and extract schema if present
-        policy_spec = nil
-        output_format = nil
-        
-        if input['policy_mode'].to_s == 'json' && input['policy_json'].present?
-          parsed_policy = call(:safe_json_obj!, input['policy_json'])
+          # Parse policy specification and extract schema if present
+          policy_spec = nil
+          output_format = nil
           
-          # Handle both direct policy spec and nested policy_config
-          if parsed_policy['policy_config'].is_a?(Hash)
-            policy_spec = parsed_policy['policy_config']
-            output_format = policy_spec['output_format']
-          else
-            policy_spec = parsed_policy
-            output_format = parsed_policy['output_format']
+          if input['policy_mode'].to_s == 'json' && input['policy_json'].present?
+            parsed_policy = call(:safe_json_obj!, input['policy_json'])
+            
+            # Handle both direct policy spec and nested policy_config
+            if parsed_policy.is_a?(Hash)
+              if parsed_policy['policy_config'].is_a?(Hash)
+                policy_spec = parsed_policy['policy_config']
+                output_format = policy_spec['output_format'] if policy_spec.is_a?(Hash)
+              else
+                policy_spec = parsed_policy
+                output_format = parsed_policy['output_format'] if parsed_policy.is_a?(Hash)
+              end
+            end
           end
-        end
 
-        # Build LLM configuration from schema if available
-        llm_config = output_format ? call(:build_llm_config_from_schema, output_format) : {}
-        
-        # Build system text - combine base instructions with schema instructions
-        system_text = <<~SYS
-          You are a strict email policy triage. Your ENTIRE response must be valid JSON.
+          # Build LLM configuration from schema if available
+          llm_config = output_format.is_a?(Hash) ? call(:build_llm_config_from_schema, output_format) : {}
           
-          CRITICAL OUTPUT REQUIREMENTS:
-          1. Output ONLY valid JSON - no text before or after
-          2. DO NOT include markdown formatting or code blocks
-          3. Use EXACTLY these field names (case-sensitive):
-             - decision: must be exactly one of: "IRRELEVANT", "REVIEW", "KEEP"
-             - confidence: number between 0 and 1
-             - matched_signals: array of strings (max 10 items)
-             - reasons: array of strings (max 5 items)
-          4. ALL fields are required
+          # Build system text - combine base instructions with schema instructions
+          system_text = <<~SYS
+            You are a strict email policy triage. Your ENTIRE response must be valid JSON.
+            
+            CRITICAL OUTPUT REQUIREMENTS:
+            1. Output ONLY valid JSON - no text before or after
+            2. DO NOT include markdown formatting or code blocks
+            3. Use EXACTLY these field names (case-sensitive):
+              - decision: must be exactly one of: "IRRELEVANT", "REVIEW", "KEEP"
+              - confidence: number between 0 and 1
+              - matched_signals: array of strings (max 10 items)
+              - reasons: array of strings (max 5 items)
+            4. ALL fields are required
+            
+            Example valid response:
+            {"decision":"KEEP","confidence":0.85,"matched_signals":["direct_question"],"reasons":["Clear PTO request"]}
+          SYS
           
-          Example valid response:
-          {"decision":"KEEP","confidence":0.85,"matched_signals":["direct_question"],"reasons":["Clear PTO request"]}
-        SYS
-        
-        # Add schema-specific instructions if available
-        if output_format && output_format['instructions']
-          system_text += "\n\n#{output_format['instructions']}"
-        end
-        
-        # Add example if provided by schema
-        if llm_config['prompt_addition']
-          system_text += llm_config['prompt_addition']
-        end
-        
-        # Add policy spec to system text if present
-        if policy_spec
-          system_text += "\n\nPolicy spec JSON:\n#{call(:json_compact, policy_spec)}"
-        end
+          # Add schema-specific instructions if available
+          if output_format.is_a?(Hash) && output_format['instructions'].present?
+            system_text += "\n\n#{output_format['instructions']}"
+          end
+          
+          # Add example if provided by schema
+          if llm_config.is_a?(Hash) && llm_config['prompt_addition'].present?
+            system_text += llm_config['prompt_addition']
+          end
+          
+          # Add policy spec to system text if present
+          if policy_spec
+            system_text += "\n\nPolicy spec JSON:\n#{call(:json_compact, policy_spec)}"
+          end
 
-        # Build generation config - use schema-derived or fallback to default
-        if llm_config['response_schema']
-          gen_config = {
-            'temperature' => 0,
-            'maxOutputTokens' => 256,
-            'responseMimeType' => 'application/json',
-            'responseSchema' => llm_config['response_schema']
+          # Build generation config - use schema-derived or fallback to default
+          if llm_config.is_a?(Hash) && llm_config['response_schema'].is_a?(Hash)
+            gen_config = {
+              'temperature' => 0,
+              'maxOutputTokens' => 256,
+              'responseMimeType' => 'application/json',
+              'responseSchema' => llm_config['response_schema']
+            }
+          else
+            # Fallback to original hardcoded schema
+            gen_config = {
+              'temperature' => 0, 
+              'maxOutputTokens' => 256,
+              'responseMimeType' => 'application/json',
+              'responseSchema' => {
+                'type' => 'object',
+                'additionalProperties' => false,
+                'properties' => {
+                  'decision' => {'type' => 'string'},
+                  'confidence' => {'type' => 'number'},
+                  'matched_signals' => {'type' => 'array','items' => {'type' => 'string'}},
+                  'reasons' => {'type' => 'array','items' => {'type' => 'string'}}
+                }, 
+                'required' => ['decision']
+              }
+            }
+          end
+
+          # Build the request payload
+          payload = {
+            'systemInstruction' => { 'role' => 'system','parts' => [{'text' => system_text}] },
+            'contents' => [ { 'role' => 'user', 'parts' => [ { 'text' => "Email:\n#{input['email_text']}" } ] } ],
+            'generationConfig' => gen_config
           }
-        else
-          # Fallback to original hardcoded schema
-          gen_config = {
-            'temperature' => 0, 
-            'maxOutputTokens' => 256,
-            'responseMimeType' => 'application/json',
-            'responseSchema' => {
-              'type' => 'object',
-              'additionalProperties' => false,
-              'properties' => {
-                'decision' => {'type' => 'string'},
-                'confidence' => {'type' => 'number'},
-                'matched_signals' => {'type' => 'array','items' => {'type' => 'string'}},
-                'reasons' => {'type' => 'array','items' => {'type' => 'string'}}
-              }, 
-              'required' => ['decision']
+
+          # Make the API request
+          resp = post(url).headers(call(:request_headers_auth, connection, ctx['cid'], connection['user_project'], req_params))
+                          .payload(call(:json_compact, payload))
+          
+          # Initialize default policy
+          policy = { 
+            'decision' => 'REVIEW', 
+            'confidence' => 0.0, 
+            'matched_signals' => [], 
+            'reasons' => ['Default fallback'] 
+          }
+          
+          # Extract and parse the response with proper error handling
+          if resp.is_a?(Hash)
+            candidates = resp['candidates']
+            if candidates.is_a?(Array) && candidates.any?
+              text = resp.dig('candidates',0,'content','parts',0,'text')
+              
+              # Strict JSON extraction and validation
+              clean_text = if text.is_a?(String)
+                text.gsub(/```json\n?/, '').gsub(/```\n?/, '').strip
+              else
+                '{"decision":"REVIEW","confidence":0.0,"matched_signals":[],"reasons":["No response text"]}'
+              end
+              
+              # Ensure it looks like JSON
+              unless clean_text.start_with?('{') && clean_text.end_with?('}')
+                # Try to extract JSON from the text
+                json_match = clean_text.match(/\{[^{}]*\}/)
+                clean_text = json_match ? json_match[0] : '{"decision":"REVIEW","confidence":0.0,"matched_signals":[],"reasons":["Parse error"]}'
+              end
+              
+              policy = begin
+                parsed = JSON.parse(clean_text)
+                # Ensure it's a Hash
+                parsed.is_a?(Hash) ? parsed : { 'decision' => 'REVIEW', 'confidence' => 0.0, 'matched_signals' => [], 'reasons' => ['Invalid response format'] }
+              rescue => e
+                { 'decision' => 'REVIEW', 'confidence' => 0.0, 'matched_signals' => [], 'reasons' => ['JSON parse failed'] }
+              end
+            else
+              # Check for prompt feedback issues
+              prompt_feedback = resp['promptFeedback']
+              if prompt_feedback.is_a?(Hash) && prompt_feedback['blockReason']
+                policy['reasons'] = ["Content blocked: #{prompt_feedback['blockReason']}"]
+              else
+                policy['reasons'] = ['No candidates in response']
+              end
+            end
+          else
+            policy['reasons'] = ['Invalid response format']
+          end
+          
+          # Validate and correct response against schema if available
+          if output_format.is_a?(Hash)
+            policy = call(:validate_policy_schema!, policy, output_format)
+          end
+          
+          # Ensure decision is valid (original logic preserved)
+          if !['IRRELEVANT', 'REVIEW', 'KEEP'].include?(policy['decision'])
+            policy['decision'] = 'REVIEW'  # Safe default
+          end
+          
+          # Ensure arrays are arrays
+          policy['matched_signals'] = Array(policy['matched_signals'])
+          policy['reasons'] = Array(policy['reasons'])
+          
+          # Ensure confidence is a number
+          policy['confidence'] = begin
+            conf_val = policy['confidence']
+            case conf_val
+            when Numeric then [[conf_val.to_f, 0.0].max, 1.0].min  # Clamp to [0,1]
+            when String then [[conf_val.to_f, 0.0].max, 1.0].min
+            else 0.0
+            end
+          rescue
+            0.0
+          end
+          
+          # Calculate short circuit (original logic preserved)
+          short_circuit = (policy['decision'] == 'IRRELEVANT' && 
+                          policy['confidence'].to_f >= (input['confidence_short_circuit'] || 0.8).to_f)
+
+          # Generator gate logic (original logic preserved)
+          email_type = (input['email_type'].presence || 'direct_request')
+          min_conf = (input['min_confidence_for_generation'].presence || 0.60).to_f
+          decision = policy['decision'].to_s.upcase
+          conf = policy['confidence'].to_f
+          
+          block_reasons = []
+          block_reasons << 'non_direct_request' if email_type != 'direct_request'
+          block_reasons << 'policy_irrelevant' if decision == 'IRRELEVANT'
+          block_reasons << 'low_confidence' if conf < min_conf
+          
+          pass_to_responder = block_reasons.empty?
+          generator_hint = pass_to_responder ? 'pass' : 'blocked'
+
+          # Build output (original structure preserved)
+          out = {
+            'policy' => policy,
+            'short_circuit' => short_circuit,
+            'email_type' => email_type,
+            'generator_gate' => {
+              'pass_to_responder' => pass_to_responder,
+              'reason' => (block_reasons.any? ? block_reasons.join(',') : 'meets_minimums'),
+              'generator_hint' => generator_hint
             }
           }
-        end
-
-        # Build the request payload
-        payload = {
-          'systemInstruction' => { 'role' => 'system','parts' => [{'text' => system_text}] },
-          'contents' => [ { 'role' => 'user', 'parts' => [ { 'text' => "Email:\n#{input['email_text']}" } ] } ],
-          'generationConfig' => gen_config
-        }
-
-        # Make the API request
-        resp = post(url).headers(call(:request_headers_auth, connection, ctx['cid'], connection['user_project'], req_params))
-                        .payload(call(:json_compact, payload))
-        
-        # Extract and parse the response
-        text = resp.dig('candidates',0,'content','parts',0,'text').to_s
-        # Strict JSON extraction and validation
-        clean_text = text.gsub(/```json\n?/, '').gsub(/```\n?/, '').strip
-        
-        # Ensure it looks like JSON
-        unless clean_text.start_with?('{') && clean_text.end_with?('}')
-          # Try to extract JSON from the text
-          json_match = clean_text.match(/\{[^{}]*\}/)
-          clean_text = json_match ? json_match[0] : '{"decision":"REVIEW","confidence":0.0,"matched_signals":[],"reasons":["Parse error"]}'
-        end
-        
-        policy = begin
-          JSON.parse(clean_text)
+          
+          # Build facets and complete output (original logic preserved)
+          call(:step_ok!, ctx, out, call(:telemetry_success_code, resp), 'OK', {
+            'decision' => policy['decision'],
+            'confidence' => policy['confidence'],
+            'short_circuit' => short_circuit,
+            'email_type' => email_type,
+            'generator_hint' => generator_hint,
+            'signals_count' => (policy['matched_signals'] || []).length,
+            'reasons_count' => (policy['reasons'] || []).length,
+            'model_used' => input['model'] || 'gemini-2.0-flash',
+            'policy_mode' => input['policy_mode'] || 'none',
+            'schema_enhanced' => output_format.is_a?(Hash) && output_format.any?  # New facet to track schema usage
+          })
+          
         rescue => e
-          { 'decision' => 'REVIEW', 'confidence' => 0.0, 'matched_signals' => [], 'reasons' => ['JSON parse failed'] }
+          call(:step_err!, ctx, e)
         end
-        
-        # Validate and correct response against schema if available
-        if output_format
-          policy = call(:validate_policy_schema!, policy, output_format)
-        end
-        
-        # Ensure decision is valid (original logic preserved)
-        if !['IRRELEVANT', 'REVIEW', 'KEEP'].include?(policy['decision'])
-          policy['decision'] = 'REVIEW'  # Safe default
-        end
-        
-        # Calculate short circuit (original logic preserved)
-        short_circuit = (policy['decision'] == 'IRRELEVANT' && 
-                        policy['confidence'].to_f >= (input['confidence_short_circuit'] || 0.8).to_f)
-
-        # Generator gate logic (original logic preserved)
-        email_type = (input['email_type'].presence || 'direct_request')
-        min_conf = (input['min_confidence_for_generation'].presence || 0.60).to_f
-        decision = policy['decision'].to_s.upcase
-        conf = policy['confidence'].to_f
-        
-        block_reasons = []
-        block_reasons << 'non_direct_request' if email_type != 'direct_request'
-        block_reasons << 'policy_irrelevant' if decision == 'IRRELEVANT'
-        block_reasons << 'low_confidence' if conf < min_conf
-        
-        pass_to_responder = block_reasons.empty?
-        generator_hint = pass_to_responder ? 'pass' : 'blocked'
-
-        # Build output (original structure preserved)
-        out = {
-          'policy' => policy,
-          'short_circuit' => short_circuit,
-          'email_type' => email_type,
-          'generator_gate' => {
-            'pass_to_responder' => pass_to_responder,
-            'reason' => (block_reasons.any? ? block_reasons.join(',') : 'meets_minimums'),
-            'generator_hint' => generator_hint
-          }
-        }
-        
-        # Build facets and complete output (original logic preserved)
-        call(:step_ok!, ctx, out, call(:telemetry_success_code, resp), 'OK', {
-          'decision' => policy['decision'],
-          'confidence' => policy['confidence'],
-          'short_circuit' => short_circuit,
-          'email_type' => email_type,
-          'generator_hint' => generator_hint,
-          'signals_count' => (policy['matched_signals'] || []).length,
-          'reasons_count' => (policy['reasons'] || []).length,
-          'model_used' => input['model'] || 'gemini-2.0-flash',
-          'policy_mode' => input['policy_mode'] || 'none',
-          'schema_enhanced' => output_format.present?  # New facet to track schema usage
-        })
-        
-      rescue => e
-        call(:step_err!, ctx, e)
       end,
       sample_output: lambda do
         call(:sample_ai_policy_filter)
