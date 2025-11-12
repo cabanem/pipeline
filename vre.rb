@@ -714,29 +714,48 @@ require 'securerandom'
           url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
           req_params = "model=#{model_path}"
 
-          # Parse policy specification and extract schema if present
+          # Parse policy specification using safe helpers
           policy_spec = nil
           output_format = nil
+          llm_config = {}
           
           if input['policy_mode'].to_s == 'json' && input['policy_json'].present?
-            parsed_policy = call(:safe_json_obj!, input['policy_json'])
-            
-            # Handle both direct policy spec and nested policy_config
-            if parsed_policy.is_a?(Hash)
-              if parsed_policy['policy_config'].is_a?(Hash)
-                policy_spec = parsed_policy['policy_config']
-                output_format = policy_spec['output_format'] if policy_spec.is_a?(Hash)
-              else
-                policy_spec = parsed_policy
-                output_format = parsed_policy['output_format'] if parsed_policy.is_a?(Hash)
+            begin
+              parsed_policy = call(:safe_json_obj!, input['policy_json'])
+              
+              if parsed_policy.is_a?(Hash)
+                # Check for nested policy_config first
+                if parsed_policy['policy_config'].is_a?(Hash)
+                  policy_spec = parsed_policy['policy_config']
+                  # Only assign output_format if it's a Hash with the expected structure
+                  temp = policy_spec['output_format']
+                  if temp.is_a?(Hash) && temp['structure'].is_a?(Hash)
+                    output_format = temp
+                  end
+                else
+                  policy_spec = parsed_policy
+                  # Only assign output_format if it's a Hash with the expected structure
+                  temp = parsed_policy['output_format']
+                  if temp.is_a?(Hash) && temp['structure'].is_a?(Hash)
+                    output_format = temp
+                  end
+                end
+                
+                # Only call build_llm_config_from_schema if we have a valid output_format
+                if output_format.is_a?(Hash) && output_format['structure'].is_a?(Hash)
+                  llm_config = call(:build_llm_config_from_schema, output_format)
+                  llm_config = {} unless llm_config.is_a?(Hash)
+                end
               end
+            rescue => e
+              # Log but continue with defaults
+              policy_spec = nil
+              output_format = nil
+              llm_config = {}
             end
           end
-
-          # Build LLM configuration from schema if available
-          llm_config = output_format.is_a?(Hash) ? call(:build_llm_config_from_schema, output_format) : {}
           
-          # Build system text - combine base instructions with schema instructions
+          # Build system text
           system_text = <<~SYS
             You are a strict email policy triage. Your ENTIRE response must be valid JSON.
             
@@ -754,32 +773,29 @@ require 'securerandom'
             {"decision":"KEEP","confidence":0.85,"matched_signals":["direct_question"],"reasons":["Clear PTO request"]}
           SYS
           
-          # Add schema-specific instructions if available
-          if output_format.is_a?(Hash) && output_format['instructions'].present?
+          # Safe additions to system text
+          if output_format.is_a?(Hash) && output_format['instructions'].is_a?(String)
             system_text += "\n\n#{output_format['instructions']}"
           end
           
-          # Add example if provided by schema
-          if llm_config.is_a?(Hash) && llm_config['prompt_addition'].present?
+          if llm_config.is_a?(Hash) && llm_config['prompt_addition'].is_a?(String)
             system_text += llm_config['prompt_addition']
           end
           
-          # Add policy spec to system text if present
-          if policy_spec
+          if policy_spec.is_a?(Hash)
             system_text += "\n\nPolicy spec JSON:\n#{call(:json_compact, policy_spec)}"
           end
 
-          # Build generation config - use schema-derived or fallback to default
-          if llm_config.is_a?(Hash) && llm_config['response_schema'].is_a?(Hash)
-            gen_config = {
+          # Build generation config with safe defaults
+          gen_config = if llm_config.is_a?(Hash) && llm_config['response_schema'].is_a?(Hash)
+            {
               'temperature' => 0,
               'maxOutputTokens' => 256,
               'responseMimeType' => 'application/json',
               'responseSchema' => llm_config['response_schema']
             }
           else
-            # Fallback to original hardcoded schema
-            gen_config = {
+            {
               'temperature' => 0, 
               'maxOutputTokens' => 256,
               'responseMimeType' => 'application/json',
@@ -808,7 +824,10 @@ require 'securerandom'
           resp = post(url).headers(call(:request_headers_auth, connection, ctx['cid'], connection['user_project'], req_params))
                           .payload(call(:json_compact, payload))
           
-          # Initialize default policy
+          # Use extract_candidate_text helper for safe navigation
+          text, meta = call(:extract_candidate_text, resp)
+          
+          # Parse the response text
           policy = { 
             'decision' => 'REVIEW', 
             'confidence' => 0.0, 
@@ -816,77 +835,57 @@ require 'securerandom'
             'reasons' => ['Default fallback'] 
           }
           
-          # Extract and parse the response with proper error handling
-          if resp.is_a?(Hash)
-            candidates = resp['candidates']
-            if candidates.is_a?(Array) && candidates.any?
-              text = resp.dig('candidates',0,'content','parts',0,'text')
-              
-              # Strict JSON extraction and validation
-              clean_text = if text.is_a?(String)
-                text.gsub(/```json\n?/, '').gsub(/```\n?/, '').strip
-              else
-                '{"decision":"REVIEW","confidence":0.0,"matched_signals":[],"reasons":["No response text"]}'
-              end
-              
-              # Ensure it looks like JSON
-              unless clean_text.start_with?('{') && clean_text.end_with?('}')
-                # Try to extract JSON from the text
-                json_match = clean_text.match(/\{[^{}]*\}/)
-                clean_text = json_match ? json_match[0] : '{"decision":"REVIEW","confidence":0.0,"matched_signals":[],"reasons":["Parse error"]}'
-              end
-              
-              policy = begin
-                parsed = JSON.parse(clean_text)
-                # Ensure it's a Hash
-                parsed.is_a?(Hash) ? parsed : { 'decision' => 'REVIEW', 'confidence' => 0.0, 'matched_signals' => [], 'reasons' => ['Invalid response format'] }
-              rescue => e
-                { 'decision' => 'REVIEW', 'confidence' => 0.0, 'matched_signals' => [], 'reasons' => ['JSON parse failed'] }
+          if text.is_a?(String) && text.length > 0
+            # Clean the text
+            clean_text = text.gsub(/```json\n?/, '').gsub(/```\n?/, '').strip
+            
+            # Try to parse JSON
+            if clean_text.start_with?('{')
+              parsed = call(:safe_json, clean_text)
+              if parsed.is_a?(Hash)
+                policy = parsed
               end
             else
-              # Check for prompt feedback issues
-              prompt_feedback = resp['promptFeedback']
-              if prompt_feedback.is_a?(Hash) && prompt_feedback['blockReason']
-                policy['reasons'] = ["Content blocked: #{prompt_feedback['blockReason']}"]
-              else
-                policy['reasons'] = ['No candidates in response']
+              # Try to extract JSON from text
+              json_match = clean_text.match(/\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}/)
+              if json_match
+                parsed = call(:safe_json, json_match[0])
+                if parsed.is_a?(Hash)
+                  policy = parsed
+                end
               end
             end
-          else
-            policy['reasons'] = ['Invalid response format']
+          elsif meta.is_a?(Hash) && meta['promptFeedback'].is_a?(Hash)
+            # Handle blocked content
+            policy['reasons'] = ["Content blocked: #{meta['promptFeedback']['blockReason'] || 'unknown'}"]
           end
           
-          # Validate and correct response against schema if available
-          if output_format.is_a?(Hash)
-            policy = call(:validate_policy_schema!, policy, output_format)
+          # Ensure required fields with safe defaults
+          policy['decision'] = (policy['decision'] || 'REVIEW').to_s
+          policy['confidence'] = call(:safe_float, policy['confidence']) || 0.0
+          policy['matched_signals'] = call(:safe_array, policy['matched_signals'])
+          policy['reasons'] = call(:safe_array, policy['reasons'])
+          
+          # Apply schema validation if we have a valid schema
+          if output_format.is_a?(Hash) && output_format['structure'].is_a?(Hash)
+            # Use validate_against_schema instead of validate_policy_schema!
+            policy = call(:validate_against_schema, policy, output_format, true)
           end
           
-          # Ensure decision is valid (original logic preserved)
-          if !['IRRELEVANT', 'REVIEW', 'KEEP'].include?(policy['decision'])
-            policy['decision'] = 'REVIEW'  # Safe default
+          # Ensure valid decision
+          valid_decisions = ['IRRELEVANT', 'REVIEW', 'KEEP']
+          unless valid_decisions.include?(policy['decision'])
+            policy['decision'] = 'REVIEW'
           end
           
-          # Ensure arrays are arrays
-          policy['matched_signals'] = Array(policy['matched_signals'])
-          policy['reasons'] = Array(policy['reasons'])
+          # Clamp confidence to [0,1]
+          policy['confidence'] = [[policy['confidence'], 0.0].max, 1.0].min
           
-          # Ensure confidence is a number
-          policy['confidence'] = begin
-            conf_val = policy['confidence']
-            case conf_val
-            when Numeric then [[conf_val.to_f, 0.0].max, 1.0].min  # Clamp to [0,1]
-            when String then [[conf_val.to_f, 0.0].max, 1.0].min
-            else 0.0
-            end
-          rescue
-            0.0
-          end
-          
-          # Calculate short circuit (original logic preserved)
+          # Calculate short circuit
           short_circuit = (policy['decision'] == 'IRRELEVANT' && 
-                          policy['confidence'].to_f >= (input['confidence_short_circuit'] || 0.8).to_f)
+                          policy['confidence'] >= (input['confidence_short_circuit'] || 0.8).to_f)
 
-          # Generator gate logic (original logic preserved)
+          # Generator gate logic
           email_type = (input['email_type'].presence || 'direct_request')
           min_conf = (input['min_confidence_for_generation'].presence || 0.60).to_f
           decision = policy['decision'].to_s.upcase
@@ -900,7 +899,7 @@ require 'securerandom'
           pass_to_responder = block_reasons.empty?
           generator_hint = pass_to_responder ? 'pass' : 'blocked'
 
-          # Build output (original structure preserved)
+          # Build output
           out = {
             'policy' => policy,
             'short_circuit' => short_circuit,
@@ -912,18 +911,18 @@ require 'securerandom'
             }
           }
           
-          # Build facets and complete output (original logic preserved)
+          # Build facets and complete output
           call(:step_ok!, ctx, out, call(:telemetry_success_code, resp), 'OK', {
             'decision' => policy['decision'],
             'confidence' => policy['confidence'],
             'short_circuit' => short_circuit,
             'email_type' => email_type,
             'generator_hint' => generator_hint,
-            'signals_count' => (policy['matched_signals'] || []).length,
-            'reasons_count' => (policy['reasons'] || []).length,
+            'signals_count' => policy['matched_signals'].length,
+            'reasons_count' => policy['reasons'].length,
             'model_used' => input['model'] || 'gemini-2.0-flash',
             'policy_mode' => input['policy_mode'] || 'none',
-            'schema_enhanced' => output_format.is_a?(Hash) && output_format.any?  # New facet to track schema usage
+            'schema_enhanced' => output_format.is_a?(Hash) && output_format.any?
           })
           
         rescue => e
