@@ -778,6 +778,8 @@ require 'securerandom'
           { name: 'email_text', optional: false },
           { name: 'email_type', optional: true, default: 'direct_request',
             hint: 'From deterministic filter' },
+          { name: 'system_preamble', label: 'System Instructions', control_type: 'text-area', 
+            optional: true, hint: 'Override default system instructions for email triage' },
           
           # Thresholds
           { name: 'min_confidence_for_keep', type: 'number', 
@@ -826,7 +828,7 @@ require 'securerandom'
         model_path = call(:build_model_path_with_global_preview, connection, model)
         
         # Enhanced system prompt that recognizes broader employee questions
-        system_text = <<~SYS
+        default_system_text = <<~SYS
           You are an email triage system for employee inquiries. Classify emails carefully.
           
           DECISIONS:
@@ -859,6 +861,9 @@ require 'securerandom'
           
           Output MUST be valid JSON only. No text before or after.
         SYS
+
+        # Use the user-provided prompt or fall back to default
+        system_text = input['system_preamble'].presence || default_system_text
         
         # Add custom policy if provided
         if input['custom_policy_json'].present?
@@ -973,7 +978,8 @@ require 'securerandom'
       input_fields: lambda do |object_definitions, connection, config_fields|
         base = [
           { name: 'email_text', optional: false },
-          
+          { name: 'system_preamble', label: 'System Instructions', control_type: 'text-area',
+            optional: true, hint: 'Override default system instructions for intent classification' },
           # Intent configuration
           { name: 'intent_types', type: 'array', of: 'string',
             default: ['information_request', 'action_request', 'status_inquiry', 
@@ -1058,9 +1064,15 @@ require 'securerandom'
           - unknown: Cannot determine clear intent
           
           Output MUST be valid JSON only.
-          #{input['extract_entities'] ? 'Extract key entities mentioned.' : ''}
-          #{input['detect_sentiment'] ? 'Detect overall sentiment.' : ''}
         SYS
+        
+        # Use user-provided system prompt or fall back to default
+        system_text = input['system_preamble'].presence || default_system_text
+
+        # Append any conditional instructions (existing logic)
+        system_text += "\n#{input['extract_entities'] ? 'Extract key entities mentioned.' : ''}"
+        system_text += "\n#{input['detect_sentiment'] ? 'Detect overall sentiment.' : ''}"
+        
         
         # Build response schema
         schema_props = {
