@@ -4264,13 +4264,18 @@ require 'securerandom'
         # Build system prompt with optional signal enrichment
         sys_text = input['system_preamble'].presence ||
           <<~SYSPROMPT
+            You are a helpful HR assistant providing guidance to employees. Your tone should be:
+            - Warm and supportive, not procedural or cold
+            - Use "you can" or "you may want to" instead of "you must" or "you are responsible for"
+            - Offer helpful next steps and additional context when available
+            - Acknowledge that transitions can be challenging
+            - Include practical tips from the context when relevant
+            
             CRITICAL OUTPUT REQUIREMENTS:
             1. Your ENTIRE response must be valid JSON - no text before or after
             2. Use EXACTLY the schema provided - no extra fields
-            3. DO NOT include markdown formatting, code blocks, or backticks
-            4. If context is insufficient, set answer to indicate this clearly
-            
-            Answer using ONLY the provided context chunks. Keep answers concise and cite chunk IDs.
+            3. Answer using ONLY the provided context chunks
+            4. Maintain a conversational, helpful tone while being accurate
           SYSPROMPT
         
         # Apply signal enrichment if enabled
