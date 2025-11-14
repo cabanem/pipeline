@@ -148,58 +148,88 @@ require 'securerandom'
     gen_generate_input: {
       fields: lambda do |connection, config_fields, object_definitions|
         [
-          { name: 'mode', control_type: 'select', pick_list: 'gen_generate_modes', optional: false, default: 'plain' },
+          { name: 'mode', control_type: 'select', pick_list: 'gen_generate_modes', 
+            optional: false, default: 'plain' },
           { name: 'model', optional: false, control_type: 'text' },
-          { name: 'correlation_id', label: 'Correlation ID', optional: true, hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
-          { name: 'signals_category', optional: true, hint: 'Category context for generation' },
-          { name: 'signals_confidence', optional: true, hint: 'Upstream confidence (can affect generation)' },
-          # Show 'contents' for plain/grounded modes; hide for rag_with_context
+          
+          # Optional signal enrichment fields (always visible for pipeline use)
+          { name: 'signals_category', optional: true, sticky: true,
+            hint: 'Category context from upstream classification (enhances generation focus)' },
+          { name: 'signals_confidence', optional: true, type: 'number', sticky: true,
+            hint: 'Upstream confidence score (may adjust generation parameters)' },
+          { name: 'signals_intent', optional: true, sticky: true,
+            hint: 'Intent classification from upstream (customizes response style)' },
+          { name: 'use_signal_enrichment', type: 'boolean', control_type: 'checkbox', 
+            optional: true, default: true,
+            hint: 'Apply upstream signals to enhance generation quality' },
+          
+          # Mode-specific fields
           { name: 'contents',
             type: 'array', of: 'object', properties: object_definitions['content'], optional: true,
             ngIf: 'input.mode != "rag_with_context"' },
-
-          { name: 'system_preamble', label: 'System Instructions', control_type: 'text-area', extends_schema: false,
-            optional: true, hint: 'Provide system-level instructions to guide the model\'s behavior (e.g., tone, role, constraints). This becomes the systemInstruction for the model.'},
-          { name: 'generation_config', type: 'object', properties: object_definitions['generation_config'] },
-          { name: 'safetySettings', type: 'array', of: 'object', properties: object_definitions['safety_setting'] },
+          
+          { name: 'system_preamble', label: 'System Instructions', control_type: 'text-area', 
+            extends_schema: false, optional: true, 
+            hint: 'Provide system-level instructions to guide the model\'s behavior' },
+          
+          { name: 'generation_config', type: 'object', 
+            properties: object_definitions['generation_config'] },
+          { name: 'safetySettings', type: 'array', of: 'object', 
+            properties: object_definitions['safety_setting'] },
           { name: 'toolConfig', type: 'object' },
+          
+          # Correlation and debugging
+          { name: 'correlation_id', label: 'Correlation ID', optional: true, sticky: true,
+            hint: 'Pass the same ID across actions to stitch logs and metrics.' },
           { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true },
-
+          
           # ---------- Grounding (only when grounded_* modes) ----------
-          # Google Search has no extra inputs; just reveal hint line if desired
           { name: 'grounding_info', label: 'Grounding via Google Search',
             hint: 'Uses the built-in googleSearch tool.',
             ngIf: 'input.mode == "grounded_google"', optional: true },
-
-          # Vertex AI Search XOR parameters (only show in grounded_vertex)
+          
+          # Vertex AI Search parameters
           { name: 'vertex_ai_search_datastore',
             hint: 'projects/.../locations/.../collections/default_collection/dataStores/...',
             ngIf: 'input.mode == "grounded_vertex"', optional: true },
           { name: 'vertex_ai_search_serving_config',
             hint: 'projects/.../locations/.../collections/.../engines/.../servingConfigs/default_config',
             ngIf: 'input.mode == "grounded_vertex"', optional: true },
-
+          
           # ---------- RAG-lite (only when rag_with_context) ----------
           { name: 'question', optional: true, ngIf: 'input.mode == "rag_with_context"' },
           { name: 'context_chunks', type: 'array', of: 'object', optional: true,
             properties: [
-              { name: 'id' }, { name: 'text', optional: false }, { name: 'source' }, { name: 'uri' },
-              { name: 'score', type: 'number' }, { name: 'metadata', type: 'object' }
+              { name: 'id' }, 
+              { name: 'text', optional: false }, 
+              { name: 'source' }, 
+              { name: 'uri' },
+              { name: 'score', type: 'number' }, 
+              { name: 'metadata', type: 'object' }
             ],
             ngIf: 'input.mode == "rag_with_context"'
           },
-          { name: 'max_chunks', type: 'integer', optional: true, default: 20, ngIf: 'input.mode == "rag_with_context"' },
-          { name: 'salience_text', optional: true, ngIf: 'input.mode == "rag_with_context"' },
-          { name: 'salience_id', optional: true, ngIf: 'input.mode == "rag_with_context"' },
-          { name: 'salience_score', type: 'number', optional: true, ngIf: 'input.mode == "rag_with_context"' },
-          { name: 'max_prompt_tokens', type: 'integer', optional: true, default: 3000, ngIf: 'input.mode == "rag_with_context"' },
-          { name: 'reserve_output_tokens', type: 'integer', optional: true, default: 512, ngIf: 'input.mode == "rag_with_context"' },
-          { name: 'count_tokens_model', optional: true, ngIf: 'input.mode == "rag_with_context"' },
-          { name: 'trim_strategy', control_type: 'select', pick_list: 'trim_strategies', optional: true, default: 'drop_low_score', ngIf: 'input.mode == "rag_with_context"' },
-          { name: 'temperature', type: 'number', optional: true, ngIf: 'input.mode == "rag_with_context"' },
-          { name: 'rag_corpus', optional: true, hint: 'projects/{project}/locations/{region}/ragCorpora/{corpus}', ngIf: 'input.mode == "grounded_rag_store"' },
+          { name: 'max_chunks', type: 'integer', optional: true, default: 20, 
+            ngIf: 'input.mode == "rag_with_context"' },
+          { name: 'max_prompt_tokens', type: 'integer', optional: true, default: 3000, 
+            ngIf: 'input.mode == "rag_with_context"' },
+          { name: 'reserve_output_tokens', type: 'integer', optional: true, default: 512, 
+            ngIf: 'input.mode == "rag_with_context"' },
+          { name: 'count_tokens_model', optional: true, 
+            ngIf: 'input.mode == "rag_with_context"' },
+          { name: 'trim_strategy', control_type: 'select', pick_list: 'trim_strategies', 
+            optional: true, default: 'drop_low_score', 
+            ngIf: 'input.mode == "rag_with_context"' },
+          { name: 'temperature', type: 'number', optional: true, 
+            ngIf: 'input.mode == "rag_with_context"' },
+          
+          # RAG Store grounding
+          { name: 'rag_corpus', optional: true, 
+            hint: 'projects/{project}/locations/{region}/ragCorpora/{corpus}', 
+            ngIf: 'input.mode == "grounded_rag_store"' },
           { name: 'rag_retrieval_config', label: 'Retrieval config', type: 'object',
-            properties: object_definitions['rag_retrieval_config'], ngIf: 'input.mode == "grounded_rag_store"', optional: true }
+            properties: object_definitions['rag_retrieval_config'], 
+            ngIf: 'input.mode == "grounded_rag_store"', optional: true }
         ]
       end
     },
@@ -2489,12 +2519,11 @@ require 'securerandom'
       help: lambda do |_|
         {
           body: "Select an option from the `Mode` field, then fill only the fields rendered by the recipe builder. "\
-                "Required fields per mode: `RAG-LITE`: [question, context_chunks, max_chunks, salience_text, " \
-                'salience_id, salience_score, max_prompt_tokens, reserve_output_tokens, count_tokens_model, ' \
-                'trim_strategy, temperature].  ' \
-                '`VERTEX-SEARCH ONLY`: [vertex_ai_search_datastore, vertex_ai_search_serving_config].   ' \
-                '`RAG-STORE ONLY`: [rag_corpus, rag_retrieval_config, similarity_top_k, vector_distance_threshold,'\
-                'vector_similarity_threshold, rank_service_model, llm_ranker_model]. ',
+                "Required fields per mode: `RAG-LITE`: [question, context_chunks]. " \
+                '`VERTEX-SEARCH ONLY`: [vertex_ai_search_datastore OR vertex_ai_search_serving_config]. ' \
+                '`RAG-STORE ONLY`: [rag_corpus]. ' \
+                '`GOOGLE SEARCH`: No additional fields required. ' \
+                '`PLAIN`: Just model and contents.',
           learn_more_url: 'https://ai.google.dev/gemini-api/docs/models',
           learn_more_text: 'Find a current list of available Gemini models'
         }
@@ -2503,7 +2532,9 @@ require 'securerandom'
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
-      input_fields:  lambda { |od, c, cf| od['gen_generate_input'] },
+      
+      input_fields: lambda { |od, c, cf| od['gen_generate_input'] },
+      
       output_fields: lambda do |od, c|
         [
           # Gemini API response structure
@@ -2538,26 +2569,26 @@ require 'securerandom'
           
           { name: 'confidence', type: 'number' },
           
+          # Signal tracking
+          { name: 'applied_signals', type: 'array', of: 'string',
+            hint: 'Which signals were used to enhance generation' },
+          
           # Standard fields
           { name: 'complete_output', type: 'object' },
           { name: 'facets', type: 'object', optional: true }
         ] + call(:standard_operational_outputs)
       end,
+      
       execute: lambda do |connection, raw_input|
         ctx = call(:step_begin!, :gen_generate, raw_input)
         
         begin
           input = call(:normalize_input_keys, raw_input)
           
-          # Prepare the request (all logic except HTTP call)
+          # Prepare the request
           request_info = call(:gen_generate_prepare_request!, connection, input, ctx['cid'])
           
-          # Check if pre-generation gate blocked the request
-          if request_info['gate_blocked']
-            return call(:step_ok!, ctx, request_info['gate_result'], 200, 'Blocked by pre-generation gate', {})
-          end
-          
-          # Make the HTTP request directly in execute block (this will be traced)
+          # Make the HTTP request
           resp = post(request_info['url'])
                   .headers(request_info['headers'])
                   .payload(request_info['payload'])
@@ -2565,31 +2596,31 @@ require 'securerandom'
           # Process the response
           result = call(:gen_generate_process_response!, resp, input, request_info, connection)
           
+          # Add applied signals tracking
+          result['applied_signals'] = request_info['applied_signals'] || []
+          
           # Extract key metrics for facets
           mode = (input['mode'] || 'plain').to_s
           model = input['model']
           finish_reason = call(:_facet_finish_reason, result) rescue result.dig('candidates', 0, 'finishReason')
           
-          # Standard facets from compute_facets_for! plus action-specific ones
+          # Build facets
           facets = {
             'mode' => mode,
             'model' => model,
             'finish_reason' => finish_reason,
             'confidence' => result['confidence'],
-            'has_citations' => result.dig('parsed', 'citations').is_a?(Array) && result.dig('parsed', 'citations').any?
+            'has_citations' => result.dig('parsed', 'citations').is_a?(Array) && result.dig('parsed', 'citations').any?,
+            'signals_used' => result['applied_signals'].any?
           }.compact
           
           call(:step_ok!, ctx, result, 200, 'OK', facets)
           
         rescue => e
-          # For errors, we need request_info for debug output
-          if defined?(request_info) && request_info
-            call(:gen_generate_handle_error!, e, request_info, connection, input)
-          else
-            call(:step_err!, ctx, e)
-          end
+          call(:step_err!, ctx, e)
         end
       end,
+      
       sample_output: lambda do
         call(:sample_gen_generate)
       end
@@ -2905,7 +2936,6 @@ require 'securerandom'
       })
     end,
     sample_gen_generate: lambda do
-      # Business data
       candidates = [{
         'content' => { 
           'parts' => [{ 'text' => 'Based on the provided context, the invoice total is $1,234.56.' }],
@@ -2913,16 +2943,14 @@ require 'securerandom'
         },
         'finishReason' => 'STOP',
         'safetyRatings' => [
-          { 'category' => 'HARM_CATEGORY_SEXUALLY_EXPLICIT', 'probability' => 'NEGLIGIBLE' },
-          { 'category' => 'HARM_CATEGORY_HATE_SPEECH', 'probability' => 'NEGLIGIBLE' }
+          { 'category' => 'HARM_CATEGORY_SEXUALLY_EXPLICIT', 'probability' => 'NEGLIGIBLE' }
         ]
       }]
       
       parsed = {
         'answer' => 'Based on the provided context, the invoice total is $1,234.56.',
         'citations' => [
-          { 'chunk_id' => 'doc-1#c2', 'source' => 'invoice.pdf', 'uri' => 'gs://bucket/invoice.pdf', 'score' => 0.92 },
-          { 'chunk_id' => 'doc-1#c5', 'source' => 'invoice.pdf', 'uri' => 'gs://bucket/invoice.pdf', 'score' => 0.88 }
+          { 'chunk_id' => 'doc-1#c2', 'source' => 'invoice.pdf', 'uri' => 'gs://bucket/invoice.pdf', 'score' => 0.92 }
         ]
       }
       
@@ -2937,32 +2965,24 @@ require 'securerandom'
         'candidates' => candidates,
         'usageMetadata' => usage_metadata,
         'confidence' => 0.90,
-        'parsed' => parsed
+        'parsed' => parsed,
+        'applied_signals' => ['category', 'intent']
       }
       
-      # Build facets
       facets = {
         'mode' => 'rag_with_context',
         'model' => 'gemini-2.0-flash',
         'finish_reason' => 'STOP',
         'confidence' => 0.90,
         'has_citations' => true,
-        'citations_count' => 2,
-        'tokens_prompt' => 245,
-        'tokens_candidates' => 26,
-        'tokens_total' => 271,
-        'confidence_basis' => 'citations_topk_avg',
-        'confidence_k' => 3,
-        'safety_blocked' => false,
-        'correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
+        'signals_used' => true
       }
       
-      # Return with standard envelope
       business_data.merge({
         'complete_output' => business_data.dup,
         'facets' => facets,
         'ok' => true,
-        'telemetry' => call(:sample_telemetry, 150) # Assuming gen calls take ~150ms
+        'telemetry' => call(:sample_telemetry, 150)
       })
     end,
     sample_rank_texts_with_ranking_api: lambda do
@@ -5114,24 +5134,9 @@ require 'securerandom'
     gen_generate_prepare_request!: lambda do |connection, input, corr=nil|
       corr = (corr.to_s.strip.empty? ? call(:build_correlation_id) : corr.to_s.strip)
       mode = (input['mode'] || 'plain').to_s
-
-      # Pre-generation validation for RAG mode
-      if mode == 'rag_with_context'
-        gate_check = call(:pre_generation_gate!, input)
-        unless gate_check['gate_passed']
-          return {
-            'gate_blocked' => true,
-            'gate_result' => {
-              'status' => 'blocked',
-              'gate_check' => gate_check,
-              'responseId' => nil,
-              'candidates' => [],
-              'confidence' => 0.0,
-              'telemetry' => call(:telemetry_envelope, Time.now, corr, false, 200, gate_check['reason'])
-            }
-          }
-        end
-      end
+      
+      # Track which signals we're using
+      applied_signals = []
 
       # Model + location
       model_path     = call(:build_model_path_with_global_preview, connection, input['model'])
@@ -5160,15 +5165,13 @@ require 'securerandom'
         vas = {}; vas['datastore'] = ds unless ds.blank?; vas['servingConfig'] = scfg unless scfg.blank?
         tools = [ { 'retrieval' => { 'vertexAiSearch' => vas } } ]
       when 'grounded_rag_store'
-        # Build the retrieval tool payload for Vertex RAG Store
         corpus = call(:normalize_rag_corpus, connection, input['rag_corpus'])
         error('rag_corpus is required for grounded_rag_store') if corpus.blank?
-        # Guards for unions
+        
         call(:guard_threshold_union!, input['vector_distance_threshold'], input['vector_similarity_threshold'])
         call(:guard_ranker_union!, input['rank_service_model'], input['llm_ranker_model'])
 
         vr = { 'ragResources' => [ { 'ragCorpus' => corpus } ] }
-        # Optional knobs
         filt = {}
         if input['vector_distance_threshold'].present?
           filt['vectorDistanceThreshold'] = call(:safe_float, input['vector_distance_threshold'])
@@ -5187,63 +5190,95 @@ require 'securerandom'
         retrieval_cfg['ranking'] = rconf unless rconf.empty?
 
         tools = [ { 'retrieval' => { 'vertexRagStore' => vr.merge( (retrieval_cfg.empty? ? {} : { 'ragRetrievalConfig' => retrieval_cfg }) ) } } ]
+        
       when 'rag_with_context'
-        # Build RAG-lite prompt + JSON schema
+        # Technical validation: contexts are required for this mode
+        chunks = call(:safe_array, input['context_chunks'])
+        error('context_chunks are required for rag_with_context mode') if chunks.empty?
+        
+        # Build RAG prompt
         q        = input['question'].to_s
+        error('question is required for rag_with_context mode') if q.blank?
+        
         maxn     = call(:clamp_int, (input['max_chunks'] || 20), 1, 100)
-        chunks   = call(:safe_array, input['context_chunks']).first(maxn)
-        sal_text = input['salience_text'].to_s.strip
-        sal_id   = (input['salience_id'].presence || 'salience').to_s
-        sal_scr  = (input['salience_score'].presence || 1.0).to_f
-        items    = []
-        items << { 'id'=>sal_id,'text'=>sal_text,'score'=>sal_scr,'source'=>'salience' } if sal_text.present?
-        items.concat(chunks)
-
+        chunks   = chunks.first(maxn)
+        
+        items = chunks.map { |c| 
+          c.merge('text' => call(:truncate_chunk_text, c['text'], 800)) 
+        }
+        
         target_total  = (input['max_prompt_tokens'].presence || 3000).to_i
         reserve_out   = (input['reserve_output_tokens'].presence || 512).to_i
         budget_prompt = [target_total - reserve_out, 400].max
         model_for_cnt = (input['count_tokens_model'].presence || input['model']).to_s
         strategy      = (input['trim_strategy'].presence || 'drop_low_score').to_s
 
-        base = []; base << items.shift if items.first && items.first['source']=='salience'
-        items = items.map { |c| c.merge('text'=>call(:truncate_chunk_text, c['text'], 800)) }
         ordered = case strategy
-                  when 'diverse_mmr'   then call(:mmr_diverse_order, items.sort_by { |c| [-(c['score']||0.0).to_f, c['id'].to_s] }, alpha: 0.7, per_source_cap: 3)
+                  when 'diverse_mmr' then call(:mmr_diverse_order, items.sort_by { |c| [-(c['score']||0.0).to_f, c['id'].to_s] }, alpha: 0.7, per_source_cap: 3)
                   when 'drop_low_score' then items.sort_by { |c| [-(c['score']||0.0).to_f, c['id'].to_s] }
                   else items
                   end
         ordered = call(:drop_near_duplicates, ordered, 0.9)
-        pool    = base + ordered
 
+        # Build system prompt with optional signal enrichment
         sys_text = input['system_preamble'].presence ||
           <<~SYSPROMPT
             CRITICAL OUTPUT REQUIREMENTS:
             1. Your ENTIRE response must be valid JSON - no text before or after
             2. Use EXACTLY the schema provided - no extra fields
             3. DO NOT include markdown formatting, code blocks, or backticks
-            4. If context is insufficient, set status to "insufficient_context"
+            4. If context is insufficient, set answer to indicate this clearly
             
             Answer using ONLY the provided context chunks. Keep answers concise and cite chunk IDs.
-            
-            Example structure:
-            {"answer":"Based on context...", "citations":[{"chunk_id":"c1","source":"doc.pdf"}]}
           SYSPROMPT
-        kept    = call(:select_prefix_by_budget, connection, pool, q, sys_text, budget_prompt, model_for_cnt)
-        blob    = call(:format_context_chunks, kept)
-        gen_cfg = {
-          'temperature'      => (input['temperature'].present? ? call(:safe_float, input['temperature']) : 0),
-          'maxOutputTokens'  => reserve_out,
-          'responseMimeType' => 'application/json',
-          'responseSchema'   => {
-            'type'=>'object','additionalProperties'=>false,
-            'properties'=>{
-              'answer'=>{'type'=>'string'},
-              'citations'=>{'type'=>'array','items'=>{'type'=>'object','additionalProperties'=>false,
-                'properties'=>{'chunk_id'=>{'type'=>'string'},'source'=>{'type'=>'string'},'uri'=>{'type'=>'string'},'score'=>{'type'=>'number'}}}}
-            },
-            'required'=>['answer']
-          }
+        
+        # Apply signal enrichment if enabled
+        if input['use_signal_enrichment'] != false
+          if input['signals_category'].present?
+            sys_text += "\n\nDomain context: This is a #{input['signals_category']} inquiry."
+            applied_signals << 'category'
+          end
+          
+          if input['signals_intent'].present?
+            intent_guidance = case input['signals_intent']
+            when 'information_request' then 'Provide clear, factual information.'
+            when 'action_request' then 'Focus on actionable steps or procedures.'
+            when 'status_inquiry' then 'Provide current status and any relevant updates.'
+            else nil
+            end
+            if intent_guidance
+              sys_text += "\nResponse style: #{intent_guidance}"
+              applied_signals << 'intent'
+            end
+          end
+          
+          # Adjust temperature based on confidence signal
+          if input['signals_confidence'].present? && gen_cfg.nil?
+            conf = input['signals_confidence'].to_f
+            # Higher upstream confidence = lower temperature
+            temp_adjustment = conf > 0.8 ? 0.0 : (conf > 0.6 ? 0.3 : 0.5)
+            gen_cfg = { 'temperature' => temp_adjustment }
+            applied_signals << 'confidence'
+          end
+        end
+        
+        kept = call(:select_prefix_by_budget, connection, ordered, q, sys_text, budget_prompt, model_for_cnt)
+        blob = call(:format_context_chunks, kept)
+        
+        gen_cfg ||= {}
+        gen_cfg['temperature'] = (input['temperature'].present? ? call(:safe_float, input['temperature']) : 0)
+        gen_cfg['maxOutputTokens'] = reserve_out
+        gen_cfg['responseMimeType'] = 'application/json'
+        gen_cfg['responseSchema'] = {
+          'type'=>'object','additionalProperties'=>false,
+          'properties'=>{
+            'answer'=>{'type'=>'string'},
+            'citations'=>{'type'=>'array','items'=>{'type'=>'object','additionalProperties'=>false,
+              'properties'=>{'chunk_id'=>{'type'=>'string'},'source'=>{'type'=>'string'},'uri'=>{'type'=>'string'},'score'=>{'type'=>'number'}}}}
+          },
+          'required'=>['answer']
         }
+        
         sys_inst = call(:system_instruction_from_text, sys_text)
         contents = [{ 'role'=>'user','parts'=>[{'text'=>"Question:\n#{q}\n\nContext:\n#{blob}"}]}]
       else
@@ -5259,14 +5294,14 @@ require 'securerandom'
         'generationConfig'  => gen_cfg
       }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
 
-      # Return all request components
       {
         'url' => url,
         'headers' => call(:request_headers_auth, connection, corr, connection['user_project'], req_params),
         'payload' => call(:json_compact, payload),
         'mode' => mode,
         'correlation_id' => corr,
-        'started_at' => Time.now
+        'started_at' => Time.now,
+        'applied_signals' => applied_signals
       }
     end,
     gen_generate_process_response!: lambda do |resp, input, request_info, connection|
@@ -5282,11 +5317,14 @@ require 'securerandom'
         text   = resp.dig('candidates',0,'content','parts',0,'text').to_s
         parsed = call(:safe_parse_json, text)
         out['parsed'] = { 'answer'=>parsed['answer'] || text, 'citations'=>parsed['citations'] || [] }
-        # Compute overall confidence from cited chunk scores, if available
+        # Compute overall confidence from cited chunk scores
         conf = call(:overall_confidence_from_citations, out['parsed']['citations'])
         out['confidence'] = conf if conf
-        (out['telemetry'] ||= {})['confidence'] = { 'basis' => 'citations_topk_avg', 'k' => 3,
-                                                    'n' => Array(out.dig('parsed','citations')).length }
+        (out['telemetry'] ||= {})['confidence'] = { 
+          'basis' => 'citations_topk_avg', 
+          'k' => 3,
+          'n' => Array(out.dig('parsed','citations')).length 
+        }
       end
       
       out
