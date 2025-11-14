@@ -2185,14 +2185,17 @@ require 'securerandom'
         base = [
           { name: 'query_text', optional: false, hint: 'The user query to rank contexts against' },
           { name: 'records', type: 'array', of: 'object', optional: false, properties: [
-              { name: 'id', optional: false }, 
-              { name: 'content', optional: false }, 
-              { name: 'metadata', type: 'object' }
+            { name: 'id', optional: false }, 
+            { name: 'content', optional: false }, 
+            { name: 'score', type: 'number', optional: true, hint: 'Original retrieval score' },
+            { name: 'source', optional: true, hint: 'Source document name' },
+            { name: 'uri', optional: true, hint: 'Source document URI/path' },
+            { name: 'metadata', type: 'object', optional: true }
             ], hint: 'Retrieved contexts to rank (id + content required)' },
           { name: 'category', optional: true, 
             hint: 'Pre-determined category (e.g., PTO, Billing, Support) to inform ranking' },
           { name: 'signals_category', optional: true, 
-            hint: '📥 Falls back to this if category not provided directly' },
+            hint: 'Falls back to this if category not provided directly' },
           { name: 'correlation_id', label: 'Correlation ID', optional: true, 
             hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
           { name: 'llm_model', optional: true, default: 'gemini-2.0-flash',
@@ -2251,6 +2254,8 @@ require 'securerandom'
             { name: 'score', type: 'number' },
             { name: 'rank', type: 'integer' },
             { name: 'content' },
+            { name: 'source' },
+            { name: 'uri' },
             { name: 'metadata', type: 'object' },
             { name: 'llm_relevance', type: 'number' },
             { name: 'category_alignment', type: 'number' }
@@ -2348,8 +2353,10 @@ require 'securerandom'
           # Initialize all records with base scores
           enriched = records_to_rank.map do |orig|
             orig.merge(
-              'score' => 0.0,
-              'rank' => 999
+              'score' => orig['score'] || 0.0,
+              'rank' => 999,
+              'source' => orig['source'],       # Preserve source
+              'uri' => orig['uri']  
             )
           end
           
@@ -2449,12 +2456,19 @@ require 'securerandom'
           case shape
           when 'records_only'
             result['records'] = enriched.map { |r|
-              { 'id' => r['id'], 'score' => r['score'], 'rank' => r['rank'] }
+              { 
+                'id' => r['id'], 
+                'score' => r['score'], 
+                'rank' => r['rank'],
+                'uri' => r['uri'],      # Include URI
+                'source' => r['source']  # Include source
+              }
             }
           when 'enriched_records'
             result['records'] = enriched
           else  # context_chunks
             chunks = enriched.map { |r|
+              # Try to get from direct fields first
               md = r['metadata'] || {}
               source_key = input['source_key'] || 'source'
               uri_key = input['uri_key'] || 'uri'
@@ -2463,8 +2477,8 @@ require 'securerandom'
                 'id' => r['id'],
                 'text' => r['content'].to_s,
                 'score' => r['score'].to_f,
-                'source' => md[source_key],
-                'uri' => md[uri_key],
+                'source' => r['source'] || md[source_key],
+                'uri' => r['uri'] || md[uri_key],
                 'metadata' => md,
                 'metadata_kv' => md.map { |k, v| { 'key' => k, 'value' => v } },
                 'metadata_json' => md.empty? ? nil : md.to_json
