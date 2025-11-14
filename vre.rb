@@ -9,7 +9,7 @@ require 'securerandom'
 {
   title: 'Vertex RAG Engine',
   subtitle: 'RAG Engine',
-  version: '1.0.1',
+  version: '1.0.3',
   description: 'RAG engine via service account (JWT)',
   author: 'Emily Cabaniss',
   help: lambda do |input, picklist_label|
@@ -589,21 +589,17 @@ require 'securerandom'
       end,
       output_fields: lambda do |object_definitions, connection|
         [
-          { name: 'pre_filter', type: 'object', properties: [
-              { name: 'hit', type: 'boolean' }, { name: 'action' }, { name: 'reason' },
-              { name: 'score', type: 'integer' }, { name: 'matched_signals', type: 'array', of: 'string' },
-              { name: 'decision' }
-          ]},
-          { name: 'intent', type: 'object', properties: Array(object_definitions['intent_out']) },
+          { name: 'pre_filter', type: 'object', 
+            properties: object_definitions['policy_decision'] },  # <-- Reuse
+          { name: 'intent', type: 'object',
+            properties: object_definitions['intent_classification'] },  # <-- Reuse
           { name: 'email_text' },
           { name: 'email_type' },
-          { name: 'gate', type: 'object', properties: [
-              { name: 'prelim_pass', type: 'boolean' }, { name: 'hard_block', type: 'boolean' },
-              { name: 'hard_reason' }, { name: 'soft_score', type: 'integer' }, { name: 'decision' }, { name: 'generator_hint' }
-            ]},
-          { name: 'complete_output', type: 'object', hint: 'All outputs consolidated for easy downstream use' },
-          { name: 'facets', type: 'object', optional: true, hint: 'Analytics facets when available' }
-        ] + Array(object_definitions['envelope_fields'])
+          { name: 'gate', type: 'object',
+            properties: object_definitions['pipeline_gate'] },  # <-- Reuse
+          { name: 'complete_output', type: 'object' },
+          { name: 'facets', type: 'object', optional: true }
+        ] + call(:standard_operational_outputs)
       end,
 
       execute: lambda do |connection, input|
@@ -754,15 +750,19 @@ require 'securerandom'
       end,
       output_fields: lambda do |object_definitions, connection|
         [
-          { name: 'policy', type: 'object', properties: Array(object_definitions['policy_out']) },
+          { name: 'policy', type: 'object',
+            properties: object_definitions['policy_decision'] },  # <-- Reuse
           { name: 'short_circuit', type: 'boolean' },
           { name: 'email_type' },
-          { name: 'generator_gate', type: 'object', properties: [
-              { name: 'pass_to_responder', type: 'boolean' }, { name: 'reason' }, { name: 'generator_hint' }
+          { name: 'generator_gate', type: 'object',
+            properties: [
+              { name: 'pass_to_responder', type: 'boolean' },
+              { name: 'reason' },
+              { name: 'generator_hint' }
             ]},
-          { name: 'complete_output', type: 'object', hint: 'All outputs consolidated for easy downstream use' },
-          { name: 'facets', type: 'object', optional: true, hint: 'Analytics facets when available' }
-        ] + Array(object_definitions['envelope_fields'])
+          { name: 'complete_output', type: 'object' },
+          { name: 'facets', type: 'object', optional: true }
+        ] + call(:standard_operational_outputs)
       end,
       execute: lambda do |connection, input|
         ctx = call(:step_begin!, :ai_policy_filter, input)
@@ -1093,13 +1093,15 @@ require 'securerandom'
       end,
       output_fields: lambda do |object_definitions, connection|
         [
-          { name: 'ranking', type: 'array', of: 'object', properties: [
-              { name: 'category' }, { name: 'prob', type: 'number' }
-          ]},
+          # Business outputs
+          { name: 'ranking', type: 'array', of: 'object',
+            properties: object_definitions['scored_category'] },  # Uses category + prob
           { name: 'shortlist', type: 'array', of: 'string' },
-          { name: 'complete_output', type: 'object', hint: 'All outputs consolidated for easy downstream use' },
-          { name: 'facets', type: 'object', optional: true, hint: 'Analytics facets when available' }
-        ] + Array(object_definitions['envelope_fields'])
+          
+          # Standard fields
+          { name: 'complete_output', type: 'object' },
+          { name: 'facets', type: 'object', optional: true }
+        ] + call(:standard_operational_outputs)
       end,
 
       execute: lambda do |connection, input|
@@ -1158,28 +1160,41 @@ require 'securerandom'
           hint: 'Toggle to reveal advanced parameters.' }
       ], 
       input_fields: lambda do |object_definitions, connection, config_fields|
-         call(:ui_ref_inputs, object_definitions, config_fields) + [
-           # --- Salience sidecar (disabled by default; 2-call flow when LLM) ---
-           { name: 'salience_mode', label: 'Salience extraction',
-             control_type: 'select', optional: true, default: 'off', extends_schema: true,
-             options: [['Off','off'], ['Heuristic (no LLM)','heuristic'], ['LLM (extra API call)','llm']],
-             hint: 'Extract a salient sentence/paragraph before refereeing. LLM mode makes a separate API call.' },
-           { name: 'salience_append_to_prompt', label: 'Append salience to prompt',
-             type: 'boolean', control_type: 'checkbox', optional: true, default: true,
-             ngIf: 'input.salience_mode != "off"',
-             hint: 'If enabled, the salient span (and light metadata) is appended to the email text shown to the referee.' },
-           { name: 'salience_max_chars', label: 'Salience max chars', type: 'integer',
-             optional: true, default: 500, ngIf: 'input.salience_mode != "off"' },
-           { name: 'salience_include_entities', label: 'Salience: include entities',
-             type: 'boolean', control_type: 'checkbox', optional: true, default: true,
-             ngIf: 'input.salience_mode == "llm"' },
-           { name: 'salience_model', label: 'Salience model',
-             control_type: 'text', optional: true, default: 'gemini-2.0-flash',
-             ngIf: 'input.salience_mode == "llm"' },
-           { name: 'salience_temperature', label: 'Salience temperature',
-             type: 'number', optional: true, default: 0,
-             ngIf: 'input.salience_mode == "llm"' }
-         ] + Array(object_definitions['observability_input_fields'])
+        [
+          # Critical business outputs
+          { name: 'chosen', hint: '⚠️ CRITICAL: Used by steps 6-8' },
+          { name: 'confidence', type: 'number' },
+          
+          { name: 'referee', type: 'object', properties: [
+            { name: 'category' },
+            { name: 'confidence', type: 'number' },
+            { name: 'reasoning' },
+            { name: 'distribution', type: 'array', of: 'object',
+              properties: object_definitions['scored_category'] }  # Reuse for distribution
+          ]},
+          
+          # Optional salience
+          { name: 'salience', type: 'object', properties: [
+            { name: 'span' },
+            { name: 'reason' },
+            { name: 'importance', type: 'number' },
+            { name: 'tags', type: 'array', of: 'string' },
+            { name: 'entities', type: 'array', of: 'object' },
+            { name: 'cta' },
+            { name: 'deadline_iso' },
+            { name: 'focus_preview' },
+            { name: 'responseId' },
+            { name: 'usage', type: 'object' },
+            { name: 'span_source' }
+          ]},
+          
+          # Signal for downstream
+          { name: 'signals_category', hint: 'Copy of chosen for downstream' },
+          
+          # Standard fields
+          { name: 'complete_output', type: 'object' },
+          { name: 'facets', type: 'object', optional: true }
+        ] + call(:standard_operational_outputs)
       end,
       output_fields: lambda do |object_definitions, connection|
         [
@@ -1439,31 +1454,23 @@ require 'securerandom'
       end,
       output_fields: lambda do |object_definitions, connection|
         [
+          # Business outputs
           { name: 'question' },
-          { name: 'contexts', type: 'array', of: 'object', properties: [
-              { name: 'id' },
-              { name: 'text' },
-              { name: 'score', type: 'number' },
-              { name: 'source' },
-              { name: 'uri' },
-              { name: 'metadata', type: 'object' },
-              { name: 'metadata_kv', type: 'array', of: 'object' },
-              { name: 'metadata_json' },
-              { name: 'is_pdf', type: 'boolean' },
-              { name: 'processing_error', type: 'boolean' }
-            ]
-          },
+          { name: 'contexts', type: 'array', of: 'object',
+            properties: object_definitions['context_chunk_standard'] },  # All context fields
+          
+          # Standard fields (but with enhanced telemetry)
           { name: 'ok', type: 'boolean' },
           { name: 'telemetry', type: 'object', properties: [
-              { name: 'http_status', type: 'integer' },
-              { name: 'message' },
-              { name: 'duration_ms', type: 'integer' },
-              { name: 'correlation_id' },
-              { name: 'success_count', type: 'integer' },
-              { name: 'error_count', type: 'integer' },
-              { name: 'partial_failure', type: 'boolean' },
-              { name: 'local_logs', type: 'array', of: 'object', optional: true }
-            ]}
+            { name: 'http_status', type: 'integer' },
+            { name: 'message' },
+            { name: 'duration_ms', type: 'integer' },
+            { name: 'correlation_id' },
+            { name: 'success_count', type: 'integer' },
+            { name: 'error_count', type: 'integer' },
+            { name: 'partial_failure', type: 'boolean' },
+            { name: 'local_logs', type: 'array', of: 'object', optional: true }
+          ]}
         ]
       end,
       execute: lambda do |connection, input|
@@ -2084,17 +2091,43 @@ require 'securerandom'
       max_retries: 3,
       input_fields:  lambda { |od, c, cf| od['gen_generate_input'] },
       output_fields: lambda do |od, c|
-        Array(od['generate_content_output']) + [
-          { name: 'confidence', type: 'number' },
-          { name: 'parsed', type: 'object', properties: [
-              { name: 'answer' },
-              { name: 'citations', type: 'array', of: 'object', properties: [
-                  { name: 'chunk_id' }, { name: 'source' }, { name: 'uri' }, { name: 'score', type: 'number' }
-              ]}
+        [
+          # Gemini API response structure
+          { name: 'responseId' },
+          { name: 'modelVersion' },
+          { name: 'usageMetadata', type: 'object', properties: [
+            { name: 'promptTokenCount', type: 'integer' },
+            { name: 'candidatesTokenCount', type: 'integer' },
+            { name: 'totalTokenCount', type: 'integer' }
           ]},
-          { name: 'complete_output', type: 'object', hint: 'All outputs consolidated for easy downstream use' },
-          { name: 'facets', type: 'object', optional: true, hint: 'Analytics facets when available' }
-        ] + Array(od['envelope_fields_1'])
+          
+          { name: 'candidates', type: 'array', of: 'object', properties: [
+            { name: 'finishReason' },
+            { name: 'safetyRatings', type: 'array', of: 'object' },
+            { name: 'groundingMetadata', type: 'object' },
+            { name: 'content', type: 'object', properties: [
+              { name: 'role' },
+              { name: 'parts', type: 'array', of: 'object' }
+            ]}
+          ]},
+          
+          # RAG-specific outputs
+          { name: 'parsed', type: 'object', properties: [
+            { name: 'answer' },
+            { name: 'citations', type: 'array', of: 'object', properties: [
+              { name: 'chunk_id' },
+              { name: 'source' },
+              { name: 'uri' },
+              { name: 'score', type: 'number' }
+            ]}
+          ]},
+          
+          { name: 'confidence', type: 'number' },
+          
+          # Standard fields
+          { name: 'complete_output', type: 'object' },
+          { name: 'facets', type: 'object', optional: true }
+        ] + call(:standard_operational_outputs)
       end,
       execute: lambda do |connection, raw_input|
         ctx = call(:step_begin!, :gen_generate, raw_input)
