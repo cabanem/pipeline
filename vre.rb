@@ -3478,7 +3478,7 @@ require 'securerandom'
       error('Invalid JSON for categories: expected array or object with "categories" array') unless v.is_a?(Array)
       v
     end,
-    
+
     # UI assembly helpers (schema-by-config)
     ui_show_advanced_toggle: lambda do |default=false|
       { name: 'show_advanced', label: 'Show advanced options',
@@ -4158,7 +4158,6 @@ require 'securerandom'
     end,
 
     # Generative query
-
     gen_generate_prepare_request!: lambda do |connection, input, corr=nil|
       corr = (corr.to_s.strip.empty? ? call(:build_correlation_id) : corr.to_s.strip)
       mode = (input['mode'] || 'plain').to_s
@@ -4344,10 +4343,61 @@ require 'securerandom'
       if mode == 'rag_with_context'
         text   = resp.dig('candidates',0,'content','parts',0,'text').to_s
         parsed = call(:safe_parse_json, text)
-        out['parsed'] = { 'answer'=>parsed['answer'] || text, 'citations'=>parsed['citations'] || [] }
+        
+        # ENHANCEMENT: Enrich citations with complete metadata from original chunks
+        if parsed.is_a?(Hash) && parsed['citations'].is_a?(Array) && input['context_chunks'].is_a?(Array)
+          # Build a lookup map from the original context chunks
+          chunk_map = {}
+          input['context_chunks'].each do |chunk|
+            chunk_id = chunk['id'] || chunk['chunk_id']
+            if chunk_id
+              chunk_map[chunk_id] = {
+                'source' => chunk['source'] || chunk.dig('metadata', 'source'),
+                'uri' => call(:extract_uri_from_context, chunk),  # Use the helper
+                'score' => chunk['score'] || 0.0
+              }
+            end
+          end
+          
+          # Enrich each citation with missing data
+          parsed['citations'] = parsed['citations'].map do |citation|
+            # Get the chunk data for this citation
+            chunk_data = chunk_map[citation['chunk_id']]
+            
+            if chunk_data
+              # Create enriched citation preserving LLM data but filling gaps
+              {
+                'chunk_id' => citation['chunk_id'],
+                'source' => citation['source'] || chunk_data['source'],
+                'uri' => citation['uri'] || chunk_data['uri'],
+                'score' => citation['score'] || chunk_data['score']
+              }.compact  # Remove nil values
+            else
+              # If we can't find the chunk, keep original citation
+              citation
+            end
+          end
+          
+          # Log enrichment for debugging (only in non-prod mode)
+          if !call(:normalize_boolean, connection['prod_mode']) && input['debug']
+            enrichment_stats = {
+              'total_citations' => parsed['citations'].length,
+              'chunks_available' => chunk_map.keys.length,
+              'citations_with_uri' => parsed['citations'].count { |c| c['uri'].present? }
+            }
+            (out['debug'] ||= {})['citation_enrichment'] = enrichment_stats
+          end
+        end
+        
+        out['parsed'] = { 
+          'answer' => parsed['answer'] || text, 
+          'citations' => parsed['citations'] || [] 
+        }
+        
         # Compute overall confidence from cited chunk scores
         conf = call(:overall_confidence_from_citations, out['parsed']['citations'])
         out['confidence'] = conf if conf
+        
         (out['telemetry'] ||= {})['confidence'] = { 
           'basis' => 'citations_topk_avg', 
           'k' => 3,
@@ -4627,6 +4677,7 @@ require 'securerandom'
       fresh = call(:auth_issue_token!, connection, set)
       call(:auth_token_cache_put, connection, scope_key, fresh)['access_token']
     end,
+
     # --- Purpose-specific header helpers ---------------------------------
     headers_rag: lambda do |connection, correlation_id, request_params=nil|
       # Retrieval calls: NEVER send x-goog-user-project
@@ -5224,7 +5275,21 @@ require 'securerandom'
       arr = call(:safe_array, v)
       arr.map { |x| call(:sanitize_hash, x) }.compact
     end,
-
+    extract_uri_from_context: lambda do |context|
+      # Try multiple possible URI field locations
+      uri = context['uri'] || 
+            context.dig('metadata', 'uri') ||
+            context.dig('metadata', 'sourceUri') ||
+            context.dig('metadata', 'source_uri') ||
+            context.dig('metadata', 'gcsUri') ||
+            context.dig('metadata', 'url') ||
+            context['sourceUri'] ||
+            context['source_uri']
+      
+      # Clean up the URI if needed
+      uri = uri.to_s.strip if uri
+      uri.present? ? uri : nil
+    end,
     extract_candidate_text: lambda do |resp|
       # Returns [text, meta] where meta carries finishReason/safety/promptFeedback
       cands = call(:safe_array, resp['candidates'])
@@ -5241,7 +5306,6 @@ require 'securerandom'
       }.compact
       [text, meta]
     end,
-
     sanitize_safety!: lambda do |raw|
       a = call(:safe_array_of_hashes, raw).map do |h|
         c = h['category'] || h[:category]
@@ -5267,7 +5331,6 @@ require 'securerandom'
         { 'role' => role, 'parts' => parts }
       end.compact
     end,
-
     # Strip HTML → text, collapse whitespace, normalize dashes/quotes a bit
     email_minify: lambda do |subject, body|
       txt = body.to_s.dup
@@ -5568,8 +5631,8 @@ require 'securerandom'
         'facets'         => facets_merged
       }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
     end,
-    # NEW 2025-11-14
-    # Standard field groups (for reuse)
+
+    # Standard field groups
     standard_operational_outputs: lambda do
       [
         { name: 'op_correlation_id' },
