@@ -633,8 +633,15 @@ require 'securerandom'
       description: 'Pre-screen/filter that evaluates an email against rules',
       display_priority: 510,
       help: lambda do |_|
-        { body: 'Coarse evaluation of an email against rules.' }
-      end,
+        {
+          body: 'First stage email filter using rules to eliminate non-actionable emails. ' \
+                'Inputs: email (subject/body/from), exclude_patterns for quick filtering, or advanced rules with weights. ' \
+                'Outputs: passed (boolean), hard_block, email_type (direct_request, forwarded_chain, automated), soft_score, gate object for pipeline control. ' \
+                'Pipeline step 1 of 8. Use correlation_id to track across all steps. ' \
+                'Soft scores above 6 typically indicate legitimate HR requests.',
+          learn_more_url: 'https://cloud.google.com/vertex-ai/generative-ai/docs/rag-engine/rag-overview',
+          learn_more_text: 'Learn about RAG pipelines'
+        },
       config_fields: [
         { name: 'show_advanced', label: 'Show advanced options',
           type: 'boolean', control_type: 'checkbox',
@@ -818,7 +825,15 @@ require 'securerandom'
       subtitle: 'Filter: Triage (IRRELEVANT/HUMAN/KEEP)',
       description: 'LLM-based triage to determine if email should proceed through pipeline',
       display_priority: 501,
-      
+      help: lambda do |_|
+        {
+          body: 'AI-powered triage classifying emails as IRRELEVANT (spam), HUMAN (needs review), or KEEP (can automate). ' \
+                'Inputs: email_text, min_confidence_for_keep (default 0.60), confidence_short_circuit (default 0.85). ' \
+                'Outputs: decision, confidence (0-1), reasons array, should_continue boolean, detected_domain. ' \
+                'Pipeline step 2 of 8. KEEP means legitimate employee questions, HUMAN for complaints/sensitive matters, IRRELEVANT for spam/newsletters. ' \
+                'Use should_continue for conditional branching.'
+        }
+      end,
       config_fields: [
         { name: 'show_advanced', label: 'Show advanced options',
           type: 'boolean', control_type: 'checkbox',
@@ -1018,7 +1033,15 @@ require 'securerandom'
       title: 'Classify: Intent',
       subtitle: 'Classify: User intent',
       description: 'Determine what the user is trying to accomplish',
-      display_priority: 500,     
+      display_priority: 500,
+      help: lambda do |_|
+        {
+          body: 'Classifies user intent to enable appropriate response strategies. ' \
+                'Inputs: email_text, intent_types array, actionable_intents list. ' \
+                'Outputs: intent (information_request, action_request, status_inquiry, complaint, feedback), confidence, is_actionable boolean, entities, sentiment. ' \
+                'Optional enhancement step. Use requires_context to determine if RAG retrieval needed.'
+        }
+      end,  
       config_fields: [
         { name: 'show_advanced', label: 'Show advanced options',
           type: 'boolean', control_type: 'checkbox',
@@ -1221,269 +1244,17 @@ require 'securerandom'
         call(:sample_ai_intent_classifier)
       end
     },
-    ai_policy_filter: {
-      title: 'Filter: AI triage',
-      subtitle: 'Filter: Triage',
-      description: 'Fuzzy triage via LLM under a strict JSON schema',
-      display_priority: 501,
-      help: lambda do |_|
-        { body: 'Constrained LLM decides IRRELEVANT/HUMAN/KEEP. Returns results as JSON.' }
-      end,
-      config_fields: [
-        { name: 'show_advanced', label: 'Show advanced options',
-          type: 'boolean', control_type: 'checkbox',
-          default: false, sticky: true, extends_schema: true,
-          hint: 'Toggle to reveal advanced parameters.' }
-      ],  
-      input_fields: lambda do |object_definitions, connection, config_fields|
-        call(:ui_policy_inputs_enhanced, object_definitions, config_fields) +
-          Array(object_definitions['observability_input_fields'])
-      end,
-      output_fields: lambda do |object_definitions, connection|
-        [
-          # Triage outputs
-          { name: 'policy', type: 'object',
-            properties: object_definitions['policy_decision'] },
-          
-          # Intent outputs (NEW)
-          { name: 'intent', type: 'object',
-            properties: object_definitions['intent_classification'] },
-          
-          { name: 'short_circuit', type: 'boolean' },
-          { name: 'email_type' },
-          
-          { name: 'generator_gate', type: 'object', properties: [
-            { name: 'pass_to_responder', type: 'boolean' },
-            { name: 'reason' },
-            { name: 'generator_hint' }
-          ]},
-          
-          # Pass-through signals for downstream
-          { name: 'signals_intent' },
-          { name: 'signals_intent_confidence', type: 'number' },
-          
-          { name: 'complete_output', type: 'object' },
-          { name: 'facets', type: 'object', optional: true }
-        ] + call(:standard_operational_outputs)
-      end,
-      execute: lambda do |connection, input|
-        ctx = call(:step_begin!, :ai_policy_filter, input)
-        
-        begin
-          # Build model path
-          model = input['model'] || 'gemini-2.0-flash'
-          model_path = call(:build_model_path_with_global_preview, connection, model)
-          loc = (model_path[/\/locations\/([^\/]+)/,1] || 'global').to_s.downcase
-          url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
-          req_params = "model=#{model_path}"
-
-          # Get intent types configuration
-          intent_types = input['intent_types'] || 
-                        ['information_request', 'action_request', 'status_inquiry', 
-                        'complaint', 'auto_reply', 'unknown']
-          
-          actionable_intents = input['actionable_intents'] || 
-                              ['information_request', 'action_request']
-
-          # Build enhanced system text with intent
-          system_text = <<~SYS
-            You are a strict email classification system. Your ENTIRE response must be valid JSON.
-            
-            Classify the email with TWO tasks:
-            1. TRIAGE decision: Is this email relevant and how should it be handled?
-            2. INTENT detection: What is the user trying to accomplish?
-            
-            TRIAGE DECISIONS:
-            - IRRELEVANT: Not relevant to HR, spam, newsletters, auto-generated
-            - HUMAN: Needs human review (complaints, complex, sensitive)
-            - KEEP: Valid request that can be handled automatically
-            
-            INTENT TYPES:
-            - information_request: Asking for information, policies, or procedures
-            - action_request: Requesting a specific action (approval, document generation)
-            - status_inquiry: Checking status of existing request
-            - complaint: Expressing dissatisfaction or escalation
-            - auto_reply: Out-of-office, bounce, or automated response
-            - unknown: Cannot determine clear intent
-            
-            CRITICAL: Output ONLY valid JSON. No text before or after.
-            
-            Example valid response:
-            {"decision":"KEEP","confidence":0.85,"intent":"information_request","intent_confidence":0.9,"matched_signals":["policy_question"],"reasons":["Clear PTO policy inquiry"]}
-          SYS
-
-          # Add custom policy if provided
-          if input['policy_json'].present? && input['policy_mode'] == 'json'
-            policy_spec = call(:safe_json_obj!, input['policy_json'])
-            if policy_spec.is_a?(Hash)
-              system_text += "\n\nAdditional policy rules:\n#{call(:json_compact, policy_spec)}"
-            end
-          end
-
-          # Build response schema with intent
-          response_schema = {
-            'type' => 'object',
-            'additionalProperties' => false,
-            'properties' => {
-              'decision' => {
-                'type' => 'string',
-                'enum' => ['IRRELEVANT', 'HUMAN', 'KEEP']
-              },
-              'confidence' => { 
-                'type' => 'number', 
-                'minimum' => 0, 
-                'maximum' => 1 
-              },
-              'intent' => { 
-                'type' => 'string', 
-                'enum' => intent_types 
-              },
-              'intent_confidence' => { 
-                'type' => 'number', 
-                'minimum' => 0, 
-                'maximum' => 1 
-              },
-              'matched_signals' => {
-                'type' => 'array',
-                'items' => { 'type' => 'string' },
-                'maxItems' => 10
-              },
-              'reasons' => {
-                'type' => 'array',
-                'items' => { 'type' => 'string' },
-                'maxItems' => 5
-              }
-            },
-            'required' => ['decision', 'confidence', 'intent']
-          }
-
-          # Build generation config
-          gen_config = {
-            'temperature' => (input['temperature'] || 0).to_f,
-            'maxOutputTokens' => 512,
-            'responseMimeType' => 'application/json',
-            'responseSchema' => response_schema
-          }
-
-          # Build request payload
-          payload = {
-            'systemInstruction' => { 
-              'role' => 'system', 
-              'parts' => [{'text' => system_text}] 
-            },
-            'contents' => [
-              { 
-                'role' => 'user', 
-                'parts' => [{ 'text' => "Email:\n#{input['email_text']}" }] 
-              }
-            ],
-            'generationConfig' => gen_config
-          }
-
-          # Make API request
-          resp = post(url)
-                  .headers(call(:request_headers_auth, connection, ctx['cid'], 
-                              connection['user_project'], req_params))
-                  .payload(call(:json_compact, payload))
-          
-          # Parse response
-          text, meta = call(:extract_candidate_text, resp)
-          
-          # Parse JSON with defaults
-          parsed = {}
-          if text.is_a?(String) && text.length > 0
-            clean_text = text.gsub(/```json\n?/, '').gsub(/```\n?/, '').strip
-            parsed = call(:safe_json, clean_text) || {}
-          end
-          
-          # Extract and validate fields
-          decision = (parsed['decision'] || 'HUMAN').to_s
-          unless ['IRRELEVANT', 'HUMAN', 'KEEP'].include?(decision)
-            decision = 'HUMAN'
-          end
-          
-          confidence = [[call(:safe_float, parsed['confidence']) || 0.0, 0.0].max, 1.0].min
-          
-          intent = (parsed['intent'] || 'unknown').to_s
-          unless intent_types.include?(intent)
-            intent = 'unknown'
-          end
-          
-          intent_confidence = [[call(:safe_float, parsed['intent_confidence']) || confidence, 0.0].max, 1.0].min
-          
-          # Build policy and intent objects
-          policy = {
-            'decision' => decision,
-            'confidence' => confidence,
-            'matched_signals' => call(:safe_array, parsed['matched_signals']),
-            'reasons' => call(:safe_array, parsed['reasons'])
-          }
-          
-          intent_obj = {
-            'label' => intent,
-            'confidence' => intent_confidence,
-            'basis' => 'llm_classification'
-          }
-          
-          # Calculate short circuit
-          short_circuit = (decision == 'IRRELEVANT' && 
-                          confidence >= (input['confidence_short_circuit'] || 0.8).to_f)
-
-          # Generator gate logic with intent check
-          email_type = input['email_type'] || 'direct_request'
-          min_conf = (input['min_confidence_for_generation'] || 0.60).to_f
-          
-          block_reasons = []
-          block_reasons << 'non_direct_request' if email_type != 'direct_request'
-          block_reasons << 'policy_irrelevant' if decision == 'IRRELEVANT'
-          block_reasons << 'low_confidence' if confidence < min_conf
-          
-          # Check intent gate (NEW)
-          if input['require_actionable_intent'] && !actionable_intents.include?(intent)
-            block_reasons << "non_actionable_intent:#{intent}"
-          end
-          
-          pass_to_responder = block_reasons.empty?
-          generator_hint = pass_to_responder ? 'pass' : 'blocked'
-
-          # Build output
-          out = {
-            'policy' => policy,
-            'intent' => intent_obj,
-            'short_circuit' => short_circuit,
-            'email_type' => email_type,
-            'generator_gate' => {
-              'pass_to_responder' => pass_to_responder,
-              'reason' => block_reasons.any? ? block_reasons.join(',') : 'meets_requirements',
-              'generator_hint' => generator_hint
-            },
-            'signals_intent' => intent,
-            'signals_intent_confidence' => intent_confidence
-          }
-          
-          call(:step_ok!, ctx, out, call(:telemetry_success_code, resp), 'OK', {
-            'decision' => decision,
-            'confidence' => confidence,
-            'intent' => intent,
-            'intent_confidence' => intent_confidence,
-            'short_circuit' => short_circuit,
-            'generator_hint' => generator_hint
-          })
-          
-        rescue => e
-          call(:step_err!, ctx, e)
-        end
-      end,
-      sample_output: lambda do
-        call(:sample_ai_policy_filter_enhanced)
-      end
-    },
     embed_text_against_categories: {
       title: 'Categorize: Semantic similarity',
       subtitle: 'Categorize: Semantic similarity (email against categories)',
       display_priority: 499,
       help: lambda do |_|
-        { body: 'Embeds email and categories, returns similarity scores and a top-K shortlist.' }
+        {
+          body: 'Uses embeddings to find semantically similar categories for the email. ' \
+                'Inputs: email_text, categories array with name/description/examples, shortlist_k (default 3). ' \
+                'Outputs: scores array with similarity scores and cosine distances, shortlist of top K categories. ' \
+                'Pipeline step 3 of 8. Scores above 0.7 indicate strong matches. Cosine ranges from -1 to 1.'
+        }
       end,
 
       config_fields: [
@@ -1568,7 +1339,12 @@ require 'securerandom'
       description: 'Listwise re-ordering of categories using an LLM. Emits probability distribution over the shortlist.',
       display_priority: 498,
       help: lambda do |_|
-        { body: 'Uses LLM to produce a probability distribution over the shortlist and re-orders it.' }
+        {
+          body: 'LLM reranking of category shortlist with probability distribution. ' \
+                'Inputs: email_text, shortlist from step 3, categories, mode (none or llm). ' \
+                'Outputs: ranking array with probabilities, reordered shortlist. ' \
+                'Pipeline step 4 of 8. LLM mode produces calibrated probability distribution summing to 1.0.'
+        }
       end,
 
       config_fields: [
@@ -1646,7 +1422,12 @@ require 'securerandom'
       subtitle: 'Adjudicate among shortlist; accepts ranked categories',
       display_priority: 497,
       help: lambda do |_|
-        { body: 'Chooses final category using shortlist + category metadata; can append ranked contexts to the email text.' }
+        {
+          body: 'Final category selection using LLM reasoning with optional salience extraction. ' \
+                'Inputs: email_text, categories, shortlist, min_confidence (0.25), fallback_category, salience_mode (off/heuristic/llm). ' \
+                'Outputs: chosen (CRITICAL - used by steps 6-8), confidence, referee object with reasoning, salience with key sentence. ' \
+                'Pipeline step 5 of 8. Always provide fallback_category. The chosen field is required by downstream steps.'
+        }
       end,
       config_fields: [
         { name: 'show_advanced', label: 'Show advanced options',
@@ -1899,7 +1680,17 @@ require 'securerandom'
       display_priority: 489,
       retry_on_response: [408, 429, 500, 502, 503, 504],
       max_retries: 3,
-      
+      help: lambda do |_|
+        {
+          body: 'Retrieves relevant contexts from Vertex RAG corpus with enhanced processing and PDF cleaning. ' \
+                'Inputs: query_text, rag_corpus (required), top_k (default 20), sanitize_pdf_content (default true), signals_category from step 5. ' \
+                'Outputs: contexts array with text/score/source/uri/metadata, telemetry with success_count and error_count. ' \
+                'Pipeline step 6 of 8. Supports distance/similarity thresholds and ranking models in advanced options. ' \
+                'Monitor success_count vs error_count for quality.',
+          learn_more_url: 'https://cloud.google.com/vertex-ai/generative-ai/docs/rag-engine/retrieval-and-ranking',
+          learn_more_text: 'Vertex AI retrieval and ranking'
+        }
+      end,
       config_fields: [
         { name: 'show_advanced', label: 'Show advanced options',
           type: 'boolean', control_type: 'checkbox',
@@ -2225,7 +2016,11 @@ require 'securerandom'
       description: '',
       help: lambda do |input, picklist_label|
         {
-          body: 'Rerank retrieved contexts for a query within a known category using LLM-based ranking with category awareness.',
+          body: 'Category-aware reranking of retrieved contexts using LLM scoring for relevance and alignment. ' \
+                'Inputs: query_text, records array (id/content required), category, llm_model (default gemini-2.0-flash), top_n limit. ' \
+                'Outputs: records with scores/ranks, context_chunks formatted for RAG, ranking_metadata with category and counts. ' \
+                'Pipeline step 7 of 8. Emit_shape options: records_only (minimal), enriched_records (full), context_chunks (RAG-ready). ' \
+                'Scores combine relevance (0.8 weight) and category alignment (0.2 weight).',
           learn_more_url: 'https://cloud.google.com/vertex-ai/generative-ai/docs/rag-engine/retrieval-and-ranking',
           learn_more_text: 'Check out Google docs for retrieval and ranking'
         }
@@ -2593,14 +2388,14 @@ require 'securerandom'
       description: 'Query a generative endpoint (configurable to allow grounding)',
       help: lambda do |_|
         {
-          body: "Select an option from the `Mode` field, then fill only the fields rendered by the recipe builder. "\
-                "Required fields per mode: `RAG-LITE`: [question, context_chunks]. " \
-                '`VERTEX-SEARCH ONLY`: [vertex_ai_search_datastore OR vertex_ai_search_serving_config]. ' \
-                '`RAG-STORE ONLY`: [rag_corpus]. ' \
-                '`GOOGLE SEARCH`: No additional fields required. ' \
-                '`PLAIN`: Just model and contents.',
+          body: 'Final response generation with multiple grounding modes and signal enrichment. ' \
+                'Modes: plain (no grounding), rag_with_context (pipeline mode with context_chunks), grounded_google (search), grounded_vertex (datastore), grounded_rag_store (corpus). ' \
+                'RAG mode inputs: question, context_chunks from step 7, max_chunks (20), signals from upstream, use_signal_enrichment (true). ' \
+                'Outputs: candidates with response text, parsed object with answer and citations, confidence score, token usage. ' \
+                'Pipeline step 8 of 8. Citations automatically enriched with source/URI. Signal enrichment adjusts prompt and temperature. ' \
+                'Monitor has_citations and token usage in facets.',
           learn_more_url: 'https://ai.google.dev/gemini-api/docs/models',
-          learn_more_text: 'Find a current list of available Gemini models'
+          learn_more_text: 'Gemini model documentation'
         }
       end,
       display_priority: 470,
@@ -2855,34 +2650,18 @@ require 'securerandom'
           'decision' => 'KEEP',
           'generator_hint' => 'check_policy'
         },
+        'complete_output' => {}, # Would contain business fields
+        'facets' => {
+          'hard_blocked' => false,
+          'email_type' => 'direct_request',
+          'soft_score' => 3,
+          'rules_evaluated' => true,
+          'exclusion_source' => 'quick_patterns',
+          'patterns_count' => 2,
+          'correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
+        },
         'ok' => true,
         'op_telemetry' => call(:sample_telemetry, 8)
-      }
-    end,
-    sample_ai_policy_filter_enhanced: lambda do
-      {
-        'policy' => {
-          'decision' => 'KEEP',
-          'confidence' => 0.85,
-          'matched_signals' => ['direct_question', 'policy_reference'],
-          'reasons' => ['Clear PTO policy question']
-        },
-        'intent' => {
-          'label' => 'information_request',
-          'confidence' => 0.92,
-          'basis' => 'llm_classification'
-        },
-        'short_circuit' => false,
-        'email_type' => 'direct_request',
-        'generator_gate' => {
-          'pass_to_responder' => true,
-          'reason' => 'meets_requirements',
-          'generator_hint' => 'pass'
-        },
-        'signals_intent' => 'information_request',
-        'signals_intent_confidence' => 0.92,
-        'ok' => true,
-        'op_telemetry' => call(:sample_telemetry, 45)
       }
     end,
     sample_ai_triage_filter: lambda do
@@ -2902,6 +2681,16 @@ require 'securerandom'
         'signals_triage' => 'KEEP',
         'signals_confidence' => 0.88,
         'signals_domain' => 'benefits',
+        'complete_output' => {}, # Would contain business fields
+        'facets' => {
+          'decision' => 'KEEP',
+          'confidence' => 0.88,
+          'detected_domain' => 'benefits',
+          'has_question' => true,
+          'should_continue' => true,
+          'short_circuit' => false,
+          'correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
+        },
         'ok' => true,
         'op_telemetry' => call(:sample_telemetry, 35)
       }
@@ -2930,6 +2719,15 @@ require 'securerandom'
         'signals_intent' => 'information_request',
         'signals_intent_confidence' => 0.88,
         'signals_triage' => 'KEEP',
+        'complete_output' => {}, # Would contain business fields
+        'facets' => {
+          'intent' => 'information_request',
+          'confidence' => 0.88,
+          'is_actionable' => true,
+          'has_entities' => true,
+          'sentiment' => 'neutral',
+          'correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
+        },
         'ok' => true,
         'op_telemetry' => call(:sample_telemetry, 38)
       }
@@ -2943,14 +2741,22 @@ require 'securerandom'
       
       business_data = {
         'scores' => scores,
-        'shortlist' => ['Billing', 'Support', 'Sales']
+        'shortlist' => ['Billing', 'Support', 'Sales'],
+        'signals_category' => 'Billing',
+        'signals_confidence' => 0.85,
+        'signals_intent' => 'information_request'
       }
       
       business_data.merge({
         'complete_output' => business_data.dup,
         'facets' => {
+          'k' => 3,
+          'categories_count' => 3,
+          'shortlist_k' => 3,
           'top_score' => 0.91,
-          'categories_count' => 3
+          'embedding_model' => 'text-embedding-005',
+          'categories_mode' => 'array',
+          'correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
         },
         'ok' => true,
         'op_correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
@@ -2966,14 +2772,21 @@ require 'securerandom'
       
       business_data = {
         'ranking' => ranking,
-        'shortlist' => ['Billing', 'Support', 'Sales']
+        'shortlist' => ['Billing', 'Support', 'Sales'],
+        'signals_category' => 'Billing',
+        'signals_confidence' => 0.86,
+        'signals_intent' => 'information_request'
       }
       
       business_data.merge({
         'complete_output' => business_data.dup,
         'facets' => {
           'mode' => 'llm',
-          'top_prob' => 0.86
+          'top_prob' => 0.86,
+          'categories_ranked' => 3,
+          'generative_model' => 'gemini-2.0-flash',
+          'categories_mode' => 'array',
+          'correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
         },
         'ok' => true,
         'op_correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
@@ -3009,36 +2822,141 @@ require 'securerandom'
         'confidence' => 0.86,
         'referee' => referee,
         'salience' => salience,
-        'signals_category' => 'Billing'  # For downstream
+        'signals_category' => 'Billing',
+        'signals_confidence' => 0.86
       }
       
       business_data.merge({
         'complete_output' => business_data.dup,
         'facets' => {
           'chosen' => 'Billing',
-          'confidence' => 0.86
+          'confidence' => 0.86,
+          'salience_mode' => 'llm',
+          'salience_len' => 39,
+          'salience_importance' => 0.92,
+          'salience_source' => 'llm',
+          'has_contexts' => false,
+          'shortlist_size' => 3,
+          'generative_model' => 'gemini-2.0-flash',
+          'categories_mode' => 'array',
+          'correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
         },
         'ok' => true,
         'op_correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
         'op_telemetry' => call(:sample_telemetry, 19)
       })
     end,
+    sample_rank_texts_with_ranking_api: lambda do
+      records = [
+        {
+          'id' => 'doc-1',
+          'score' => 0.92,
+          'rank' => 1,
+          'content' => 'PTO policy: 20 days per year...',
+          'source' => 'hr-handbook.pdf',
+          'uri' => 'gs://bucket/hr-handbook.pdf',
+          'metadata' => { 'page' => 15, 'section' => 'Benefits' },
+          'llm_relevance' => 0.95,
+          'category_alignment' => 0.85
+        },
+        {
+          'id' => 'doc-2',
+          'score' => 0.87,
+          'rank' => 2,
+          'content' => 'Request PTO through HRIS system...',
+          'source' => 'hr-handbook.pdf',
+          'uri' => 'gs://bucket/hr-handbook.pdf',
+          'metadata' => { 'page' => 16, 'section' => 'Benefits' },
+          'llm_relevance' => 0.88,
+          'category_alignment' => 0.82
+        }
+      ]
+      
+      context_chunks = [
+        {
+          'id' => 'doc-1',
+          'text' => 'PTO policy: 20 days per year...',
+          'score' => 0.92,
+          'source' => 'hr-handbook.pdf',
+          'uri' => 'gs://bucket/hr-handbook.pdf',
+          'metadata' => { 'page' => 15, 'section' => 'Benefits' },
+          'metadata_kv' => [
+            { 'key' => 'page', 'value' => '15' },
+            { 'key' => 'section', 'value' => 'Benefits' }
+          ],
+          'metadata_json' => '{"page":15,"section":"Benefits"}',
+          'llm_relevance' => 0.95,
+          'category_alignment' => 0.85
+        },
+        {
+          'id' => 'doc-2',
+          'text' => 'Request PTO through HRIS system...',
+          'score' => 0.87,
+          'source' => 'hr-handbook.pdf',
+          'uri' => 'gs://bucket/hr-handbook.pdf',
+          'metadata' => { 'page' => 16, 'section' => 'Benefits' },
+          'metadata_kv' => [
+            { 'key' => 'page', 'value' => '16' },
+            { 'key' => 'section', 'value' => 'Benefits' }
+          ],
+          'metadata_json' => '{"page":16,"section":"Benefits"}',
+          'llm_relevance' => 0.88,
+          'category_alignment' => 0.82
+        }
+      ]
+      
+      business_data = {
+        'records' => records,
+        'context_chunks' => context_chunks,
+        'ranking_metadata' => {
+          'category' => 'PTO',
+          'llm_model' => 'gemini-2.0-flash',
+          'contexts_filtered' => 0,
+          'contexts_ranked' => 2
+        }
+      }
+      
+      business_data.merge({
+        'complete_output' => business_data.dup,
+        'facets' => {
+          'ranking_api' => 'llm.category_ranker',
+          'category' => 'PTO',
+          'llm_model' => 'gemini-2.0-flash',
+          'emit_shape' => 'context_chunks',
+          'records_input' => 2,
+          'records_filtered' => 0,
+          'records_ranked' => 2,
+          'records_output' => 2,
+          'has_distribution' => false,
+          'top_score' => 0.92,
+          'category_filtered' => false,
+          'correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
+        },
+        'ok' => true,
+        'op_correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+        'op_telemetry' => call(:sample_telemetry, 85)
+      })
+    end,
     sample_gen_generate: lambda do
       candidates = [{
         'content' => { 
-          'parts' => [{ 'text' => 'Based on the provided context, the invoice total is $1,234.56.' }],
+          'parts' => [{ 'text' => 'Based on the provided context, employees receive 20 days of PTO per year.' }],
           'role' => 'model'
         },
         'finishReason' => 'STOP',
         'safetyRatings' => [
-          { 'category' => 'HARM_CATEGORY_SEXUALLY_EXPLICIT', 'probability' => 'NEGLIGIBLE' }
+          { 'category' => 'HARM_CATEGORY_SEXUALLY_EXPLICIT', 'probability' => 'NEGLIGIBLE' },
+          { 'category' => 'HARM_CATEGORY_HATE_SPEECH', 'probability' => 'NEGLIGIBLE' },
+          { 'category' => 'HARM_CATEGORY_HARASSMENT', 'probability' => 'NEGLIGIBLE' },
+          { 'category' => 'HARM_CATEGORY_DANGEROUS_CONTENT', 'probability' => 'NEGLIGIBLE' }
         ]
       }]
       
       parsed = {
-        'answer' => 'Based on the provided context, the invoice total is $1,234.56.',
+        'answer' => 'Based on the provided context, employees receive 20 days of PTO per year.',
         'citations' => [
-          { 'chunk_id' => 'doc-1#c2', 'source' => 'invoice.pdf', 'uri' => 'gs://bucket/invoice.pdf', 'score' => 0.92 }
+          { 'chunk_id' => 'doc-1', 'source' => 'hr-handbook.pdf', 'uri' => 'gs://bucket/hr-handbook.pdf', 'score' => 0.92 },
+          { 'chunk_id' => 'doc-2', 'source' => 'hr-handbook.pdf', 'uri' => 'gs://bucket/hr-handbook.pdf', 'score' => 0.87 }
         ]
       }
       
@@ -3050,77 +2968,37 @@ require 'securerandom'
       
       business_data = {
         'responseId' => 'resp-abc123',
+        'modelVersion' => 'gemini-2.0-flash-002',
         'candidates' => candidates,
         'usageMetadata' => usage_metadata,
         'confidence' => 0.90,
         'parsed' => parsed,
-        'applied_signals' => ['category', 'intent']
-      }
-      
-      facets = {
-        'mode' => 'rag_with_context',
-        'model' => 'gemini-2.0-flash',
-        'finish_reason' => 'STOP',
-        'confidence' => 0.90,
-        'has_citations' => true,
-        'signals_used' => true
-      }
-      
-      business_data.merge({
-        'complete_output' => business_data.dup,
-        'facets' => facets,
-        'ok' => true,
-        'telemetry' => call(:sample_telemetry, 150)
-      })
-    end,
-    sample_rank_texts_with_ranking_api: lambda do
-      records = [
-        {
-          'id' => 'doc-1',
-          'score' => 0.92,
-          'rank' => 1,
-          'content' => 'PTO policy: 20 days per year...',
-          'metadata' => { 'source' => 'hr-handbook.pdf' },
-          'llm_relevance' => 0.95,
-          'category_alignment' => 0.85
-        }
-      ]
-      
-      context_chunks = [
-        {
-          'id' => 'doc-1',
-          'text' => 'PTO policy: 20 days per year...',
-          'score' => 0.92,
-          'source' => 'hr-handbook.pdf',
-          'uri' => 'gs://bucket/hr-handbook.pdf',
-          'metadata' => { 'page' => 15 },
-          'metadata_kv' => [{ 'key' => 'page', 'value' => '15' }],
-          'metadata_json' => '{"page":15}',
-          'llm_relevance' => 0.95,
-          'category_alignment' => 0.85
-        }
-      ]
-      
-      business_data = {
-        'records' => records,
-        'context_chunks' => context_chunks,
-        'ranking_metadata' => {
-          'category' => 'PTO',
-          'llm_model' => 'gemini-2.0-flash',
-          'contexts_filtered' => 0,
-          'contexts_ranked' => 1
-        }
+        'applied_signals' => ['category', 'intent', 'confidence']
       }
       
       business_data.merge({
         'complete_output' => business_data.dup,
         'facets' => {
-          'category' => 'PTO',
-          'top_score' => 0.92
+          'mode' => 'rag_with_context',
+          'model' => 'gemini-2.0-flash',
+          'finish_reason' => 'STOP',
+          'confidence' => 0.90,
+          'has_citations' => true,
+          'signals_used' => true,
+          'contexts_returned' => 2,
+          'tokens_prompt' => 245,
+          'tokens_candidates' => 26,
+          'tokens_total' => 271,
+          'correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
         },
         'ok' => true,
-        'op_correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
-        'op_telemetry' => call(:sample_telemetry, 85)
+        'telemetry' => call(:sample_telemetry, 150).merge({
+          'confidence' => { 
+            'basis' => 'citations_topk_avg', 
+            'k' => 3,
+            'n' => 2
+          }
+        })
       })
     end,
     sample_rag_retrieve_contexts_enhanced: lambda do
@@ -3162,26 +3040,16 @@ require 'securerandom'
         'contexts' => contexts
       }
       
-      facets = {
-        'top_k' => 20,
-        'contexts_count' => 2,
+      # Enhanced telemetry with extra fields from the action
+      telemetry = call(:sample_telemetry, 45).merge({
         'success_count' => 2,
         'error_count' => 0,
-        'pdf_contexts_count' => 2,
-        'partial_failure' => false,
-        'filter_type' => 'similarity',
-        'filter_value' => 0.7,
-        'rank_mode' => 'llmRanker',
-        'rank_model' => 'gemini-2.0-flash',
-        'network_error' => false,
-        'correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
-      }
+        'partial_failure' => false
+      })
       
       business_data.merge({
-        'complete_output' => business_data.dup,
-        'facets' => facets,
         'ok' => true,
-        'telemetry' => call(:sample_telemetry, 45) # RAG retrieval typically ~45ms
+        'telemetry' => telemetry
       })
     end,
     # Output
