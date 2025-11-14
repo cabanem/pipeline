@@ -151,6 +151,8 @@ require 'securerandom'
           { name: 'mode', control_type: 'select', pick_list: 'gen_generate_modes', optional: false, default: 'plain' },
           { name: 'model', optional: false, control_type: 'text' },
           { name: 'correlation_id', label: 'Correlation ID', optional: true, hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
+          { name: 'signals_category', optional: true, hint: 'Category context for generation' },
+          { name: 'signals_confidence', optional: true, hint: 'Upstream confidence (can affect generation)' },
           # Show 'contents' for plain/grounded modes; hide for rag_with_context
           { name: 'contents',
             type: 'array', of: 'object', properties: object_definitions['content'], optional: true,
@@ -1160,9 +1162,33 @@ require 'securerandom'
           hint: 'Toggle to reveal advanced parameters.' }
       ], 
       input_fields: lambda do |object_definitions, connection, config_fields|
+         call(:ui_ref_inputs, object_definitions, config_fields) + [
+           # --- Salience sidecar (disabled by default; 2-call flow when LLM) ---
+           { name: 'salience_mode', label: 'Salience extraction',
+             control_type: 'select', optional: true, default: 'off', extends_schema: true,
+             options: [['Off','off'], ['Heuristic (no LLM)','heuristic'], ['LLM (extra API call)','llm']],
+             hint: 'Extract a salient sentence/paragraph before refereeing. LLM mode makes a separate API call.' },
+           { name: 'salience_append_to_prompt', label: 'Append salience to prompt',
+             type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+             ngIf: 'input.salience_mode != "off"',
+             hint: 'If enabled, the salient span (and light metadata) is appended to the email text shown to the referee.' },
+           { name: 'salience_max_chars', label: 'Salience max chars', type: 'integer',
+             optional: true, default: 500, ngIf: 'input.salience_mode != "off"' },
+           { name: 'salience_include_entities', label: 'Salience: include entities',
+             type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+             ngIf: 'input.salience_mode == "llm"' },
+           { name: 'salience_model', label: 'Salience model',
+             control_type: 'text', optional: true, default: 'gemini-2.0-flash',
+             ngIf: 'input.salience_mode == "llm"' },
+           { name: 'salience_temperature', label: 'Salience temperature',
+             type: 'number', optional: true, default: 0,
+             ngIf: 'input.salience_mode == "llm"' }
+         ] + Array(object_definitions['observability_input_fields'])
+      end,
+      output_fields: lambda do |object_definitions, connection|
         [
           # Critical business outputs
-          { name: 'chosen', hint: '⚠️ CRITICAL: Used by steps 6-8' },
+          { name: 'chosen', hint: 'CRITICAL: Used by steps 6-8' },
           { name: 'confidence', type: 'number' },
           
           { name: 'referee', type: 'object', properties: [
@@ -1190,39 +1216,12 @@ require 'securerandom'
           
           # Signal for downstream
           { name: 'signals_category', hint: 'Copy of chosen for downstream' },
+          { name: 'signals_confidence', hint: 'Confidence for downstream use' },
           
           # Standard fields
           { name: 'complete_output', type: 'object' },
           { name: 'facets', type: 'object', optional: true }
         ] + call(:standard_operational_outputs)
-      end,
-      output_fields: lambda do |object_definitions, connection|
-        [
-          { name: 'referee', type: 'object', properties: Array(object_definitions['referee_out']) },
-          { name: 'chosen' },
-          { name: 'confidence', type: 'number' },
-          # Salience sidecar (top-level field; backward compatible)
-          { name: 'salience', type: 'object', properties: [
-               { name: 'span' },
-               { name: 'reason' },
-               { name: 'importance', type: 'number' },
-               { name: 'tags', type: 'array', of: 'string' },
-               { name: 'entities', type: 'array', of: 'object',
-                 properties: [{ name: 'type' }, { name: 'text' }] },
-               { name: 'cta' },
-               { name: 'deadline_iso' },
-               { name: 'focus_preview' },
-               { name: 'responseId' },
-               { name: 'usage', type: 'object', properties: [
-                   { name: 'promptTokenCount', type: 'integer' },
-                   { name: 'candidatesTokenCount', type: 'integer' },
-                   { name: 'totalTokenCount', type: 'integer' }
-               ]},
-               { name: 'span_source' } # heuristic | llm
-             ]},
-          { name: 'complete_output', type: 'object', hint: 'All outputs consolidated for easy downstream use' },
-          { name: 'facets', type: 'object', optional: true, hint: 'Analytics facets when available' }
-        ] + Array(object_definitions['envelope_fields'])
       end,
       execute: lambda do |connection, input|
         ctx = call(:step_begin!, :llm_referee_with_contexts, input)
@@ -1374,8 +1373,11 @@ require 'securerandom'
         out = {
           'referee'=>ref,
           'chosen'=>chosen,
-          'confidence'=>[ref['confidence'], 0.0].compact.first.to_f
+          'confidence'=>[ref['confidence'], 0.0].compact.first.to_f,
+          'signals_category' => chosen
         }
+        out['signals_category'] = chosen
+        out['signals_confidence'] = out['confidence']
         out['salience'] = salience if salience
  
         extras = {
@@ -1417,25 +1419,20 @@ require 'securerandom'
         
         base = [
           { name: 'query_text', label: 'Query text', optional: false },
-          { name: 'rag_corpus', optional: true,
-            hint: 'Full or short ID. Example: my-corpus. Will auto-expand using connection project/location.' },
+          { name: 'rag_corpus', optional: true, hint: 'Full or short ID. Example: my-corpus. Will auto-expand using connection project/location.' },
           { name: 'rag_file_ids', type: 'array', of: 'string', optional: true,
             hint: 'Optional: limit to these file IDs (must belong to the same corpus).' },
           { name: 'top_k', type: 'integer', optional: true, default: 20, hint: 'Max contexts to return.' },
           { name: 'correlation_id', optional: true, hint: 'For tracking related requests.' },
-          { name: 'sanitize_pdf_content', 
-            type: 'boolean', 
-            control_type: 'checkbox',
-            default: true,
+          { name: 'signals_category', optional: true, hint: 'Category from step 5 (enhances retrieval)' },
+          { name: 'sanitize_pdf_content', type: 'boolean', control_type: 'checkbox',default: true,
             hint: 'Clean PDF extraction artifacts when detected (recommended)' },
-          { name: 'on_error_behavior', 
-            control_type: 'select',
+          { name: 'on_error_behavior', control_type: 'select', default: 'skip',
             pick_list: [
               ['Skip failed contexts', 'skip'],
               ['Include error placeholders', 'include'],
               ['Fail entire request', 'fail']
             ],
-            default: 'skip',
             hint: 'How to handle individual context processing errors' }
         ]
         
@@ -1754,12 +1751,11 @@ require 'securerandom'
               { name: 'content', optional: false }, 
               { name: 'metadata', type: 'object' }
             ], hint: 'Retrieved contexts to rank (id + content required)' },
-          { name: 'category', optional: true, 
-            hint: 'Pre-determined category (e.g., PTO, Billing, Support) to inform ranking' },
-          { name: 'category_context', optional: true,
-            hint: 'Additional context about the category to guide ranking (description, scope, etc.)' },
+          { name: 'category', optional: true, hint: 'Pre-determined category (e.g., PTO, Billing, Support) to inform ranking' },
+          { name: 'category_context', optional: true, hint: 'Additional context about the category to guide ranking (description, scope, etc.)' },
           { name: 'include_category_in_query', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
             hint: 'Include category context in ranking query for better relevance' },
+          { name: 'signals_category', optional: true, hint: 'If category not provided directly, uses this' },
           { name: 'correlation_id', label: 'Correlation ID', optional: true, 
             hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
           
@@ -1853,7 +1849,7 @@ require 'securerandom'
           loc = call(:aiapps_loc_resolve, connection, input['ai_apps_location'])
           
           # Extract category and prepare query
-          category = input['category'].to_s.strip
+          category = input['category'].to_s.strip || input['signals_category'] || ''
           category_ctx = input['category_context'].to_s.strip
           query = input['query_text'].to_s
           
