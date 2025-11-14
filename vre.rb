@@ -1149,7 +1149,7 @@ require 'securerandom'
         out['signals_category'] = input['signals_category']
         out['signals_confidence'] = input['signals_confidence']
         out['signals_intent'] = input['signals_intent']
-        
+
         call(:step_ok!, ctx, out, 200, 'OK', { 
           'mode' => 'llm',
           'top_prob' => ranking.first ? ranking.first['prob'] : 0,
@@ -1755,62 +1755,75 @@ require 'securerandom'
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
-
-      input_fields: lambda do |_object_definitions, _connection, _config_fields|
-        [
+      config_fields: [
+        { name: 'show_advanced', label: 'Show advanced options',
+          type: 'boolean', control_type: 'checkbox',
+          default: false, sticky: true, extends_schema: true,
+          hint: 'Toggle to reveal filtering and distribution options.' }
+      ],
+      input_fields: lambda do |object_definitions, connection, config_fields|
+        show_adv = (config_fields['show_advanced'] == true)
+        
+        base = [
           { name: 'query_text', optional: false, hint: 'The user query to rank contexts against' },
           { name: 'records', type: 'array', of: 'object', optional: false, properties: [
               { name: 'id', optional: false }, 
               { name: 'content', optional: false }, 
               { name: 'metadata', type: 'object' }
             ], hint: 'Retrieved contexts to rank (id + content required)' },
-          { name: 'category', optional: true, hint: 'Pre-determined category (e.g., PTO, Billing, Support) to inform ranking' },
-          { name: 'category_context', optional: true, hint: 'Additional context about the category to guide ranking (description, scope, etc.)' },
-          { name: 'include_category_in_query', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
-            hint: 'Include category context in ranking query for better relevance' },
-          { name: 'signals_category', optional: true, hint: 'If category not provided directly, uses this' },
+          { name: 'category', optional: true, 
+            hint: 'Pre-determined category (e.g., PTO, Billing, Support) to inform ranking' },
+          { name: 'signals_category', optional: true, 
+            hint: '📥 Falls back to this if category not provided directly' },
           { name: 'correlation_id', label: 'Correlation ID', optional: true, 
             hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
-          
-          # LLM ranking options (no longer conditional)
           { name: 'llm_model', optional: true, default: 'gemini-2.0-flash',
             hint: 'LLM model for semantic ranking' },
-          { name: 'top_n', type: 'integer', optional: true, hint: 'Max contexts to return (default: all)' },
-          
-          # Advanced options toggle
-          { name: 'show_advanced', label: 'Show advanced options', type: 'boolean', control_type: 'checkbox',
-            default: false, sticky: true, extends_schema: true },
-          
-          # Context filtering
-          { name: 'filter_by_category_metadata', type: 'boolean', control_type: 'checkbox', optional: true, default: false,
-            ngIf: 'input.show_advanced', 
-            hint: 'Pre-filter contexts by category match in metadata before ranking' },
-          { name: 'category_metadata_key', optional: true, default: 'category',
-            ngIf: 'input.show_advanced && input.filter_by_category_metadata', 
-            hint: 'Metadata field containing category tags' },
-          
-          # LLM processing limits
-          { name: 'llm_max_contexts', type: 'integer', optional: true, default: 50,
-            ngIf: 'input.show_advanced',
-            hint: 'Maximum number of contexts to process with LLM (for cost/performance)' },
-          { name: 'include_confidence_distribution', type: 'boolean', control_type: 'checkbox', optional: true, default: false,
-            ngIf: 'input.show_advanced',
-            hint: 'Return probability distribution across contexts' },
-          
-          # Output shape control
-          { name: 'emit_shape', control_type: 'select', pick_list: 'rerank_emit_shapes', 
-            optional: true, default: 'context_chunks',
-            hint: 'Output format: minimal records, enriched records, or RAG-ready context_chunks' },
-          { name: 'source_key', optional: true, default: 'source',
-            hint: 'Metadata key for document source' },
-          { name: 'uri_key', optional: true, default: 'uri',
-            hint: 'Metadata key for document URI' },
-          
-          # Location override
-          { name: 'ai_apps_location', label: 'AI-Apps location (override)', control_type: 'select', 
-            pick_list: 'ai_apps_locations', optional: true,
-            hint: 'Force specific multi-region (global/us/eu). Usually auto-detected.' }
+          { name: 'top_n', type: 'integer', optional: true, 
+            hint: 'Max contexts to return (default: all)' }
         ]
+        
+        if show_adv
+          base + [
+            # Category-specific options
+            { name: 'category_context', optional: true,
+              hint: 'Additional context about the category to guide ranking' },
+            { name: 'include_category_in_query', type: 'boolean', control_type: 'checkbox', 
+              optional: true, default: true,
+              hint: 'Include category context in ranking query for better relevance' },
+            
+            # Filtering options
+            { name: 'filter_by_category_metadata', type: 'boolean', control_type: 'checkbox', 
+              optional: true, default: false,
+              hint: 'Pre-filter contexts by category match in metadata before ranking' },
+            { name: 'category_metadata_key', optional: true, default: 'category',
+              ngIf: 'input.filter_by_category_metadata',
+              hint: 'Metadata field containing category tags' },
+            
+            # LLM processing limits
+            { name: 'llm_max_contexts', type: 'integer', optional: true, default: 50,
+              hint: 'Maximum number of contexts to process with LLM (for cost/performance)' },
+            { name: 'include_confidence_distribution', type: 'boolean', control_type: 'checkbox', 
+              optional: true, default: false,
+              hint: 'Return probability distribution across contexts' },
+            
+            # Output options
+            { name: 'emit_shape', control_type: 'select', pick_list: 'rerank_emit_shapes', 
+              optional: true, default: 'context_chunks',
+              hint: 'Output format: minimal records, enriched records, or RAG-ready context_chunks' },
+            { name: 'source_key', optional: true, default: 'source',
+              hint: 'Metadata key for document source' },
+            { name: 'uri_key', optional: true, default: 'uri',
+              hint: 'Metadata key for document URI' },
+            
+            # Location override
+            { name: 'ai_apps_location', label: 'AI-Apps location (override)', control_type: 'select', 
+              pick_list: 'ai_apps_locations', optional: true,
+              hint: 'Force specific multi-region (global/us/eu). Usually auto-detected.' }
+          ]
+        else
+          base
+        end
       end,
       output_fields: lambda do |object_definitions, _connection|
         [
@@ -3851,15 +3864,29 @@ require 'securerandom'
       (v == true) || (v.to_s.downcase == 'true') || (v.to_s == '1')
     end,
     ui_df_inputs: lambda do |object_definitions, cfg|
-      [
+      show_adv = call(:ui_truthy, cfg['show_advanced'])
+      
+      base = [
         { name: 'email', label: 'Email', type: 'object',
-          properties: Array(object_definitions['email_envelope']), optional: false },
-        { name: 'rules_mode', control_type: 'select', default: 'none', pick_list: 'rules_modes' },
-        { name: 'rules_rows', ngIf: 'input.rules_mode == "rows"',
-          type: 'array', of: 'object', properties: Array(object_definitions['rule_rows_table']), optional: true },
-        { name: 'rules_json', ngIf: 'input.rules_mode == "json"', optional: true, control_type: 'text-area' },
-        { name: 'fallback_category', optional: true, default: 'Other' }
+          properties: Array(object_definitions['email_envelope']), optional: false }
       ]
+      
+      if show_adv
+        # Show all options when advanced is enabled
+        base + [
+          { name: 'rules_mode', control_type: 'select', default: 'none', pick_list: 'rules_modes',
+            extends_schema: true, hint: 'Choose how to provide rules' },
+          { name: 'rules_rows', ngIf: 'input.rules_mode == "rows"',
+            type: 'array', of: 'object', properties: Array(object_definitions['rule_rows_table']), optional: true },
+          { name: 'rules_json', ngIf: 'input.rules_mode == "json"', optional: true, control_type: 'text-area',
+            hint: 'Paste compiled rulepack JSON' },
+          { name: 'fallback_category', optional: true, default: 'Other',
+            hint: 'Category to use when rules produce no clear result' }
+        ]
+      else
+        # Simplified view - no rules configuration
+        base
+      end
     end,
     ui_policy_inputs: lambda do |object_definitions, cfg|
       adv = call(:ui_truthy, cfg['show_advanced'])
@@ -3925,7 +3952,8 @@ require 'securerandom'
       base
     end,
     ui_ref_inputs: lambda do |object_definitions, cfg|
-      adv = call(:ui_truthy, cfg['show_advanced'])
+      show_adv = call(:ui_truthy, cfg['show_advanced'])
+      
       base = [
         { name: 'email_text', optional: false },
         { name: 'categories_mode', label: 'Categories input mode', control_type: 'select',
@@ -3940,12 +3968,26 @@ require 'securerandom'
         { name: 'min_confidence', type: 'number', optional: true, default: 0.25 },
         { name: 'fallback_category', optional: true, default: 'Other' }
       ]
-      if adv
-        base << { name: 'categories_json', label: 'Categories JSON', control_type: 'text-area',
-                  ngIf: 'input.categories_mode == "json"', optional: true,
-                  hint: 'Paste categories array JSON for testing (overrides pills this run).' }
+      
+      if show_adv
+        base + [
+          { name: 'categories_json', label: 'Categories JSON', control_type: 'text-area',
+            ngIf: 'input.categories_mode == "json"', optional: true,
+            hint: 'Paste categories array JSON for testing (overrides pills this run).' },
+          { name: 'contexts', type: 'array', of: 'object', optional: true,
+            properties: [
+              { name: 'id' },
+              { name: 'text' },
+              { name: 'score', type: 'number' },
+              { name: 'source' }
+            ],
+            hint: 'Pre-provide contexts to append to email for better categorization' },
+          { name: 'intent_kind', optional: true,
+            hint: 'Can gate processing based on intent type from earlier steps' }
+        ]
+      else
+        base
       end
-      base
     end,
     ui_retrieve_inputs: lambda do |object_definitions, cfg|
       adv = call(:ui_truthy, cfg['show_advanced'])
