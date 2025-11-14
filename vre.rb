@@ -3866,25 +3866,28 @@ require 'securerandom'
     ui_df_inputs: lambda do |object_definitions, cfg|
       show_adv = call(:ui_truthy, cfg['show_advanced'])
       
+      # Properly get the email fields
+      email_fields = if object_definitions['email_envelope']['fields'].respond_to?(:call)
+        object_definitions['email_envelope']['fields'].call({}, {})
+      else
+        object_definitions['email_envelope']['fields']
+      end
+      
       base = [
         { name: 'email', label: 'Email', type: 'object',
-          properties: Array(object_definitions['email_envelope']), optional: false }
+          properties: email_fields, optional: false }
       ]
       
       if show_adv
-        # Show all options when advanced is enabled
         base + [
           { name: 'rules_mode', control_type: 'select', default: 'none', pick_list: 'rules_modes',
             extends_schema: true, hint: 'Choose how to provide rules' },
           { name: 'rules_rows', ngIf: 'input.rules_mode == "rows"',
             type: 'array', of: 'object', properties: Array(object_definitions['rule_rows_table']), optional: true },
-          { name: 'rules_json', ngIf: 'input.rules_mode == "json"', optional: true, control_type: 'text-area',
-            hint: 'Paste compiled rulepack JSON' },
-          { name: 'fallback_category', optional: true, default: 'Other',
-            hint: 'Category to use when rules produce no clear result' }
+          { name: 'rules_json', ngIf: 'input.rules_mode == "json"', optional: true, control_type: 'text-area' },
+          { name: 'fallback_category', optional: true, default: 'Other' }
         ]
       else
-        # Simplified view - no rules configuration
         base
       end
     end,
