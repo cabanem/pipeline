@@ -3866,47 +3866,61 @@ require 'securerandom'
     ui_df_inputs: lambda do |object_definitions, cfg|
       show_adv = call(:ui_truthy, cfg['show_advanced'])
       
-      # Get the actual fields from the email_envelope definition
-      email_fields = object_definitions['email_envelope']['fields'].call({}, {})
-      
-      # Always show basic email fields
+      # Define the fields directly - simpler and clearer
       base = [
-        { name: 'subject', label: 'Email Subject', optional: false },
-        { name: 'body', label: 'Email Body', optional: false, control_type: 'text-area' }
+        { name: 'subject', label: 'Email Subject', optional: false, 
+          hint: 'Subject line of the email to filter' },
+        { name: 'body', label: 'Email Body', optional: false, control_type: 'text-area',
+          hint: 'Body content of the email' },
+        { name: 'fallback_category', label: 'Fallback Category', optional: true, default: 'Other',
+          hint: 'Category to use when rules produce no clear result' }
       ]
       
       if show_adv
-        # Advanced mode: show all email fields + rules configuration
-        all_email_fields = [
-          { name: 'subject', label: 'Email Subject', optional: false },
-          { name: 'body', label: 'Email Body', optional: false, control_type: 'text-area' },
+        # Advanced mode adds more email fields and rules configuration
+        base + [
           { name: 'from', label: 'From Address', optional: true },
           { name: 'headers', label: 'Email Headers', type: 'object', optional: true,
-            hint: 'Key-value pairs of email headers' },
+            hint: 'Key-value pairs of email headers for rule matching' },
           { name: 'attachments', label: 'Attachments', type: 'array', of: 'object', optional: true,
             properties: [
               { name: 'filename' },
               { name: 'mimeType' },
               { name: 'size', type: 'integer' }
-            ]},
+            ],
+            hint: 'List of attachments for rule evaluation' },
           { name: 'auth', label: 'Auth Info', type: 'object', optional: true,
-            hint: 'Authentication/security flags' }
-        ]
-        
-        all_email_fields + [
-          { name: 'rules_mode', control_type: 'select', default: 'none', pick_list: 'rules_modes',
-            extends_schema: true, hint: 'Choose how to provide rules' },
-          { name: 'rules_rows', ngIf: 'input.rules_mode == "rows"',
-            type: 'array', of: 'object', properties: Array(object_definitions['rule_rows_table']), optional: true,
+            hint: 'Authentication/security flags' },
+          { name: 'rules_mode', label: 'Rules Mode', control_type: 'select', 
+            default: 'none', pick_list: 'rules_modes',
+            extends_schema: true, hint: 'Choose how to provide filtering rules' },
+          { name: 'rules_rows', label: 'Rule Rows',
+            ngIf: 'input.rules_mode == "rows"',
+            type: 'array', of: 'object', 
+            properties: [
+              { name: 'rule_id' },
+              { name: 'family' },
+              { name: 'field' },
+              { name: 'operator' },
+              { name: 'pattern' },
+              { name: 'weight' },
+              { name: 'action' },
+              { name: 'enabled' }
+            ],
+            optional: true,
             hint: 'Define rules in table format' },
-          { name: 'rules_json', ngIf: 'input.rules_mode == "json"', optional: true, control_type: 'text-area',
-            hint: 'Paste compiled rulepack JSON' },
-          { name: 'fallback_category', optional: true, default: 'Other',
-            hint: 'Category to use when rules produce no clear result' }
+          { name: 'rules_json', label: 'Rules JSON',
+            ngIf: 'input.rules_mode == "json"', 
+            optional: true, control_type: 'text-area',
+            hint: 'Paste compiled rulepack JSON' }
         ]
       else
-        # Simple mode: just subject and body
-        base
+        # Simple mode shows just the basics + rules mode (but no rule details)
+        base + [
+          { name: 'rules_mode', label: 'Rules Mode', control_type: 'select', 
+            default: 'none', pick_list: 'rules_modes',
+            hint: 'Set to "none" to skip rule evaluation' }
+        ]
       end
     end,
     ui_policy_inputs: lambda do |object_definitions, cfg|
