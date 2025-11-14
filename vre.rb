@@ -630,7 +630,7 @@ require 'securerandom'
     deterministic_filter: {
       title: 'Filter: Heuristics (with intent)',
       subtitle: 'Filter: Heuristics',
-      description: 'Pre-screen/filter that evaluates an email against rules and heuristically infers intent',
+      description: 'Pre-screen/filter that evaluates an email against rules',
       display_priority: 510,
       help: lambda do |_|
         { body: 'Coarse evaluation of an email against rules.' }
@@ -647,8 +647,7 @@ require 'securerandom'
       end,
       output_fields: lambda do |object_definitions, connection|
         [
-          { name: 'passed', type: 'boolean', 
-            hint: 'True if email passes all hard rules' },
+          { name: 'passed', type: 'boolean', hint: 'True if email passes all hard rules' },
           { name: 'hard_block', type: 'boolean' },
           { name: 'hard_reason', hint: 'e.g., forwarded_chain, safety_block' },
           { name: 'email_type', hint: 'direct_request, forwarded_chain, etc.' },
@@ -666,12 +665,20 @@ require 'securerandom'
         env = call(:norm_email_envelope!, (input['email'] || input))
         subj, body, email_text = env['subject'], env['body'], env['email_text']
 
-        # Build/choose rulepack
+        # Build/choose rulepack with priority system
         rules = nil
-        if input['rules_mode'] == 'json' && input['rules_json'].present?
-          rules = call(:safe_json, input['rules_json'])
-        elsif input['rules_mode'] == 'rows' && Array(input['rules_rows']).any?
-          rules = call(:hr_compile_rulepack_from_rows!, input['rules_rows'])
+        
+        # Check if using advanced rules
+        if input['use_advanced_rules'] == true
+          # Advanced rules take precedence
+          if input['rules_mode'] == 'json' && input['rules_json'].present?
+            rules = call(:safe_json, input['rules_json'])
+          elsif input['rules_mode'] == 'rows' && Array(input['rules_rows']).any?
+            rules = call(:hr_compile_rulepack_from_rows!, input['rules_rows'])
+          end
+        elsif Array(input['exclude_patterns']).any?
+          # Use quick exclusions if not using advanced rules
+          rules = call(:convert_patterns_to_rules, input['exclude_patterns'])
         end
 
         # Defaults
@@ -680,10 +687,11 @@ require 'securerandom'
         hard_reason = nil
         soft_score = 0
         preliminary_decision = 'KEEP'
+        excluded_pattern = nil  # Track which pattern caused exclusion
 
         if rules.is_a?(Hash)
-          # Check hard rules
-          hard = call(:hr_eval_hard?, {
+          # Check hard rules with enhanced evaluation
+          hard = call(:hr_eval_hard_enhanced?, {
             'subject' => subj, 
             'body' => body, 
             'from' => env['from'],
@@ -694,23 +702,57 @@ require 'securerandom'
 
           if hard[:hit]
             hard_reason = hard[:reason]
+            excluded_pattern = hard[:action]  # Track the specific pattern
             
-            # Map hard reasons to email type
+            # Enhanced mapping for new patterns
             case hard_reason
-            when 'forwarded_chain'
+            when 'forwarded_chain', 'email_chains'
               email_type = 'forwarded_chain'
               hard_block = true
               preliminary_decision = 'HUMAN'
-            when 'internal_discussion'
-              email_type = 'internal_discussion'
-              hard_block = true
-              preliminary_decision = 'HUMAN'
-            when 'mailing_list', 'bounce'
-              email_type = hard_reason
+              
+            when 'automated', 'auto_reply', 'noreply'
+              email_type = 'automated'
               hard_block = true
               preliminary_decision = 'IRRELEVANT'
+              
+            when 'newsletter', 'marketing'
+              email_type = 'newsletter'
+              hard_block = true
+              preliminary_decision = 'IRRELEVANT'
+              
+            when 'system', 'notification', 'automated_report'
+              email_type = 'system_notification'
+              hard_block = true
+              preliminary_decision = 'IRRELEVANT'
+              
+            when 'calendar'
+              email_type = 'calendar_invite'
+              hard_block = true
+              preliminary_decision = 'IRRELEVANT'
+              
+            when 'ticket_update'
+              email_type = 'support_ticket'
+              hard_block = true
+              preliminary_decision = 'HUMAN'
+              
+            when 'bounce'
+              email_type = 'bounce'
+              hard_block = true
+              preliminary_decision = 'IRRELEVANT'
+              
+            when 'mailing_list'
+              email_type = 'mailing_list'
+              hard_block = true
+              preliminary_decision = 'IRRELEVANT'
+              
             when 'safety_block'
               email_type = 'blocked'
+              hard_block = true
+              preliminary_decision = 'HUMAN'
+              
+            when 'internal_discussion'
+              email_type = 'internal_discussion'
               hard_block = true
               preliminary_decision = 'HUMAN'
             end
@@ -738,7 +780,8 @@ require 'securerandom'
           'hard_reason' => hard_reason,
           'soft_score' => soft_score,
           'decision' => preliminary_decision,
-          'generator_hint' => (hard_block ? 'blocked' : 'check_policy')
+          'generator_hint' => (hard_block ? 'blocked' : 'check_policy'),
+          'excluded_pattern' => excluded_pattern  # Include which pattern matched
         }
 
         out = {
@@ -748,16 +791,24 @@ require 'securerandom'
           'email_type' => email_type,
           'email_text' => email_text,
           'soft_score' => soft_score,
-          'gate' => gate
+          'gate' => gate,
+          'excluded_pattern' => excluded_pattern
         }
 
-        call(:step_ok!, ctx, out, 200, 'OK', { 
+        # Enhanced facets with pattern info
+        facets = { 
           'hard_blocked' => hard_block,
           'email_type' => email_type,
           'soft_score' => soft_score,
-          'rules_evaluated' => rules.is_a?(Hash)
-        })
-      end, 
+          'rules_evaluated' => rules.is_a?(Hash),
+          'exclusion_source' => input['use_advanced_rules'] ? 'advanced_rules' : 
+                              (Array(input['exclude_patterns']).any? ? 'quick_patterns' : 'none'),
+          'patterns_count' => Array(input['exclude_patterns']).length
+        }
+        facets['excluded_by'] = excluded_pattern if excluded_pattern
+
+        call(:step_ok!, ctx, out, 200, 'OK', facets)
+      end,
       sample_output: lambda do
         call(:sample_deterministic_filter_simplified)
       end
@@ -776,8 +827,7 @@ require 'securerandom'
       input_fields: lambda do |object_definitions, connection, config_fields|
         base = [
           { name: 'email_text', optional: false },
-          { name: 'email_type', optional: true, default: 'direct_request',
-            hint: 'From deterministic filter' },
+          { name: 'email_type', optional: true, default: 'direct_request', hint: 'From deterministic filter' },
           { name: 'system_preamble', label: 'System Instructions', control_type: 'text-area', 
             optional: true, hint: 'Override default system instructions for email triage' },
           
@@ -791,8 +841,7 @@ require 'securerandom'
         adv = config_fields['show_advanced'] ? [
           { name: 'model', default: 'gemini-2.0-flash' },
           { name: 'temperature', type: 'number', default: 0 },
-          { name: 'custom_policy_json', control_type: 'text-area', optional: true,
-            hint: 'Additional triage rules in JSON format' }
+          { name: 'custom_policy_json', control_type: 'text-area', optional: true, hint: 'Additional triage rules in JSON format' }
         ] : []
         
         base + adv + Array(object_definitions['observability_input_fields'])
@@ -2655,6 +2704,19 @@ require 'securerandom'
   
   # --------- PICK LISTS ---------------------------------------------------
   pick_lists: {
+    common_email_patterns: lambda do |_connection|
+      [
+        ['Email chains (RE:/FW:)', 'email_chains'],
+        ['No-reply addresses', 'noreply_addresses'],
+        ['Auto-replies (Out of Office)', 'auto_replies'],
+        ['System notifications', 'system_notifications'],
+        ['Newsletters/Marketing', 'newsletters'],
+        ['Bounce messages', 'bounce_messages'],
+        ['Calendar invites', 'calendar_invites'],
+        ['Automated reports', 'automated_reports'],
+        ['Support ticket updates', 'ticket_updates']
+      ]
+    end,
     response_templates: lambda do |_connection|
       [
         ['PTO Approved', 'pto_approved'],
@@ -3518,7 +3580,6 @@ require 'securerandom'
     ui_df_inputs_simplified: lambda do |object_definitions, cfg|
       show_adv = call(:ui_truthy, cfg['show_advanced'])
       
-      # Simplified base - no intent-related fields
       base = [
         { name: 'email', type: 'object', optional: false, properties: [
           { name: 'subject', optional: false, hint: 'Email subject line' },
@@ -3526,12 +3587,29 @@ require 'securerandom'
           { name: 'from', optional: true, hint: 'Sender email address' }
         ]},
         
+        # NEW: Simple pattern selection - always visible
+        { name: 'exclude_patterns', label: 'Quick exclusions',
+          type: 'array', control_type: 'multiselect', pick_list: 'common_email_patterns',
+          optional: true, sticky: true,
+          hint: 'Select common email types to exclude from processing' },
+        
+        # Pattern OR Rules toggle
+        { name: 'use_advanced_rules', label: 'Use advanced rules instead',
+          type: 'boolean', control_type: 'checkbox', optional: true,
+          extends_schema: true,
+          hint: 'Switch to advanced rule configuration (overrides quick exclusions)' }
+      ]
+      
+      # Advanced rules (only shown when checkbox is true)
+      advanced_rules = [
         { name: 'rules_mode', label: 'Rules Mode', control_type: 'select', 
-          default: 'none', pick_list: 'rules_modes', extends_schema: true,
+          default: 'none', pick_list: 'rules_modes',
+          ngIf: 'input.use_advanced_rules', extends_schema: true,
           hint: 'Choose how to provide filtering rules' },
           
         { name: 'rules_rows', label: 'Rule Definitions',
-          ngIf: 'input.rules_mode == "rows"', type: 'array', of: 'object',
+          ngIf: 'input.use_advanced_rules && input.rules_mode == "rows"', 
+          type: 'array', of: 'object',
           properties: [
             { name: 'family', control_type: 'select',
               options: [['HARD','HARD'], ['SOFT','SOFT'], ['THRESHOLD','THRESHOLD']] },
@@ -3547,12 +3625,13 @@ require 'securerandom'
           optional: true, hint: 'Define rules for filtering' },
           
         { name: 'rules_json', label: 'Rules JSON',
-          ngIf: 'input.rules_mode == "json"', optional: true, control_type: 'text-area',
+          ngIf: 'input.use_advanced_rules && input.rules_mode == "json"', 
+          optional: true, control_type: 'text-area',
           hint: 'Paste complete rulepack JSON' }
       ]
       
       if show_adv
-        base + [
+        base + advanced_rules + [
           { name: 'attachments', type: 'array', of: 'object', optional: true,
             properties: [
               { name: 'filename' },
@@ -3564,7 +3643,7 @@ require 'securerandom'
             hint: 'Authentication flags (SPF, DKIM)' }
         ]
       else
-        base
+        base + advanced_rules
       end
     end,
     ui_policy_inputs_enhanced: lambda do |object_definitions, cfg|
@@ -3934,6 +4013,31 @@ require 'securerandom'
         'auth'        => (email['auth'] || {})
       }
     },
+    hr_eval_hard_enhanced?: lambda do |email, hard_pack|
+      result = call(:hr_eval_hard?, email, hard_pack)
+      
+      # Map new action types to appropriate categories
+      if result[:hit] && result[:action]
+        case result[:action]
+        when 'automated', 'auto_reply', 'system', 'newsletter', 'automated_report'
+          result[:reason] = result[:action]
+          result[:category] = 'IRRELEVANT'
+        when 'forwarded_chain', 'ticket_update'
+          result[:reason] = result[:action]  
+          result[:category] = 'HUMAN'
+        when 'calendar'
+          result[:reason] = 'calendar'
+          result[:category] = 'IRRELEVANT'
+        when 'bounce'
+          result[:reason] = 'bounce'
+          result[:category] = 'IRRELEVANT'
+        else
+          result[:category] = 'HUMAN' # Default for unknown
+        end
+      end
+      
+      result
+    end,
     hr_eval_hard?: lambda do |email, hard_pack|
       f = call(:hr_pick, email)
 
@@ -4032,6 +4136,121 @@ require 'securerandom'
         rx = call(:hr_rx, rxs); return false if rx && (f['subject'] =~ rx || f['body'] =~ rx)
       end
       true
+    end,
+    convert_patterns_to_rules: lambda do |patterns|
+      hard_rules = {}
+      soft_signals = []
+      
+      Array(patterns).each do |pattern|
+        case pattern
+        when 'email_chains'
+          # Check subject for RE:/FW: patterns
+          (hard_rules['subject'] ||= []) << {
+            'operator' => 'regex',
+            'pattern' => '^\s*(RE|Re|FW|Fw|Fwd|FWD):\s*',
+            'action' => 'forwarded_chain'
+          }
+          # Also check body for common forward indicators
+          (hard_rules['body'] ||= []) << {
+            'operator' => 'regex',
+            'pattern' => '(---- Original Message ----|---- Forwarded message ----)',
+            'action' => 'forwarded_chain'
+          }
+        
+        when 'noreply_addresses'
+          (hard_rules['from'] ||= []) << {
+            'operator' => 'regex',
+            'pattern' => '(noreply|no-reply|donotreply|do-not-reply|notification|automated|system|mailer-daemon)@',
+            'action' => 'automated'
+          }
+        
+        when 'auto_replies'
+          (hard_rules['subject'] ||= []) << {
+            'operator' => 'regex',
+            'pattern' => '(Out of Office|Auto.?Reply|Automatic reply|OOO|Away from office)',
+            'action' => 'auto_reply'
+          }
+          (hard_rules['body'] ||= []) << {
+            'operator' => 'regex',
+            'pattern' => '(currently out of office|will be out of the office|limited access to email)',
+            'action' => 'auto_reply'
+          }
+        
+        when 'newsletters'
+          # Multiple indicators for newsletters
+          (hard_rules['body'] ||= []) << {
+            'operator' => 'regex',
+            'pattern' => '(unsubscribe|opt.?out|email preferences|manage subscriptions)',
+            'action' => 'newsletter'
+          }
+          (hard_rules['from'] ||= []) << {
+            'operator' => 'regex', 
+            'pattern' => '(newsletter|marketing|promo|campaign|mailchimp|constantcontact|news@|updates@)@',
+            'action' => 'newsletter'
+          }
+        
+        when 'system_notifications'
+          (hard_rules['from'] ||= []) << {
+            'operator' => 'regex',
+            'pattern' => '(system|admin|notification|alert|service|daemon|postmaster)@',
+            'action' => 'system'
+          }
+          (hard_rules['subject'] ||= []) << {
+            'operator' => 'regex',
+            'pattern' => '^\[ALERT\]|\[SYSTEM\]|\[NOTIFICATION\]',
+            'action' => 'system'
+          }
+        
+        when 'bounce_messages'
+          (hard_rules['subject'] ||= []) << {
+            'operator' => 'regex',
+            'pattern' => '(Undelivered Mail|Delivery Status Notification|Mail Delivery Failed|Returned mail)',
+            'action' => 'bounce'
+          }
+          (hard_rules['from'] ||= []) << {
+            'operator' => 'regex',
+            'pattern' => '(mailer-daemon|postmaster)@',
+            'action' => 'bounce'
+          }
+        
+        when 'calendar_invites'
+          (hard_rules['subject'] ||= []) << {
+            'operator' => 'regex',
+            'pattern' => '(Invitation:|Accepted:|Declined:|Tentative:|Canceled:)',
+            'action' => 'calendar'
+          }
+          (hard_rules['body'] ||= []) << {
+            'operator' => 'contains',
+            'pattern' => 'has invited you to',
+            'action' => 'calendar'
+          }
+        
+        when 'automated_reports'
+          (hard_rules['subject'] ||= []) << {
+            'operator' => 'regex',
+            'pattern' => '(Daily Report|Weekly Report|Monthly Report|Automated Report|\[Report\])',
+            'action' => 'automated_report'
+          }
+        
+        when 'ticket_updates'
+          (hard_rules['subject'] ||= []) << {
+            'operator' => 'regex',
+            'pattern' => '(\[Ticket #|\[Support\]|\[Case #|Ticket ID:|Request #)',
+            'action' => 'ticket_update'
+          }
+          (hard_rules['from'] ||= []) << {
+            'operator' => 'regex',
+            'pattern' => '(support|helpdesk|servicedesk|tickets?)@',
+            'action' => 'ticket_update'
+          }
+        end
+      end
+      
+      {
+        'hard_exclude' => hard_rules,
+        'soft_signals' => soft_signals,
+        'thresholds' => { 'keep' => 6, 'triage_min' => 4, 'triage_max' => 5 }
+      }
     end,
     ensure_correlation_id!: lambda do |input|
       cid = input['correlation_id']
