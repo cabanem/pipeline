@@ -795,17 +795,39 @@ require 'securerandom'
         model = input['model'] || 'gemini-2.0-flash'
         model_path = call(:build_model_path_with_global_preview, connection, model)
         
-        # System prompt focused on triage only
+        # Enhanced system prompt that recognizes broader employee questions
         system_text = <<~SYS
-          You are a strict email triage system. Classify emails into three categories.
+          You are an email triage system for employee inquiries. Classify emails carefully.
           
           DECISIONS:
-          - IRRELEVANT: Spam, newsletters, auto-generated, not relevant to HR
-          - HUMAN: Needs human review (complex, sensitive, complaints, escalations)  
-          - KEEP: Clear, valid request that can be handled automatically
+          - KEEP: Any legitimate employee question or request that could be answered, including:
+            * HR policies (PTO, leave, attendance)
+            * Benefits questions (401k, health insurance, FSA, retirement)
+            * Payroll or compensation inquiries
+            * Employment verification or documentation requests
+            * Workplace policies or procedures
+            * Any question where the employee is seeking information or help
+          
+          - HUMAN: Requires human judgment:
+            * Complaints or grievances
+            * Sensitive or legal matters
+            * Escalations or threats
+            * Complex situations requiring context beyond what could be contained in a knowledge base
+            * Potentially discriminatory content
+            
+          - IRRELEVANT: Not an employee inquiry:
+            * Spam or marketing emails
+            * Newsletters (unless internal company newsletters with questions)
+            * Auto-generated messages with no action needed
+            * Personal conversations unrelated to employment
+          
+          IMPORTANT: If an employee is asking a question about ANY work-related topic
+          (even if managed by third parties like 401k providers, insureres), classify as KEEP.
+          
+          Also detect if the email contains a question that needs answering.
+          #{input['include_domain_detection'] ? 'Identify the domain/topic area.' : ''}
           
           Output MUST be valid JSON only. No text before or after.
-          Confidence is calibrated [0,1]. Be decisive.
         SYS
         
         # Add custom policy if provided
@@ -813,28 +835,37 @@ require 'securerandom'
           system_text += "\n\nAdditional rules:\n#{input['custom_policy_json']}"
         end
         
-        # Response schema - simple and focused
+        # Response schema with domain detection
+        schema_props = {
+          'decision' => {
+            'type' => 'string',
+            'enum' => ['IRRELEVANT', 'HUMAN', 'KEEP']
+          },
+          'confidence' => { 'type' => 'number', 'minimum' => 0, 'maximum' => 1 },
+          'reasons' => {
+            'type' => 'array',
+            'items' => { 'type' => 'string' },
+            'maxItems' => 3
+          },
+          'matched_signals' => {
+            'type' => 'array',
+            'items' => { 'type' => 'string' },
+            'maxItems' => 5
+          },
+          'has_question' => { 'type' => 'boolean' }
+        }
+        
+        required = ['decision', 'confidence', 'has_question']
+        
+        if input['include_domain_detection'] != false
+          schema_props['detected_domain'] = { 'type' => 'string' }
+        end
+        
         response_schema = {
           'type' => 'object',
           'additionalProperties' => false,
-          'properties' => {
-            'decision' => {
-              'type' => 'string',
-              'enum' => ['IRRELEVANT', 'HUMAN', 'KEEP']
-            },
-            'confidence' => { 'type' => 'number', 'minimum' => 0, 'maximum' => 1 },
-            'reasons' => {
-              'type' => 'array',
-              'items' => { 'type' => 'string' },
-              'maxItems' => 3
-            },
-            'matched_signals' => {
-              'type' => 'array',
-              'items' => { 'type' => 'string' },
-              'maxItems' => 5
-            }
-          },
-          'required' => ['decision', 'confidence']
+          'properties' => schema_props,
+          'required' => required
         }
         
         # Make API call
@@ -867,7 +898,7 @@ require 'securerandom'
         # Determine pipeline flow
         min_conf = (input['min_confidence_for_keep'] || 0.60).to_f
         should_continue = (decision == 'KEEP' && confidence >= min_conf) || 
-                        (decision == 'HUMAN')
+                          (decision == 'HUMAN')
         
         short_circuit = decision == 'IRRELEVANT' && 
                       confidence >= (input['confidence_short_circuit'] || 0.85).to_f
@@ -877,15 +908,20 @@ require 'securerandom'
           'confidence' => confidence,
           'reasons' => call(:safe_array, parsed['reasons']),
           'matched_signals' => call(:safe_array, parsed['matched_signals']),
+          'detected_domain' => parsed['detected_domain'],
+          'has_question' => parsed['has_question'] || false,
           'should_continue' => should_continue,
           'short_circuit' => short_circuit,
           'signals_triage' => decision,
-          'signals_confidence' => confidence
+          'signals_confidence' => confidence,
+          'signals_domain' => parsed['detected_domain']
         }
         
         call(:step_ok!, ctx, out, 200, 'OK', {
           'decision' => decision,
           'confidence' => confidence,
+          'detected_domain' => parsed['detected_domain'],
+          'has_question' => parsed['has_question'],
           'should_continue' => should_continue,
           'short_circuit' => short_circuit
         })
@@ -2733,17 +2769,20 @@ require 'securerandom'
     sample_ai_triage_filter: lambda do
       {
         'decision' => 'KEEP',
-        'confidence' => 0.82,
+        'confidence' => 0.88,
         'reasons' => [
-          'Clear PTO policy question',
-          'Direct request from employee',
-          'No sensitive content detected'
+          'Employee asking about benefits transfer',
+          'Clear question requiring information',
+          'Legitimate work-related inquiry'
         ],
-        'matched_signals' => ['policy_question', 'direct_question', 'pto_reference'],
+        'matched_signals' => ['question', 'benefits', '401k', 'transfer_request'],
+        'detected_domain' => 'benefits',
+        'has_question' => true,
         'should_continue' => true,
         'short_circuit' => false,
         'signals_triage' => 'KEEP',
-        'signals_confidence' => 0.82,
+        'signals_confidence' => 0.88,
+        'signals_domain' => 'benefits',
         'ok' => true,
         'op_telemetry' => call(:sample_telemetry, 35)
       }
