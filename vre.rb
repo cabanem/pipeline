@@ -4344,49 +4344,76 @@ require 'securerandom'
         text   = resp.dig('candidates',0,'content','parts',0,'text').to_s
         parsed = call(:safe_parse_json, text)
         
-        # ENHANCEMENT: Enrich citations with complete metadata from original chunks
-        if parsed.is_a?(Hash) && parsed['citations'].is_a?(Array) && input['context_chunks'].is_a?(Array)
-          # Build a lookup map from the original context chunks
-          chunk_map = {}
-          input['context_chunks'].each do |chunk|
-            chunk_id = chunk['id'] || chunk['chunk_id']
-            if chunk_id
-              chunk_map[chunk_id] = {
-                'source' => chunk['source'] || chunk.dig('metadata', 'source'),
-                'uri' => call(:extract_uri_from_context, chunk),  # Use the helper
-                'score' => chunk['score'] || 0.0
+        # DEBUG: Log what we're working with
+        debug_info = {}
+        
+        # Check what chunks we received
+        debug_info['chunks_received'] = input['context_chunks'].is_a?(Array) ? input['context_chunks'].length : 0
+        debug_info['chunks_sample'] = input['context_chunks']&.first&.keys if input['context_chunks'].is_a?(Array)
+        
+        # Check what citations the LLM gave us
+        debug_info['citations_from_llm'] = parsed['citations']&.length || 0
+        debug_info['citation_ids'] = parsed['citations']&.map { |c| c['chunk_id'] } if parsed['citations'].is_a?(Array)
+        
+        # ENHANCEMENT: Build chunk map with multiple ID formats
+        chunk_map = {}
+        if input['context_chunks'].is_a?(Array)
+          input['context_chunks'].each_with_index do |chunk, idx|
+            # Try multiple ID fields
+            chunk_id = chunk['id'] || chunk['chunk_id'] || "ctx-#{idx+1}"
+            
+            # Also map without brackets in case LLM returns [ctx-1] as ctx-1
+            cleaned_id = chunk_id.to_s.gsub(/^\[|\]$/, '')
+            
+            # Map both the original and cleaned IDs
+            [chunk_id, cleaned_id, "[#{chunk_id}]", "[#{cleaned_id}]"].each do |id_variant|
+              chunk_map[id_variant] = {
+                'source' => chunk['source'] || chunk.dig('metadata', 'source') || chunk.dig('metadata', 'sourceDisplayName'),
+                'uri' => chunk['uri'] || chunk.dig('metadata', 'uri') || chunk.dig('metadata', 'sourceUri') || chunk.dig('metadata', 'url'),
+                'score' => chunk['score'] || chunk['relevanceScore'] || 0.0,
+                'original_id' => chunk_id
               }
             end
           end
           
-          # Enrich each citation with missing data
+          debug_info['chunk_map_keys'] = chunk_map.keys.take(5)  # First 5 keys for debugging
+        end
+        
+        # Enrich citations
+        if parsed.is_a?(Hash) && parsed['citations'].is_a?(Array)
           parsed['citations'] = parsed['citations'].map do |citation|
-            # Get the chunk data for this citation
-            chunk_data = chunk_map[citation['chunk_id']]
+            cited_id = citation['chunk_id']
+            
+            # Try to find chunk data with various ID formats
+            chunk_data = chunk_map[cited_id] || 
+                        chunk_map["[#{cited_id}]"] || 
+                        chunk_map[cited_id.to_s.gsub(/^\[|\]$/, '')]
             
             if chunk_data
-              # Create enriched citation preserving LLM data but filling gaps
-              {
+              enriched = {
                 'chunk_id' => citation['chunk_id'],
-                'source' => citation['source'] || chunk_data['source'],
-                'uri' => citation['uri'] || chunk_data['uri'],
+                'source' => citation['source'].present? ? citation['source'] : chunk_data['source'],
+                'uri' => citation['uri'].present? ? citation['uri'] : chunk_data['uri'],
                 'score' => citation['score'] || chunk_data['score']
-              }.compact  # Remove nil values
+              }
+              
+              debug_info["enriched_#{cited_id}"] = {
+                'had_uri_before' => citation['uri'].present?,
+                'has_uri_after' => enriched['uri'].present?,
+                'uri_value' => enriched['uri']
+              }
+              
+              enriched.compact
             else
-              # If we can't find the chunk, keep original citation
+              debug_info["missing_#{cited_id}"] = 'not_found_in_chunk_map'
               citation
             end
           end
-          
-          # Log enrichment for debugging (only in non-prod mode)
-          if !call(:normalize_boolean, connection['prod_mode']) && input['debug']
-            enrichment_stats = {
-              'total_citations' => parsed['citations'].length,
-              'chunks_available' => chunk_map.keys.length,
-              'citations_with_uri' => parsed['citations'].count { |c| c['uri'].present? }
-            }
-            (out['debug'] ||= {})['citation_enrichment'] = enrichment_stats
-          end
+        end
+        
+        # Add debug info to output if in debug mode
+        if !call(:normalize_boolean, connection['prod_mode']) || input['debug']
+          (out['debug'] ||= {})['citation_enrichment'] = debug_info
         end
         
         out['parsed'] = { 
