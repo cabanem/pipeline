@@ -2320,83 +2320,69 @@ require 'securerandom'
       
       business_data = {
         'policy' => policy,
-        'short_circuit' => false
-      }
-      
-      facets = {
-        'decision' => policy['decision'],
-        'confidence' => policy['confidence'],
         'short_circuit' => false,
-        'signals_count' => policy['matched_signals'].length,
-        'model_used' => 'gemini-2.0-flash',
-        'policy_mode' => 'json',
-        'correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
+        'email_type' => 'direct_request',
+        'generator_gate' => {
+          'pass_to_responder' => true,
+          'reason' => 'meets_minimums',
+          'generator_hint' => 'pass'
+        }
       }
       
       business_data.merge({
         'complete_output' => business_data.dup,
-        'facets' => facets,
+        'facets' => {
+          'decision' => 'REVIEW',
+          'confidence' => 0.62
+        },
         'ok' => true,
-        'telemetry' => call(:sample_telemetry, 20)
+        'op_correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+        'op_telemetry' => call(:sample_telemetry, 20)
       })
     end,
     sample_deterministic_filter: lambda do
-      # Business data that would be returned
-      pre_filter = { 
-        'hit' => false, 
-        'score' => 3, 
-        'matched_signals' => ['mentions_invoice', 'attachment_pdf'], 
-        'decision' => 'REVIEW' 
+      # Using our object definitions structure
+      pre_filter = {
+        'decision' => 'REVIEW',
+        'confidence' => 0.7,
+        'matched_signals' => ['mentions_invoice', 'attachment_pdf'],
+        'reasons' => ['Contains invoice reference']
       }
       
-      intent = { 
+      intent = {
         'label' => 'transactional',
         'confidence' => 0.7,
-        'basis' => 'keywords' 
+        'basis' => 'keywords'
       }
       
-      email_text = "Subject: Invoice #12345 - Payment Due\n\nBody:\nPlease find attached..."
+      gate = {
+        'prelim_pass' => true,
+        'hard_block' => false,
+        'hard_reason' => nil,
+        'soft_score' => 3,
+        'decision' => 'REVIEW',
+        'generator_hint' => 'pass'
+      }
       
-      # Build the business data section
       business_data = {
         'pre_filter' => pre_filter,
         'intent' => intent,
-        'email_text' => email_text
+        'email_text' => "Subject: Invoice #12345\n\nBody: Please find attached...",
+        'email_type' => 'direct_request',
+        'gate' => gate
       }
       
-      # Build facets
-      facets = {
-        'decision_path' => 'soft_eval',
-        'final_decision' => 'REVIEW',
-        'intent_label' => intent['label'],
-        'intent_confidence' => intent['confidence'],
-        'intent_basis' => intent['basis'],
-        'rules_evaluated' => true,
-        'hard_rules_count' => 5,
-        'soft_signals_count' => 12,
-        'signals_matched' => pre_filter['matched_signals'].length,
-        'soft_score' => pre_filter['score'],
-        'has_attachments' => true,
-        'has_auth_flags' => false,
-        'email_length' => email_text.length,
-        'special_headers' => true,
-        'correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
-      }
-      
-      # Build telemetry
-      telemetry = { 
-        'http_status' => 200, 
-        'message' => 'OK', 
-        'duration_ms' => 12, 
-        'correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890' 
-      }
-      
-      # Assemble complete output
+      # Standard structure
       business_data.merge({
         'complete_output' => business_data.dup,
-        'facets' => facets,
+        'facets' => {
+          'decision_path' => 'soft_eval',
+          'final_decision' => 'REVIEW',
+          'intent_label' => 'transactional'
+        },
         'ok' => true,
-        'telemetry' => telemetry
+        'op_correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+        'op_telemetry' => call(:sample_telemetry, 12)
       })
     end,
     sample_embed_text_against_categories: lambda do
@@ -2411,20 +2397,15 @@ require 'securerandom'
         'shortlist' => ['Billing', 'Support', 'Sales']
       }
       
-      facets = {
-        'categories_count' => scores.length,
-        'shortlist_k' => 3,
-        'top_score' => scores.first['score'],
-        'embedding_model' => 'text-embedding-005',
-        'categories_mode' => 'array',
-        'correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
-      }
-      
       business_data.merge({
         'complete_output' => business_data.dup,
-        'facets' => facets,
+        'facets' => {
+          'top_score' => 0.91,
+          'categories_count' => 3
+        },
         'ok' => true,
-        'telemetry' => call(:sample_telemetry, 11)
+        'op_correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+        'op_telemetry' => call(:sample_telemetry, 11)
       })
     end,
     sample_rerank_shortlist: lambda do
@@ -2439,26 +2420,22 @@ require 'securerandom'
         'shortlist' => ['Billing', 'Support', 'Sales']
       }
       
-      facets = {
-        'mode' => 'llm',
-        'top_prob' => ranking.first['prob'],
-        'categories_ranked' => ranking.length,
-        'generative_model' => 'gemini-2.0-flash',
-        'correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
-      }
-      
       business_data.merge({
         'complete_output' => business_data.dup,
-        'facets' => facets,
+        'facets' => {
+          'mode' => 'llm',
+          'top_prob' => 0.86
+        },
         'ok' => true,
-        'telemetry' => call(:sample_telemetry, 18)
+        'op_correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+        'op_telemetry' => call(:sample_telemetry, 18)
       })
     end,
     sample_llm_referee_with_contexts: lambda do
       referee = {
         'category' => 'Billing',
         'confidence' => 0.86,
-        'reasoning' => 'Mentions invoice 4411.',
+        'reasoning' => 'Invoice reference detected',
         'distribution' => [
           { 'category' => 'Billing', 'prob' => 0.86 },
           { 'category' => 'Support', 'prob' => 0.10 },
@@ -2467,43 +2444,34 @@ require 'securerandom'
       }
       
       salience = {
-        'span' => 'Can you approve the Q4 budget increase by Friday?',
-        'reason' => 'Explicit ask with a clear deadline',
+        'span' => 'Can you approve the Q4 budget increase?',
+        'reason' => 'Clear action request',
         'importance' => 0.92,
-        'tags' => ['approval', 'budget', 'deadline'],
-        'entities' => [{ 'type' => 'team', 'text' => 'Finance' }],
-        'cta' => 'Approve Q4 budget increase',
+        'tags' => ['approval', 'budget'],
+        'entities' => [{ 'type' => 'department', 'text' => 'Finance' }],
+        'cta' => 'Approve budget',
         'deadline_iso' => '2025-10-24T17:00:00Z',
-        'focus_preview' => 'Email (trimmed): ...',
-        'responseId' => 'resp-sal-xyz',
-        'usage' => { 'promptTokenCount' => 120, 'candidatesTokenCount' => 70, 'totalTokenCount' => 190 },
+        'focus_preview' => 'Email preview...',
         'span_source' => 'llm'
       }
       
       business_data = {
+        'chosen' => 'Billing',  # CRITICAL field
+        'confidence' => 0.86,
         'referee' => referee,
-        'chosen' => 'Billing',
-        'confidence' => 0.86,
-        'salience' => salience
-      }
-      
-      facets = {
-        'chosen' => 'Billing',
-        'confidence' => 0.86,
-        'salience_mode' => 'llm',
-        'salience_len' => salience['span'].length,
-        'salience_importance' => salience['importance'],
-        'has_contexts' => false,
-        'shortlist_size' => 3,
-        'generative_model' => 'gemini-2.0-flash',
-        'correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
+        'salience' => salience,
+        'signals_category' => 'Billing'  # For downstream
       }
       
       business_data.merge({
         'complete_output' => business_data.dup,
-        'facets' => facets,
+        'facets' => {
+          'chosen' => 'Billing',
+          'confidence' => 0.86
+        },
         'ok' => true,
-        'telemetry' => call(:sample_telemetry, 19)
+        'op_correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+        'op_telemetry' => call(:sample_telemetry, 19)
       })
     end,
     sample_gen_generate: lambda do
@@ -2568,104 +2536,53 @@ require 'securerandom'
       })
     end,
     sample_rank_texts_with_ranking_api: lambda do
-      # Business data
       records = [
         {
           'id' => 'doc-1',
           'score' => 0.92,
           'rank' => 1,
-          'content' => 'Our PTO policy allows employees to take up to 20 days per year...',
-          'metadata' => { 'source' => 'hr-handbook.pdf', 'category' => 'PTO', 'page' => 15 },
+          'content' => 'PTO policy: 20 days per year...',
+          'metadata' => { 'source' => 'hr-handbook.pdf' },
           'llm_relevance' => 0.95,
           'category_alignment' => 0.85
-        },
-        {
-          'id' => 'doc-2',
-          'score' => 0.84,
-          'rank' => 2,
-          'content' => 'Vacation requests must be submitted at least 2 weeks in advance...',
-          'metadata' => { 'source' => 'hr-handbook.pdf', 'category' => 'PTO', 'page' => 16 },
-          'llm_relevance' => 0.86,
-          'category_alignment' => 0.78
         }
       ]
       
       context_chunks = [
         {
           'id' => 'doc-1',
-          'text' => 'Our PTO policy allows employees to take up to 20 days per year...',
+          'text' => 'PTO policy: 20 days per year...',
           'score' => 0.92,
           'source' => 'hr-handbook.pdf',
           'uri' => 'gs://bucket/hr-handbook.pdf',
-          'metadata' => { 'source' => 'hr-handbook.pdf', 'category' => 'PTO', 'page' => 15 },
-          'metadata_kv' => [
-            { 'key' => 'source', 'value' => 'hr-handbook.pdf' },
-            { 'key' => 'category', 'value' => 'PTO' },
-            { 'key' => 'page', 'value' => 15 }
-          ],
-          'metadata_json' => '{"source":"hr-handbook.pdf","category":"PTO","page":15}',
+          'metadata' => { 'page' => 15 },
+          'metadata_kv' => [{ 'key' => 'page', 'value' => '15' }],
+          'metadata_json' => '{"page":15}',
           'llm_relevance' => 0.95,
           'category_alignment' => 0.85
-        },
-        {
-          'id' => 'doc-2',
-          'text' => 'Vacation requests must be submitted at least 2 weeks in advance...',
-          'score' => 0.84,
-          'source' => 'hr-handbook.pdf',
-          'uri' => 'gs://bucket/hr-handbook.pdf',
-          'metadata' => { 'source' => 'hr-handbook.pdf', 'category' => 'PTO', 'page' => 16 },
-          'metadata_kv' => [
-            { 'key' => 'source', 'value' => 'hr-handbook.pdf' },
-            { 'key' => 'category', 'value' => 'PTO' },
-            { 'key' => 'page', 'value' => 16 }
-          ],
-          'metadata_json' => '{"source":"hr-handbook.pdf","category":"PTO","page":16}',
-          'llm_relevance' => 0.86,
-          'category_alignment' => 0.78
         }
       ]
-      
-      confidence_distribution = [
-        { 'id' => 'doc-1', 'probability' => 0.523, 'reasoning' => 'Directly addresses PTO policy limits' },
-        { 'id' => 'doc-2', 'probability' => 0.477, 'reasoning' => 'Covers PTO request procedures' }
-      ]
-      
-      ranking_metadata = {
-        'category' => 'PTO',
-        'llm_model' => 'gemini-2.0-flash',
-        'contexts_filtered' => 0,
-        'contexts_ranked' => 2
-      }
       
       business_data = {
         'records' => records,
         'context_chunks' => context_chunks,
-        'confidence_distribution' => confidence_distribution,
-        'ranking_metadata' => ranking_metadata
+        'ranking_metadata' => {
+          'category' => 'PTO',
+          'llm_model' => 'gemini-2.0-flash',
+          'contexts_filtered' => 0,
+          'contexts_ranked' => 1
+        }
       }
       
-      # Build facets
-      facets = {
-        'ranking_api' => 'llm.category_ranker',
-        'category' => 'PTO',
-        'llm_model' => 'gemini-2.0-flash',
-        'emit_shape' => 'context_chunks',
-        'records_input' => 5,
-        'records_filtered' => 0,
-        'records_ranked' => 2,
-        'records_output' => 2,
-        'has_distribution' => true,
-        'top_score' => 0.92,
-        'category_filtered' => false,
-        'correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
-      }
-      
-      # Return with standard envelope
       business_data.merge({
         'complete_output' => business_data.dup,
-        'facets' => facets,
+        'facets' => {
+          'category' => 'PTO',
+          'top_score' => 0.92
+        },
         'ok' => true,
-        'telemetry' => call(:sample_telemetry, 85)
+        'op_correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+        'op_telemetry' => call(:sample_telemetry, 85)
       })
     end,
     sample_rag_retrieve_contexts_enhanced: lambda do
