@@ -3588,10 +3588,26 @@ require 'securerandom'
         ]},
         
         # NEW: Simple pattern selection - always visible
-        { name: 'exclude_patterns', label: 'Quick exclusions',
-          type: 'array', control_type: 'multiselect', pick_list: 'common_email_patterns',
-          optional: true, sticky: true,
-          hint: 'Select common email types to exclude from processing' },
+        { name: 'exclude_patterns', 
+          label: 'Quick exclusions',
+          control_type: 'multiselect',
+          delimiter: ',',                            # <-- THIS WAS MISSING
+          pick_list: 'common_email_patterns',
+          convert_input: 'convert_multiselect_patterns',  # <-- THIS WAS MISSING
+          optional: true,
+          sticky: true,
+          hint: 'Select common email types to exclude from processing',
+          toggle_hint: 'Select from list',
+          toggle_field: {
+            name: 'exclude_patterns',
+            label: 'Pattern codes',
+            type: 'string',
+            control_type: 'text',
+            optional: true,
+            toggle_hint: 'Use custom value',
+            hint: 'Provide comma-separated pattern codes: email_chains, noreply_addresses, auto_replies, system_notifications, newsletters, bounce_messages, calendar_invites, automated_reports, ticket_updates'
+          }
+        },
         
         # Pattern OR Rules toggle
         { name: 'use_advanced_rules', label: 'Use advanced rules instead',
@@ -4251,6 +4267,9 @@ require 'securerandom'
         'soft_signals' => soft_signals,
         'thresholds' => { 'keep' => 6, 'triage_min' => 4, 'triage_max' => 5 }
       }
+    end,
+    convert_multiselect_patterns: lambda do |input|
+      input.to_s.split(',').map(&:strip)
     end,
     ensure_correlation_id!: lambda do |input|
       cid = input['correlation_id']
