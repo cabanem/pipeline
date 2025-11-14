@@ -708,6 +708,8 @@ require 'securerandom'
           'email_type' => email_type,
           'gate'       => gate
         }
+        out['signals_intent'] = intent['label']
+        out['signals_intent_confidence'] = intent['confidence']
         # Compute facets
         call(:step_ok!, ctx, out, 200, 'OK', { 
           'decision_path' => 'soft_eval',
@@ -972,6 +974,8 @@ require 'securerandom'
               'generator_hint' => generator_hint
             }
           }
+          out['signals_intent'] = input['signals_intent'] || 'unknown'
+          out['signals_intent_confidence'] = input['signals_intent_confidence'] || 0.0
           
           # Build facets and complete output
           call(:step_ok!, ctx, out, call(:telemetry_success_code, resp), 'OK', {
@@ -1060,6 +1064,11 @@ require 'securerandom'
         shortlist = scores.first(k).map { |h| h['category'] }
 
         out = { 'scores'=>scores, 'shortlist'=>shortlist }
+        # Pass through signals
+        out['signals_category'] = input['signals_category']
+        out['signals_confidence'] = input['signals_confidence']
+        out['signals_intent'] = input['signals_intent']
+
         call(:step_ok!, ctx, out, 200, 'OK', { 
           'k' => k,
           'categories_count' => cats.length,
@@ -1136,6 +1145,11 @@ require 'securerandom'
         dist.concat(missing.map { |m| { 'category'=>m, 'prob'=>0.0 } })
         ranking = dist.sort_by { |h| -h['prob'].to_f }
         out = { 'ranking'=>ranking, 'shortlist'=>ranking.map { |r| r['category'] } }
+        # Pass through signals
+        out['signals_category'] = input['signals_category']
+        out['signals_confidence'] = input['signals_confidence']
+        out['signals_intent'] = input['signals_intent']
+        
         call(:step_ok!, ctx, out, 200, 'OK', { 
           'mode' => 'llm',
           'top_prob' => ranking.first ? ranking.first['prob'] : 0,
@@ -1373,8 +1387,7 @@ require 'securerandom'
         out = {
           'referee'=>ref,
           'chosen'=>chosen,
-          'confidence'=>[ref['confidence'], 0.0].compact.first.to_f,
-          'signals_category' => chosen
+          'confidence'=>[ref['confidence'], 0.0].compact.first.to_f
         }
         out['signals_category'] = chosen
         out['signals_confidence'] = out['confidence']
