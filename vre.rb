@@ -502,8 +502,68 @@ require 'securerandom'
           { name: 'ranking', type: 'object', properties: object_definitions['rag_ranking'] }
         ]
       end
+    },
+    # NEW 2025-11-14
+    pipeline_gate: {
+      fields: lambda do |c, cf|
+        [
+          { name: 'prelim_pass', type: 'boolean' },
+          { name: 'hard_block', type: 'boolean' },
+          { name: 'hard_reason' },
+          { name: 'soft_score', type: 'integer' },
+          { name: 'decision' },
+          { name: 'generator_hint' },
+          { name: 'can_proceed', type: 'boolean' },
+          { name: 'has_category', type: 'boolean' },
+          { name: 'generation_eligible', type: 'boolean' }
+        ]
+      end
+    },
+    scored_category: {
+      fields: lambda do |c, cf|
+        [
+          { name: 'category' },
+          { name: 'score', type: 'number' },
+          { name: 'cosine', type: 'number', optional: true },
+          { name: 'prob', type: 'number', optional: true }
+        ]
+      end
+    },
+    policy_decision: {
+      fields: lambda do |c, cf|
+        [
+          { name: 'decision' },
+          { name: 'confidence', type: 'number' },
+          { name: 'matched_signals', type: 'array', of: 'string' },
+          { name: 'reasons', type: 'array', of: 'string' }
+        ]
+      end
+    },
+    intent_classification: {
+      fields: lambda do |c, cf|
+        [
+          { name: 'label' },
+          { name: 'confidence', type: 'number' },
+          { name: 'basis' }
+        ]
+      end
+    },
+    context_chunk_standard: {
+      fields: lambda do |c, cf|
+        [
+          { name: 'id' },
+          { name: 'text' },
+          { name: 'score', type: 'number' },
+          { name: 'source' },
+          { name: 'uri' },
+          { name: 'metadata', type: 'object' },
+          { name: 'metadata_kv', type: 'array', of: 'object' },
+          { name: 'metadata_json' },
+          { name: 'is_pdf', type: 'boolean', optional: true },
+          { name: 'processing_error', type: 'boolean', optional: true }
+        ]
+      end
     }
-
   },
 
   # --------- ACTIONS ------------------------------------------------------
@@ -953,13 +1013,15 @@ require 'securerandom'
       end,
       output_fields: lambda do |object_definitions, _conn|
         [
-          { name: 'scores', type: 'array', of: 'object', properties: [
-              { name: 'category' }, { name: 'score', type: 'number' }, { name: 'cosine', type: 'number' }
-          ]},
+          # Business outputs
+          { name: 'scores', type: 'array', of: 'object',
+            properties: object_definitions['scored_category'] },  # <-- Using object def
           { name: 'shortlist', type: 'array', of: 'string' },
-          { name: 'complete_output', type: 'object', hint: 'All outputs consolidated for easy downstream use' },
-          { name: 'facets', type: 'object', optional: true, hint: 'Analytics facets when available' }
-        ] + Array(object_definitions['envelope_fields'])
+          
+          # Standard fields
+          { name: 'complete_output', type: 'object' },
+          { name: 'facets', type: 'object', optional: true }
+        ] + call(:standard_operational_outputs) 
       end,
 
       execute: lambda do |connection, input|
@@ -2039,7 +2101,22 @@ require 'securerandom'
         
         begin
           input = call(:normalize_input_keys, raw_input)
-          result = call(:gen_generate_core!, connection, input, ctx['cid'])
+          
+          # Prepare the request (all logic except HTTP call)
+          request_info = call(:gen_generate_prepare_request!, connection, input, ctx['cid'])
+          
+          # Check if pre-generation gate blocked the request
+          if request_info['gate_blocked']
+            return call(:step_ok!, ctx, request_info['gate_result'], 200, 'Blocked by pre-generation gate', {})
+          end
+          
+          # Make the HTTP request directly in execute block (this will be traced)
+          resp = post(request_info['url'])
+                  .headers(request_info['headers'])
+                  .payload(request_info['payload'])
+          
+          # Process the response
+          result = call(:gen_generate_process_response!, resp, input, request_info, connection)
           
           # Extract key metrics for facets
           mode = (input['mode'] || 'plain').to_s
@@ -2056,8 +2133,14 @@ require 'securerandom'
           }.compact
           
           call(:step_ok!, ctx, result, 200, 'OK', facets)
+          
         rescue => e
-          call(:step_err!, ctx, e)
+          # For errors, we need request_info for debug output
+          if defined?(request_info) && request_info
+            call(:gen_generate_handle_error!, e, request_info, connection, input)
+          else
+            call(:step_err!, ctx, e)
+          end
         end
       end,
       sample_output: lambda do
@@ -4384,6 +4467,7 @@ require 'securerandom'
       container
     end,
 
+    # Generative query
     gen_generate_core!: lambda do |connection, input, corr=nil|
       t0   = Time.now
       corr = (corr.to_s.strip.empty? ? call(:build_correlation_id) : corr.to_s.strip)
@@ -4555,6 +4639,202 @@ require 'securerandom'
       end
       error(env)
     end,
+    gen_generate_prepare_request!: lambda do |connection, input, corr=nil|
+      corr = (corr.to_s.strip.empty? ? call(:build_correlation_id) : corr.to_s.strip)
+      mode = (input['mode'] || 'plain').to_s
+
+      # Pre-generation validation for RAG mode
+      if mode == 'rag_with_context'
+        gate_check = call(:pre_generation_gate!, input)
+        unless gate_check['gate_passed']
+          return {
+            'gate_blocked' => true,
+            'gate_result' => {
+              'status' => 'blocked',
+              'gate_check' => gate_check,
+              'responseId' => nil,
+              'candidates' => [],
+              'confidence' => 0.0,
+              'telemetry' => call(:telemetry_envelope, Time.now, corr, false, 200, gate_check['reason'])
+            }
+          }
+        end
+      end
+
+      # Model + location
+      model_path     = call(:build_model_path_with_global_preview, connection, input['model'])
+      loc_from_model = (model_path[/\/locations\/([^\/]+)/,1] || (connection['location'].presence || 'global')).to_s.downcase
+      url            = call(:aipl_v1_url, connection, loc_from_model, "#{model_path}:generateContent")
+      req_params     = "model=#{model_path}"
+
+      # Base fields
+      contents = call(:sanitize_contents!, input['contents'])
+      sys_inst = call(:system_instruction_from_text, input['system_preamble'])
+      gen_cfg  = call(:sanitize_generation_config, input['generation_config'])
+      safety   = call(:sanitize_safety!, input['safetySettings'])
+      tool_cfg = call(:safe_obj, input['toolConfig'])
+      tools    = nil
+
+      case mode
+      when 'plain'
+        # no special tools
+      when 'grounded_google'
+        tools = [ { 'googleSearch' => {} } ]
+      when 'grounded_vertex'
+        ds   = input['vertex_ai_search_datastore'].to_s
+        scfg = input['vertex_ai_search_serving_config'].to_s
+        error('Provide exactly one of vertex_ai_search_datastore OR vertex_ai_search_serving_config') \
+          if (ds.blank? && scfg.blank?) || (ds.present? && scfg.present?)
+        vas = {}; vas['datastore'] = ds unless ds.blank?; vas['servingConfig'] = scfg unless scfg.blank?
+        tools = [ { 'retrieval' => { 'vertexAiSearch' => vas } } ]
+      when 'grounded_rag_store'
+        # Build the retrieval tool payload for Vertex RAG Store
+        corpus = call(:normalize_rag_corpus, connection, input['rag_corpus'])
+        error('rag_corpus is required for grounded_rag_store') if corpus.blank?
+        # Guards for unions
+        call(:guard_threshold_union!, input['vector_distance_threshold'], input['vector_similarity_threshold'])
+        call(:guard_ranker_union!, input['rank_service_model'], input['llm_ranker_model'])
+
+        vr = { 'ragResources' => [ { 'ragCorpus' => corpus } ] }
+        # Optional knobs
+        filt = {}
+        if input['vector_distance_threshold'].present?
+          filt['vectorDistanceThreshold'] = call(:safe_float, input['vector_distance_threshold'])
+        elsif input['vector_similarity_threshold'].present?
+          filt['vectorSimilarityThreshold'] = call(:safe_float, input['vector_similarity_threshold'])
+        end
+        rconf = {}
+        if input['rank_service_model'].to_s.strip != ''
+          rconf['rankService'] = { 'modelName' => input['rank_service_model'].to_s.strip }
+        elsif input['llm_ranker_model'].to_s.strip != ''
+          rconf['llmRanker']   = { 'modelName' => input['llm_ranker_model'].to_s.strip }
+        end
+        retrieval_cfg = {}
+        retrieval_cfg['similarityTopK'] = call(:clamp_int, (input['similarity_top_k'] || 0), 1, 200) if input['similarity_top_k'].present?
+        retrieval_cfg['filter']  = filt unless filt.empty?
+        retrieval_cfg['ranking'] = rconf unless rconf.empty?
+
+        tools = [ { 'retrieval' => { 'vertexRagStore' => vr.merge( (retrieval_cfg.empty? ? {} : { 'ragRetrievalConfig' => retrieval_cfg }) ) } } ]
+      when 'rag_with_context'
+        # Build RAG-lite prompt + JSON schema
+        q        = input['question'].to_s
+        maxn     = call(:clamp_int, (input['max_chunks'] || 20), 1, 100)
+        chunks   = call(:safe_array, input['context_chunks']).first(maxn)
+        sal_text = input['salience_text'].to_s.strip
+        sal_id   = (input['salience_id'].presence || 'salience').to_s
+        sal_scr  = (input['salience_score'].presence || 1.0).to_f
+        items    = []
+        items << { 'id'=>sal_id,'text'=>sal_text,'score'=>sal_scr,'source'=>'salience' } if sal_text.present?
+        items.concat(chunks)
+
+        target_total  = (input['max_prompt_tokens'].presence || 3000).to_i
+        reserve_out   = (input['reserve_output_tokens'].presence || 512).to_i
+        budget_prompt = [target_total - reserve_out, 400].max
+        model_for_cnt = (input['count_tokens_model'].presence || input['model']).to_s
+        strategy      = (input['trim_strategy'].presence || 'drop_low_score').to_s
+
+        base = []; base << items.shift if items.first && items.first['source']=='salience'
+        items = items.map { |c| c.merge('text'=>call(:truncate_chunk_text, c['text'], 800)) }
+        ordered = case strategy
+                  when 'diverse_mmr'   then call(:mmr_diverse_order, items.sort_by { |c| [-(c['score']||0.0).to_f, c['id'].to_s] }, alpha: 0.7, per_source_cap: 3)
+                  when 'drop_low_score' then items.sort_by { |c| [-(c['score']||0.0).to_f, c['id'].to_s] }
+                  else items
+                  end
+        ordered = call(:drop_near_duplicates, ordered, 0.9)
+        pool    = base + ordered
+
+        sys_text = input['system_preamble'].presence ||
+          <<~SYSPROMPT
+            CRITICAL OUTPUT REQUIREMENTS:
+            1. Your ENTIRE response must be valid JSON - no text before or after
+            2. Use EXACTLY the schema provided - no extra fields
+            3. DO NOT include markdown formatting, code blocks, or backticks
+            4. If context is insufficient, set status to "insufficient_context"
+            
+            Answer using ONLY the provided context chunks. Keep answers concise and cite chunk IDs.
+            
+            Example structure:
+            {"answer":"Based on context...", "citations":[{"chunk_id":"c1","source":"doc.pdf"}]}
+          SYSPROMPT
+        kept    = call(:select_prefix_by_budget, connection, pool, q, sys_text, budget_prompt, model_for_cnt)
+        blob    = call(:format_context_chunks, kept)
+        gen_cfg = {
+          'temperature'      => (input['temperature'].present? ? call(:safe_float, input['temperature']) : 0),
+          'maxOutputTokens'  => reserve_out,
+          'responseMimeType' => 'application/json',
+          'responseSchema'   => {
+            'type'=>'object','additionalProperties'=>false,
+            'properties'=>{
+              'answer'=>{'type'=>'string'},
+              'citations'=>{'type'=>'array','items'=>{'type'=>'object','additionalProperties'=>false,
+                'properties'=>{'chunk_id'=>{'type'=>'string'},'source'=>{'type'=>'string'},'uri'=>{'type'=>'string'},'score'=>{'type'=>'number'}}}}
+            },
+            'required'=>['answer']
+          }
+        }
+        sys_inst = call(:system_instruction_from_text, sys_text)
+        contents = [{ 'role'=>'user','parts'=>[{'text'=>"Question:\n#{q}\n\nContext:\n#{blob}"}]}]
+      else
+        error("Unknown mode: #{mode}")
+      end
+
+      payload = {
+        'contents'          => contents,
+        'systemInstruction' => sys_inst,
+        'tools'             => tools,
+        'toolConfig'        => tool_cfg,
+        'safetySettings'    => safety,
+        'generationConfig'  => gen_cfg
+      }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
+
+      # Return all request components
+      {
+        'url' => url,
+        'headers' => call(:request_headers_auth, connection, corr, connection['user_project'], req_params),
+        'payload' => call(:json_compact, payload),
+        'mode' => mode,
+        'correlation_id' => corr,
+        'started_at' => Time.now
+      }
+    end,
+    gen_generate_process_response!: lambda do |resp, input, request_info, connection|
+      t0 = request_info['started_at']
+      corr = request_info['correlation_id']
+      mode = request_info['mode']
+      
+      code = call(:telemetry_success_code, resp)
+      
+      out = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
+      
+      if mode == 'rag_with_context'
+        text   = resp.dig('candidates',0,'content','parts',0,'text').to_s
+        parsed = call(:safe_parse_json, text)
+        out['parsed'] = { 'answer'=>parsed['answer'] || text, 'citations'=>parsed['citations'] || [] }
+        # Compute overall confidence from cited chunk scores, if available
+        conf = call(:overall_confidence_from_citations, out['parsed']['citations'])
+        out['confidence'] = conf if conf
+        (out['telemetry'] ||= {})['confidence'] = { 'basis' => 'citations_topk_avg', 'k' => 3,
+                                                    'n' => Array(out.dig('parsed','citations')).length }
+      end
+      
+      out
+    end,
+    gen_generate_handle_error!: lambda do |err, request_info, connection, input|
+      t0 = request_info['started_at']
+      corr = request_info['correlation_id']
+      
+      g   = call(:extract_google_error, err)
+      msg = [err.to_s, (g['message'] || nil)].compact.join(' | ')
+      env = call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, err), msg)
+      
+      if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
+        env['debug'] = call(:debug_pack, true, request_info['url'], request_info['payload'], g)
+      end
+      
+      error(env)
+    end,
+
+    # Preview pack
     request_preview_pack: lambda do |url, verb, headers, payload|
       {
         'request_preview' => {
@@ -5749,6 +6029,26 @@ require 'securerandom'
         'errors'         => errs,
         'facets'         => facets_merged
       }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
+    end,
+    # NEW 2025-11-14
+    # Standard field groups (for reuse)
+    standard_operational_outputs: lambda do
+      [
+        { name: 'op_correlation_id' },
+        { name: 'op_telemetry', type: 'object', properties: [
+          { name: 'http_status', type: 'integer' },
+          { name: 'message' },
+          { name: 'duration_ms', type: 'integer' },
+          { name: 'correlation_id' }
+        ]}
+      ]
+    end,
+    standard_operational_inputs: lambda do
+      [
+        { name: 'op_correlation_id', optional: true, sticky: true,
+          hint: 'Tracking ID across all stages' },
+        { name: 'op_debug', type: 'boolean', optional: true }
+      ]
     end
 
   },
@@ -5773,7 +6073,7 @@ require 'securerandom'
     # - host=`https://{LOCATION}-aiplatform.googleapis.com`
     # - path=`/v1/projects/{project}/locations/{location}/publishers/google/models/{embeddingModel}:predict`
   # Generate 
-    # - host=`https://aiplatform.googleapis.com` 
+    # - host=`https://aiplatform.googleapis.com``/v1/{model}:generateContent` 
     # - path=`/v1/{model}:generateContent`
   # Count tokens
     # - host=`https://LOCATION-aiplatform.googleapis.com`
