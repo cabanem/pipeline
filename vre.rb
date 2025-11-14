@@ -3866,20 +3866,50 @@ require 'securerandom'
     ui_df_inputs: lambda do |object_definitions, cfg|
       show_adv = call(:ui_truthy, cfg['show_advanced'])
       
-      # Define the fields directly - simpler and clearer
+      # Always visible fields
       base = [
         { name: 'subject', label: 'Email Subject', optional: false, 
           hint: 'Subject line of the email to filter' },
         { name: 'body', label: 'Email Body', optional: false, control_type: 'text-area',
           hint: 'Body content of the email' },
         { name: 'fallback_category', label: 'Fallback Category', optional: true, default: 'Other',
-          hint: 'Category to use when rules produce no clear result' }
+          hint: 'Category to use when rules produce no clear result' },
+        { name: 'rules_mode', label: 'Rules Mode', control_type: 'select', 
+          default: 'none', pick_list: 'rules_modes',
+          extends_schema: true,  # ← THIS IS KEY! Makes the UI rebuild when changed
+          hint: 'Choose how to provide filtering rules' },
+        # These will show/hide based on rules_mode selection
+        { name: 'rules_rows', label: 'Rule Definitions',
+          ngIf: 'input.rules_mode == "rows"',  # ← Shows only when mode is "rows"
+          type: 'array', of: 'object', 
+          properties: [
+            { name: 'rule_id', label: 'Rule ID' },
+            { name: 'family', label: 'Family', control_type: 'select',
+              options: [['HARD','HARD'], ['SOFT','SOFT'], ['THRESHOLD','THRESHOLD']] },
+            { name: 'field', label: 'Field', control_type: 'select',
+              options: [['subject','subject'], ['body','body'], ['from','from'], 
+                      ['headers','headers'], ['attachments','attachments']] },
+            { name: 'operator', label: 'Operator', control_type: 'select',
+              options: [['contains','contains'], ['equals','equals'], ['regex','regex'],
+                      ['header_present','header_present'], ['ext_in','ext_in']] },
+            { name: 'pattern', label: 'Pattern', hint: 'Pattern to match' },
+            { name: 'weight', label: 'Weight', type: 'integer', default: 1 },
+            { name: 'action', label: 'Action', optional: true },
+            { name: 'enabled', label: 'Enabled', type: 'boolean', control_type: 'checkbox', default: true }
+          ],
+          optional: true,
+          hint: 'Add rules one by one. Each row is a rule.' },
+        { name: 'rules_json', label: 'Rules JSON',
+          ngIf: 'input.rules_mode == "json"',  # ← Shows only when mode is "json"
+          optional: true, control_type: 'text-area',
+          hint: 'Paste a complete rulepack JSON object' }
       ]
       
       if show_adv
-        # Advanced mode adds more email fields and rules configuration
+        # Advanced mode adds more optional email fields
         base + [
-          { name: 'from', label: 'From Address', optional: true },
+          { name: 'from', label: 'From Address', optional: true,
+            hint: 'Sender email for rule matching' },
           { name: 'headers', label: 'Email Headers', type: 'object', optional: true,
             hint: 'Key-value pairs of email headers for rule matching' },
           { name: 'attachments', label: 'Attachments', type: 'array', of: 'object', optional: true,
@@ -3890,37 +3920,10 @@ require 'securerandom'
             ],
             hint: 'List of attachments for rule evaluation' },
           { name: 'auth', label: 'Auth Info', type: 'object', optional: true,
-            hint: 'Authentication/security flags' },
-          { name: 'rules_mode', label: 'Rules Mode', control_type: 'select', 
-            default: 'none', pick_list: 'rules_modes',
-            extends_schema: true, hint: 'Choose how to provide filtering rules' },
-          { name: 'rules_rows', label: 'Rule Rows',
-            ngIf: 'input.rules_mode == "rows"',
-            type: 'array', of: 'object', 
-            properties: [
-              { name: 'rule_id' },
-              { name: 'family' },
-              { name: 'field' },
-              { name: 'operator' },
-              { name: 'pattern' },
-              { name: 'weight' },
-              { name: 'action' },
-              { name: 'enabled' }
-            ],
-            optional: true,
-            hint: 'Define rules in table format' },
-          { name: 'rules_json', label: 'Rules JSON',
-            ngIf: 'input.rules_mode == "json"', 
-            optional: true, control_type: 'text-area',
-            hint: 'Paste compiled rulepack JSON' }
+            hint: 'Authentication/security flags (e.g., SPF, DKIM results)' }
         ]
       else
-        # Simple mode shows just the basics + rules mode (but no rule details)
-        base + [
-          { name: 'rules_mode', label: 'Rules Mode', control_type: 'select', 
-            default: 'none', pick_list: 'rules_modes',
-            hint: 'Set to "none" to skip rule evaluation' }
-        ]
+        base
       end
     end,
     ui_policy_inputs: lambda do |object_definitions, cfg|
