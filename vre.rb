@@ -581,7 +581,7 @@ require 'securerandom'
     policy_with_intent: {
       fields: lambda do |_connection, _config_fields|
         [
-          { name: 'decision', hint: 'IRRELEVANT/REVIEW/KEEP' },
+          { name: 'decision', hint: 'IRRELEVANT/HUMAN/KEEP' },
           { name: 'confidence', type: 'number' },
           { name: 'intent', type: 'object', properties: [
             { name: 'label' },
@@ -670,11 +670,11 @@ require 'securerandom'
             when 'forwarded_chain'
               email_type = 'forwarded_chain'
               hard_block = true
-              preliminary_decision = 'REVIEW'
+              preliminary_decision = 'HUMAN'
             when 'internal_discussion'
               email_type = 'internal_discussion'
               hard_block = true
-              preliminary_decision = 'REVIEW'
+              preliminary_decision = 'HUMAN'
             when 'mailing_list', 'bounce'
               email_type = hard_reason
               hard_block = true
@@ -682,7 +682,7 @@ require 'securerandom'
             when 'safety_block'
               email_type = 'blocked'
               hard_block = true
-              preliminary_decision = 'REVIEW'
+              preliminary_decision = 'HUMAN'
             end
           end
 
@@ -732,13 +732,375 @@ require 'securerandom'
         call(:sample_deterministic_filter_simplified)
       end
     },
+    ai_triage_filter: {
+      title: 'Filter: AI triage',
+      subtitle: 'Filter: Triage (IRRELEVANT/HUMAN/KEEP)',
+      description: 'LLM-based triage to determine if email should proceed through pipeline',
+      display_priority: 501,
+      
+      config_fields: [
+        { name: 'show_advanced', label: 'Show advanced options',
+          type: 'boolean', control_type: 'checkbox',
+          default: false, sticky: true, extends_schema: true }
+      ],
+      input_fields: lambda do |object_definitions, connection, config_fields|
+        base = [
+          { name: 'email_text', optional: false },
+          { name: 'email_type', optional: true, default: 'direct_request',
+            hint: 'From deterministic filter' },
+          
+          # Thresholds
+          { name: 'min_confidence_for_keep', type: 'number', 
+            default: 0.60, hint: 'Minimum confidence to mark as KEEP' },
+          { name: 'confidence_short_circuit', type: 'number', 
+            default: 0.85, hint: 'High confidence IRRELEVANT bypasses downstream' }
+        ]
+        
+        adv = config_fields['show_advanced'] ? [
+          { name: 'model', default: 'gemini-2.0-flash' },
+          { name: 'temperature', type: 'number', default: 0 },
+          { name: 'custom_policy_json', control_type: 'text-area', optional: true,
+            hint: 'Additional triage rules in JSON format' }
+        ] : []
+        
+        base + adv + Array(object_definitions['observability_input_fields'])
+      end,     
+      output_fields: lambda do |object_definitions, connection|
+        [
+          # Business outputs
+          { name: 'decision', hint: 'IRRELEVANT, HUMAN, or KEEP' },
+          { name: 'confidence', type: 'number' },
+          { name: 'reasons', type: 'array', of: 'string' },
+          { name: 'matched_signals', type: 'array', of: 'string' },
+          
+          # Pipeline control
+          { name: 'should_continue', type: 'boolean',
+            hint: 'True if pipeline should continue to next step' },
+          { name: 'short_circuit', type: 'boolean',
+            hint: 'True if high-confidence IRRELEVANT' },
+          
+          # Pass-through signals
+          { name: 'signals_triage', hint: 'Copy of decision for downstream' },
+          { name: 'signals_confidence', type: 'number' },
+          
+          # Standard fields
+          { name: 'complete_output', type: 'object' },
+          { name: 'facets', type: 'object', optional: true }
+        ] + call(:standard_operational_outputs)
+      end,     
+      execute: lambda do |connection, input|
+        ctx = call(:step_begin!, :ai_triage_filter, input)
+        
+        # Build model path
+        model = input['model'] || 'gemini-2.0-flash'
+        model_path = call(:build_model_path_with_global_preview, connection, model)
+        
+        # System prompt focused on triage only
+        system_text = <<~SYS
+          You are a strict email triage system. Classify emails into three categories.
+          
+          DECISIONS:
+          - IRRELEVANT: Spam, newsletters, auto-generated, not relevant to HR
+          - HUMAN: Needs human review (complex, sensitive, complaints, escalations)  
+          - KEEP: Clear, valid request that can be handled automatically
+          
+          Output MUST be valid JSON only. No text before or after.
+          Confidence is calibrated [0,1]. Be decisive.
+        SYS
+        
+        # Add custom policy if provided
+        if input['custom_policy_json'].present?
+          system_text += "\n\nAdditional rules:\n#{input['custom_policy_json']}"
+        end
+        
+        # Response schema - simple and focused
+        response_schema = {
+          'type' => 'object',
+          'additionalProperties' => false,
+          'properties' => {
+            'decision' => {
+              'type' => 'string',
+              'enum' => ['IRRELEVANT', 'HUMAN', 'KEEP']
+            },
+            'confidence' => { 'type' => 'number', 'minimum' => 0, 'maximum' => 1 },
+            'reasons' => {
+              'type' => 'array',
+              'items' => { 'type' => 'string' },
+              'maxItems' => 3
+            },
+            'matched_signals' => {
+              'type' => 'array',
+              'items' => { 'type' => 'string' },
+              'maxItems' => 5
+            }
+          },
+          'required' => ['decision', 'confidence']
+        }
+        
+        # Make API call
+        payload = {
+          'systemInstruction' => { 'role' => 'system', 'parts' => [{'text' => system_text}] },
+          'contents' => [{ 'role' => 'user', 'parts' => [{ 'text' => "Email:\n#{input['email_text']}" }] }],
+          'generationConfig' => {
+            'temperature' => (input['temperature'] || 0).to_f,
+            'maxOutputTokens' => 256,
+            'responseMimeType' => 'application/json',
+            'responseSchema' => response_schema
+          }
+        }
+        
+        loc = (model_path[/\/locations\/([^\/]+)/,1] || 'global').to_s.downcase
+        url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
+        
+        resp = post(url)
+                .headers(call(:request_headers_auth, connection, ctx['cid'], 
+                            connection['user_project'], "model=#{model_path}"))
+                .payload(call(:json_compact, payload))
+        
+        # Parse response
+        text = resp.dig('candidates',0,'content','parts',0,'text').to_s
+        parsed = call(:safe_json, text) || {}
+        
+        decision = (parsed['decision'] || 'HUMAN').to_s
+        confidence = [[call(:safe_float, parsed['confidence']) || 0.0, 0.0].max, 1.0].min
+        
+        # Determine pipeline flow
+        min_conf = (input['min_confidence_for_keep'] || 0.60).to_f
+        should_continue = (decision == 'KEEP' && confidence >= min_conf) || 
+                        (decision == 'HUMAN')
+        
+        short_circuit = decision == 'IRRELEVANT' && 
+                      confidence >= (input['confidence_short_circuit'] || 0.85).to_f
+        
+        out = {
+          'decision' => decision,
+          'confidence' => confidence,
+          'reasons' => call(:safe_array, parsed['reasons']),
+          'matched_signals' => call(:safe_array, parsed['matched_signals']),
+          'should_continue' => should_continue,
+          'short_circuit' => short_circuit,
+          'signals_triage' => decision,
+          'signals_confidence' => confidence
+        }
+        
+        call(:step_ok!, ctx, out, 200, 'OK', {
+          'decision' => decision,
+          'confidence' => confidence,
+          'should_continue' => should_continue,
+          'short_circuit' => short_circuit
+        })
+      end,
+      sample_output: lambda do
+        call(:sample_ai_triage_filter)
+      end
+    },
+    ai_intent_classifier: {
+      title: 'Classify: Intent',
+      subtitle: 'Classify: User intent',
+      description: 'Determine what the user is trying to accomplish',
+      display_priority: 500,     
+      config_fields: [
+        { name: 'show_advanced', label: 'Show advanced options',
+          type: 'boolean', control_type: 'checkbox',
+          default: false, sticky: true, extends_schema: true }
+      ],
+      input_fields: lambda do |object_definitions, connection, config_fields|
+        base = [
+          { name: 'email_text', optional: false },
+          
+          # Intent configuration
+          { name: 'intent_types', type: 'array', of: 'string',
+            default: ['information_request', 'action_request', 'status_inquiry', 
+                    'complaint', 'feedback', 'auto_reply', 'unknown'],
+            hint: 'Possible intent categories' },
+          
+          { name: 'actionable_intents', type: 'array', of: 'string',
+            default: ['information_request', 'action_request'],
+            hint: 'Intents that can be automated' },
+          
+          # Pass-through from previous steps
+          { name: 'signals_triage', optional: true,
+            hint: 'Triage decision from previous step' },
+          { name: 'email_type', optional: true }
+        ]
+        
+        adv = config_fields['show_advanced'] ? [
+          { name: 'model', default: 'gemini-2.0-flash' },
+          { name: 'temperature', type: 'number', default: 0 },
+          { name: 'extract_entities', type: 'boolean', control_type: 'checkbox',
+            default: false, hint: 'Extract named entities' },
+          { name: 'detect_sentiment', type: 'boolean', control_type: 'checkbox',
+            default: false, hint: 'Detect emotional sentiment' }
+        ] : []
+        
+        base + adv + Array(object_definitions['observability_input_fields'])
+      end,      
+      output_fields: lambda do |object_definitions, connection|
+        [
+          # Business outputs
+          { name: 'intent', hint: 'Primary user intent' },
+          { name: 'confidence', type: 'number' },
+          { name: 'is_actionable', type: 'boolean',
+            hint: 'True if intent can be automated' },
+          
+          # Optional enrichments
+          { name: 'secondary_intents', type: 'array', of: 'string', optional: true },
+          { name: 'entities', type: 'array', of: 'object', optional: true,
+            properties: [
+              { name: 'type' },
+              { name: 'value' },
+              { name: 'context' }
+            ]
+          },
+          { name: 'sentiment', optional: true,
+            hint: 'positive, negative, or neutral' },
+          
+          # Pipeline control
+          { name: 'requires_context', type: 'boolean',
+            hint: 'True if RAG retrieval recommended' },
+          { name: 'suggested_category', optional: true,
+            hint: 'Hint for category classification' },
+          
+          # Pass-through signals  
+          { name: 'signals_intent' },
+          { name: 'signals_intent_confidence', type: 'number' },
+          { name: 'signals_triage' },  # Pass through from previous
+          
+          # Standard fields
+          { name: 'complete_output', type: 'object' },
+          { name: 'facets', type: 'object', optional: true }
+        ] + call(:standard_operational_outputs)
+      end,    
+      execute: lambda do |connection, input|
+        ctx = call(:step_begin!, :ai_intent_classifier, input)
+        
+        # Build model path
+        model = input['model'] || 'gemini-2.0-flash'
+        model_path = call(:build_model_path_with_global_preview, connection, model)
+        
+        # System prompt focused on intent only
+        system_text = <<~SYS
+          You are an intent classification system. Determine what the user wants.
+          
+          INTENT TYPES:
+          - information_request: Asking for information, policies, procedures
+          - action_request: Requesting specific action (approval, document)
+          - status_inquiry: Checking status of existing request
+          - complaint: Expressing dissatisfaction or escalation
+          - feedback: Providing feedback or suggestions
+          - auto_reply: Out-of-office or automated response
+          - unknown: Cannot determine clear intent
+          
+          Output MUST be valid JSON only.
+          #{input['extract_entities'] ? 'Extract key entities mentioned.' : ''}
+          #{input['detect_sentiment'] ? 'Detect overall sentiment.' : ''}
+        SYS
+        
+        # Build response schema
+        schema_props = {
+          'intent' => {
+            'type' => 'string',
+            'enum' => input['intent_types']
+          },
+          'confidence' => { 'type' => 'number', 'minimum' => 0, 'maximum' => 1 },
+          'secondary_intents' => {
+            'type' => 'array',
+            'items' => { 'type' => 'string', 'enum' => input['intent_types'] }
+          },
+          'requires_context' => { 'type' => 'boolean' },
+          'suggested_category' => { 'type' => 'string' }
+        }
+        
+        required = ['intent', 'confidence']
+        
+        if input['extract_entities']
+          schema_props['entities'] = {
+            'type' => 'array',
+            'items' => {
+              'type' => 'object',
+              'properties' => {
+                'type' => { 'type' => 'string' },
+                'value' => { 'type' => 'string' },
+                'context' => { 'type' => 'string' }
+              },
+              'required' => ['type', 'value']
+            }
+          }
+        end
+        
+        if input['detect_sentiment']
+          schema_props['sentiment'] = {
+            'type' => 'string',
+            'enum' => ['positive', 'negative', 'neutral']
+          }
+        end
+        
+        # Make API call
+        payload = {
+          'systemInstruction' => { 'role' => 'system', 'parts' => [{'text' => system_text}] },
+          'contents' => [{ 'role' => 'user', 'parts' => [{ 'text' => "Email:\n#{input['email_text']}" }] }],
+          'generationConfig' => {
+            'temperature' => (input['temperature'] || 0).to_f,
+            'maxOutputTokens' => 512,
+            'responseMimeType' => 'application/json',
+            'responseSchema' => {
+              'type' => 'object',
+              'additionalProperties' => false,
+              'properties' => schema_props,
+              'required' => required
+            }
+          }
+        }
+        
+        loc = (model_path[/\/locations\/([^\/]+)/,1] || 'global').to_s.downcase
+        url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
+        
+        resp = post(url)
+                .headers(call(:request_headers_auth, connection, ctx['cid'],
+                            connection['user_project'], "model=#{model_path}"))
+                .payload(call(:json_compact, payload))
+        
+        # Parse response
+        text = resp.dig('candidates',0,'content','parts',0,'text').to_s
+        parsed = call(:safe_json, text) || {}
+        
+        intent = (parsed['intent'] || 'unknown').to_s
+        confidence = [[call(:safe_float, parsed['confidence']) || 0.0, 0.0].max, 1.0].min
+        actionable_intents = input['actionable_intents'] || ['information_request', 'action_request']
+        
+        out = {
+          'intent' => intent,
+          'confidence' => confidence,
+          'is_actionable' => actionable_intents.include?(intent),
+          'secondary_intents' => parsed['secondary_intents'],
+          'entities' => parsed['entities'],
+          'sentiment' => parsed['sentiment'],
+          'requires_context' => parsed['requires_context'] || false,
+          'suggested_category' => parsed['suggested_category'],
+          'signals_intent' => intent,
+          'signals_intent_confidence' => confidence,
+          'signals_triage' => input['signals_triage']  # Pass through
+        }
+        
+        call(:step_ok!, ctx, out, 200, 'OK', {
+          'intent' => intent,
+          'confidence' => confidence,
+          'is_actionable' => out['is_actionable'],
+          'has_entities' => parsed['entities'].is_a?(Array) && parsed['entities'].any?,
+          'sentiment' => parsed['sentiment']
+        })
+      end,
+      sample_output: lambda do
+        call(:sample_ai_intent_classifier)
+      end
+    },
     ai_policy_filter: {
       title: 'Filter: AI triage',
       subtitle: 'Filter: Triage',
       description: 'Fuzzy triage via LLM under a strict JSON schema',
       display_priority: 501,
       help: lambda do |_|
-        { body: 'Constrained LLM decides IRRELEVANT/REVIEW/KEEP. Returns results as JSON.' }
+        { body: 'Constrained LLM decides IRRELEVANT/HUMAN/KEEP. Returns results as JSON.' }
       end,
       config_fields: [
         { name: 'show_advanced', label: 'Show advanced options',
@@ -806,7 +1168,7 @@ require 'securerandom'
             
             TRIAGE DECISIONS:
             - IRRELEVANT: Not relevant to HR, spam, newsletters, auto-generated
-            - REVIEW: Needs human review (complaints, complex, sensitive)
+            - HUMAN: Needs human review (complaints, complex, sensitive)
             - KEEP: Valid request that can be handled automatically
             
             INTENT TYPES:
@@ -838,7 +1200,7 @@ require 'securerandom'
             'properties' => {
               'decision' => {
                 'type' => 'string',
-                'enum' => ['IRRELEVANT', 'REVIEW', 'KEEP']
+                'enum' => ['IRRELEVANT', 'HUMAN', 'KEEP']
               },
               'confidence' => { 
                 'type' => 'number', 
@@ -908,9 +1270,9 @@ require 'securerandom'
           end
           
           # Extract and validate fields
-          decision = (parsed['decision'] || 'REVIEW').to_s
-          unless ['IRRELEVANT', 'REVIEW', 'KEEP'].include?(decision)
-            decision = 'REVIEW'
+          decision = (parsed['decision'] || 'HUMAN').to_s
+          unless ['IRRELEVANT', 'HUMAN', 'KEEP'].include?(decision)
+            decision = 'HUMAN'
           end
           
           confidence = [[call(:safe_float, parsed['confidence']) || 0.0, 0.0].max, 1.0].min
@@ -2368,6 +2730,52 @@ require 'securerandom'
         'op_telemetry' => call(:sample_telemetry, 45)
       }
     end,
+    sample_ai_triage_filter: lambda do
+      {
+        'decision' => 'KEEP',
+        'confidence' => 0.82,
+        'reasons' => [
+          'Clear PTO policy question',
+          'Direct request from employee',
+          'No sensitive content detected'
+        ],
+        'matched_signals' => ['policy_question', 'direct_question', 'pto_reference'],
+        'should_continue' => true,
+        'short_circuit' => false,
+        'signals_triage' => 'KEEP',
+        'signals_confidence' => 0.82,
+        'ok' => true,
+        'op_telemetry' => call(:sample_telemetry, 35)
+      }
+    end,
+    sample_ai_intent_classifier: lambda do
+      {
+        'intent' => 'information_request',
+        'confidence' => 0.88,
+        'is_actionable' => true,
+        'secondary_intents' => ['status_inquiry'],
+        'entities' => [
+          {
+            'type' => 'policy_type',
+            'value' => 'PTO',
+            'context' => 'vacation time policy'
+          },
+          {
+            'type' => 'date_reference',
+            'value' => 'next month',
+            'context' => 'planning vacation next month'
+          }
+        ],
+        'sentiment' => 'neutral',
+        'requires_context' => true,
+        'suggested_category' => 'PTO',
+        'signals_intent' => 'information_request',
+        'signals_intent_confidence' => 0.88,
+        'signals_triage' => 'KEEP',
+        'ok' => true,
+        'op_telemetry' => call(:sample_telemetry, 38)
+      }
+    end,
     sample_embed_text_against_categories: lambda do
       scores = [
         { 'category' => 'Billing', 'score' => 0.91, 'cosine' => 0.82 },
@@ -3014,11 +3422,11 @@ require 'securerandom'
       
       # Validate decision enum strictly
       if response['decision']
-        valid_decisions = structure.dig('decision', 'enum') || ['IRRELEVANT', 'REVIEW', 'KEEP']
+        valid_decisions = structure.dig('decision', 'enum') || ['IRRELEVANT', 'HUMAN', 'KEEP']
         unless valid_decisions.include?(response['decision'])
-          response['decision'] = 'REVIEW' # Safe default
+          response['decision'] = 'HUMAN' # Safe default
           response['_validation_warnings'] ||= []
-          response['_validation_warnings'] << "Invalid decision corrected to REVIEW"
+          response['_validation_warnings'] << "Invalid decision corrected to HUMAN"
         end
       end
       
@@ -4323,7 +4731,7 @@ require 'securerandom'
       lo   = (thr['triage_min'] || 4).to_i
       hi   = (thr['triage_max'] || 5).to_i
       if score >= keep then 'HR-REQUEST'
-      elsif score >= lo && score <= hi then 'REVIEW'
+      elsif score >= lo && score <= hi then 'HUMAN'
       else 'IRRELEVANT'
       end
     end,
