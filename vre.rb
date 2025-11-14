@@ -3866,28 +3866,46 @@ require 'securerandom'
     ui_df_inputs: lambda do |object_definitions, cfg|
       show_adv = call(:ui_truthy, cfg['show_advanced'])
       
-      # Properly get the email fields
-      email_fields = if object_definitions['email_envelope']['fields'].respond_to?(:call)
-        object_definitions['email_envelope']['fields'].call({}, {})
-      else
-        object_definitions['email_envelope']['fields']
-      end
+      # Get the actual fields from the email_envelope definition
+      email_fields = object_definitions['email_envelope']['fields'].call({}, {})
       
+      # Always show basic email fields
       base = [
-        { name: 'email', label: 'Email', type: 'object',
-          properties: email_fields, optional: false }
+        { name: 'subject', label: 'Email Subject', optional: false },
+        { name: 'body', label: 'Email Body', optional: false, control_type: 'text-area' }
       ]
       
       if show_adv
-        base + [
+        # Advanced mode: show all email fields + rules configuration
+        all_email_fields = [
+          { name: 'subject', label: 'Email Subject', optional: false },
+          { name: 'body', label: 'Email Body', optional: false, control_type: 'text-area' },
+          { name: 'from', label: 'From Address', optional: true },
+          { name: 'headers', label: 'Email Headers', type: 'object', optional: true,
+            hint: 'Key-value pairs of email headers' },
+          { name: 'attachments', label: 'Attachments', type: 'array', of: 'object', optional: true,
+            properties: [
+              { name: 'filename' },
+              { name: 'mimeType' },
+              { name: 'size', type: 'integer' }
+            ]},
+          { name: 'auth', label: 'Auth Info', type: 'object', optional: true,
+            hint: 'Authentication/security flags' }
+        ]
+        
+        all_email_fields + [
           { name: 'rules_mode', control_type: 'select', default: 'none', pick_list: 'rules_modes',
             extends_schema: true, hint: 'Choose how to provide rules' },
           { name: 'rules_rows', ngIf: 'input.rules_mode == "rows"',
-            type: 'array', of: 'object', properties: Array(object_definitions['rule_rows_table']), optional: true },
-          { name: 'rules_json', ngIf: 'input.rules_mode == "json"', optional: true, control_type: 'text-area' },
-          { name: 'fallback_category', optional: true, default: 'Other' }
+            type: 'array', of: 'object', properties: Array(object_definitions['rule_rows_table']), optional: true,
+            hint: 'Define rules in table format' },
+          { name: 'rules_json', ngIf: 'input.rules_mode == "json"', optional: true, control_type: 'text-area',
+            hint: 'Paste compiled rulepack JSON' },
+          { name: 'fallback_category', optional: true, default: 'Other',
+            hint: 'Category to use when rules produce no clear result' }
         ]
       else
+        # Simple mode: just subject and body
         base
       end
     end,
