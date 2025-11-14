@@ -1805,41 +1805,45 @@ require 'securerandom'
       end,
       output_fields: lambda do |object_definitions, _connection|
         [
+          # Business outputs - records always present
           { name: 'records', type: 'array', of: 'object', properties: [
-              { name: 'id' }, 
-              { name: 'score', type: 'number' }, 
-              { name: 'rank', type: 'integer' },
-              { name: 'content' }, 
-              { name: 'metadata', type: 'object' },
+            { name: 'id' },
+            { name: 'score', type: 'number' },
+            { name: 'rank', type: 'integer' },
+            { name: 'content' },
+            { name: 'metadata', type: 'object' },
+            { name: 'llm_relevance', type: 'number' },
+            { name: 'category_alignment', type: 'number' }
+          ]},
+          
+          # Context chunks (when emit_shape = context_chunks)
+          { name: 'context_chunks', type: 'array', of: 'object', 
+            properties: object_definitions['context_chunk_standard'] + [
+              # Additional fields specific to ranking
               { name: 'llm_relevance', type: 'number' },
               { name: 'category_alignment', type: 'number' }
-            ] },
-          { name: 'context_chunks', type: 'array', of: 'object', properties: [
-              { name: 'id' }, 
-              { name: 'text' }, 
-              { name: 'score', type: 'number' },
-              { name: 'source' }, 
-              { name: 'uri' },
-              { name: 'metadata', type: 'object' },
-              { name: 'metadata_kv', type: 'array', of: 'object', properties: object_definitions['kv_pair'] },
-              { name: 'metadata_json' },
-              { name: 'llm_relevance', type: 'number' },
-              { name: 'category_alignment', type: 'number' }
-            ] },
+            ]
+          },
+          
+          # Optional confidence distribution
           { name: 'confidence_distribution', type: 'array', of: 'object', properties: [
-              { name: 'id' }, 
-              { name: 'probability', type: 'number' },
-              { name: 'reasoning' }
-            ] },
+            { name: 'id' },
+            { name: 'probability', type: 'number' },
+            { name: 'reasoning' }
+          ]},
+          
+          # Metadata about the ranking operation
           { name: 'ranking_metadata', type: 'object', properties: [
-              { name: 'category' },
-              { name: 'llm_model' },
-              { name: 'contexts_filtered', type: 'integer' },
-              { name: 'contexts_ranked', type: 'integer' }
-            ] },
-          { name: 'complete_output', type: 'object', hint: 'All outputs consolidated for easy downstream use' },
-          { name: 'facets', type: 'object', optional: true, hint: 'Analytics facets when available' }
-        ] + Array(object_definitions['envelope_fields_1'])
+            { name: 'category' },
+            { name: 'llm_model' },
+            { name: 'contexts_filtered', type: 'integer' },
+            { name: 'contexts_ranked', type: 'integer' }
+          ]},
+          
+          # Standard fields
+          { name: 'complete_output', type: 'object' },
+          { name: 'facets', type: 'object', optional: true }
+        ] + call(:standard_operational_outputs)
       end,
       execute: lambda do |connection, input|
         ctx = call(:step_begin!, :rank_texts_with_ranking_api, input)
