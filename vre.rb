@@ -565,6 +565,33 @@ require 'securerandom'
           { name: 'processing_error', type: 'boolean', optional: true }
         ]
       end
+    },
+    # Enhanced intent classification with richer types
+    intent_classification_enhanced: {
+      fields: lambda do |_connection, _config_fields|
+        [
+          { name: 'label', hint: 'Intent type detected' },
+          { name: 'confidence', type: 'number' },
+          { name: 'basis', hint: 'How intent was determined' },
+          { name: 'sub_type', optional: true, hint: 'More specific intent category' }
+        ]
+      end
+    },
+    # Combined policy + intent response
+    policy_with_intent: {
+      fields: lambda do |_connection, _config_fields|
+        [
+          { name: 'decision', hint: 'IRRELEVANT/REVIEW/KEEP' },
+          { name: 'confidence', type: 'number' },
+          { name: 'intent', type: 'object', properties: [
+            { name: 'label' },
+            { name: 'confidence', type: 'number' },
+            { name: 'sub_type', optional: true }
+          ]},
+          { name: 'matched_signals', type: 'array', of: 'string' },
+          { name: 'reasons', type: 'array', of: 'string' }
+        ]
+      end
     }
   },
 
@@ -576,9 +603,8 @@ require 'securerandom'
       description: 'Pre-screen/filter that evaluates an email against rules and heuristically infers intent',
       display_priority: 510,
       help: lambda do |_|
-        { body: 'Deterministic evaluation of an email against rules and signals with coarse inference of intent.' }
+        { body: 'Coarse evaluation of an email against rules.' }
       end,
-
       config_fields: [
         { name: 'show_advanced', label: 'Show advanced options',
           type: 'boolean', control_type: 'checkbox',
@@ -586,151 +612,124 @@ require 'securerandom'
           hint: 'Toggle to reveal advanced parameters.' }
       ],
       input_fields: lambda do |object_definitions, connection, config_fields|
-        call(:ui_df_inputs, object_definitions, config_fields) +
+        call(:ui_df_inputs_simplified, object_definitions, config_fields) +
           Array(object_definitions['observability_input_fields'])
       end,
       output_fields: lambda do |object_definitions, connection|
         [
-          { name: 'pre_filter', type: 'object', 
-            properties: object_definitions['policy_decision'] },  # <-- Reuse
-          { name: 'intent', type: 'object',
-            properties: object_definitions['intent_classification'] },  # <-- Reuse
+          { name: 'passed', type: 'boolean', 
+            hint: 'True if email passes all hard rules' },
+          { name: 'hard_block', type: 'boolean' },
+          { name: 'hard_reason', hint: 'e.g., forwarded_chain, safety_block' },
+          { name: 'email_type', hint: 'direct_request, forwarded_chain, etc.' },
           { name: 'email_text' },
-          { name: 'email_type' },
+          { name: 'soft_score', type: 'integer', hint: 'Soft signals score if rules configured' },
           { name: 'gate', type: 'object',
-            properties: object_definitions['pipeline_gate'] },  # <-- Reuse
+            properties: object_definitions['pipeline_gate'] },
           { name: 'complete_output', type: 'object' },
           { name: 'facets', type: 'object', optional: true }
         ] + call(:standard_operational_outputs)
       end,
-
       execute: lambda do |connection, input|
         ctx = call(:step_begin!, :deterministic_filter, input)
 
         env = call(:norm_email_envelope!, (input['email'] || input))
         subj, body, email_text = env['subject'], env['body'], env['email_text']
-        #subj = (input['subject'] || '').to_s.strip
-        #body = (input['body']    || '').to_s.strip
-        #error('Provide subject and/or body') if subj.empty? && body.empty?
-        #email_text = call(:build_email_text, subj, body)
 
         # Build/choose rulepack
-        rules =
-          if input['rules_mode'] == 'json' && input['rules_json'].present?
-            call(:safe_json, input['rules_json'])
-          elsif input['rules_mode'] == 'rows' && Array(input['rules_rows']).any?
-            call(:hr_compile_rulepack_from_rows!, input['rules_rows'])
-          else
-            nil
-          end
+        rules = nil
+        if input['rules_mode'] == 'json' && input['rules_json'].present?
+          rules = call(:safe_json, input['rules_json'])
+        elsif input['rules_mode'] == 'rows' && Array(input['rules_rows']).any?
+          rules = call(:hr_compile_rulepack_from_rows!, input['rules_rows'])
+        end
 
-        pre = { 'hit' => false }
+        # Defaults
         email_type = 'direct_request'
         hard_block = false
         hard_reason = nil
+        soft_score = 0
+        preliminary_decision = 'KEEP'
+
         if rules.is_a?(Hash)
+          # Check hard rules
           hard = call(:hr_eval_hard?, {
-            'subject'=>subj, 'body'=>body, 'from'=>env['from'],
-            'headers'=>env['headers'], 'attachments'=>env['attachments'], 'auth'=>env['auth']
+            'subject' => subj, 
+            'body' => body, 
+            'from' => env['from'],
+            'headers' => env['headers'], 
+            'attachments' => env['attachments'], 
+            'auth' => env['auth']
           }, (rules['hard_exclude'] || {}))
 
           if hard[:hit]
-            hard_reason = hard[:reason] # e.g., forwarded_chain | internal_discussion | mailing_list | bounce | safety_block
-            # Map hard reasons to a deterministic decision and email_type
-            decision_map = {
-              'forwarded_chain'     => 'REVIEW',
-              'internal_discussion' => 'REVIEW',
-              'mailing_list'        => 'IRRELEVANT',
-              'bounce'              => 'IRRELEVANT',
-              'safety_block'        => 'REVIEW'
-            }
-            email_type = 'forwarded_chain'     if hard_reason == 'forwarded_chain'
-            email_type = 'internal_discussion' if hard_reason == 'internal_discussion'
-            hard_block = %w[forwarded_chain internal_discussion safety_block mailing_list bounce].include?(hard_reason)
-            dec = (decision_map[hard_reason] || 'IRRELEVANT')
-            gate = { 'prelim_pass'=>false, 'hard_block'=>hard_block, 'hard_reason'=>hard_reason, 'soft_score'=>0, 'decision'=>dec, 'generator_hint'=>'blocked' }
-            out = {
-              'pre_filter' => hard.merge({ 'decision' => dec }),
-              'intent'     => nil,
-              'email_text' => email_text,
-              'email_type' => email_type,
-              'gate'       => gate
-            }
-            # Compute facets
-            return call(:step_ok!, ctx, out, 200, 'OK', { 
-              'decision_path' => 'hard_exit',
-              'final_decision' => dec,
-              'hard_rule_triggered' => hard[:reason],
-              'rules_evaluated' => true,
-              'intent_label' => 'none',
-              'email_length' => email_text.length
-            })
+            hard_reason = hard[:reason]
+            
+            # Map hard reasons to email type
+            case hard_reason
+            when 'forwarded_chain'
+              email_type = 'forwarded_chain'
+              hard_block = true
+              preliminary_decision = 'REVIEW'
+            when 'internal_discussion'
+              email_type = 'internal_discussion'
+              hard_block = true
+              preliminary_decision = 'REVIEW'
+            when 'mailing_list', 'bounce'
+              email_type = hard_reason
+              hard_block = true
+              preliminary_decision = 'IRRELEVANT'
+            when 'safety_block'
+              email_type = 'blocked'
+              hard_block = true
+              preliminary_decision = 'REVIEW'
+            end
           end
 
-          soft = call(:hr_eval_soft, {
-            'subject'=>subj, 'body'=>body, 'from'=>env['from'],
-            'headers'=>env['headers'], 'attachments'=>env['attachments']
-          }, (rules['soft_signals'] || []))
-          decision = call(:hr_eval_decide, soft[:score], (rules['thresholds'] || {}))
-          pre = { 'hit'=>false, 'score'=>soft[:score], 'matched_signals'=>soft[:matched], 'decision'=>decision }
+          # If not hard blocked, check soft signals
+          unless hard_block
+            soft = call(:hr_eval_soft, {
+              'subject' => subj, 
+              'body' => body, 
+              'from' => env['from'],
+              'headers' => env['headers'], 
+              'attachments' => env['attachments']
+            }, (rules['soft_signals'] || []))
+            
+            soft_score = soft[:score] || 0
+            preliminary_decision = call(:hr_eval_decide, soft_score, (rules['thresholds'] || {}))
+          end
         end
 
-        # Lightweight intent (deterministic)
-        headers = (env['headers'] || {}).transform_keys(&:to_s)
-        s = "#{subj}\n\n#{body}".downcase
-        intent = { 'label' => 'unknown', 'confidence' => 0.0, 'basis' => 'deterministic' }
-        if headers['auto-submitted'].to_s.downcase != '' && headers['auto-submitted'].to_s.downcase != 'no'
-          intent = { 'label'=>'auto_reply','confidence'=>0.95,'basis'=>'header:auto-submitted' }
-        elsif headers.key?('x-autoreply') || s =~ /(out of office|auto.?reply|automatic reply)/
-          intent = { 'label'=>'auto_reply','confidence'=>0.9,'basis'=>'header/subject' }
-        elsif headers.key?('list-unsubscribe') || headers.key?('list-id') || headers['precedence'].to_s =~ /(bulk|list)/i
-          intent = { 'label'=>'marketing','confidence'=>0.8,'basis'=>'list-headers' }
-        elsif s =~ /(invoice|receipt|order\s?#|shipment|ticket\s?#)/i
-          intent = { 'label'=>'transactional','confidence'=>0.7,'basis'=>'keywords' }
-        end
-
-        # Preliminary generator gate (upstream of policy): block if any hard_block; require direct_request; disallow IRRELEVANT
-        prelim_pass = (!hard_block) && (email_type == 'direct_request') && (pre['decision'] != 'IRRELEVANT')
+        # Build gate
         gate = {
-          'prelim_pass'    => prelim_pass,
-          'hard_block'     => hard_block,
-          'hard_reason'    => hard_reason,
-          'soft_score'     => pre['score'] || 0,
-          'decision'       => pre['decision'],
-          'generator_hint' => (prelim_pass ? 'pass' : 'blocked')
+          'prelim_pass' => !hard_block && email_type == 'direct_request',
+          'hard_block' => hard_block,
+          'hard_reason' => hard_reason,
+          'soft_score' => soft_score,
+          'decision' => preliminary_decision,
+          'generator_hint' => (hard_block ? 'blocked' : 'check_policy')
         }
 
-        # Standard outputs
         out = {
-          'pre_filter' => pre,
-          'intent'     => intent,
+          'passed' => !hard_block,
+          'hard_block' => hard_block,
+          'hard_reason' => hard_reason,
+          'email_type' => email_type,
           'email_text' => email_text,
-          'email_type' => email_type,
-          'gate'       => gate
+          'soft_score' => soft_score,
+          'gate' => gate
         }
-        out['signals_intent'] = intent['label']
-        out['signals_intent_confidence'] = intent['confidence']
-        # Compute facets
+
         call(:step_ok!, ctx, out, 200, 'OK', { 
-          'decision_path' => 'soft_eval',
-          'final_decision' => pre['decision'],
-          'intent_label' => intent['label'],
-          'intent_confidence' => intent['confidence'],
-          'intent_basis' => intent['basis'],
-          'soft_score' => pre['score'] || 0,
-          'signals_matched' => (pre['matched_signals'] || []).length,
-          'rules_evaluated' => rules.is_a?(Hash),
-          'hard_rules_count' => rules.is_a?(Hash) ? (rules['hard_exclude'] || {}).values.flatten.length : 0,
-          'soft_signals_count' => rules.is_a?(Hash) ? (rules['soft_signals'] || []).length : 0,
-          'has_attachments' => env['attachments'].present? && env['attachments'].any?,
-          'email_length' => email_text.length,
-          'special_headers' => headers.keys.any? { |k| k.match(/^(x-|list-|auto-|precedence)/i) },
+          'hard_blocked' => hard_block,
           'email_type' => email_type,
-          'generator_hint' => gate['generator_hint']
+          'soft_score' => soft_score,
+          'rules_evaluated' => rules.is_a?(Hash)
         })
-      end,
+      end, 
       sample_output: lambda do
-        call(:sample_deterministic_filter)
+        call(:sample_deterministic_filter_simplified)
       end
     },
     ai_policy_filter: {
@@ -741,29 +740,39 @@ require 'securerandom'
       help: lambda do |_|
         { body: 'Constrained LLM decides IRRELEVANT/REVIEW/KEEP. Returns results as JSON.' }
       end,
-
       config_fields: [
         { name: 'show_advanced', label: 'Show advanced options',
           type: 'boolean', control_type: 'checkbox',
           default: false, sticky: true, extends_schema: true,
           hint: 'Toggle to reveal advanced parameters.' }
-      ],
+      ],  
       input_fields: lambda do |object_definitions, connection, config_fields|
-        call(:ui_policy_inputs, object_definitions, config_fields) +
+        call(:ui_policy_inputs_enhanced, object_definitions, config_fields) +
           Array(object_definitions['observability_input_fields'])
       end,
       output_fields: lambda do |object_definitions, connection|
         [
+          # Triage outputs
           { name: 'policy', type: 'object',
-            properties: object_definitions['policy_decision'] },  # <-- Reuse
+            properties: object_definitions['policy_decision'] },
+          
+          # Intent outputs (NEW)
+          { name: 'intent', type: 'object',
+            properties: object_definitions['intent_classification'] },
+          
           { name: 'short_circuit', type: 'boolean' },
           { name: 'email_type' },
-          { name: 'generator_gate', type: 'object',
-            properties: [
-              { name: 'pass_to_responder', type: 'boolean' },
-              { name: 'reason' },
-              { name: 'generator_hint' }
-            ]},
+          
+          { name: 'generator_gate', type: 'object', properties: [
+            { name: 'pass_to_responder', type: 'boolean' },
+            { name: 'reason' },
+            { name: 'generator_hint' }
+          ]},
+          
+          # Pass-through signals for downstream
+          { name: 'signals_intent' },
+          { name: 'signals_intent_confidence', type: 'number' },
+          
           { name: 'complete_output', type: 'object' },
           { name: 'facets', type: 'object', optional: true }
         ] + call(:standard_operational_outputs)
@@ -773,192 +782,177 @@ require 'securerandom'
         
         begin
           # Build model path
-          model_path = call(:build_model_path_with_global_preview, connection, (input['model'] || 'gemini-2.0-flash'))
-          loc = (model_path[/\/locations\/([^\/]+)/,1] || (connection['location'].presence || 'global')).to_s.downcase
+          model = input['model'] || 'gemini-2.0-flash'
+          model_path = call(:build_model_path_with_global_preview, connection, model)
+          loc = (model_path[/\/locations\/([^\/]+)/,1] || 'global').to_s.downcase
           url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
           req_params = "model=#{model_path}"
 
-          # Parse policy specification using safe helpers
-          policy_spec = nil
-          output_format = nil
-          llm_config = {}
+          # Get intent types configuration
+          intent_types = input['intent_types'] || 
+                        ['information_request', 'action_request', 'status_inquiry', 
+                        'complaint', 'auto_reply', 'unknown']
           
-          if input['policy_mode'].to_s == 'json' && input['policy_json'].present?
-            begin
-              parsed_policy = call(:safe_json_obj!, input['policy_json'])
-              
-              if parsed_policy.is_a?(Hash)
-                # Check for nested policy_config first
-                if parsed_policy['policy_config'].is_a?(Hash)
-                  policy_spec = parsed_policy['policy_config']
-                  # Only assign output_format if it's a Hash with the expected structure
-                  temp = policy_spec['output_format']
-                  if temp.is_a?(Hash) && temp['structure'].is_a?(Hash)
-                    output_format = temp
-                  end
-                else
-                  policy_spec = parsed_policy
-                  # Only assign output_format if it's a Hash with the expected structure
-                  temp = parsed_policy['output_format']
-                  if temp.is_a?(Hash) && temp['structure'].is_a?(Hash)
-                    output_format = temp
-                  end
-                end
-                
-                # Only call build_llm_config_from_schema if we have a valid output_format
-                if output_format.is_a?(Hash) && output_format['structure'].is_a?(Hash)
-                  llm_config = call(:build_llm_config_from_schema, output_format)
-                  llm_config = {} unless llm_config.is_a?(Hash)
-                end
-              end
-            rescue => e
-              # Log but continue with defaults
-              policy_spec = nil
-              output_format = nil
-              llm_config = {}
-            end
-          end
-          
-          # Build system text
+          actionable_intents = input['actionable_intents'] || 
+                              ['information_request', 'action_request']
+
+          # Build enhanced system text with intent
           system_text = <<~SYS
-            You are a strict email policy triage. Your ENTIRE response must be valid JSON.
+            You are a strict email classification system. Your ENTIRE response must be valid JSON.
             
-            CRITICAL OUTPUT REQUIREMENTS:
-            1. Output ONLY valid JSON - no text before or after
-            2. DO NOT include markdown formatting or code blocks
-            3. Use EXACTLY these field names (case-sensitive):
-              - decision: must be exactly one of: "IRRELEVANT", "REVIEW", "KEEP"
-              - confidence: number between 0 and 1
-              - matched_signals: array of strings (max 10 items)
-              - reasons: array of strings (max 5 items)
-            4. ALL fields are required
+            Classify the email with TWO tasks:
+            1. TRIAGE decision: Is this email relevant and how should it be handled?
+            2. INTENT detection: What is the user trying to accomplish?
+            
+            TRIAGE DECISIONS:
+            - IRRELEVANT: Not relevant to HR, spam, newsletters, auto-generated
+            - REVIEW: Needs human review (complaints, complex, sensitive)
+            - KEEP: Valid request that can be handled automatically
+            
+            INTENT TYPES:
+            - information_request: Asking for information, policies, or procedures
+            - action_request: Requesting a specific action (approval, document generation)
+            - status_inquiry: Checking status of existing request
+            - complaint: Expressing dissatisfaction or escalation
+            - auto_reply: Out-of-office, bounce, or automated response
+            - unknown: Cannot determine clear intent
+            
+            CRITICAL: Output ONLY valid JSON. No text before or after.
             
             Example valid response:
-            {"decision":"KEEP","confidence":0.85,"matched_signals":["direct_question"],"reasons":["Clear PTO request"]}
+            {"decision":"KEEP","confidence":0.85,"intent":"information_request","intent_confidence":0.9,"matched_signals":["policy_question"],"reasons":["Clear PTO policy inquiry"]}
           SYS
-          
-          # Safe additions to system text
-          if output_format.is_a?(Hash) && output_format['instructions'].is_a?(String)
-            system_text += "\n\n#{output_format['instructions']}"
-          end
-          
-          if llm_config.is_a?(Hash) && llm_config['prompt_addition'].is_a?(String)
-            system_text += llm_config['prompt_addition']
-          end
-          
-          if policy_spec.is_a?(Hash)
-            system_text += "\n\nPolicy spec JSON:\n#{call(:json_compact, policy_spec)}"
+
+          # Add custom policy if provided
+          if input['policy_json'].present? && input['policy_mode'] == 'json'
+            policy_spec = call(:safe_json_obj!, input['policy_json'])
+            if policy_spec.is_a?(Hash)
+              system_text += "\n\nAdditional policy rules:\n#{call(:json_compact, policy_spec)}"
+            end
           end
 
-          # Build generation config with safe defaults
-          gen_config = if llm_config.is_a?(Hash) && llm_config['response_schema'].is_a?(Hash)
-            {
-              'temperature' => 0,
-              'maxOutputTokens' => 256,
-              'responseMimeType' => 'application/json',
-              'responseSchema' => llm_config['response_schema']
-            }
-          else
-            {
-              'temperature' => 0, 
-              'maxOutputTokens' => 256,
-              'responseMimeType' => 'application/json',
-              'responseSchema' => {
-                'type' => 'object',
-                'additionalProperties' => false,
-                'properties' => {
-                  'decision' => {'type' => 'string'},
-                  'confidence' => {'type' => 'number'},
-                  'matched_signals' => {'type' => 'array','items' => {'type' => 'string'}},
-                  'reasons' => {'type' => 'array','items' => {'type' => 'string'}}
-                }, 
-                'required' => ['decision']
+          # Build response schema with intent
+          response_schema = {
+            'type' => 'object',
+            'additionalProperties' => false,
+            'properties' => {
+              'decision' => {
+                'type' => 'string',
+                'enum' => ['IRRELEVANT', 'REVIEW', 'KEEP']
+              },
+              'confidence' => { 
+                'type' => 'number', 
+                'minimum' => 0, 
+                'maximum' => 1 
+              },
+              'intent' => { 
+                'type' => 'string', 
+                'enum' => intent_types 
+              },
+              'intent_confidence' => { 
+                'type' => 'number', 
+                'minimum' => 0, 
+                'maximum' => 1 
+              },
+              'matched_signals' => {
+                'type' => 'array',
+                'items' => { 'type' => 'string' },
+                'maxItems' => 10
+              },
+              'reasons' => {
+                'type' => 'array',
+                'items' => { 'type' => 'string' },
+                'maxItems' => 5
               }
-            }
-          end
+            },
+            'required' => ['decision', 'confidence', 'intent']
+          }
 
-          # Build the request payload
+          # Build generation config
+          gen_config = {
+            'temperature' => (input['temperature'] || 0).to_f,
+            'maxOutputTokens' => 512,
+            'responseMimeType' => 'application/json',
+            'responseSchema' => response_schema
+          }
+
+          # Build request payload
           payload = {
-            'systemInstruction' => { 'role' => 'system','parts' => [{'text' => system_text}] },
-            'contents' => [ { 'role' => 'user', 'parts' => [ { 'text' => "Email:\n#{input['email_text']}" } ] } ],
+            'systemInstruction' => { 
+              'role' => 'system', 
+              'parts' => [{'text' => system_text}] 
+            },
+            'contents' => [
+              { 
+                'role' => 'user', 
+                'parts' => [{ 'text' => "Email:\n#{input['email_text']}" }] 
+              }
+            ],
             'generationConfig' => gen_config
           }
 
-          # Make the API request
-          resp = post(url).headers(call(:request_headers_auth, connection, ctx['cid'], connection['user_project'], req_params))
-                          .payload(call(:json_compact, payload))
+          # Make API request
+          resp = post(url)
+                  .headers(call(:request_headers_auth, connection, ctx['cid'], 
+                              connection['user_project'], req_params))
+                  .payload(call(:json_compact, payload))
           
-          # Use extract_candidate_text helper for safe navigation
+          # Parse response
           text, meta = call(:extract_candidate_text, resp)
           
-          # Parse the response text
-          policy = { 
-            'decision' => 'REVIEW', 
-            'confidence' => 0.0, 
-            'matched_signals' => [], 
-            'reasons' => ['Default fallback'] 
+          # Parse JSON with defaults
+          parsed = {}
+          if text.is_a?(String) && text.length > 0
+            clean_text = text.gsub(/```json\n?/, '').gsub(/```\n?/, '').strip
+            parsed = call(:safe_json, clean_text) || {}
+          end
+          
+          # Extract and validate fields
+          decision = (parsed['decision'] || 'REVIEW').to_s
+          unless ['IRRELEVANT', 'REVIEW', 'KEEP'].include?(decision)
+            decision = 'REVIEW'
+          end
+          
+          confidence = [[call(:safe_float, parsed['confidence']) || 0.0, 0.0].max, 1.0].min
+          
+          intent = (parsed['intent'] || 'unknown').to_s
+          unless intent_types.include?(intent)
+            intent = 'unknown'
+          end
+          
+          intent_confidence = [[call(:safe_float, parsed['intent_confidence']) || confidence, 0.0].max, 1.0].min
+          
+          # Build policy and intent objects
+          policy = {
+            'decision' => decision,
+            'confidence' => confidence,
+            'matched_signals' => call(:safe_array, parsed['matched_signals']),
+            'reasons' => call(:safe_array, parsed['reasons'])
           }
           
-          if text.is_a?(String) && text.length > 0
-            # Clean the text
-            clean_text = text.gsub(/```json\n?/, '').gsub(/```\n?/, '').strip
-            
-            # Try to parse JSON
-            if clean_text.start_with?('{')
-              parsed = call(:safe_json, clean_text)
-              if parsed.is_a?(Hash)
-                policy = parsed
-              end
-            else
-              # Try to extract JSON from text
-              json_match = clean_text.match(/\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}/)
-              if json_match
-                parsed = call(:safe_json, json_match[0])
-                if parsed.is_a?(Hash)
-                  policy = parsed
-                end
-              end
-            end
-          elsif meta.is_a?(Hash) && meta['promptFeedback'].is_a?(Hash)
-            # Handle blocked content
-            policy['reasons'] = ["Content blocked: #{meta['promptFeedback']['blockReason'] || 'unknown'}"]
-          end
-          
-          # Ensure required fields with safe defaults
-          policy['decision'] = (policy['decision'] || 'REVIEW').to_s
-          policy['confidence'] = call(:safe_float, policy['confidence']) || 0.0
-          policy['matched_signals'] = call(:safe_array, policy['matched_signals'])
-          policy['reasons'] = call(:safe_array, policy['reasons'])
-          
-          # Apply schema validation if we have a valid schema
-          if output_format.is_a?(Hash) && output_format['structure'].is_a?(Hash)
-            # Use validate_against_schema instead of validate_policy_schema!
-            policy = call(:validate_against_schema, policy, output_format, true)
-          end
-          
-          # Ensure valid decision
-          valid_decisions = ['IRRELEVANT', 'REVIEW', 'KEEP']
-          unless valid_decisions.include?(policy['decision'])
-            policy['decision'] = 'REVIEW'
-          end
-          
-          # Clamp confidence to [0,1]
-          policy['confidence'] = [[policy['confidence'], 0.0].max, 1.0].min
+          intent_obj = {
+            'label' => intent,
+            'confidence' => intent_confidence,
+            'basis' => 'llm_classification'
+          }
           
           # Calculate short circuit
-          short_circuit = (policy['decision'] == 'IRRELEVANT' && 
-                          policy['confidence'] >= (input['confidence_short_circuit'] || 0.8).to_f)
+          short_circuit = (decision == 'IRRELEVANT' && 
+                          confidence >= (input['confidence_short_circuit'] || 0.8).to_f)
 
-          # Generator gate logic
-          email_type = (input['email_type'].presence || 'direct_request')
-          min_conf = (input['min_confidence_for_generation'].presence || 0.60).to_f
-          decision = policy['decision'].to_s.upcase
-          conf = policy['confidence'].to_f
+          # Generator gate logic with intent check
+          email_type = input['email_type'] || 'direct_request'
+          min_conf = (input['min_confidence_for_generation'] || 0.60).to_f
           
           block_reasons = []
           block_reasons << 'non_direct_request' if email_type != 'direct_request'
           block_reasons << 'policy_irrelevant' if decision == 'IRRELEVANT'
-          block_reasons << 'low_confidence' if conf < min_conf
+          block_reasons << 'low_confidence' if confidence < min_conf
+          
+          # Check intent gate (NEW)
+          if input['require_actionable_intent'] && !actionable_intents.include?(intent)
+            block_reasons << "non_actionable_intent:#{intent}"
+          end
           
           pass_to_responder = block_reasons.empty?
           generator_hint = pass_to_responder ? 'pass' : 'blocked'
@@ -966,29 +960,25 @@ require 'securerandom'
           # Build output
           out = {
             'policy' => policy,
+            'intent' => intent_obj,
             'short_circuit' => short_circuit,
             'email_type' => email_type,
             'generator_gate' => {
               'pass_to_responder' => pass_to_responder,
-              'reason' => (block_reasons.any? ? block_reasons.join(',') : 'meets_minimums'),
+              'reason' => block_reasons.any? ? block_reasons.join(',') : 'meets_requirements',
               'generator_hint' => generator_hint
-            }
+            },
+            'signals_intent' => intent,
+            'signals_intent_confidence' => intent_confidence
           }
-          out['signals_intent'] = input['signals_intent'] || 'unknown'
-          out['signals_intent_confidence'] = input['signals_intent_confidence'] || 0.0
           
-          # Build facets and complete output
           call(:step_ok!, ctx, out, call(:telemetry_success_code, resp), 'OK', {
-            'decision' => policy['decision'],
-            'confidence' => policy['confidence'],
+            'decision' => decision,
+            'confidence' => confidence,
+            'intent' => intent,
+            'intent_confidence' => intent_confidence,
             'short_circuit' => short_circuit,
-            'email_type' => email_type,
-            'generator_hint' => generator_hint,
-            'signals_count' => policy['matched_signals'].length,
-            'reasons_count' => policy['reasons'].length,
-            'model_used' => input['model'] || 'gemini-2.0-flash',
-            'policy_mode' => input['policy_mode'] || 'none',
-            'schema_enhanced' => output_format.is_a?(Hash) && output_format.any?
+            'generator_hint' => generator_hint
           })
           
         rescue => e
@@ -996,7 +986,7 @@ require 'securerandom'
         end
       end,
       sample_output: lambda do
-        call(:sample_ai_policy_filter)
+        call(:sample_ai_policy_filter_enhanced)
       end
     },
     embed_text_against_categories: {
@@ -2332,80 +2322,51 @@ require 'securerandom'
         'correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
       }
     end,
-    sample_ai_policy_filter: lambda do
-      policy = {
-        'decision' => 'REVIEW',
-        'confidence' => 0.62,
-        'matched_signals' => ['low_detail', 'missing_context'],
-        'reasons' => ['thin context', 'needs review']
+    sample_deterministic_filter_simplified: lambda do
+      {
+        'passed' => true,
+        'hard_block' => false,
+        'hard_reason' => nil,
+        'email_type' => 'direct_request',
+        'email_text' => "Subject: PTO Request\n\nBody: I'd like to request...",
+        'soft_score' => 3,
+        'gate' => {
+          'prelim_pass' => true,
+          'hard_block' => false,
+          'hard_reason' => nil,
+          'soft_score' => 3,
+          'decision' => 'KEEP',
+          'generator_hint' => 'check_policy'
+        },
+        'ok' => true,
+        'op_telemetry' => call(:sample_telemetry, 8)
       }
-      
-      business_data = {
-        'policy' => policy,
+    end,
+    sample_ai_policy_filter_enhanced: lambda do
+      {
+        'policy' => {
+          'decision' => 'KEEP',
+          'confidence' => 0.85,
+          'matched_signals' => ['direct_question', 'policy_reference'],
+          'reasons' => ['Clear PTO policy question']
+        },
+        'intent' => {
+          'label' => 'information_request',
+          'confidence' => 0.92,
+          'basis' => 'llm_classification'
+        },
         'short_circuit' => false,
         'email_type' => 'direct_request',
         'generator_gate' => {
           'pass_to_responder' => true,
-          'reason' => 'meets_minimums',
+          'reason' => 'meets_requirements',
           'generator_hint' => 'pass'
-        }
-      }
-      
-      business_data.merge({
-        'complete_output' => business_data.dup,
-        'facets' => {
-          'decision' => 'REVIEW',
-          'confidence' => 0.62
         },
+        'signals_intent' => 'information_request',
+        'signals_intent_confidence' => 0.92,
         'ok' => true,
-        'op_correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
-        'op_telemetry' => call(:sample_telemetry, 20)
-      })
-    end,
-    sample_deterministic_filter: lambda do
-      # Using our object definitions structure
-      pre_filter = {
-        'decision' => 'REVIEW',
-        'confidence' => 0.7,
-        'matched_signals' => ['mentions_invoice', 'attachment_pdf'],
-        'reasons' => ['Contains invoice reference']
+        'op_telemetry' => call(:sample_telemetry, 45)
       }
-      
-      intent = {
-        'label' => 'transactional',
-        'confidence' => 0.7,
-        'basis' => 'keywords'
-      }
-      
-      gate = {
-        'prelim_pass' => true,
-        'hard_block' => false,
-        'hard_reason' => nil,
-        'soft_score' => 3,
-        'decision' => 'REVIEW',
-        'generator_hint' => 'pass'
-      }
-      
-      business_data = {
-        'pre_filter' => pre_filter,
-        'intent' => intent,
-        'email_text' => "Subject: Invoice #12345\n\nBody: Please find attached...",
-        'email_type' => 'direct_request',
-        'gate' => gate
-      }
-      
-      # Standard structure
-      business_data.merge({
-        'complete_output' => business_data.dup,
-        'facets' => {
-          'decision_path' => 'soft_eval',
-          'final_decision' => 'REVIEW',
-          'intent_label' => 'transactional'
-        },
-        'ok' => true,
-        'op_correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
-        'op_telemetry' => call(:sample_telemetry, 12)
-      })
     end,
     sample_embed_text_against_categories: lambda do
       scores = [
@@ -3863,85 +3824,106 @@ require 'securerandom'
     ui_truthy: lambda do |v|
       (v == true) || (v.to_s.downcase == 'true') || (v.to_s == '1')
     end,
-    ui_df_inputs: lambda do |object_definitions, cfg|
+    ui_df_inputs_simplified: lambda do |object_definitions, cfg|
       show_adv = call(:ui_truthy, cfg['show_advanced'])
       
-      # Always visible fields
+      # Simplified base - no intent-related fields
       base = [
-        { name: 'subject', label: 'Email Subject', optional: false, 
-          hint: 'Subject line of the email to filter' },
-        { name: 'body', label: 'Email Body', optional: false, control_type: 'text-area',
-          hint: 'Body content of the email' },
-        { name: 'fallback_category', label: 'Fallback Category', optional: true, default: 'Other',
-          hint: 'Category to use when rules produce no clear result' },
+        { name: 'email', type: 'object', optional: false, properties: [
+          { name: 'subject', optional: false, hint: 'Email subject line' },
+          { name: 'body', optional: false, control_type: 'text-area', hint: 'Email body content' },
+          { name: 'from', optional: true, hint: 'Sender email address' }
+        ]},
+        
         { name: 'rules_mode', label: 'Rules Mode', control_type: 'select', 
-          default: 'none', pick_list: 'rules_modes',
-          extends_schema: true,  # ← THIS IS KEY! Makes the UI rebuild when changed
+          default: 'none', pick_list: 'rules_modes', extends_schema: true,
           hint: 'Choose how to provide filtering rules' },
-        # These will show/hide based on rules_mode selection
+          
         { name: 'rules_rows', label: 'Rule Definitions',
-          ngIf: 'input.rules_mode == "rows"',  # ← Shows only when mode is "rows"
-          type: 'array', of: 'object', 
+          ngIf: 'input.rules_mode == "rows"', type: 'array', of: 'object',
           properties: [
-            { name: 'rule_id', label: 'Rule ID' },
-            { name: 'family', label: 'Family', control_type: 'select',
+            { name: 'family', control_type: 'select',
               options: [['HARD','HARD'], ['SOFT','SOFT'], ['THRESHOLD','THRESHOLD']] },
-            { name: 'field', label: 'Field', control_type: 'select',
-              options: [['subject','subject'], ['body','body'], ['from','from'], 
-                      ['headers','headers'], ['attachments','attachments']] },
-            { name: 'operator', label: 'Operator', control_type: 'select',
-              options: [['contains','contains'], ['equals','equals'], ['regex','regex'],
-                      ['header_present','header_present'], ['ext_in','ext_in']] },
-            { name: 'pattern', label: 'Pattern', hint: 'Pattern to match' },
-            { name: 'weight', label: 'Weight', type: 'integer', default: 1 },
-            { name: 'action', label: 'Action', optional: true },
-            { name: 'enabled', label: 'Enabled', type: 'boolean', control_type: 'checkbox', default: true }
+            { name: 'field', control_type: 'select',
+              options: [['subject','subject'], ['body','body'], ['from','from']] },
+            { name: 'operator', control_type: 'select',
+              options: [['contains','contains'], ['regex','regex']] },
+            { name: 'pattern', hint: 'Pattern to match' },
+            { name: 'weight', type: 'integer', default: 1 },
+            { name: 'action', optional: true },
+            { name: 'enabled', type: 'boolean', control_type: 'checkbox', default: true }
           ],
-          optional: true,
-          hint: 'Add rules one by one. Each row is a rule.' },
+          optional: true, hint: 'Define rules for filtering' },
+          
         { name: 'rules_json', label: 'Rules JSON',
-          ngIf: 'input.rules_mode == "json"',  # ← Shows only when mode is "json"
-          optional: true, control_type: 'text-area',
-          hint: 'Paste a complete rulepack JSON object' }
+          ngIf: 'input.rules_mode == "json"', optional: true, control_type: 'text-area',
+          hint: 'Paste complete rulepack JSON' }
       ]
       
       if show_adv
-        # Advanced mode adds more optional email fields
         base + [
-          { name: 'from', label: 'From Address', optional: true,
-            hint: 'Sender email for rule matching' },
-          { name: 'headers', label: 'Email Headers', type: 'object', optional: true,
-            hint: 'Key-value pairs of email headers for rule matching' },
-          { name: 'attachments', label: 'Attachments', type: 'array', of: 'object', optional: true,
+          { name: 'attachments', type: 'array', of: 'object', optional: true,
             properties: [
               { name: 'filename' },
               { name: 'mimeType' },
               { name: 'size', type: 'integer' }
             ],
-            hint: 'List of attachments for rule evaluation' },
-          { name: 'auth', label: 'Auth Info', type: 'object', optional: true,
-            hint: 'Authentication/security flags (e.g., SPF, DKIM results)' }
+            hint: 'Attachments for rule evaluation' },
+          { name: 'auth', type: 'object', optional: true,
+            hint: 'Authentication flags (SPF, DKIM)' }
         ]
       else
         base
       end
     end,
-    ui_policy_inputs: lambda do |object_definitions, cfg|
+    ui_policy_inputs_enhanced: lambda do |object_definitions, cfg|
       adv = call(:ui_truthy, cfg['show_advanced'])
+      
       base = [
         { name: 'email_text', optional: false },
-        { name: 'policy_mode', label: 'Policy input mode', control_type: 'select',
-          options: [['None','none'], ['JSON','json']], default: 'none', optional: false,
-          extends_schema: true, hint: 'Switch to use JSON policy for testing.' }
+        { name: 'email_type', optional: true, default: 'direct_request',
+          hint: 'From deterministic filter (direct_request, forwarded_chain, etc.)' },
+        
+        # Intent configuration
+        { name: 'intent_types', label: 'Intent Types', type: 'array', of: 'string',
+          default: ['information_request', 'action_request', 'status_inquiry', 
+                  'complaint', 'auto_reply', 'unknown'],
+          hint: 'Intent categories to detect' },
+        
+        { name: 'actionable_intents', label: 'Actionable Intents', 
+          type: 'array', of: 'string',
+          default: ['information_request', 'action_request'],
+          hint: 'Intents that can proceed to generation' },
+        
+        { name: 'require_actionable_intent', type: 'boolean', 
+          control_type: 'checkbox', default: true,
+          hint: 'Block generation for non-actionable intents' },
+        
+        # Confidence thresholds
+        { name: 'min_confidence_for_generation', type: 'number', 
+          default: 0.60, hint: 'Minimum confidence to pass to generator' },
+        
+        { name: 'confidence_short_circuit', type: 'number', 
+          default: 0.85, hint: 'Confidence to skip downstream when IRRELEVANT' }
       ]
-      base << { name: 'model', label: 'Generative model', control_type: 'text',
-                optional: true, default: 'gemini-2.0-flash' } if adv
-      base << { name: 'policy_json', label: 'Policy JSON',
-                ngIf: 'input.policy_mode == "json"', optional: true,
-                hint: 'Paste policy spec JSON for testing (overrides defaults this run).' } if adv
-      base << { name: 'confidence_short_circuit', type: 'number', optional: true, default: 0.8,
-                hint: 'Short-circuit only when decision=IRRELEVANT and confidence ≥ this value.' }
-      base
+      
+      if adv
+        base + [
+          { name: 'model', default: 'gemini-2.0-flash' },
+          { name: 'temperature', type: 'number', default: 0 },
+          
+          { name: 'policy_mode', control_type: 'select',
+            options: [['None','none'], ['JSON','json']], 
+            default: 'none', extends_schema: true },
+            
+          { name: 'policy_json', label: 'Policy JSON',
+            ngIf: 'input.policy_mode == "json"', optional: true,
+            control_type: 'text-area',
+            hint: 'Additional policy rules in JSON format' }
+        ]
+      else
+        base
+      end
     end,
     ui_embed_inputs: lambda do |object_definitions, cfg|
       adv = call(:ui_truthy, cfg['show_advanced'])
