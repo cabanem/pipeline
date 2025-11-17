@@ -679,7 +679,7 @@ require 'securerandom'
         if input['use_advanced_rules'] == true
           # Advanced rules take precedence
           if input['rules_mode'] == 'json' && input['rules_json'].present?
-            rules = call(:safe_json, input['rules_json'])
+            rules = (call(:json_parse_safe,  input['rules_json']) rescue nil)
           elsif input['rules_mode'] == 'rows' && Array(input['rules_rows']).any?
             rules = call(:hr_compile_rulepack_from_rows!, input['rules_rows'])
           end
@@ -989,7 +989,7 @@ require 'securerandom'
         
         # Parse response
         text = resp.dig('candidates',0,'content','parts',0,'text').to_s
-        parsed = call(:safe_json, text) || {}
+        parsed = (call(:json_parse_safe, text) rescue nil)
         
         decision = (parsed['decision'] || 'HUMAN').to_s
         confidence = [[call(:safe_float, parsed['confidence']) || 0.0, 0.0].max, 1.0].min
@@ -1212,7 +1212,7 @@ require 'securerandom'
         
         # Parse response
         text = resp.dig('candidates',0,'content','parts',0,'text').to_s
-        parsed = call(:safe_json, text) || {}
+        parsed = (call(:json_parse_safe, text) rescue nil)
         
         intent = (parsed['intent'] || 'unknown').to_s
         confidence = [[call(:safe_float, parsed['confidence']) || 0.0, 0.0].max, 1.0].min
@@ -1285,7 +1285,7 @@ require 'securerandom'
         # Select categories source (array vs JSON)
         cats_raw =
           if input['categories_mode'].to_s == 'json' && input['categories_json'].present?
-            call(:safe_json_arr!, input['categories_json'])
+            call(:json_parse_safe, input['categories_json'], type: :array, required: true, allow_wrapper: true)
           else
             input['categories']
           end
@@ -1387,7 +1387,7 @@ require 'securerandom'
         # LLM listwise: reuse referee to get distribution over shortlist
         cats_raw =
           if input['categories_mode'].to_s == 'json' && input['categories_json'].present?
-            call(:safe_json_arr!, input['categories_json'])
+            call(:json_parse_safe, input['categories_json'], type: :array, required: true, allow_wrapper: true)
           else
             input['categories']
           end
@@ -1523,7 +1523,7 @@ require 'securerandom'
         # Select categories source (array vs JSON)
         cats_raw =
           if input['categories_mode'].to_s == 'json' && input['categories_json'].present?
-            call(:safe_json_arr!, input['categories_json'])
+            call(:json_parse_safe, input['categories_json'], type: :array, required: true, allow_wrapper: true)
           else
             input['categories']
           end
@@ -1601,7 +1601,7 @@ require 'securerandom'
                               .payload(req_body)
  
                txt = resp.dig('candidates',0,'content','parts',0,'text').to_s
-               parsed = call(:json_parse_gently!, txt)
+               parsed = call(:json_parse_safe, txt)
                span = parsed['salient_span'].to_s.strip
                if span.empty? || span =~ /\A(hi|hello|hey)\b[:,\s]*\z/i || span.length < 8
                  focus = email_text.to_s[0, 8000]
@@ -3371,16 +3371,6 @@ require 'securerandom'
     path_rag_retrieve_contexts: lambda do |connection|
       "/v1/projects/#{call(:ensure_project_id!, connection)}/locations/#{call(:ensure_location!, connection)}:retrieveContexts"
     end,
-    safe_parse_json: lambda do |maybe_string|
-      return maybe_string unless maybe_string.is_a?(String)
-      begin
-        parse_json(maybe_string)
-      rescue
-        # If the server lied about content-type or returned pretty text,
-        # keep the original; the caller can handle/log.
-        maybe_string
-      end
-    end,
     ensure_project_id!: lambda do |connection|
       pid = connection['project'].to_s.strip
       error('Project is required') if pid.empty?
@@ -3401,6 +3391,7 @@ require 'securerandom'
     aiplatform_host: lambda do |connection|
       "#{call(:ensure_location!, connection)}-aiplatform.googleapis.com"
     end,
+
     # --- JSON helpers (gentle, friendly errors) -------------------------------
     json_parse_gently!: lambda do |raw|
       return raw if raw.is_a?(Hash) || raw.is_a?(Array)
@@ -3418,13 +3409,13 @@ require 'securerandom'
       end
     end,
     safe_json_obj!: lambda do |raw|
-      v = call(:json_parse_gently!, raw)
+      v = call(:json_parse_safe, raw)
       error('Invalid JSON for policy: empty input') if v.nil?
       error('Invalid JSON for policy: expected object') unless v.is_a?(Hash)
       v
     end,
     safe_json_arr!: lambda do |raw|
-      v = call(:json_parse_gently!, raw)
+      v = call(:json_parse_safe, raw)
       
       # Handle object with "categories" key (common wrapper format)
       if v.is_a?(Hash) && v['categories'].is_a?(Array)
@@ -3433,6 +3424,96 @@ require 'securerandom'
       
       error('Invalid JSON for categories: expected array or object with "categories" array') unless v.is_a?(Array)
       v
+    end,
+    safe_json: lambda do |body|
+      begin
+        case body
+        when String then JSON.parse(body)
+        when Hash, Array then body # already JSON-like
+        else JSON.parse(body.to_s)
+        end
+      rescue
+        nil
+      end
+    end,
+    safe_parse_json: lambda do |maybe_string|
+      return maybe_string unless maybe_string.is_a?(String)
+      begin
+        call(:json_parse_safe, maybe_string)
+      rescue
+        # If the server lied about content-type or returned pretty text,
+        # keep the original; the caller can handle/log.
+        maybe_string
+      end
+    end,
+    safe_obj: lambda do |v|
+      call(:sanitize_hash, v)
+    end,
+
+    safe_array_of_hashes: lambda do |v|
+      arr = call(:safe_array, v)
+      arr.map do |x|
+        if x.is_a?(Hash)
+          x
+        elsif x.is_a?(String)
+          call(:json_parse_safe, x, type: :hash) rescue nil
+        else
+          nil
+        end
+      end.compact
+    end,
+    # PRIMARY JSON PARSER - Single source of truth for all JSON parsing
+    json_parse_safe: lambda do |raw, type: nil, required: false, allow_wrapper: false|
+      # Handle pre-parsed objects
+      return raw if raw.is_a?(Hash) || raw.is_a?(Array)
+      
+      # Handle nil/empty
+      s = raw.to_s.strip
+      if s.empty?
+        return nil unless required
+        error("Invalid JSON: empty input#{type ? " for #{type}" : ''}")
+      end
+      
+      # Check for common errors BEFORE parsing
+      if s.include?('=>')
+        error('Invalid JSON: looks like a Ruby hash (=>). Convert to JSON (":" and double quotes).')
+      end
+      
+      # Check for smart quotes (common copy-paste error)
+      if s.match(/[""''`´]/)
+        error('Invalid JSON: contains smart quotes or backticks. Use standard double quotes (").')
+      end
+      
+      # Parse with error handling
+      begin
+        parsed = JSON.parse(s)
+      rescue JSON::ParserError => e
+        # Provide helpful error context
+        head = s.gsub(/[\r\n\t]/, ' ')[0, 120]
+        error("Invalid JSON: #{e.message.split(':').first}. Starts with: #{head.inspect}")
+      end
+      
+      # Type validation if requested
+      case type
+      when :hash, :object
+        unless parsed.is_a?(Hash)
+          error("Invalid JSON: expected object/hash, got #{parsed.class}")
+        end
+      when :array
+        # Handle wrapper objects like {categories: [...]} or {items: [...]}
+        if allow_wrapper && parsed.is_a?(Hash)
+          # Look for common wrapper patterns
+          wrapped = parsed['categories'] || parsed['items'] || parsed['data'] || parsed['results']
+          if wrapped.is_a?(Array)
+            return wrapped
+          end
+        end
+        unless parsed.is_a?(Array)
+          error("Invalid JSON: expected array, got #{parsed.class}")
+        end
+      end
+      
+      parsed
     end,
 
     # UI assembly helpers (schema-by-config)
@@ -4479,7 +4560,7 @@ require 'securerandom'
       
       if mode == 'rag_with_context'
         text   = resp.dig('candidates',0,'content','parts',0,'text').to_s
-        parsed = call(:safe_parse_json, text)
+        parsed = (call(:json_parse_safe, text) rescue nil)
         
         # DEBUG: Log what we're working with
         debug_info = {}
@@ -4587,16 +4668,6 @@ require 'securerandom'
     end,
 
     # Preview pack
-    request_preview_pack: lambda do |url, verb, headers, payload|
-      {
-        'request_preview' => {
-          'method'  => verb.to_s.upcase,
-          'url'     => url.to_s,
-          'headers' => headers || {},
-          'payload' => call(:redact_json, payload)
-        }
-      }
-    end,
     request_preview_pack: lambda do |url, verb, headers, payload|
       {
         'request_preview' => {
@@ -5095,7 +5166,7 @@ require 'securerandom'
         h  = c.is_a?(Hash) ? c : {}
         # metadata may arrive as a JSON string
         md_raw = h['metadata']
-        md     = md_raw.is_a?(Hash) ? md_raw : (call(:safe_json, md_raw) || {})
+        md     = md_raw.is_a?(Hash) ? md_raw : ((call(:json_parse_safe, md_raw) rescue nil) || {})
         # text/id/score aliases across API variants
         text = h['text'] ||
                h['chunkText'] ||
@@ -5122,17 +5193,6 @@ require 'securerandom'
       return [] if v.nil? || v == false
       return v  if v.is_a?(Array)
       [v]
-    end,
-    safe_json: lambda do |body|
-      begin
-        case body
-        when String then JSON.parse(body)
-        when Hash, Array then body # already JSON-like
-        else JSON.parse(body.to_s)
-        end
-      rescue
-        nil
-      end
     end,
     safe_integer: lambda do |v|
       return nil if v.nil?; Integer(v) rescue v.to_i
@@ -5279,9 +5339,6 @@ require 'securerandom'
         meta_str = meta.present? ? "\n(meta: #{meta.to_json})" : ''
         "#{header}\n#{body}#{meta_str}"
       }.join("\n\n---\n\n")
-    end,
-    safe_parse_json: lambda do |s|
-      JSON.parse(s) rescue { 'answer' => s }
     end,
     llm_referee: lambda do |connection, model, email_text, shortlist_names, all_cats, fallback_category = nil, corr=nil, system_preamble=nil|
       # Minimal, schema-constrained JSON referee using Gemini
@@ -5432,13 +5489,6 @@ require 'securerandom'
     sanitize_hash: lambda do |v|
       v.is_a?(Hash) ? v : (v.is_a?(String) ? (JSON.parse(v) rescue nil) : nil)
     end,
-    safe_obj: lambda do |v|
-      call(:sanitize_hash, v)
-    end,
-    safe_array_of_hashes: lambda do |v|
-      arr = call(:safe_array, v)
-      arr.map { |x| call(:sanitize_hash, x) }.compact
-    end,
     extract_uri_from_context: lambda do |context|
       # Try multiple possible URI field locations
       uri = context['uri'] || 
@@ -5579,7 +5629,7 @@ require 'securerandom'
                 })
 
       text   = resp.dig('candidates',0,'content','parts',0,'text').to_s
-      parsed = call(:safe_parse_json, text)
+      parsed = (call(:json_parse_safe, text) rescue nil)
       {
         'focus_preview' => focus,
         'salient_span'  => parsed['salient_span'].to_s,
@@ -5694,7 +5744,7 @@ require 'securerandom'
     la_json_parse_safe!: lambda do |text|
       return [] unless text.is_a?(String) && text.strip != ''
       begin
-        j = JSON.parse(text)
+        j = call(:json_parse_safe, text)
         j.is_a?(Array) ? j : [j]
       rescue
         text.lines.map(&:strip).reject(&:empty?).map { |ln| JSON.parse(ln) rescue nil }.compact
