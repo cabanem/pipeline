@@ -103,7 +103,6 @@ require 'securerandom'
 
   # --------- OBJECT DEFINITIONS -------------------------------------------
   object_definitions: {
-    # Matches the hash produced by methods.local_log_entry
     log_entry: {
       fields: lambda do |_connection, _config_fields|
         [
@@ -145,92 +144,148 @@ require 'securerandom'
         ]
       end
     },
+
     gen_generate_input: {
       fields: lambda do |connection, config_fields, object_definitions|
-        [
-          { name: 'mode', control_type: 'select', pick_list: 'gen_generate_modes', 
-            optional: false, default: 'plain' },
-          { name: 'model', optional: false, control_type: 'text' },
-          
-          # Optional signal enrichment fields (always visible for pipeline use)
-          { name: 'signals_category', optional: true, sticky: true,
-            hint: 'Category context from upstream classification (enhances generation focus)' },
-          { name: 'signals_confidence', optional: true, type: 'number', sticky: true,
-            hint: 'Upstream confidence score (may adjust generation parameters)' },
-          { name: 'signals_intent', optional: true, sticky: true,
-            hint: 'Intent classification from upstream (customizes response style)' },
-          { name: 'use_signal_enrichment', type: 'boolean', control_type: 'checkbox', 
-            optional: true, default: true,
-            hint: 'Apply upstream signals to enhance generation quality' },
-          
-          # Mode-specific fields
+        mode_field = [
+          { name: 'mode', control_type: 'select', pick_list: 'gen_generate_modes', optional: false, default: 'plain',
+            hint: 'Generation mode: plain, grounded, or RAG' }
+        ]
+        
+        model_field = [
+          { name: 'model', optional: false, control_type: 'text',
+            default: 'gemini-2.0-flash' }
+        ]
+        
+        # Prompt configuration for generation
+        prompt_fields = [
+          { name: 'generation_prompt_config',
+            label: 'Response Style',
+            type: 'object',
+            properties: [
+              { name: 'template', control_type: 'select',
+                default: 'hr_assistant',
+                pick_list: 'prompt_templates',
+                extends_schema: true,
+                hint: 'Choose response personality' },
+              { name: 'custom_prompt', control_type: 'text-area',
+                ngIf: 'input.generation_prompt_config.template == "custom"',
+                hint: 'Custom system instructions for generation' }
+            ]
+          }
+        ]
+        
+        # Signal enrichment configuration
+        signal_fields = [
+          { name: 'signal_config', label: 'Signal Processing', type: 'object',
+            properties: [
+              { name: 'use_signal_enrichment', type: 'boolean', control_type: 'checkbox',
+                default: true,
+                hint: 'Apply upstream signals to enhance generation quality' },
+              { name: 'signals_category', optional: true, sticky: true,
+                ngIf: 'input.signal_config.use_signal_enrichment',
+                hint: 'Category from classification (enhances focus)' },
+              { name: 'signals_confidence', optional: true, type: 'number', sticky: true,
+                ngIf: 'input.signal_config.use_signal_enrichment',
+                hint: 'Upstream confidence (may adjust parameters)' },
+              { name: 'signals_intent', optional: true, sticky: true,
+                ngIf: 'input.signal_config.use_signal_enrichment',
+                hint: 'Intent classification (customizes style)' }
+            ]
+          }
+        ]
+        
+        # RAG configuration with thresholds
+        rag_fields = [
+          { name: 'rag_config',
+            label: 'RAG Configuration',
+            type: 'object',
+            ngIf: 'input.mode == "rag_with_context"',
+            properties: [
+              { name: 'threshold_preset', control_type: 'select',
+                default: 'balanced',
+                options: [
+                  ['Conservative (fewer chunks, strict tokens)', 'conservative'],
+                  ['Balanced (moderate chunks/tokens)', 'balanced'],
+                  ['Generous (more chunks, more tokens)', 'generous'],
+                  ['Custom', 'custom']
+                ]
+              },
+              { name: 'custom_limits', type: 'object',
+                ngIf: 'input.rag_config.threshold_preset == "custom"',
+                properties: [
+                  { name: 'max_chunks', type: 'integer', default: 20,
+                    hint: 'Max context chunks to use' },
+                  { name: 'max_prompt_tokens', type: 'integer', default: 3000,
+                    hint: 'Token budget for prompt' },
+                  { name: 'reserve_output_tokens', type: 'integer', default: 512,
+                    hint: 'Tokens reserved for response' }
+                ]
+              },
+              { name: 'trim_strategy', control_type: 'select',
+                pick_list: 'trim_strategies',
+                default: 'drop_low_score',
+                hint: 'How to select chunks when over limit' },
+              { name: 'count_tokens_model', optional: true,
+                hint: 'Model for token counting (defaults to generation model)' }
+            ]
+          }
+        ]
+        
+        # Mode-specific fields
+        mode_specific = [
+          # Common generation fields
           { name: 'contents',
-            type: 'array', of: 'object', properties: object_definitions['content'], optional: true,
+            type: 'array', of: 'object', properties: object_definitions['content'], 
+            optional: true,
             ngIf: 'input.mode != "rag_with_context"' },
           
-          { name: 'system_preamble', label: 'System Instructions', control_type: 'text-area', 
-            extends_schema: false, optional: true, 
-            hint: 'Provide system-level instructions to guide the model\'s behavior' },
+          # RAG-specific fields
+          { name: 'question', optional: true, 
+            ngIf: 'input.mode == "rag_with_context"' },
+          { name: 'context_chunks', type: 'array', of: 'object', optional: true,
+            properties: object_definitions['context_chunk_standard'],
+            ngIf: 'input.mode == "rag_with_context"' },
           
-          { name: 'generation_config', type: 'object', 
-            properties: object_definitions['generation_config'] },
-          { name: 'safetySettings', type: 'array', of: 'object', 
-            properties: object_definitions['safety_setting'] },
-          { name: 'toolConfig', type: 'object' },
-          
-          # Correlation and debugging
-          { name: 'correlation_id', label: 'Correlation ID', optional: true, sticky: true,
-            hint: 'Pass the same ID across actions to stitch logs and metrics.' },
-          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true },
-          
-          # ---------- Grounding (only when grounded_* modes) ----------
+          # Grounding fields
           { name: 'grounding_info', label: 'Grounding via Google Search',
             hint: 'Uses the built-in googleSearch tool.',
             ngIf: 'input.mode == "grounded_google"', optional: true },
           
-          # Vertex AI Search parameters
           { name: 'vertex_ai_search_datastore',
-            hint: 'projects/.../locations/.../collections/default_collection/dataStores/...',
+            hint: 'projects/.../dataStores/...',
             ngIf: 'input.mode == "grounded_vertex"', optional: true },
           { name: 'vertex_ai_search_serving_config',
-            hint: 'projects/.../locations/.../collections/.../engines/.../servingConfigs/default_config',
+            hint: 'projects/.../servingConfigs/default_config',
             ngIf: 'input.mode == "grounded_vertex"', optional: true },
           
-          # ---------- RAG-lite (only when rag_with_context) ----------
-          { name: 'question', optional: true, ngIf: 'input.mode == "rag_with_context"' },
-          { name: 'context_chunks', type: 'array', of: 'object', optional: true,
-            properties: [
-              { name: 'id' }, 
-              { name: 'text', optional: false }, 
-              { name: 'source' }, 
-              { name: 'uri' },
-              { name: 'score', type: 'number' }, 
-              { name: 'metadata', type: 'object' }
-            ],
-            ngIf: 'input.mode == "rag_with_context"'
-          },
-          { name: 'max_chunks', type: 'integer', optional: true, default: 20, 
-            ngIf: 'input.mode == "rag_with_context"' },
-          { name: 'max_prompt_tokens', type: 'integer', optional: true, default: 3000, 
-            ngIf: 'input.mode == "rag_with_context"' },
-          { name: 'reserve_output_tokens', type: 'integer', optional: true, default: 512, 
-            ngIf: 'input.mode == "rag_with_context"' },
-          { name: 'count_tokens_model', optional: true, 
-            ngIf: 'input.mode == "rag_with_context"' },
-          { name: 'trim_strategy', control_type: 'select', pick_list: 'trim_strategies', 
-            optional: true, default: 'drop_low_score', 
-            ngIf: 'input.mode == "rag_with_context"' },
-          { name: 'temperature', type: 'number', optional: true, 
-            ngIf: 'input.mode == "rag_with_context"' },
-          
-          # RAG Store grounding
-          { name: 'rag_corpus', optional: true, 
-            hint: 'projects/{project}/locations/{region}/ragCorpora/{corpus}', 
+          { name: 'rag_corpus', optional: true,
+            hint: 'projects/{project}/locations/{region}/ragCorpora/{corpus}',
             ngIf: 'input.mode == "grounded_rag_store"' },
           { name: 'rag_retrieval_config', label: 'Retrieval config', type: 'object',
-            properties: object_definitions['rag_retrieval_config'], 
+            properties: object_definitions['rag_retrieval_config'],
             ngIf: 'input.mode == "grounded_rag_store"', optional: true }
         ]
+        
+        # Generation parameters
+        gen_params = [
+          { name: 'generation_config', type: 'object',
+            properties: object_definitions['generation_config'] },
+          { name: 'safetySettings', type: 'array', of: 'object',
+            properties: object_definitions['safety_setting'] },
+          { name: 'toolConfig', type: 'object' },
+          { name: 'temperature', type: 'number', optional: true }
+        ]
+        
+        # Debugging
+        debug_fields = [
+          { name: 'correlation_id', label: 'Correlation ID', optional: true, sticky: true,
+            hint: 'Pass the same ID across actions to stitch logs and metrics.' },
+          { name: 'debug', type: 'boolean', control_type: 'checkbox', optional: true }
+        ]
+        
+        mode_field + model_field + prompt_fields + signal_fields + rag_fields + 
+          mode_specific + gen_params + debug_fields
       end
     },
     gen_generate_content_input: {
@@ -644,50 +699,117 @@ require 'securerandom'
         }
       end,
       config_fields: [
-        { name: 'show_advanced', label: 'Show advanced options',
-          type: 'boolean', control_type: 'checkbox',
-          default: false, sticky: true, extends_schema: true,
-          hint: 'Toggle to reveal advanced parameters.' }
+        { name: 'show_advanced', label: 'Show advanced options', type: 'boolean', control_type: 'checkbox',
+          default: false, sticky: true, extends_schema: true, hint: 'Toggle to reveal advanced parameters.' }
       ],
       input_fields: lambda do |object_definitions, connection, config_fields|
-        call(:ui_df_inputs_simplified, object_definitions, config_fields) +
-          Array(object_definitions['observability_input_fields'])
+        base = call(:ui_df_inputs_simplified, object_definitions, config_fields)
+        
+        # Threshold configuration for soft scoring
+        threshold_fields = [
+          { name: 'scoring_thresholds', label: 'Scoring Configuration',
+            type: 'object',
+            optional: true,
+            properties: [
+              { name: 'use_preset', type: 'boolean', control_type: 'checkbox',
+                default: true, extends_schema: true,
+                hint: 'Use standard scoring thresholds' },
+              
+              { name: 'preset', control_type: 'select',
+                ngIf: 'input.scoring_thresholds.use_preset',
+                default: 'balanced',
+                options: [
+                  ['Conservative (8+ for KEEP)', 'conservative'],
+                  ['Balanced (6+ for KEEP)', 'balanced'],  
+                  ['Permissive (4+ for KEEP)', 'permissive']
+                ]
+              },
+              
+              { name: 'custom_values', type: 'object',
+                ngIf: '!input.scoring_thresholds.use_preset',
+                properties: [
+                  { name: 'keep_threshold', type: 'integer', default: 6,
+                    hint: 'Score needed to classify as HR-REQUEST' },
+                  { name: 'triage_min', type: 'integer', default: 4,
+                    hint: 'Minimum score for HUMAN review' },
+                  { name: 'triage_max', type: 'integer', default: 5,
+                    hint: 'Maximum score for HUMAN review' }
+                ]
+              }
+            ]
+          }
+        ]
+        
+        # Add configurable email type mappings
+        email_type_fields = config_fields['show_advanced'] ? [
+          { name: 'email_type_mapping', label: 'Email Type Decisions', type: 'object', optional: true,
+            properties: [
+              { name: 'forwarded_action', control_type: 'select',
+                default: 'HUMAN',
+                options: [['Send to Human', 'HUMAN'], ['Mark Irrelevant', 'IRRELEVANT'], ['Keep Processing', 'KEEP']],
+                hint: 'Action for forwarded chains' },
+              { name: 'automated_action', control_type: 'select', 
+                default: 'IRRELEVANT',
+                options: [['Send to Human', 'HUMAN'], ['Mark Irrelevant', 'IRRELEVANT'], ['Keep Processing', 'KEEP']],
+                hint: 'Action for automated emails' },
+              { name: 'newsletter_action', control_type: 'select',
+                default: 'IRRELEVANT', 
+                options: [['Send to Human', 'HUMAN'], ['Mark Irrelevant', 'IRRELEVANT'], ['Keep Processing', 'KEEP']],
+                hint: 'Action for newsletters' }
+            ] }
+        ] : []
+        
+        base + threshold_fields + email_type_fields + Array(object_definitions['observability_input_fields'])
       end,
       output_fields: lambda do |object_definitions, connection|
         [
           { name: 'passed', type: 'boolean', hint: 'True if email passes all hard rules' },
-          { name: 'hard_block', type: 'boolean' },
+          { name: 'hard_block', type: 'boolean', convert_output: 'boolean_conversion' },
           { name: 'hard_reason', hint: 'e.g., forwarded_chain, safety_block' },
           { name: 'email_type', hint: 'direct_request, forwarded_chain, etc.' },
           { name: 'email_text' },
           { name: 'soft_score', type: 'integer', hint: 'Soft signals score if rules configured' },
-          { name: 'gate', type: 'object',
-            properties: object_definitions['pipeline_gate'] },
+          { name: 'gate', type: 'object', properties: object_definitions['pipeline_gate'] },
           { name: 'complete_output', type: 'object' },
           { name: 'facets', type: 'object', optional: true }
         ] + call(:standard_operational_outputs)
-      end,
+      end,  
       execute: lambda do |connection, input|
         ctx = call(:step_begin!, :deterministic_filter, input)
-
+        
         env = call(:norm_email_envelope!, (input['email'] || input))
         subj, body, email_text = env['subject'], env['body'], env['email_text']
 
         # Build/choose rulepack with priority system
         rules = nil
         
-        # Check if using advanced rules
         if input['use_advanced_rules'] == true
-          # Advanced rules take precedence
           if input['rules_mode'] == 'json' && input['rules_json'].present?
-            rules = (call(:json_parse_safe,  input['rules_json']) rescue nil)
+            rules = (call(:json_parse_safe, input['rules_json']) rescue nil)
           elsif input['rules_mode'] == 'rows' && Array(input['rules_rows']).any?
             rules = call(:hr_compile_rulepack_from_rows!, input['rules_rows'])
           end
         elsif Array(input['exclude_patterns']).any?
-          # Use quick exclusions if not using advanced rules
           rules = call(:convert_patterns_to_rules, input['exclude_patterns'])
         end
+        
+        # Get threshold configuration
+        thresholds = if input['scoring_thresholds'] && !input['scoring_thresholds']['use_preset']
+          input['scoring_thresholds']['custom_values'] || {}
+        else
+          preset = input.dig('scoring_thresholds', 'preset') || 'balanced'
+          case preset
+          when 'conservative'
+            { 'keep' => 8, 'triage_min' => 6, 'triage_max' => 7 }
+          when 'permissive'
+            { 'keep' => 4, 'triage_min' => 2, 'triage_max' => 3 }
+          else # balanced
+            { 'keep' => 6, 'triage_min' => 4, 'triage_max' => 5 }
+          end
+        end
+        
+        # Get email type action mappings
+        type_mappings = input['email_type_mapping'] || {}
 
         # Defaults
         email_type = 'direct_request'
@@ -695,7 +817,7 @@ require 'securerandom'
         hard_reason = nil
         soft_score = 0
         preliminary_decision = 'KEEP'
-        excluded_pattern = nil  # Track which pattern caused exclusion
+        excluded_pattern = nil
 
         if rules.is_a?(Hash)
           # Check hard rules with enhanced evaluation
@@ -710,25 +832,26 @@ require 'securerandom'
 
           if hard[:hit]
             hard_reason = hard[:reason]
-            excluded_pattern = hard[:action]  # Track the specific pattern
+            excluded_pattern = hard[:action]
             
-            # Enhanced mapping for new patterns
+            # Enhanced mapping with configurable actions
             case hard_reason
             when 'forwarded_chain', 'email_chains'
               email_type = 'forwarded_chain'
               hard_block = true
-              preliminary_decision = 'HUMAN'
+              preliminary_decision = type_mappings['forwarded_action'] || 'HUMAN'
               
             when 'automated', 'auto_reply', 'noreply'
               email_type = 'automated'
               hard_block = true
-              preliminary_decision = 'IRRELEVANT'
+              preliminary_decision = type_mappings['automated_action'] || 'IRRELEVANT'
               
             when 'newsletter', 'marketing'
               email_type = 'newsletter'
               hard_block = true
-              preliminary_decision = 'IRRELEVANT'
+              preliminary_decision = type_mappings['newsletter_action'] || 'IRRELEVANT'
               
+            # Keep other mappings unchanged
             when 'system', 'notification', 'automated_report'
               email_type = 'system_notification'
               hard_block = true
@@ -766,7 +889,7 @@ require 'securerandom'
             end
           end
 
-          # If not hard blocked, check soft signals
+          # If not hard blocked, check soft signals with configurable thresholds
           unless hard_block
             soft = call(:hr_eval_soft, {
               'subject' => subj, 
@@ -777,7 +900,10 @@ require 'securerandom'
             }, (rules['soft_signals'] || []))
             
             soft_score = soft[:score] || 0
-            preliminary_decision = call(:hr_eval_decide, soft_score, (rules['thresholds'] || {}))
+            
+            # Apply configured thresholds
+            adjusted_thresholds = thresholds.merge(rules['thresholds'] || {})
+            preliminary_decision = call(:hr_eval_decide, soft_score, adjusted_thresholds)
           end
         end
 
@@ -789,7 +915,7 @@ require 'securerandom'
           'soft_score' => soft_score,
           'decision' => preliminary_decision,
           'generator_hint' => (hard_block ? 'blocked' : 'check_policy'),
-          'excluded_pattern' => excluded_pattern  # Include which pattern matched
+          'excluded_pattern' => excluded_pattern
         }
 
         out = {
@@ -811,7 +937,8 @@ require 'securerandom'
           'rules_evaluated' => rules.is_a?(Hash),
           'exclusion_source' => input['use_advanced_rules'] ? 'advanced_rules' : 
                               (Array(input['exclude_patterns']).any? ? 'quick_patterns' : 'none'),
-          'patterns_count' => Array(input['exclude_patterns']).length
+          'patterns_count' => Array(input['exclude_patterns']).length,
+          'threshold_preset' => input.dig('scoring_thresholds', 'preset') || 'balanced'
         }
         facets['excluded_by'] = excluded_pattern if excluded_pattern
 
@@ -836,110 +963,157 @@ require 'securerandom'
         }
       end,
       config_fields: [
-        { name: 'show_advanced', label: 'Show advanced options',
-          type: 'boolean', control_type: 'checkbox',
+        { name: 'show_advanced', label: 'Show advanced options', type: 'boolean', control_type: 'checkbox',
           default: false, sticky: true, extends_schema: true }
       ],
       input_fields: lambda do |object_definitions, connection, config_fields|
         base = [
           { name: 'email_text', optional: false },
-          { name: 'email_type', optional: true, default: 'direct_request', hint: 'From deterministic filter' },
-          { name: 'system_preamble', label: 'System Instructions', control_type: 'text-area', 
-            optional: true, hint: 'Override default system instructions for email triage' },
+          { name: 'email_type', optional: true, default: 'direct_request', 
+            hint: 'From deterministic filter' }
+        ]
+        
+        # Prompt configuration
+        prompt_fields = [
+          { name: 'prompt_template', 
+            label: 'Prompt Template',
+            control_type: 'select',
+            pick_list: 'prompt_templates',
+            default: 'hr_assistant',
+            extends_schema: true,
+            hint: 'Choose a pre-configured prompt style or create custom' },
           
-          # Thresholds
-          { name: 'min_confidence_for_keep', type: 'number', 
-            default: 0.60, hint: 'Minimum confidence to mark as KEEP' },
-          { name: 'confidence_short_circuit', type: 'number', 
-            default: 0.85, hint: 'High confidence IRRELEVANT bypasses downstream' }
+          { name: 'custom_system_prompt',
+            label: 'Custom System Prompt', 
+            control_type: 'text-area',
+            optional: true,
+            ngIf: 'input.prompt_template == "custom"',
+            hint: 'Define your custom system instructions for triage' }
+        ]
+        
+        # Threshold configuration
+        threshold_fields = [
+          { name: 'threshold_preset',
+            label: 'Confidence Thresholds',
+            control_type: 'select', 
+            pick_list: 'threshold_presets',
+            default: 'balanced',
+            extends_schema: true,
+            hint: 'Choose confidence level requirements' },
+            
+          { name: 'custom_thresholds',
+            label: 'Custom Threshold Settings',
+            type: 'object',
+            optional: true,
+            ngIf: 'input.threshold_preset == "custom"',
+            properties: [
+              { name: 'min_confidence_for_keep', type: 'number', 
+                hint: 'Min confidence to mark as KEEP (0.0-1.0)', default: 0.60 },
+              { name: 'confidence_short_circuit', type: 'number',
+                hint: 'Confidence to skip downstream when IRRELEVANT (0.0-1.0)', default: 0.85 }
+            ]
+          }
+        ]
+        
+        # Configurable decision types
+        decision_fields = [
+          { name: 'decision_config',
+            label: 'Decision Categories',
+            type: 'object',
+            optional: true,
+            properties: [
+              { name: 'use_standard', type: 'boolean', control_type: 'checkbox',
+                default: true, extends_schema: true,
+                hint: 'Use standard IRRELEVANT/HUMAN/KEEP decisions' },
+              
+              { name: 'custom_decisions', type: 'array', of: 'object',
+                ngIf: '!input.decision_config.use_standard',
+                properties: [
+                  { name: 'decision', hint: 'Decision label' },
+                  { name: 'continues_pipeline', type: 'boolean', control_type: 'checkbox',
+                    hint: 'Should this decision continue to next step?' },
+                  { name: 'description', hint: 'When to use this decision' }
+                ],
+                default: [
+                  { 'decision' => 'IRRELEVANT', 'continues_pipeline' => false },
+                  { 'decision' => 'HUMAN', 'continues_pipeline' => true },
+                  { 'decision' => 'KEEP', 'continues_pipeline' => true }
+                ]
+              }
+            ]
+          }
         ]
         
         adv = config_fields['show_advanced'] ? [
           { name: 'model', default: 'gemini-2.0-flash' },
           { name: 'temperature', type: 'number', default: 0 },
-          { name: 'custom_policy_json', control_type: 'text-area', optional: true, hint: 'Additional triage rules in JSON format' }
+          { name: 'custom_policy_json', control_type: 'text-area', 
+            optional: true, hint: 'Additional triage rules in JSON format' },
+          { name: 'include_domain_detection', type: 'boolean', control_type: 'checkbox',
+            default: true, hint: 'Detect email domain/topic' }
         ] : []
         
-        base + adv + Array(object_definitions['observability_input_fields'])
-      end,     
+        base + prompt_fields + threshold_fields + decision_fields + adv + 
+          Array(object_definitions['observability_input_fields'])
+      end,  
       output_fields: lambda do |object_definitions, connection|
         [
-          # Business outputs
           { name: 'decision', hint: 'IRRELEVANT, HUMAN, or KEEP' },
           { name: 'confidence', type: 'number' },
           { name: 'reasons', type: 'array', of: 'string' },
           { name: 'matched_signals', type: 'array', of: 'string' },
-          
-          # Pipeline control
-          { name: 'should_continue', type: 'boolean',
-            hint: 'True if pipeline should continue to next step' },
-          { name: 'short_circuit', type: 'boolean',
-            hint: 'True if high-confidence IRRELEVANT' },
-          
-          # Pass-through signals
+          { name: 'detected_domain', optional: true },
+          { name: 'has_question', type: 'boolean', convert_output: 'boolean_conversion',  optional: true },
+          { name: 'should_continue', type: 'boolean', convert_output: 'boolean_conversion', hint: 'True if pipeline should continue to next step' },
+          { name: 'short_circuit', type: 'boolean', convert_output: 'boolean_conversion', hint: 'True if high-confidence IRRELEVANT' },
           { name: 'signals_triage', hint: 'Copy of decision for downstream' },
           { name: 'signals_confidence', type: 'number' },
-          
-          # Standard fields
+          { name: 'signals_domain', optional: true },
           { name: 'complete_output', type: 'object' },
           { name: 'facets', type: 'object', optional: true }
         ] + call(:standard_operational_outputs)
-      end,     
+      end,
       execute: lambda do |connection, input|
         ctx = call(:step_begin!, :ai_triage_filter, input)
+        
+        # Resolve configuration values
+        thresholds = call(:resolve_thresholds, input)
         
         # Build model path
         model = input['model'] || 'gemini-2.0-flash'
         model_path = call(:build_model_path_with_global_preview, connection, model)
         
-        # Enhanced system prompt that recognizes broader employee questions
-        default_system_text = <<~SYS
-          You are an email triage system for employee inquiries. Classify emails carefully.
+        # Get decision types
+        decision_types = if input['decision_config'] && !input['decision_config']['use_standard']
+          Array(input['decision_config']['custom_decisions']).map { |d| d['decision'] }
+        else
+          ['IRRELEVANT', 'HUMAN', 'KEEP']
+        end
+        
+        # Resolve prompt template
+        default_prompt = <<~SYS
+        You are an email triage system. Classify emails carefully. 
+          Use only the decision types provided: #{decision_types.join(', ')}
           
-          DECISIONS:
-          - KEEP: Any legitimate employee question or request that could be answered, including:
-            * HR policies (PTO, leave, attendance)
-            * Benefits questions (401k, health insurance, FSA, retirement)
-            * Payroll or compensation inquiries
-            * Employment verification or documentation requests
-            * Workplace policies or procedures
-            * Any question where the employee is seeking information or help
-          
-          - HUMAN: Requires human judgment:
-            * Complaints or grievances
-            * Sensitive or legal matters
-            * Escalations or threats
-            * Complex situations requiring context beyond what could be contained in a knowledge base
-            * Potentially discriminatory content
-            
-          - IRRELEVANT: Not an employee inquiry:
-            * Spam or marketing emails
-            * Newsletters (unless internal company newsletters with questions)
-            * Auto-generated messages with no action needed
-            * Personal conversations unrelated to employment
-          
-          IMPORTANT: If an employee is asking a question about ANY work-related topic
-          (even if managed by third parties like 401k providers, insureres), classify as KEEP.
-          
-          Also detect if the email contains a question that needs answering.
-          #{input['include_domain_detection'] ? 'Identify the domain/topic area.' : ''}
-          
+          Provide confidence scores between 0 and 1.
+          Include up to 3 brief reasons for your decision.
+          #{input['include_domain_detection'] != false ? 'Detect the email domain/topic.' : ''}
+
           Output MUST be valid JSON only. No text before or after.
         SYS
-
-        # Use the user-provided prompt or fall back to default
-        system_text = input['system_preamble'].presence || default_system_text
+        
+        system_text = call(:resolve_prompt, input, default_prompt)
         
         # Add custom policy if provided
         if input['custom_policy_json'].present?
           system_text += "\n\nAdditional rules:\n#{input['custom_policy_json']}"
         end
         
-        # Response schema with domain detection
+        # Response schema with configurable decisions
         schema_props = {
           'decision' => {
             'type' => 'string',
-            'enum' => ['IRRELEVANT', 'HUMAN', 'KEEP']
+            'enum' => decision_types
           },
           'confidence' => { 'type' => 'number', 'minimum' => 0, 'maximum' => 1 },
           'reasons' => {
@@ -968,7 +1142,7 @@ require 'securerandom'
           'required' => required
         }
         
-        # Make API call
+        # Make API call (unchanged)
         payload = {
           'systemInstruction' => { 'role' => 'system', 'parts' => [{'text' => system_text}] },
           'contents' => [{ 'role' => 'user', 'parts' => [{ 'text' => "Email:\n#{input['email_text']}" }] }],
@@ -990,18 +1164,26 @@ require 'securerandom'
         
         # Parse response
         text = resp.dig('candidates',0,'content','parts',0,'text').to_s
-        parsed = (call(:json_parse_safe, text) rescue nil)
+        parsed = (call(:json_parse_safe, text) rescue {})
         
         decision = (parsed['decision'] || 'HUMAN').to_s
         confidence = [[call(:safe_float, parsed['confidence']) || 0.0, 0.0].max, 1.0].min
         
-        # Determine pipeline flow
-        min_conf = (input['min_confidence_for_keep'] || 0.60).to_f
-        should_continue = (decision == 'KEEP' && confidence >= min_conf) || 
-                          (decision == 'HUMAN')
+        # Determine pipeline flow with configurable thresholds
+        min_conf = thresholds['min_confidence_for_keep'] || 0.60
+        short_circuit_conf = thresholds['confidence_short_circuit'] || 0.85
         
-        short_circuit = decision == 'IRRELEVANT' && 
-                      confidence >= (input['confidence_short_circuit'] || 0.85).to_f
+        # Check if decision should continue pipeline
+        decision_config = input['decision_config']
+        if decision_config && !decision_config['use_standard']
+          custom_decisions = Array(decision_config['custom_decisions'])
+          decision_info = custom_decisions.find { |d| d['decision'] == decision }
+          should_continue = decision_info ? decision_info['continues_pipeline'] : false
+        else
+          should_continue = (decision == 'KEEP' && confidence >= min_conf) || (decision == 'HUMAN')
+        end
+        
+        short_circuit = decision == 'IRRELEVANT' && confidence >= short_circuit_conf
         
         out = {
           'decision' => decision,
@@ -1023,7 +1205,9 @@ require 'securerandom'
           'detected_domain' => parsed['detected_domain'],
           'has_question' => parsed['has_question'],
           'should_continue' => should_continue,
-          'short_circuit' => short_circuit
+          'short_circuit' => short_circuit,
+          'prompt_template' => input['prompt_template'] || 'default',
+          'threshold_preset' => input['threshold_preset'] || 'balanced'
         })
       end,
       sample_output: lambda do
@@ -1039,83 +1223,81 @@ require 'securerandom'
         {
           body: 'Classifies user intent to enable appropriate response strategies. ' \
                 'Inputs: email_text, intent_types array, actionable_intents list. ' \
-                'Outputs: intent (information_request, action_request, status_inquiry, complaint, feedback), confidence, is_actionable boolean, entities, sentiment. ' \
+                'Outputs: intent, confidence, is_actionable boolean, entities, sentiment. ' \
                 'Optional enhancement step. Use requires_context to determine if RAG retrieval needed.'
         }
-      end,  
+      end,
       config_fields: [
-        { name: 'show_advanced', label: 'Show advanced options',
-          type: 'boolean', control_type: 'checkbox',
+        { name: 'show_advanced', label: 'Show advanced options', type: 'boolean', control_type: 'checkbox',
           default: false, sticky: true, extends_schema: true }
       ],
       input_fields: lambda do |object_definitions, connection, config_fields|
         base = [
-          { name: 'email_text', optional: false },
-          { name: 'system_preamble', label: 'System Instructions', control_type: 'text-area',
-            optional: true, hint: 'Override default system instructions for intent classification' },
-          # Intent configuration
-          { name: 'intent_types', type: 'array', of: 'string',
-            default: ['information_request', 'action_request', 'status_inquiry', 
-                    'complaint', 'feedback', 'auto_reply', 'unknown'],
-            hint: 'Possible intent categories' },
-          
-          { name: 'actionable_intents', type: 'array', of: 'string',
-            default: ['information_request', 'action_request'],
-            hint: 'Intents that can be automated' },
-          
-          # Pass-through from previous steps
-          { name: 'signals_triage', optional: true,
-            hint: 'Triage decision from previous step' },
+          { name: 'email_text', optional: false }
+        ]
+        
+        # Prompt configuration
+        prompt_fields = [
+          { name: 'prompt_template', label: 'Prompt Template', control_type: 'select', pick_list: 'prompt_templates', 
+            default: 'hr_assistant', extends_schema: true, hint: 'Choose a pre-configured prompt style or create custom' },
+          { name: 'custom_system_prompt', label: 'Custom System Prompt',  control_type: 'text-area', optional: true,
+            ngIf: 'input.prompt_template == "custom"', hint: 'Define your custom system instructions for intent classification' }
+        ]
+        
+        # Intent configuration with presets
+        intent_fields = [
+          { name: 'intent_preset', label: 'Intent Categories', control_type: 'select', pick_list: 'intent_presets',
+            default: 'hr_intents', extends_schema: true, hint: 'Choose intent categories for your use case' },  
+          { name: 'custom_intents', type: 'array', of: 'object', ngIf: 'input.intent_preset == "custom_intents"',
+            properties: [
+              { name: 'intent', hint: 'Intent identifier (no spaces)' },
+              { name: 'description', hint: 'When to use this intent' },
+              { name: 'actionable', type: 'boolean', control_type: 'checkbox',
+                hint: 'Can this be automated?' }
+            ],
+            item_label: 'Intent',
+            add_item_label: 'Add Intent Type' }
+        ]
+        
+        # Pass-through from previous steps
+        pass_through = [
+          { name: 'signals_triage', optional: true, hint: 'Triage decision from previous step' },
           { name: 'email_type', optional: true }
         ]
         
         adv = config_fields['show_advanced'] ? [
           { name: 'model', default: 'gemini-2.0-flash' },
           { name: 'temperature', type: 'number', default: 0 },
-          { name: 'extract_entities', type: 'boolean', control_type: 'checkbox',
-            default: false, hint: 'Extract named entities' },
-          { name: 'detect_sentiment', type: 'boolean', control_type: 'checkbox',
-            default: false, hint: 'Detect emotional sentiment' }
+          { name: 'extract_entities', type: 'boolean', control_type: 'checkbox', default: false, hint: 'Extract named entities' },
+          { name: 'detect_sentiment', type: 'boolean', control_type: 'checkbox', default: false, hint: 'Detect emotional sentiment' },
+          { name: 'confidence_threshold', type: 'number', default: 0.70, hint: 'Minimum confidence for primary intent' }
         ] : []
         
-        base + adv + Array(object_definitions['observability_input_fields'])
-      end,      
+        base + prompt_fields + intent_fields + pass_through + adv + 
+          Array(object_definitions['observability_input_fields'])
+      end,
       output_fields: lambda do |object_definitions, connection|
         [
-          # Business outputs
           { name: 'intent', hint: 'Primary user intent' },
           { name: 'confidence', type: 'number' },
-          { name: 'is_actionable', type: 'boolean',
-            hint: 'True if intent can be automated' },
-          
-          # Optional enrichments
+          { name: 'is_actionable', type: 'boolean', convert_output: 'boolean_conversion', hint: 'True if intent can be automated' },
           { name: 'secondary_intents', type: 'array', of: 'string', optional: true },
           { name: 'entities', type: 'array', of: 'object', optional: true,
             properties: [
               { name: 'type' },
               { name: 'value' },
               { name: 'context' }
-            ]
-          },
-          { name: 'sentiment', optional: true,
-            hint: 'positive, negative, or neutral' },
-          
-          # Pipeline control
-          { name: 'requires_context', type: 'boolean',
-            hint: 'True if RAG retrieval recommended' },
-          { name: 'suggested_category', optional: true,
-            hint: 'Hint for category classification' },
-          
-          # Pass-through signals  
+            ] },
+          { name: 'sentiment', optional: true, hint: 'positive, negative, or neutral' },
+          { name: 'requires_context', type: 'boolean', convert_output: 'boolean_conversion', hint: 'True if RAG retrieval recommended' },
+          { name: 'suggested_category', optional: true, hint: 'Hint for category classification' },
           { name: 'signals_intent' },
           { name: 'signals_intent_confidence', type: 'number' },
-          { name: 'signals_triage' },  # Pass through from previous
-          
-          # Standard fields
+          { name: 'signals_triage' },
           { name: 'complete_output', type: 'object' },
           { name: 'facets', type: 'object', optional: true }
         ] + call(:standard_operational_outputs)
-      end,    
+      end, 
       execute: lambda do |connection, input|
         ctx = call(:step_begin!, :ai_intent_classifier, input)
         
@@ -1123,40 +1305,41 @@ require 'securerandom'
         model = input['model'] || 'gemini-2.0-flash'
         model_path = call(:build_model_path_with_global_preview, connection, model)
         
-        # System prompt focused on intent only
-        default_system_text = <<~SYS
-          You are an intent classification system. Determine what the user wants.
+        # Get intent configuration from preset or custom
+        intent_list = if input['intent_preset'] == 'custom_intents'
+          Array(input['custom_intents'])
+        else
+          call(:get_intent_preset, input['intent_preset'] || 'hr_intents')
+        end
+        
+        intent_types = intent_list.map { |i| i['intent'] }
+        actionable_intents = call(:get_actionable_intents, intent_list)
+        
+        # Build prompt with intent descriptions
+        intent_prompt = call(:build_intent_prompt, intent_list)
+        
+        # Resolve prompt template
+        default_prompt = <<~SYS
+          #{intent_prompt}
           
-          INTENT TYPES:
-          - information_request: Asking for information, policies, procedures
-          - action_request: Requesting specific action (approval, document)
-          - status_inquiry: Checking status of existing request
-          - complaint: Expressing dissatisfaction or escalation
-          - feedback: Providing feedback or suggestions
-          - auto_reply: Out-of-office or automated response
-          - unknown: Cannot determine clear intent
+          #{input['extract_entities'] ? 'Extract key entities mentioned.' : ''}
+          #{input['detect_sentiment'] ? 'Detect overall sentiment.' : ''}
           
           Output MUST be valid JSON only.
         SYS
         
-        # Use user-provided system prompt or fall back to default
-        system_text = input['system_preamble'].presence || default_system_text
-
-        # Append any conditional instructions
-        system_text += "\n#{input['extract_entities'] ? 'Extract key entities mentioned.' : ''}"
-        system_text += "\n#{input['detect_sentiment'] ? 'Detect overall sentiment.' : ''}"
-        
+        system_text = call(:resolve_prompt, input, default_prompt)
         
         # Build response schema
         schema_props = {
           'intent' => {
             'type' => 'string',
-            'enum' => input['intent_types']
+            'enum' => intent_types
           },
           'confidence' => { 'type' => 'number', 'minimum' => 0, 'maximum' => 1 },
           'secondary_intents' => {
             'type' => 'array',
-            'items' => { 'type' => 'string', 'enum' => input['intent_types'] }
+            'items' => { 'type' => 'string', 'enum' => intent_types }
           },
           'requires_context' => { 'type' => 'boolean' },
           'suggested_category' => { 'type' => 'string' }
@@ -1186,7 +1369,7 @@ require 'securerandom'
           }
         end
         
-        # Make API call
+        # Make API call (unchanged)
         payload = {
           'systemInstruction' => { 'role' => 'system', 'parts' => [{'text' => system_text}] },
           'contents' => [{ 'role' => 'user', 'parts' => [{ 'text' => "Email:\n#{input['email_text']}" }] }],
@@ -1214,12 +1397,10 @@ require 'securerandom'
         # Parse response
         text = resp.dig('candidates',0,'content','parts',0,'text').to_s
         
-        # Parse JSON with proper error handling
         parsed = if text.present?
           begin
             call(:json_parse_safe, text, type: :hash)
           rescue => e
-            # If parsing fails, create minimal valid response
             { 'intent' => 'unknown', 'confidence' => 0.0 }
           end
         else
@@ -1228,7 +1409,12 @@ require 'securerandom'
         
         intent = (parsed['intent'] || 'unknown').to_s
         confidence = [[call(:safe_float, parsed['confidence']) || 0.0, 0.0].max, 1.0].min
-        actionable_intents = input['actionable_intents'] || ['information_request', 'action_request']
+        
+        # Check confidence threshold
+        conf_threshold = input['confidence_threshold'] || 0.70
+        if confidence < conf_threshold
+          intent = 'unknown'
+        end
         
         out = {
           'intent' => intent,
@@ -1241,7 +1427,7 @@ require 'securerandom'
           'suggested_category' => parsed['suggested_category'],
           'signals_intent' => intent,
           'signals_intent_confidence' => confidence,
-          'signals_triage' => input['signals_triage']  # Pass through
+          'signals_triage' => input['signals_triage']
         }
         
         call(:step_ok!, ctx, out, 200, 'OK', {
@@ -1249,7 +1435,9 @@ require 'securerandom'
           'confidence' => confidence,
           'is_actionable' => out['is_actionable'],
           'has_entities' => parsed['entities'].is_a?(Array) && parsed['entities'].any?,
-          'sentiment' => parsed['sentiment']
+          'sentiment' => parsed['sentiment'],
+          'intent_preset' => input['intent_preset'] || 'hr_intents',
+          'prompt_template' => input['prompt_template'] || 'default'
         })
       end,
       sample_output: lambda do
@@ -1357,71 +1545,315 @@ require 'securerandom'
                 'Pipeline step 4 of 8. LLM mode produces calibrated probability distribution summing to 1.0.'
         }
       end,
-
       config_fields: [
         { name: 'show_advanced', label: 'Show advanced options',
           type: 'boolean', control_type: 'checkbox',
           default: false, sticky: true, extends_schema: true,
           hint: 'Toggle to reveal advanced parameters.' }
-      ],  
+      ], 
       input_fields: lambda do |object_definitions, connection, config_fields|
-        call(:ui_rerank_inputs, object_definitions, config_fields) +
+        base = [
+          { name: 'email_text', optional: false },
+          { name: 'shortlist', type: 'array', of: 'string', optional: false,
+            hint: 'Categories to rank (from embedding step)' }
+        ]
+        
+        # Mode configuration with enhanced options
+        mode_fields = [
+          { name: 'ranking_mode',
+            label: 'Ranking Mode',
+            control_type: 'select',
+            default: 'none',
+            extends_schema: true,
+            options: [
+              ['None (preserve order)', 'none'],
+              ['LLM Distribution', 'llm'],
+              ['Score-based', 'score_based']
+            ],
+            hint: 'How to reorder the shortlist' }
+        ]
+        
+        # Prompt configuration for LLM mode
+        prompt_fields = [
+          { name: 'ranking_prompt',
+            label: 'Ranking Instructions',
+            type: 'object',
+            ngIf: 'input.ranking_mode == "llm"',
+            properties: [
+              { name: 'template', control_type: 'select',
+                default: 'balanced',
+                options: [
+                  ['Strict (high confidence required)', 'strict'],
+                  ['Balanced (standard distribution)', 'balanced'],
+                  ['Inclusive (broader distribution)', 'inclusive'],
+                  ['Custom', 'custom']
+                ]
+              },
+              { name: 'custom_instructions', control_type: 'text-area',
+                ngIf: 'input.ranking_prompt.template == "custom"',
+                hint: 'Custom ranking instructions for LLM' }
+            ]
+          }
+        ]
+        
+        # Categories configuration
+        categories_fields = [
+          { name: 'categories_mode', label: 'Categories input mode', 
+            control_type: 'select',
+            options: [['Array (pills)','array'], ['JSON','json']], 
+            default: 'array',
+            optional: false, extends_schema: true, 
+            hint: 'Switch to paste categories as JSON.' },
+          { name: 'categories', type: 'array', of: 'object', optional: true,
+            ngIf: 'input.categories_mode == "array"',
+            properties: Array(object_definitions['category_def']) }
+        ]
+        
+        # Distribution configuration
+        distribution_fields = [
+          { name: 'distribution_config',
+            label: 'Probability Distribution',
+            type: 'object',
+            ngIf: 'input.ranking_mode == "llm"',
+            properties: [
+              { name: 'normalize', type: 'boolean', control_type: 'checkbox',
+                default: true,
+                hint: 'Ensure probabilities sum to 1.0' },
+              { name: 'min_probability', type: 'number',
+                default: 0.01,
+                hint: 'Minimum probability for any category (0-1)' },
+              { name: 'concentration', control_type: 'select',
+                default: 'medium',
+                options: [
+                  ['Low (spread out)', 'low'],
+                  ['Medium (balanced)', 'medium'],
+                  ['High (concentrated)', 'high']
+                ],
+                hint: 'How concentrated the distribution should be' }
+            ]
+          }
+        ]
+        
+        # Advanced options
+        adv = config_fields['show_advanced'] ? [
+          { name: 'generative_model', control_type: 'text', optional: true, 
+            default: 'gemini-2.0-flash',
+            ngIf: 'input.ranking_mode == "llm"' },
+          { name: 'temperature', type: 'number', optional: true, default: 0,
+            ngIf: 'input.ranking_mode == "llm"',
+            hint: 'Temperature for LLM (0 = deterministic)' },
+          { name: 'categories_json', label: 'Categories JSON', 
+            control_type: 'text-area',
+            ngIf: 'input.categories_mode == "json"', optional: true,
+            hint: 'Paste categories array JSON for testing (overrides pills).' },
+          { name: 'include_reasoning', type: 'boolean', control_type: 'checkbox',
+            ngIf: 'input.ranking_mode == "llm"',
+            default: false,
+            hint: 'Include reasoning for each ranking' }
+        ] : []
+        
+        # Pass-through signals
+        signal_fields = [
+          { name: 'signals_category', optional: true, sticky: true,
+            hint: 'Category signal from upstream' },
+          { name: 'signals_confidence', type: 'number', optional: true, sticky: true },
+          { name: 'signals_intent', optional: true, sticky: true }
+        ]
+        
+        base + mode_fields + prompt_fields + categories_fields + 
+          distribution_fields + adv + signal_fields +
           Array(object_definitions['observability_input_fields'])
       end,
       output_fields: lambda do |object_definitions, connection|
         [
           # Business outputs
           { name: 'ranking', type: 'array', of: 'object',
-            properties: object_definitions['scored_category'] },  # Uses category + prob
-          { name: 'shortlist', type: 'array', of: 'string' },
+            properties: [
+              { name: 'category' },
+              { name: 'prob', type: 'number' },
+              { name: 'score', type: 'number', optional: true },
+              { name: 'reasoning', optional: true }
+            ]
+          },
+          { name: 'shortlist', type: 'array', of: 'string',
+            hint: 'Reordered shortlist' },
+          
+          # Distribution metadata
+          { name: 'distribution_stats', type: 'object', optional: true,
+            properties: [
+              { name: 'entropy', type: 'number' },
+              { name: 'max_prob', type: 'number' },
+              { name: 'min_prob', type: 'number' },
+              { name: 'concentration', type: 'number' }
+            ]
+          },
+          
+          # Pass-through signals
+          { name: 'signals_category', optional: true },
+          { name: 'signals_confidence', type: 'number', optional: true },
+          { name: 'signals_intent', optional: true },
           
           # Standard fields
           { name: 'complete_output', type: 'object' },
           { name: 'facets', type: 'object', optional: true }
         ] + call(:standard_operational_outputs)
       end,
-
       execute: lambda do |connection, input|
         ctx = call(:step_begin!, :rerank_shortlist, input)
-        mode = (input['mode'] || 'none').to_s
+        mode = (input['ranking_mode'] || 'none').to_s
+        
+        # Pass through signals
+        signals = {
+          'signals_category' => input['signals_category'],
+          'signals_confidence' => input['signals_confidence'],
+          'signals_intent' => input['signals_intent']
+        }
 
         if mode == 'none'
           sl = call(:safe_array, input['shortlist'])
-          ranking = sl.map { |c| { 'category'=>c, 'prob'=>nil } }
-          out = { 'ranking'=>ranking, 'shortlist'=>sl }
+          ranking = sl.map { |c| { 'category' => c, 'prob' => nil } }
+          out = { 'ranking' => ranking, 'shortlist' => sl }.merge(signals)
+          
           return call(:step_ok!, ctx, out, 200, 'OK', { 
             'mode' => 'none',
             'categories_ranked' => sl.length
           })
         end
 
-        # LLM listwise: reuse referee to get distribution over shortlist
-        cats_raw =
-          if input['categories_mode'].to_s == 'json' && input['categories_json'].present?
-            call(:json_parse_safe, input['categories_json'], type: :array, required: true, allow_wrapper: true)
-          else
-            input['categories']
-          end
+        # Get categories
+        cats_raw = if input['categories_mode'].to_s == 'json' && input['categories_json'].present?
+          call(:json_parse_safe, input['categories_json'], type: :array, required: true, allow_wrapper: true)
+        else
+          input['categories']
+        end
         cats = call(:norm_categories!, cats_raw)
-        ref  = call(:llm_referee, connection, (input['generative_model'] || 'gemini-2.0-flash'),
-                    input['email_text'], call(:safe_array, input['shortlist']), cats, nil, ctx['cid'], nil)
-        dist = call(:safe_array, ref['distribution']).map { |d| { 'category'=>d['category'], 'prob'=>d['prob'].to_f } }
+        
+        if mode == 'score_based'
+          # Simple score-based ranking (could be from upstream scores)
+          sl = call(:safe_array, input['shortlist'])
+          # For now, just preserve order but add uniform probabilities
+          prob = 1.0 / sl.length
+          ranking = sl.map { |c| { 'category' => c, 'prob' => prob } }
+          out = { 'ranking' => ranking, 'shortlist' => sl }.merge(signals)
+          
+          return call(:step_ok!, ctx, out, 200, 'OK', {
+            'mode' => 'score_based',
+            'categories_ranked' => sl.length
+          })
+        end
+        
+        # LLM mode - build prompt based on template
+        prompt_config = input['ranking_prompt'] || {}
+        template = prompt_config['template'] || 'balanced'
+        
+        system_prompt = case template
+        when 'strict'
+          <<~PROMPT
+            You are a strict category classifier. Only assign high probabilities (>0.5) when extremely confident.
+            Most categories should receive low probabilities. Be conservative.
+            Output MUST be valid JSON only.
+          PROMPT
+        when 'inclusive'
+          <<~PROMPT
+            You are an inclusive category classifier. Distribute probabilities broadly across plausible categories.
+            Avoid concentrating all probability on one category unless absolutely certain.
+            Output MUST be valid JSON only.
+          PROMPT
+        when 'custom'
+          prompt_config['custom_instructions'] || <<~PROMPT
+            Rank the categories by relevance and provide a probability distribution.
+            Output MUST be valid JSON only.
+          PROMPT
+        else # balanced
+          <<~PROMPT
+            You are a balanced category classifier. Distribute probabilities based on relevance.
+            The most relevant category should have the highest probability, with others receiving proportional scores.
+            Output MUST be valid JSON only.
+          PROMPT
+        end
+        
+        # Get distribution configuration
+        dist_config = input['distribution_config'] || {}
+        concentration = dist_config['concentration'] || 'medium'
+        
+        # Adjust temperature based on concentration
+        temperature = if input['temperature'].present?
+          input['temperature'].to_f
+        else
+          case concentration
+          when 'low' then 0.5   # More spread out
+          when 'high' then 0.0  # More concentrated
+          else 0.2              # Medium
+          end
+        end
+        
+        # Call LLM referee with enhanced prompt
+        ref = call(:llm_referee_enhanced, 
+                  connection, 
+                  (input['generative_model'] || 'gemini-2.0-flash'),
+                  input['email_text'], 
+                  call(:safe_array, input['shortlist']), 
+                  cats, 
+                  nil, 
+                  ctx['cid'], 
+                  system_prompt,
+                  temperature,
+                  input['include_reasoning'])
+        
+        dist = call(:safe_array, ref['distribution']).map { |d| 
+          { 
+            'category' => d['category'], 
+            'prob' => d['prob'].to_f,
+            'reasoning' => d['reasoning']
+          } 
+        }
+        
+        # Apply distribution configuration
+        if dist_config['normalize'] != false
+          total = dist.sum { |d| d['prob'] }
+          if total > 0
+            dist.each { |d| d['prob'] = d['prob'] / total }
+          end
+        end
+        
+        # Apply minimum probability if configured
+        min_prob = dist_config['min_probability'] || 0.01
+        dist.each do |d|
+          d['prob'] = [d['prob'], min_prob].max if d['prob'] > 0
+        end
+        
         # Ensure all shortlist items present
         missing = call(:safe_array, input['shortlist']) - dist.map { |d| d['category'] }
-        dist.concat(missing.map { |m| { 'category'=>m, 'prob'=>0.0 } })
+        dist.concat(missing.map { |m| { 'category' => m, 'prob' => min_prob } })
+        
         ranking = dist.sort_by { |h| -h['prob'].to_f }
-        out = { 'ranking'=>ranking, 'shortlist'=>ranking.map { |r| r['category'] } }
-        # Pass through signals
-        out['signals_category'] = input['signals_category']
-        out['signals_confidence'] = input['signals_confidence']
-        out['signals_intent'] = input['signals_intent']
-
+        
+        # Calculate distribution statistics
+        probs = ranking.map { |r| r['prob'] }
+        entropy = -probs.sum { |p| p > 0 ? p * Math.log(p) : 0 }
+        
+        dist_stats = {
+          'entropy' => entropy.round(4),
+          'max_prob' => probs.max,
+          'min_prob' => probs.min,
+          'concentration' => (1.0 - entropy / Math.log(probs.length)).round(4)
+        }
+        
+        out = { 
+          'ranking' => ranking, 
+          'shortlist' => ranking.map { |r| r['category'] },
+          'distribution_stats' => dist_stats
+        }.merge(signals)
+        
         call(:step_ok!, ctx, out, 200, 'OK', { 
           'mode' => 'llm',
           'top_prob' => ranking.first ? ranking.first['prob'] : 0,
           'categories_ranked' => ranking.length,
           'generative_model' => input['generative_model'] || 'gemini-2.0-flash',
-          'categories_mode' => input['categories_mode'] || 'array'
+          'categories_mode' => input['categories_mode'] || 'array',
+          'prompt_template' => template,
+          'concentration' => concentration,
+          'temperature' => temperature
         })
       end,
       sample_output: lambda do
@@ -1433,12 +1865,7 @@ require 'securerandom'
       subtitle: 'Adjudicate among shortlist; accepts ranked categories',
       display_priority: 497,
       help: lambda do |_|
-        {
-          body: 'Final category selection using LLM reasoning with optional salience extraction. ' \
-                'Inputs: email_text, categories, shortlist, min_confidence (0.25), fallback_category, salience_mode (off/heuristic/llm). ' \
-                'Outputs: chosen (CRITICAL - used by steps 6-8), confidence, referee object with reasoning, salience with key sentence. ' \
-                'Pipeline step 5 of 8. Always provide fallback_category. The chosen field is required by downstream steps.'
-        }
+        { body: 'Chooses final category using shortlist + category metadata; can append ranked contexts to the email text.' }
       end,
       config_fields: [
         { name: 'show_advanced', label: 'Show advanced options',
@@ -1513,14 +1940,15 @@ require 'securerandom'
 
         # Add intent gate check
         if input['intent_kind'].present? && input['intent_kind'] != 'information_request'
+          fallback = input.dig('confidence_config', 'fallback_category') || 'Other'
           out = {
             'referee' => { 
-              'category' => input['fallback_category'] || 'Other',
+              'category' => fallback,
               'confidence' => 0.0,
               'reasoning' => 'Non-information intent blocked',
               'distribution' => []
             },
-            'chosen' => input['fallback_category'] || 'Other',
+            'chosen' => fallback,
             'confidence' => 0.0,
             'generator_gate' => {
               'pass_to_responder' => false,
@@ -1531,143 +1959,243 @@ require 'securerandom'
           return call(:step_ok!, ctx, out, 200, 'OK', { 'blocked_reason' => 'non_information_intent' })
         end
 
-        # Select categories source (array vs JSON)
-        cats_raw =
-          if input['categories_mode'].to_s == 'json' && input['categories_json'].present?
-            call(:json_parse_safe, input['categories_json'], type: :array, required: true, allow_wrapper: true)
-          else
-            input['categories']
-          end
+        # Get categories
+        cats_raw = if input['categories_mode'].to_s == 'json' && input['categories_json'].present?
+          call(:json_parse_safe, input['categories_json'], type: :array, required: true, allow_wrapper: true)
+        else
+          input['categories']
+        end
         cats = call(:norm_categories!, cats_raw)
 
-        # Optionally append ranked contexts to the email text for better decisions
+        # Optionally append ranked contexts
         email_text = input['email_text'].to_s
         if Array(input['contexts']).any?
           blob = call(:format_context_chunks, input['contexts'])
           email_text = "#{email_text}\n\nContext:\n#{blob}"
         end
-         salience = nil
-         sal_err  = nil
-         mode     = (input['salience_mode'] || 'off').to_s
-         if mode != 'off'
-           begin
-             max_span = (input['salience_max_chars'].to_i rescue 500); max_span = [[max_span,80].max,2000].min
-             # Heuristic extraction (no extra API call)
-             if mode == 'heuristic'
-               focus = email_text.to_s[0, 8000]
-               # drop greetings
-               focus = focus.sub(/\A\s*(subject:\s*[^\n]+\n+)?\s*(hi|hello|hey)[^a-z0-9]*\n+/i, '')
-               cand = focus.split(/(?<=[.!?])\s+/).find { |s| s.strip.length >= 12 && s !~ /\A(hi|hello|hey)\b/i } || focus[0, max_span]
-               span = cand.to_s.strip[0, max_span]
-               salience = {
-                 'span'=>span, 'reason'=>nil, 'importance'=>nil, 'tags'=>nil,
-                 'entities'=>nil, 'cta'=>nil, 'deadline_iso'=>nil,
-                 'focus_preview'=>focus, 'responseId'=>nil, 'usage'=>nil, 'span_source'=>'heuristic'
-               }
-             elsif mode == 'llm'
-               # LLM extraction (separate API call)
-               model = (input['salience_model'].presence || 'gemini-2.0-flash').to_s
-               model_path = call(:build_model_path_with_global_preview, connection, model)
-               loc = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
-               url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
-               req_params = "model=#{model_path}"
- 
-               schema_props = {
-                 'salient_span'=>{'type'=>'string','minLength'=>12},
-                 'reason'=>{'type'=>'string'},
-                 'importance'=>{'type'=>'number'},
-                 'tags'=>{'type'=>'array','items'=>{'type'=>'string'}},
-                 'call_to_action'=>{'type'=>'string'},
-                 'deadline_iso'=>{'type'=>'string'}
-               }
-               schema_props['entities'] = {
-                 'type'=>'array',
-                 'items'=>{'type'=>'object','additionalProperties'=>false,
-                   'properties'=>{'type'=>{'type'=>'string'},'text'=>{'type'=>'string'}},
-                   'required'=>['text']}
-               } if call(:normalize_boolean, input['salience_include_entities'])
- 
-               system_text = "You extract the single most important sentence or short paragraph from an email. " \
-                             "Rules: (1) Return VALID JSON only. (2) Do NOT output greetings, signatures, legal footers, " \
-                             "auto-replies, or vague pleasantries. (3) Keep under #{max_span} characters; do not truncate mid-sentence. " \
-                             "(4) importance is in [0,1]; set call_to_action/deadline_iso when clearly present."
- 
-               gen_cfg = {
-                 'temperature'=> (input['salience_temperature'].present? ? input['salience_temperature'].to_f : 0),
-                 'maxOutputTokens'=>512,
-                 'responseMimeType'=>'application/json',
-                 'responseSchema'=>{
-                   'type'=>'object','additionalProperties'=>false,'properties'=>schema_props,
-                   'required'=>['salient_span']
-                 }
-               }
-               contents = [{ 'role'=>'user', 'parts'=>[{ 'text'=>"Email (trimmed):\n#{email_text.to_s[0,8000]}" }]}]
-               payload = {
-                 'contents'=>contents,
-                 'systemInstruction'=>{ 'role'=>'system', 'parts'=>[{ 'text'=>system_text }]},
-                 'generationConfig'=>gen_cfg
-               }
-               req_body = call(:json_compact, payload)
-               resp = post(url).headers(call(:request_headers_auth, connection, ctx['cid'], connection['user_project'], req_params))
-                              .payload(req_body)
- 
-               txt = resp.dig('candidates',0,'content','parts',0,'text').to_s
-               parsed = call(:json_parse_safe, txt)
-               span = parsed['salient_span'].to_s.strip
-               if span.empty? || span =~ /\A(hi|hello|hey)\b[:,\s]*\z/i || span.length < 8
-                 focus = email_text.to_s[0, 8000]
-                 focus = focus.sub(/\A\s*(subject:\s*[^\n]+\n+)?\s*(hi|hello|hey)[^a-z0-9]*\n+/i, '')
-                 cand = focus.split(/(?<=[.!?])\s+/).find { |s| s.strip.length >= 12 && s !~ /\A(hi|hello|hey)\b/i } || focus[0, max_span]
-                 span = cand.to_s.strip[0, max_span]
-               end
-               salience = {
-                 'span'=>span,
-                 'reason'=>parsed['reason'],
-                 'importance'=>parsed['importance'],
-                 'tags'=>parsed['tags'],
-                 'entities'=>parsed['entities'],
-                 'cta'=>parsed['call_to_action'],
-                 'deadline_iso'=>parsed['deadline_iso'],
-                 'focus_preview'=>email_text.to_s[0,8000],
-                 'responseId'=>resp['responseId'],
-                 'usage'=>resp['usageMetadata'],
-                 'span_source'=>'llm'
-               }
-             end
-           rescue => e
-             sal_err = e.to_s
-             salience = nil
-           end
-         end
-         # Optionally append salience to the prompt sent to the referee
-         if salience && call(:normalize_boolean, input['salience_append_to_prompt'])
-           email_text = call(:maybe_append_salience, email_text, salience, salience['importance'])
-         end
-        shortlist = call(:safe_array, input['shortlist'])
-        ref = call(:llm_referee, connection, (input['generative_model'] || 'gemini-2.0-flash'),
-                  email_text, (shortlist.any? ? shortlist : nil), cats, input['fallback_category'], ctx['cid'], nil)
+        
+        # Handle salience extraction
+        salience = nil
+        sal_err = nil
+        sal_config = input['salience_config'] || {}
+        mode = sal_config['mode'] || 'off'
+        
+        if mode != 'off'
+          begin
+            max_span = (sal_config['max_chars'] || 500).to_i
+            max_span = [[max_span, 80].max, 2000].min
+            
+            if mode == 'heuristic'
+              # Heuristic extraction
+              focus = email_text.to_s[0, 8000]
+              focus = focus.sub(/\A\s*(subject:\s*[^\n]+\n+)?\s*(hi|hello|hey)[^a-z0-9]*\n+/i, '')
+              cand = focus.split(/(?<=[.!?])\s+/).find { |s| s.strip.length >= 12 && s !~ /\A(hi|hello|hey)\b/i } || focus[0, max_span]
+              span = cand.to_s.strip[0, max_span]
+              salience = {
+                'span' => span, 
+                'reason' => nil, 
+                'importance' => nil,
+                'tags' => nil,
+                'entities' => nil, 
+                'cta' => nil, 
+                'deadline_iso' => nil,
+                'focus_preview' => focus, 
+                'responseId' => nil, 
+                'usage' => nil, 
+                'span_source' => 'heuristic'
+              }
+            elsif mode == 'llm'
+              # LLM extraction with configurable model
+              llm_cfg = sal_config['llm_config'] || {}
+              model = llm_cfg['model'] || 'gemini-2.0-flash'
+              temp = llm_cfg['temperature'] || 0
+              
+              model_path = call(:build_model_path_with_global_preview, connection, model)
+              loc = (model_path[/\/locations\/([^\/]+)/, 1] || 'global').to_s.downcase
+              url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
+              req_params = "model=#{model_path}"
 
-        min_conf = (input['min_confidence'].presence || 0.25).to_f
-        chosen =
-          if ref['confidence'].to_f < min_conf && input['fallback_category'].present?
-            input['fallback_category']
-          else
-            ref['category']
+              schema_props = {
+                'salient_span' => { 'type' => 'string', 'minLength' => 12 },
+                'reason' => { 'type' => 'string' },
+                'importance' => { 'type' => 'number' },
+                'tags' => { 'type' => 'array', 'items' => { 'type' => 'string' } },
+                'call_to_action' => { 'type' => 'string' },
+                'deadline_iso' => { 'type' => 'string' }
+              }
+              
+              if sal_config['include_entities']
+                schema_props['entities'] = {
+                  'type' => 'array',
+                  'items' => {
+                    'type' => 'object',
+                    'additionalProperties' => false,
+                    'properties' => {
+                      'type' => { 'type' => 'string' },
+                      'text' => { 'type' => 'string' }
+                    },
+                    'required' => ['text']
+                  }
+                }
+              end
+
+              system_text = "You extract the single most important sentence or short paragraph from an email. " \
+                          "Rules: (1) Return VALID JSON only. (2) Do NOT output greetings, signatures, legal footers, " \
+                          "auto-replies, or vague pleasantries. (3) Keep under #{max_span} characters; do not truncate mid-sentence. " \
+                          "(4) importance is in [0,1]; set call_to_action/deadline_iso when clearly present."
+
+              gen_cfg = {
+                'temperature' => temp.to_f,
+                'maxOutputTokens' => 512,
+                'responseMimeType' => 'application/json',
+                'responseSchema' => {
+                  'type' => 'object',
+                  'additionalProperties' => false,
+                  'properties' => schema_props,
+                  'required' => ['salient_span']
+                }
+              }
+              
+              contents = [{ 'role' => 'user', 'parts' => [{ 'text' => "Email (trimmed):\n#{email_text.to_s[0,8000]}" }]}]
+              payload = {
+                'contents' => contents,
+                'systemInstruction' => { 'role' => 'system', 'parts' => [{ 'text' => system_text }]},
+                'generationConfig' => gen_cfg
+              }
+              
+              resp = post(url)
+                      .headers(call(:request_headers_auth, connection, ctx['cid'], 
+                                  connection['user_project'], req_params))
+                      .payload(call(:json_compact, payload))
+
+              txt = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
+              parsed = call(:json_parse_safe, txt)
+              span = parsed['salient_span'].to_s.strip
+              
+              if span.empty? || span =~ /\A(hi|hello|hey)\b[:,\s]*\z/i || span.length < 8
+                focus = email_text.to_s[0, 8000]
+                focus = focus.sub(/\A\s*(subject:\s*[^\n]+\n+)?\s*(hi|hello|hey)[^a-z0-9]*\n+/i, '')
+                cand = focus.split(/(?<=[.!?])\s+/).find { |s| s.strip.length >= 12 && s !~ /\A(hi|hello|hey)\b/i } || focus[0, max_span]
+                span = cand.to_s.strip[0, max_span]
+              end
+              
+              salience = {
+                'span' => span,
+                'reason' => parsed['reason'],
+                'importance' => parsed['importance'],
+                'tags' => parsed['tags'],
+                'entities' => parsed['entities'],
+                'cta' => parsed['call_to_action'],
+                'deadline_iso' => parsed['deadline_iso'],
+                'focus_preview' => email_text.to_s[0,8000],
+                'responseId' => resp['responseId'],
+                'usage' => resp['usageMetadata'],
+                'span_source' => 'llm'
+              }
+            end
+          rescue => e
+            sal_err = e.to_s
+            salience = nil
           end
+        end
+        
+        # Optionally append salience to prompt
+        if salience && sal_config['append_to_prompt'] != false
+          email_text = call(:maybe_append_salience, email_text, salience, salience['importance'])
+        end
+        
+        # Get prompt configuration
+        prompt_config = input['referee_prompt'] || {}
+        template = prompt_config['template'] || 'balanced'
+        
+        # Build referee prompt based on template
+        system_prompt = case template
+        when 'strict'
+          <<~PROMPT
+            You are a strict email classifier. Only choose a category when highly confident.
+            If uncertain, prefer the fallback category. Require strong evidence.
+            Output MUST be valid JSON only (no prose).
+            Confidence is a calibrated estimate in [0,1]. Keep reasoning crisp (<= 2 sentences).
+          PROMPT
+        when 'permissive'
+          <<~PROMPT
+            You are an inclusive email classifier. Try to find the best matching category.
+            Be generous in interpretation but still accurate. Avoid using fallback unless necessary.
+            Output MUST be valid JSON only (no prose).
+            Confidence is a calibrated estimate in [0,1]. Keep reasoning crisp (<= 2 sentences).
+          PROMPT
+        when 'custom'
+          prompt_config['custom_prompt']
+        else # balanced
+          <<~PROMPT
+            You are a strict email classifier. Choose exactly one category from the allowed list.
+            Output MUST be valid JSON only (no prose).
+            Confidence is a calibrated estimate in [0,1]. Keep reasoning crisp (<= 2 sentences).
+          PROMPT
+        end
+        
+        # Get confidence configuration
+        conf_config = input['confidence_config'] || {}
+        conf_preset = conf_config['preset'] || 'balanced'
+        
+        min_conf = case conf_preset
+        when 'strict' then 0.40
+        when 'permissive' then 0.10
+        when 'custom' then (conf_config['custom_threshold'] || 0.25).to_f
+        else 0.25 # balanced
+        end
+        
+        fallback_category = conf_config['fallback_category'] || 'Other'
+        fallback_behavior = conf_config['fallback_behavior'] || 'use_fallback'
+        
+        # Call referee
+        shortlist = call(:safe_array, input['shortlist'])
+        ref = call(:llm_referee, 
+                  connection, 
+                  (input['generative_model'] || 'gemini-2.0-flash'),
+                  email_text, 
+                  (shortlist.any? ? shortlist : nil), 
+                  cats, 
+                  fallback_category, 
+                  ctx['cid'], 
+                  system_prompt)
+
+        # Handle low confidence based on behavior setting
+        chosen = ref['category']
+        confidence = [ref['confidence'], 0.0].compact.first.to_f
+        
+        if confidence < min_conf
+          case fallback_behavior
+          when 'error'
+            error("Confidence #{confidence} below threshold #{min_conf}")
+          when 'return_low'
+            # Keep the low confidence result
+          else # use_fallback
+            chosen = fallback_category if fallback_category.present?
+          end
+        end
 
         out = {
-          'referee'=>ref,
-          'chosen'=>chosen,
-          'confidence'=>[ref['confidence'], 0.0].compact.first.to_f
+          'referee' => ref,
+          'chosen' => chosen,
+          'confidence' => confidence
         }
+        
         out['signals_category'] = chosen
-        out['signals_confidence'] = out['confidence']
+        out['signals_confidence'] = confidence
         out['salience'] = salience if salience
- 
+        
+        # Add generator gate
+        out['generator_gate'] = {
+          'pass_to_responder' => confidence >= min_conf,
+          'reason' => confidence < min_conf ? 'low_confidence' : nil,
+          'generator_hint' => confidence >= min_conf ? 'proceed' : 'check_fallback'
+        }
+
         extras = {
           'chosen' => chosen,
-          'confidence' => out['confidence'],
-          'salience_mode' => input['salience_mode'] || 'off',
+          'confidence' => confidence,
+          'salience_mode' => mode,
           'salience_len' => (salience && salience['span'] ? salience['span'].to_s.length : nil),
           'salience_importance' => (salience && salience['importance']),
           'salience_source' => (salience && salience['span_source']),
@@ -1675,14 +2203,16 @@ require 'securerandom'
           'has_contexts' => Array(input['contexts']).any?,
           'shortlist_size' => shortlist.length,
           'generative_model' => input['generative_model'] || 'gemini-2.0-flash',
-          'categories_mode' => input['categories_mode'] || 'array'
+          'categories_mode' => input['categories_mode'] || 'array',
+          'referee_template' => template,
+          'confidence_preset' => conf_preset,
+          'min_confidence' => min_conf
         }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
 
-        # Add the missing step_ok! call with extras
         call(:step_ok!, ctx, out, 200, 'OK', extras)
       end,
       sample_output: lambda do
-        call(:sample_llm_referee_with_contexts)  # or appropriate method name for each action
+        call(:sample_llm_referee_with_contexts)
       end
     },
     rag_retrieve_contexts_enhanced: {
@@ -1703,55 +2233,91 @@ require 'securerandom'
         }
       end,
       config_fields: [
-        { name: 'show_advanced', label: 'Show advanced options',
-          type: 'boolean', control_type: 'checkbox',
-          default: false, sticky: true, extends_schema: true,
-          hint: 'Toggle to reveal threshold/ranker controls.' }
-      ],    
+        { name: 'show_advanced', label: 'Show advanced options', type: 'boolean', control_type: 'checkbox',
+          default: false, sticky: true, extends_schema: true, hint: 'Toggle to reveal threshold/ranker controls.' }
+      ],
       input_fields: lambda do |od, connection, cfg|
         show_adv = (cfg['show_advanced'] == true)
         
         base = [
           { name: 'query_text', label: 'Query text', optional: false },
-          { name: 'rag_corpus', optional: true, hint: 'Full or short ID. Example: my-corpus. Will auto-expand using connection project/location.' },
+          { name: 'rag_corpus', optional: true, 
+            hint: 'Full or short ID. Example: my-corpus. Will auto-expand using connection project/location.' },
           { name: 'rag_file_ids', type: 'array', of: 'string', optional: true,
             hint: 'Optional: limit to these file IDs (must belong to the same corpus).' },
-          { name: 'top_k', type: 'integer', optional: true, default: 20, hint: 'Max contexts to return.' },
-          { name: 'correlation_id', optional: true, hint: 'For tracking related requests.' },
-          { name: 'signals_category', optional: true, hint: 'Category from step 5 (enhances retrieval)' },
-          { name: 'sanitize_pdf_content', type: 'boolean', control_type: 'checkbox',default: true,
-            hint: 'Clean PDF extraction artifacts when detected (recommended)' },
-          { name: 'on_error_behavior', control_type: 'select', default: 'skip',
-            pick_list: [
-              ['Skip failed contexts', 'skip'],
-              ['Include error placeholders', 'include'],
-              ['Fail entire request', 'fail']
-            ],
-            hint: 'How to handle individual context processing errors' }
+          { name: 'signals_category', optional: true, 
+            hint: 'Category from step 5 (enhances retrieval)' }
         ]
         
-        adv = [
-          { name: 'vector_distance_threshold', type: 'number', optional: true,
-            hint: 'Return contexts with distance ≤ threshold. For COSINE, lower is better.' },
-          { name: 'vector_similarity_threshold', type: 'number', optional: true,
-            hint: 'Return contexts with similarity ≥ threshold. Do NOT set both thresholds.' },
-          { name: 'rank_service_model', optional: true,
-            hint: 'Vertex Ranking model, e.g. semantic-ranker-512@latest.' },
-          { name: 'llm_ranker_model', optional: true,
-            hint: 'LLM ranker, e.g. gemini-2.5-flash.' }
+        # Retrieval configuration with presets
+        retrieval_fields = [
+          { name: 'retrieval_preset', label: 'Retrieval Configuration', control_type: 'select',
+            default: 'balanced', extends_schema: true, hint: 'Choose retrieval breadth and filtering'
+            options: [
+              ['Narrow (10 contexts, high threshold)', 'narrow'],
+              ['Balanced (20 contexts, medium threshold)', 'balanced'],
+              ['Broad (50 contexts, low threshold)', 'broad'],
+              ['Custom', 'custom']
+            ] },   
+          { name: 'custom_retrieval', 
+            type: 'object', ngIf: 'input.retrieval_preset == "custom"',
+            properties: [
+              { name: 'top_k', type: 'integer', default: 20, hint: 'Max contexts to return (1-100)' },
+              { name: 'vector_distance_threshold', type: 'number', optional: true, hint: 'Distance ≤ threshold (COSINE: lower is better)' },
+              { name: 'vector_similarity_threshold', type: 'number', optional: true, hint: 'Similarity ≥ threshold (do not use with distance)' }
+            ] }
+        ]
+
+        # Processing configuration
+        processing_fields = [
+          { name: 'processing_config', label: 'Context Processing', type: 'object',
+            properties: [
+              { name: 'sanitize_pdf_content', type: 'boolean', control_type: 'checkbox',
+                default: true, hint: 'Clean PDF extraction artifacts when detected' },
+              { name: 'on_error_behavior', control_type: 'select', default: 'skip',
+                pick_list: [
+                  ['Skip failed contexts', 'skip'],
+                  ['Include error placeholders', 'include'],
+                  ['Fail entire request', 'fail']
+                ],
+                hint: 'How to handle individual context processing errors' },
+              { name: 'empty_response_behavior', control_type: 'select', default: 'placeholder',
+                options: [
+                  ['Add placeholder context', 'placeholder'],
+                  ['Return empty array', 'empty'],
+                  ['Raise error', 'error']
+                ],
+                hint: 'How to handle empty retrieval results' } ]
+          }
         ]
         
-        show_adv ? (base + adv) : base
+        adv = show_adv ? [
+          # Ranking configuration
+          { name: 'ranking_config', label: 'Ranking Model', type: 'object',
+            properties: [
+              { name: 'use_ranking', type: 'boolean', control_type: 'checkbox', default: false, extends_schema: true,
+                hint: 'Apply semantic ranking after retrieval' },
+              { name: 'ranking_type', control_type: 'select', ngIf: 'input.ranking_config.use_ranking', default: 'semantic',
+                options: [
+                  ['Semantic Ranker', 'semantic'],
+                  ['LLM Ranker', 'llm']
+                ] },
+              { name: 'semantic_model', ngIf: 'input.ranking_config.ranking_type == "semantic"', default: 'semantic-ranker-512@latest',
+                hint: 'Vertex Ranking model name' },
+              { name: 'llm_model', ngIf: 'input.ranking_config.ranking_type == "llm"', default: 'gemini-2.0-flash', hint: 'LLM for ranking' }
+            ] }
+        ] : []
+        
+        base + retrieval_fields + processing_fields + adv + [
+          { name: 'correlation_id', optional: true, sticky: true, hint: 'For tracking related requests.' }
+        ]
       end,
       output_fields: lambda do |object_definitions, connection|
         [
-          # Business outputs
           { name: 'question' },
           { name: 'contexts', type: 'array', of: 'object',
-            properties: object_definitions['context_chunk_standard'] },  # All context fields
-          
-          # Standard fields (but with enhanced telemetry)
-          { name: 'ok', type: 'boolean' },
+            properties: object_definitions['context_chunk_standard'] },
+          { name: 'ok', type: 'boolean', convert_output: 'boolean_conversion' },
           { name: 'telemetry', type: 'object', properties: [
             { name: 'http_status', type: 'integer' },
             { name: 'message' },
@@ -1760,17 +2326,17 @@ require 'securerandom'
             { name: 'success_count', type: 'integer' },
             { name: 'error_count', type: 'integer' },
             { name: 'partial_failure', type: 'boolean' },
+            { name: 'retrieval_preset' },
             { name: 'local_logs', type: 'array', of: 'object', optional: true }
           ]}
         ]
       end,
       execute: lambda do |connection, input|
-        # Initialize tracking context
         ctx = call(:step_begin!, :rag_retrieve_contexts_enhanced, input)
         
         begin
-          # Extract project/location from connection
-          sa_key = JSON.parse(connection['service_account_key_json'] || '{}') rescue {}
+          # Extract project/location from connection 
+          sa_key = JSON.parse(connection['service_account_key_json'] || '{}') rescue {} 
           project = connection['project_id'] || sa_key['project_id']
           location = connection['location'] || 'us-central1'
           
@@ -1784,12 +2350,38 @@ require 'securerandom'
             corpus = "projects/#{project}/locations/#{location}/ragCorpora/#{corpus}"
           end
           
+          # Resolve retrieval configuration from preset or custom
+          retrieval_config = case input['retrieval_preset']
+          when 'narrow'
+            { 'top_k' => 10, 'vector_similarity_threshold' => 0.8 }
+          when 'broad'
+            { 'top_k' => 50, 'vector_similarity_threshold' => 0.5 }
+          when 'custom'
+            custom = input['custom_retrieval'] || {}
+            {
+              'top_k' => custom['top_k'] || 20,
+              'vector_distance_threshold' => custom['vector_distance_threshold'],
+              'vector_similarity_threshold' => custom['vector_similarity_threshold']
+            }.compact
+          else # balanced
+            { 'top_k' => 20, 'vector_similarity_threshold' => 0.65 }
+          end
+          
           # Validate threshold parameters
-          if input['vector_distance_threshold'].present? && input['vector_similarity_threshold'].present?
+          if retrieval_config['vector_distance_threshold'] && retrieval_config['vector_similarity_threshold']
             error('Set ONLY one of: vector_distance_threshold OR vector_similarity_threshold.')
           end
-          if input['rank_service_model'].present? && input['llm_ranker_model'].present?
-            error('Choose ONE ranker: rank_service_model OR llm_ranker_model.')
+          
+          # Handle ranking configuration
+          if input['ranking_config'] && input['ranking_config']['use_ranking']
+            ranking_type = input['ranking_config']['ranking_type'] || 'semantic'
+            if ranking_type == 'semantic'
+              model_name = input['ranking_config']['semantic_model'] || 'semantic-ranker-512@latest'
+              retrieval_config['ranking'] = { 'rankService' => { 'modelName' => model_name } }
+            else
+              model_name = input['ranking_config']['llm_model'] || 'gemini-2.0-flash'
+              retrieval_config['ranking'] = { 'llmRanker' => { 'modelName' => model_name } }
+            end
           end
           
           # Build ragResources
@@ -1800,22 +2392,18 @@ require 'securerandom'
           
           error('Provide rag_corpus and/or rag_file_ids') if rag_resources.empty?
           
-          # Build retrieval config
-          retrieval_cfg = { 'topK' => (input['top_k'] || 20).to_i }
+          # Build retrieval config for API
+          retrieval_cfg = { 'topK' => retrieval_config['top_k'] || 20 }
           
           # Add filter if specified
-          if input['vector_distance_threshold'].present?
-            retrieval_cfg['filter'] = { 'vectorDistanceThreshold' => input['vector_distance_threshold'].to_f }
-          elsif input['vector_similarity_threshold'].present?
-            retrieval_cfg['filter'] = { 'vectorSimilarityThreshold' => input['vector_similarity_threshold'].to_f }
+          if retrieval_config['vector_distance_threshold']
+            retrieval_cfg['filter'] = { 'vectorDistanceThreshold' => retrieval_config['vector_distance_threshold'].to_f }
+          elsif retrieval_config['vector_similarity_threshold']
+            retrieval_cfg['filter'] = { 'vectorSimilarityThreshold' => retrieval_config['vector_similarity_threshold'].to_f }
           end
           
-          # Add ranking if specified
-          if input['rank_service_model'].present?
-            retrieval_cfg['ranking'] = { 'rankService' => { 'modelName' => input['rank_service_model'] } }
-          elsif input['llm_ranker_model'].present?
-            retrieval_cfg['ranking'] = { 'llmRanker' => { 'modelName' => input['llm_ranker_model'] } }
-          end
+          # Add ranking if configured
+          retrieval_cfg['ranking'] = retrieval_config['ranking'] if retrieval_config['ranking']
           
           # Build request
           url = "https://#{location}-aiplatform.googleapis.com/v1/projects/#{project}/locations/#{location}:retrieveContexts"
@@ -1837,78 +2425,70 @@ require 'securerandom'
             'x-goog-request-params' => "parent=projects/#{project}/locations/#{location}"
           }
           
+          
           # Make request with error handling
           response = begin
             post(url).headers(headers).payload(body)
           rescue => e
             if e.message.include?('timeout') || e.message.include?('connection')
-              # Return empty but valid response for network issues
               {
                 'contexts' => { 'contexts' => [] },
                 '_network_error' => "Network error: #{e.message[0..200]}"
               }
             else
-              raise e  # Re-raise non-network errors
+              raise e
             end
           end
           
-          # Extract and map contexts with graceful failure
+          # Extract processing configuration
+          proc_config = input['processing_config'] || {}
+          sanitize_pdf = proc_config['sanitize_pdf_content'] != false
+          on_error = proc_config['on_error_behavior'] || 'skip'
+          empty_behavior = proc_config['empty_response_behavior'] || 'placeholder'
+          
+          # Extract and map contexts
           contexts = []
-          #raw_contexts = call(:safe_extract_contexts, response)
           raw_contexts = if response && response['contexts'] && response['contexts']['contexts']
             response['contexts']['contexts']
           else
             []
           end
           
+          # Handle empty responses based on configuration
           if raw_contexts.empty? && !response['_network_error']
-            # Add informational context for empty responses
-            contexts << {
-              'id' => 'no-results',
-              'text' => 'No contexts were returned for this query.',
-              'score' => 0.0,
-              'source' => 'system',
-              'uri' => nil,
-              'metadata' => { 'info' => 'empty_response' },
-              'metadata_kv' => [{ 'key' => 'info', 'value' => 'empty_response' }],
-              'metadata_json' => '{"info":"empty_response"}',
-              'is_pdf' => false,
-              'processing_error' => false
-            }
+            case empty_behavior
+            when 'error'
+              error('No contexts were retrieved for the query')
+            when 'placeholder'
+              contexts << {
+                'id' => 'no-results',
+                'text' => 'No contexts were returned for this query.',
+                'score' => 0.0,
+                'source' => 'system',
+                'uri' => nil,
+                'metadata' => { 'info' => 'empty_response' },
+                'metadata_kv' => [{ 'key' => 'info', 'value' => 'empty_response' }],
+                'metadata_json' => '{"info":"empty_response"}',
+                'is_pdf' => false,
+                'processing_error' => false
+              }
+            # when 'empty' - just leave contexts empty
+            end
           else
+            # Process retrieved contexts
             raw_contexts.each_with_index do |ctx_item, idx|
               begin
-                # Extract metadata
                 md = ctx_item['metadata'] || {}
-                
-                # Get source URI for PDF detection
                 source_uri = ctx_item['sourceUri'] || ctx_item['uri']
-                
-                # DEBUGGING: Log what we're seeing
                 is_pdf = call(:is_pdf_source?, source_uri, md)
-                sanitize_enabled = input['sanitize_pdf_content'] != false
                 
                 # Extract text
                 raw_text = (ctx_item['text'] || ctx_item.dig('chunk', 'text') || '').to_s
                 
-                # DEBUGGING: Check for PDF indicators
-                has_double_escapes = raw_text.include?('\\\\n') || raw_text.include?('\\\\t')
-                
-                # Log for debugging (remove after fixing)
-                if has_double_escapes || is_pdf
-                  puts "DEBUG Context #{idx}: is_pdf=#{is_pdf}, sanitize=#{sanitize_enabled}, has_escapes=#{has_double_escapes}, uri=#{source_uri}"
-                end
-                
-                # Apply PDF-specific cleaning based on preference and detection
-                text = if sanitize_enabled && is_pdf
-                  puts "DEBUG: Sanitizing PDF context #{idx}"
-                  call(:sanitize_pdf_text, raw_text)
-                elsif has_double_escapes && sanitize_enabled
-                  # FALLBACK: Even if not detected as PDF, clean obvious PDF artifacts
-                  puts "DEBUG: Cleaning escaped content in context #{idx}"
+                # Apply PDF cleaning if configured
+                text = if sanitize_pdf && (is_pdf || raw_text.include?('\\\\n'))
                   call(:sanitize_pdf_text, raw_text)
                 else
-                  # Regular cleaning for non-PDF content
                   raw_text.encode('UTF-8', invalid: :replace, undef: :replace, replace: ' ')
                           .gsub(/\s+/, ' ')
                           .strip
@@ -1928,19 +2508,18 @@ require 'securerandom'
                   'source' => ctx_item['sourceDisplayName'] || source_uri&.split('/')&.last,
                   'uri' => source_uri,
                   'metadata' => md,
-                  'metadata_kv' => md.map { |k, v| { 'key' => k.to_s, 'value' => v.to_s[0..1000] } }, # Limit value size
+                  'metadata_kv' => md.map { |k, v| { 'key' => k.to_s, 'value' => v.to_s[0..1000] } },
                   'metadata_json' => metadata_json,
-                  'is_pdf' => call(:is_pdf_source?, source_uri, md),
+                  'is_pdf' => is_pdf,
                   'processing_error' => false
                 }
                 
               rescue => e
                 # Handle individual context errors based on configuration
-                case input['on_error_behavior']
+                case on_error
                 when 'fail'
-                  raise e  # Re-raise to fail entire action
+                  raise e
                 when 'include'
-                  # Add error placeholder context
                   contexts << {
                     'id' => "ctx-#{idx + 1}-error",
                     'text' => "[Error processing context: #{e.message[0..200]}]",
@@ -1949,8 +2528,7 @@ require 'securerandom'
                     'uri' => nil,
                     'metadata' => { 
                       'error' => e.message[0..500], 
-                      'error_class' => e.class.name,
-                      'original_id' => ctx_item['chunkId'] || ctx_item['id'] 
+                      'error_class' => e.class.name
                     },
                     'metadata_kv' => [
                       { 'key' => 'error', 'value' => e.message[0..500] },
@@ -1960,8 +2538,7 @@ require 'securerandom'
                     'is_pdf' => false,
                     'processing_error' => true
                   }
-                when 'skip', nil
-                  # Skip this context, continue processing
+                when 'skip'
                   next
                 end
               end
@@ -1979,7 +2556,7 @@ require 'securerandom'
             'contexts' => contexts
           }
           
-          # Add telemetry with success tracking
+          # Enhanced telemetry
           extras = {
             'retrieval' => {
               'top_k' => retrieval_cfg['topK'],
@@ -1997,6 +2574,7 @@ require 'securerandom'
               'mode' => retrieval_cfg['ranking'].keys.first,
               'model' => retrieval_cfg['ranking'].values.first['modelName']
             } : nil,
+            'retrieval_preset' => input['retrieval_preset'] || 'balanced',
             'network_error' => response['_network_error']
           }.compact
           
@@ -2009,17 +2587,15 @@ require 'securerandom'
             "Retrieved #{contexts.length} contexts"
           end
           
-          # Return success with telemetry
           call(:step_ok!, ctx, out, 200, message, extras)
           
         rescue => e
-          # Handle errors with telemetry
           call(:step_err!, ctx, e)
         end
       end,
       sample_output: lambda do
         call(:sample_rag_retrieve_contexts_enhanced)
-      end,
+      end
     },
     rank_texts_with_ranking_api: {
       title: 'Context: Rerank contexts',
@@ -2041,10 +2617,8 @@ require 'securerandom'
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
       config_fields: [
-        { name: 'show_advanced', label: 'Show advanced options',
-          type: 'boolean', control_type: 'checkbox',
-          default: false, sticky: true, extends_schema: true,
-          hint: 'Toggle to reveal filtering and distribution options.' }
+        { name: 'show_advanced', label: 'Show advanced options', type: 'boolean', control_type: 'checkbox',
+          default: false, sticky: true, extends_schema: true, hint: 'Toggle to reveal filtering and distribution options.' }
       ],
       input_fields: lambda do |object_definitions, connection, config_fields|
         show_adv = (config_fields['show_advanced'] == true)
@@ -2058,64 +2632,95 @@ require 'securerandom'
             { name: 'source', optional: true, hint: 'Source document name' },
             { name: 'uri', optional: true, hint: 'Source document URI/path' },
             { name: 'metadata', type: 'object', optional: true }
-            ], hint: 'Retrieved contexts to rank (id + content required)' },
-          { name: 'category', optional: true, 
-            hint: 'Pre-determined category (e.g., PTO, Billing, Support) to inform ranking' },
-          { name: 'signals_category', optional: true, 
-            hint: 'Falls back to this if category not provided directly' },
-          { name: 'correlation_id', label: 'Correlation ID', optional: true, 
-            hint: 'Pass the same ID across actions to stitch logs and metrics.', sticky: true },
-          { name: 'llm_model', optional: true, default: 'gemini-2.0-flash',
-            hint: 'LLM model for semantic ranking' },
-          { name: 'top_n', type: 'integer', optional: true, 
-            hint: 'Max contexts to return (default: all)' }
+          ], hint: 'Retrieved contexts to rank (id + content required)' },
+          { name: 'category', optional: true, hint: 'Pre-determined category (e.g., PTO, Billing, Support) to inform ranking' },
+          { name: 'signals_category', optional: true, hint: 'Falls back to this if category not provided directly' }
         ]
         
-        if show_adv
-          base + [
-            # Category-specific options
-            { name: 'category_context', optional: true,
-              hint: 'Additional context about the category to guide ranking' },
-            { name: 'include_category_in_query', type: 'boolean', control_type: 'checkbox', 
-              optional: true, default: true,
-              hint: 'Include category context in ranking query for better relevance' },
-            
-            # Filtering options
-            { name: 'filter_by_category_metadata', type: 'boolean', control_type: 'checkbox', 
-              optional: true, default: false,
-              hint: 'Pre-filter contexts by category match in metadata before ranking' },
-            { name: 'category_metadata_key', optional: true, default: 'category',
-              ngIf: 'input.filter_by_category_metadata',
-              hint: 'Metadata field containing category tags' },
-            
-            # LLM processing limits
-            { name: 'llm_max_contexts', type: 'integer', optional: true, default: 50,
-              hint: 'Maximum number of contexts to process with LLM (for cost/performance)' },
-            { name: 'include_confidence_distribution', type: 'boolean', control_type: 'checkbox', 
-              optional: true, default: false,
-              hint: 'Return probability distribution across contexts' },
-            
-            # Output options
-            { name: 'emit_shape', control_type: 'select', pick_list: 'rerank_emit_shapes', 
-              optional: true, default: 'context_chunks',
-              hint: 'Output format: minimal records, enriched records, or RAG-ready context_chunks' },
-            { name: 'source_key', optional: true, default: 'source',
-              hint: 'Metadata key for document source' },
-            { name: 'uri_key', optional: true, default: 'uri',
-              hint: 'Metadata key for document URI' },
-            
-            # Location override
-            { name: 'ai_apps_location', label: 'AI-Apps location (override)', control_type: 'select', 
-              pick_list: 'ai_apps_locations', optional: true,
-              hint: 'Force specific multi-region (global/us/eu). Usually auto-detected.' }
-          ]
-        else
-          base
-        end
+        # Prompt configuration for ranking
+        prompt_fields = [
+          { name: 'ranking_prompt_template', label: 'Ranking Prompt Style', control_type: 'select', default: 'category_aware',
+            extends_schema: true,
+            options: [
+              ['Category-Aware (relevance + alignment)', 'category_aware'],
+              ['Query-Only (pure relevance)', 'query_only'],
+              ['Critical (high precision)', 'critical'],
+              ['Custom', 'custom']
+            ],
+            hint: 'Choose ranking evaluation style' },
+          
+          { name: 'custom_ranking_prompt', label: 'Custom Ranking Instructions', control_type: 'text-area',
+            ngIf: 'input.ranking_prompt_template == "custom"', hint: 'Define custom scoring criteria for ranking' }
+        ]
+        
+        # Ranking configuration
+        ranking_fields = [
+          { name: 'ranking_config', label: 'Ranking Parameters', type: 'object',
+            properties: [
+              { name: 'score_weights', type: 'object',
+                properties: [
+                  { name: 'use_preset', type: 'boolean', control_type: 'checkbox',
+                    default: true, extends_schema: true },
+                  { name: 'preset', control_type: 'select',
+                    ngIf: 'input.ranking_config.score_weights.use_preset',
+                    default: 'balanced',
+                    options: [
+                      ['Relevance-Heavy (0.9 relevance, 0.1 category)', 'relevance_heavy'],
+                      ['Balanced (0.8 relevance, 0.2 category)', 'balanced'],
+                      ['Category-Heavy (0.6 relevance, 0.4 category)', 'category_heavy']
+                    ]
+                  },
+                  { name: 'custom', type: 'object',
+                    ngIf: '!input.ranking_config.score_weights.use_preset',
+                    properties: [
+                      { name: 'relevance_weight', type: 'number', default: 0.8,
+                        hint: 'Weight for query relevance (0-1)' },
+                      { name: 'category_weight', type: 'number', default: 0.2,
+                        hint: 'Weight for category alignment (0-1)' }
+                    ]
+                  }
+                ]
+              },
+              { name: 'top_n', type: 'integer', optional: true,
+                hint: 'Max contexts to return after ranking' },
+              { name: 'llm_model', default: 'gemini-2.0-flash',
+                hint: 'LLM model for semantic ranking' },
+              { name: 'llm_max_contexts', type: 'integer', default: 50,
+                hint: 'Max contexts to send to LLM (for cost control)' }
+            ] }
+        ]
+        
+        adv = show_adv ? [
+          # Category filtering
+          { name: 'filter_by_category_metadata', type: 'boolean', control_type: 'checkbox', optional: true, default: false,
+            hint: 'Pre-filter contexts by category match in metadata before ranking' },
+          { name: 'category_metadata_key', optional: true, default: 'category', ngIf: 'input.filter_by_category_metadata',
+            hint: 'Metadata field containing category tags' },
+          { name: 'category_context', optional: true, hint: 'Additional context about the category to guide ranking' },
+          { name: 'include_category_in_query', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+            hint: 'Include category context in ranking query for better relevance' },
+          
+          # Distribution
+          { name: 'include_confidence_distribution', type: 'boolean', control_type: 'checkbox', 
+            optional: true, default: false, hint: 'Return probability distribution across contexts' },
+          
+          # Output format
+          { name: 'emit_shape', control_type: 'select', pick_list: 'rerank_emit_shapes',  optional: true, default: 'context_chunks',
+            hint: 'Output format: minimal records, enriched records, or RAG-ready context_chunks' },
+          { name: 'source_key', optional: true, default: 'source', hint: 'Metadata key for document source' },
+          { name: 'uri_key', optional: true, default: 'uri', hint: 'Metadata key for document URI' },
+          
+          # Location override
+          { name: 'ai_apps_location', label: 'AI-Apps location (override)', control_type: 'select', pick_list: 'ai_apps_locations', optional: true,
+            hint: 'Force specific multi-region (global/us/eu). Usually auto-detected.' }
+        ] : []
+        
+        base + prompt_fields + ranking_fields + adv + [
+          { name: 'correlation_id', label: 'Correlation ID', optional: true, sticky: true, hint: 'Pass the same ID across actions to stitch logs and metrics.' }
+        ]
       end,
       output_fields: lambda do |object_definitions, _connection|
         [
-          # Business outputs - records always present
           { name: 'records', type: 'array', of: 'object', properties: [
             { name: 'id' },
             { name: 'score', type: 'number' },
@@ -2127,32 +2732,24 @@ require 'securerandom'
             { name: 'llm_relevance', type: 'number' },
             { name: 'category_alignment', type: 'number' }
           ]},
-          
-          # Context chunks (when emit_shape = context_chunks)
           { name: 'context_chunks', type: 'array', of: 'object', 
             properties: object_definitions['context_chunk_standard'] + [
-              # Additional fields specific to ranking
               { name: 'llm_relevance', type: 'number' },
               { name: 'category_alignment', type: 'number' }
             ]
           },
-          
-          # Optional confidence distribution
           { name: 'confidence_distribution', type: 'array', of: 'object', properties: [
             { name: 'id' },
             { name: 'probability', type: 'number' },
             { name: 'reasoning' }
           ]},
-          
-          # Metadata about the ranking operation
           { name: 'ranking_metadata', type: 'object', properties: [
             { name: 'category' },
             { name: 'llm_model' },
             { name: 'contexts_filtered', type: 'integer' },
-            { name: 'contexts_ranked', type: 'integer' }
+            { name: 'contexts_ranked', type: 'integer' },
+            { name: 'score_weights', type: 'object' }
           ]},
-          
-          # Standard fields
           { name: 'complete_output', type: 'object' },
           { name: 'facets', type: 'object', optional: true }
         ] + call(:standard_operational_outputs)
@@ -2169,6 +2766,57 @@ require 'securerandom'
           category_ctx = input['category_context'].to_s.strip
           query = input['query_text'].to_s
           
+          # Get ranking prompt
+          default_prompt = <<~PROMPT
+            You are an expert relevance scorer for a knowledge retrieval system.
+            Given a query within a specific category, evaluate how well each context answers the query.
+            
+            Scoring criteria:
+            1. Relevance (0-1): How directly the context addresses the query
+            2. Category Alignment (0-1): How well the context fits the category domain
+            
+            Be precise and calibrated in your scoring. Output valid JSON only.
+          PROMPT
+          
+          ranking_prompt = case input['ranking_prompt_template']
+          when 'query_only'
+            <<~PROMPT
+              Score each context purely on relevance to the query.
+              Ignore category considerations. Focus only on query match.
+              Output valid JSON only.
+            PROMPT
+          when 'critical'
+            <<~PROMPT
+              Apply strict relevance scoring. Only high-confidence matches should score above 0.7.
+              Be conservative - when in doubt, score lower.
+              Output valid JSON only.
+            PROMPT
+          when 'custom'
+            input['custom_ranking_prompt'] || default_prompt
+          else # category_aware
+            default_prompt
+          end
+          
+          # Get score weights
+          weights_config = input.dig('ranking_config', 'score_weights') || {}
+          score_weights = if !weights_config['use_preset'] && weights_config['custom']
+            custom = weights_config['custom']
+            {
+              'relevance' => (custom['relevance_weight'] || 0.8).to_f,
+              'category' => (custom['category_weight'] || 0.2).to_f
+            }
+          else
+            preset = weights_config['preset'] || 'balanced'
+            case preset
+            when 'relevance_heavy'
+              { 'relevance' => 0.9, 'category' => 0.1 }
+            when 'category_heavy'
+              { 'relevance' => 0.6, 'category' => 0.4 }
+            else # balanced
+              { 'relevance' => 0.8, 'category' => 0.2 }
+            end
+          end
+          
           # Enhance query with category context if requested
           if category.present? && input['include_category_in_query'] == true
             query_prefix = "Category: #{category}"
@@ -2181,7 +2829,7 @@ require 'securerandom'
           # Pre-filter contexts by category metadata if requested
           records_in = call(:safe_array, input['records'])
           
-          # Validate that records have required fields
+          # Validate records
           records_in.each_with_index do |r, i|
             error("Record at index #{i} missing required 'id' field") unless r['id'].present?
             error("Record at index #{i} missing required 'content' field") unless r['content'].present?
@@ -2212,8 +2860,12 @@ require 'securerandom'
             end
           end
           
-          # LLM-based ranking
-          llm_model = input['llm_model'] || 'gemini-2.0-flash'
+          # Get ranking configuration
+          ranking_config = input['ranking_config'] || {}
+          llm_model = ranking_config['llm_model'] || 'gemini-2.0-flash'
+          max_llm_contexts = (ranking_config['llm_max_contexts'] || 50).to_i
+          top_n = ranking_config['top_n']
+          
           distribution = nil
           enriched = []
           
@@ -2222,25 +2874,25 @@ require 'securerandom'
             orig.merge(
               'score' => orig['score'] || 0.0,
               'rank' => 999,
-              'source' => orig['source'],       # Preserve source
-              'uri' => orig['uri']  
+              'source' => orig['source'],
+              'uri' => orig['uri']
             )
           end
           
-          # Perform LLM ranking if category is present
-          if category.present?
+          # Perform LLM ranking if category is present OR if we have contexts to rank
+          if category.present? || records_to_rank.any?
             # Limit contexts for LLM processing
-            max_llm_contexts = (input['llm_max_contexts'] || 50).to_i
             contexts_for_llm = enriched.first(max_llm_contexts)
             
-            # Call LLM ranker
-            llm_result = call(:llm_category_aware_ranker,
+            # Enhanced LLM ranker call with custom prompt
+            llm_result = call(:llm_category_aware_ranker_enhanced,
                             connection,
                             llm_model,
                             enhanced_query,
                             category,
                             category_ctx,
                             contexts_for_llm,
+                            ranking_prompt,
                             ctx['cid'])
             
             if llm_result && llm_result['rankings']
@@ -2254,15 +2906,15 @@ require 'securerandom'
                 }
               end
               
-              # Apply LLM scores
+              # Apply LLM scores with configured weights
               enriched.each do |rec|
                 if llm_data = llm_scores[rec['id']]
                   rec['llm_relevance'] = llm_data['relevance']
                   rec['category_alignment'] = llm_data['category_alignment']
-                  # Score is weighted combination of relevance and category alignment
-                  rec['score'] = 0.8 * llm_data['relevance'] + 0.2 * llm_data['category_alignment']
+                  # Apply configured weights
+                  rec['score'] = score_weights['relevance'] * llm_data['relevance'] + 
+                              score_weights['category'] * llm_data['category_alignment']
                 else
-                  # Records not evaluated by LLM get zero score
                   rec['score'] = 0.0
                 end
               end
@@ -2282,29 +2934,6 @@ require 'securerandom'
                 }.sort_by { |d| -d['probability'] }
               end
             end
-          else
-            # If no category provided, use simple query-based relevance scoring
-            contexts_for_llm = enriched.first((input['llm_max_contexts'] || 50).to_i)
-            
-            # Simplified LLM ranking without category
-            llm_result = call(:llm_category_aware_ranker,
-                            connection,
-                            llm_model,
-                            enhanced_query,
-                            '',  # No category
-                            '',  # No category context
-                            contexts_for_llm,
-                            ctx['cid'])
-            
-            if llm_result && llm_result['rankings']
-              llm_result['rankings'].each do |r|
-                matching_record = enriched.find { |rec| rec['id'] == r['id'] }
-                if matching_record
-                  matching_record['llm_relevance'] = r['relevance'].to_f
-                  matching_record['score'] = r['relevance'].to_f
-                end
-              end
-            end
           end
           
           # Re-rank by final scores
@@ -2312,11 +2941,11 @@ require 'securerandom'
                             .each_with_index { |r, i| r['rank'] = i + 1 }
           
           # Apply top_n limit if specified
-          if input['top_n'].present?
-            enriched = enriched.first(input['top_n'].to_i)
+          if top_n.present?
+            enriched = enriched.first(top_n.to_i)
           end
           
-          # Shape Output
+          # Shape Output (unchanged)
           shape = input['emit_shape'] || 'context_chunks'
           result = {}
           
@@ -2327,15 +2956,14 @@ require 'securerandom'
                 'id' => r['id'], 
                 'score' => r['score'], 
                 'rank' => r['rank'],
-                'uri' => r['uri'],      # Include URI
-                'source' => r['source']  # Include source
+                'uri' => r['uri'],
+                'source' => r['source']
               }
             }
           when 'enriched_records'
             result['records'] = enriched
-          else  # context_chunks
+          else # context_chunks
             chunks = enriched.map { |r|
-              # Try to get from direct fields first
               md = r['metadata'] || {}
               source_key = input['source_key'] || 'source'
               uri_key = input['uri_key'] || 'uri'
@@ -2366,7 +2994,8 @@ require 'securerandom'
             'category' => category.presence,
             'llm_model' => llm_model,
             'contexts_filtered' => records_in.length - records_to_rank.length,
-            'contexts_ranked' => records_to_rank.length
+            'contexts_ranked' => records_to_rank.length,
+            'score_weights' => score_weights
           }.compact
           
           # Build facets
@@ -2381,7 +3010,9 @@ require 'securerandom'
             'records_output' => enriched.length,
             'has_distribution' => distribution.present?,
             'top_score' => enriched.first&.dig('score'),
-            'category_filtered' => input['filter_by_category_metadata'] == true
+            'category_filtered' => input['filter_by_category_metadata'] == true,
+            'ranking_prompt' => input['ranking_prompt_template'] || 'category_aware',
+            'weights_preset' => input.dig('ranking_config', 'score_weights', 'preset') || 'balanced'
           }.compact
           
           call(:step_ok!, ctx, result, 200, 'OK', facets)
@@ -2630,8 +3261,32 @@ require 'securerandom'
     end,
     logging_severities: lambda do |_connection|
       %w[DEFAULT DEBUG INFO NOTICE WARNING ERROR CRITICAL ALERT EMERGENCY].map { |s| [s, s] }
+    end,
+    prompt_templates: lambda do |_connection|
+      templates = call(:config_system_prompts)
+      templates.map { |k, v| [v['label'], k] }
+    end,
+    referee_prompt_templates: lambda do |_connection|
+      [
+        ['Strict (high confidence required)', 'strict'],
+        ['Balanced (standard confidence)', 'balanced'],
+        ['Permissive (accepting lower confidence)', 'permissive'],
+        ['Custom Instructions', 'custom']
+      ]
+    end.
+    threshold_presets: lambda do |_connection|
+      presets = call(:config_threshold_presets)
+      presets.map { |k, v| [v['label'], k] } + [['Custom Settings', 'custom']]
+    end,
+    intent_presets: lambda do |_connection|
+      [
+        ['HR/Employee (information, action, status, complaint)', 'hr_intents'],
+        ['IT Support (incident, request, change, problem)', 'it_intents'],
+        ['Customer Service (inquiry, complaint, feedback, order)', 'customer_intents'],
+        ['Sales (lead, opportunity, quote, demo)', 'sales_intents'],
+        ['Custom Intent List', 'custom_intents']
+      ]
     end
-
   },
   
   # --------- METHODS ------------------------------------------------------
@@ -3376,6 +4031,107 @@ require 'securerandom'
       text = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
       JSON.parse(text) rescue { 'rankings' => [] }
     end,
+    llm_referee_enhanced: lambda do |connection, model, email_text, shortlist_names, all_cats, fallback_category, corr, system_preamble, temperature, include_reasoning|
+      # Enhanced version with temperature and reasoning control
+      model_path = call(:build_model_path_with_global_preview, connection, model)
+      req_params = "model=#{model_path}"
+
+      cats_norm = call(:safe_array, all_cats).map { |c| c.is_a?(Hash) ? c : { 'name' => c.to_s } }
+      allowed = if shortlist_names.present?
+        call(:safe_array, shortlist_names).map { |x| x.is_a?(Hash) ? (x['name'] || x[:name]).to_s : x.to_s }
+      else
+        cats_norm.map { |c| c['name'] }
+      end
+
+      system_text = system_preamble.presence || <<~SYS
+        You are a strict email classifier. Choose exactly one category from the allowed list.
+        Output MUST be valid JSON only (no prose).
+        Confidence is a calibrated estimate in [0,1]. Keep reasoning crisp (<= 2 sentences).
+      SYS
+
+      user_text = <<~USR
+        Email:
+        #{email_text}
+
+        Allowed categories:
+        #{allowed.join(", ")}
+
+        Category descriptions (if any):
+        #{cats_norm.map { |c|
+            desc = c['description']
+            exs = call(:safe_array, (c['examples'] || c[:examples]))
+            line = "- #{c['name']}"
+            line += ": #{desc}" if desc.present?
+            line += " | examples: #{exs.join(' ; ')}" if exs.present?
+            line
+          }.join("\n")}
+        
+        #{include_reasoning ? 'Include reasoning for each category in the distribution.' : ''}
+      USR
+
+      # Build response schema
+      distribution_item = {
+        'type' => 'object',
+        'additionalProperties' => false,
+        'properties' => {
+          'category' => { 'type' => 'string' },
+          'prob' => { 'type' => 'number' }
+        },
+        'required' => ['category', 'prob']
+      }
+      
+      if include_reasoning
+        distribution_item['properties']['reasoning'] = { 'type' => 'string' }
+      end
+
+      payload = {
+        'systemInstruction' => { 'role' => 'system', 'parts' => [{ 'text' => system_text }] },
+        'contents' => [
+          { 'role' => 'user', 'parts' => [{ 'text' => user_text }] }
+        ],
+        'generationConfig' => {
+          'temperature' => temperature || 0,
+          'maxOutputTokens' => 256,
+          'responseMimeType' => 'application/json',
+          'responseSchema' => {
+            'type' => 'object',
+            'additionalProperties' => false,
+            'properties' => {
+              'category' => { 'type' => 'string' },
+              'confidence' => { 'type' => 'number' },
+              'reasoning' => { 'type' => 'string' },
+              'distribution' => {
+                'type' => 'array',
+                'items' => distribution_item
+              }
+            },
+            'required' => ['category']
+          }
+        }
+      }
+
+      loc = (model_path[/\/locations\/([^\/]+)/, 1] || 'global').to_s.downcase
+      url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
+      
+      resp = post(url)
+              .headers(call(:request_headers_auth, connection, (corr || call(:build_correlation_id)), 
+                          connection['user_project'], req_params))
+              .payload(call(:json_compact, payload))
+
+      text = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s.strip
+      parsed = JSON.parse(text) rescue { 'category' => nil, 'confidence' => nil, 'reasoning' => nil, 'distribution' => [] }
+
+      # Validate/repair category
+      if parsed['category'].present? && !allowed.include?(parsed['category'])
+        parsed['category'] = nil
+      end
+      if parsed['category'].blank? && fallback_category.present?
+        parsed['category'] = fallback_category
+      end
+      error('Referee returned no valid category and no fallback is configured') if parsed['category'].blank?
+
+      parsed
+    end,
     coerce_integer: lambda do |v, fallback|
       Integer(v) rescue fallback
     end,
@@ -3404,38 +4160,6 @@ require 'securerandom'
     end,
 
     # --- JSON helpers (gentle, friendly errors) -------------------------------
-    json_parse_gently!: lambda do |raw|
-      return raw if raw.is_a?(Hash) || raw.is_a?(Array)
-      s = raw.to_s.strip
-      return nil if s.empty?
-      # Common copy/paste mistakes: Ruby hashes or smart quotes
-      if s.include?('=>')
-        error('Invalid JSON: looks like a Ruby hash (=>). Convert to JSON (":" and double quotes).')
-      end
-      begin
-        JSON.parse(s)
-      rescue JSON::ParserError => e
-        head = s.gsub(/[\r\n\t]/, ' ')[0, 120]
-        error("Invalid JSON: #{e.message.split(':').first}. Starts with: #{head.inspect}")
-      end
-    end,
-    safe_json_obj!: lambda do |raw|
-      v = call(:json_parse_safe, raw)
-      error('Invalid JSON for policy: empty input') if v.nil?
-      error('Invalid JSON for policy: expected object') unless v.is_a?(Hash)
-      v
-    end,
-    safe_json_arr!: lambda do |raw|
-      v = call(:json_parse_safe, raw)
-      
-      # Handle object with "categories" key (common wrapper format)
-      if v.is_a?(Hash) && v['categories'].is_a?(Array)
-        return v['categories']
-      end
-      
-      error('Invalid JSON for categories: expected array or object with "categories" array') unless v.is_a?(Array)
-      v
-    end,
     safe_json: lambda do |body|
       begin
         case body
@@ -3447,20 +4171,9 @@ require 'securerandom'
         nil
       end
     end,
-    safe_parse_json: lambda do |maybe_string|
-      return maybe_string unless maybe_string.is_a?(String)
-      begin
-        call(:json_parse_safe, maybe_string)
-      rescue
-        # If the server lied about content-type or returned pretty text,
-        # keep the original; the caller can handle/log.
-        maybe_string
-      end
-    end,
     safe_obj: lambda do |v|
       call(:sanitize_hash, v)
     end,
-
     safe_array_of_hashes: lambda do |v|
       arr = call(:safe_array, v)
       arr.map do |x|
@@ -3473,7 +4186,6 @@ require 'securerandom'
         end
       end.compact
     end,
-    # PRIMARY JSON PARSER - Single source of truth for all JSON parsing
     json_parse_safe: lambda do |raw, type: nil, required: false, allow_wrapper: false|
       # Handle pre-parsed objects
       return raw if raw.is_a?(Hash) || raw.is_a?(Array)
@@ -4677,6 +5389,81 @@ require 'securerandom'
       
       error(env)
     end,
+    llm_category_aware_ranker_enhanced: lambda do |connection, model, query, category, category_context, contexts, custom_prompt, corr=nil|
+      model_path = call(:build_model_path_with_global_preview, connection, model)
+      
+      # Use custom prompt if provided, otherwise default
+      system_text = custom_prompt || <<~SYS
+        You are an expert relevance scorer for a knowledge retrieval system.
+        Given a query within a specific category, evaluate how well each context answers the query.
+        
+        Scoring criteria:
+        1. Relevance (0-1): How directly the context addresses the query
+        2. Category Alignment (0-1): How well the context fits the category domain
+        
+        Be precise and calibrated in your scoring. Output valid JSON only.
+      SYS
+      
+      # Build context descriptions
+      context_list = contexts.map { |c|
+        text_preview = (c['content'] || c['text']).to_s[0..400]
+        source = (c['metadata'] || {})['source'] || 'unknown'
+        
+        "ID: #{c['id']}\nSource: #{source}\nContent: #{text_preview}"
+      }.join("\n\n---\n\n")
+      
+      user_prompt = <<~USR
+        #{category.present? ? "Category: #{category}" : ""}
+        #{category_context.present? ? "Category Context: #{category_context}" : ""}
+        
+        Query: #{query}
+        
+        Contexts to evaluate:
+        #{context_list}
+        
+        Score each context for relevance to the query#{category.present? ? ' and alignment with the category' : ''}.
+      USR
+      
+      payload = {
+        'systemInstruction' => { 'role' => 'system', 'parts' => [{ 'text' => system_text }] },
+        'contents' => [{ 'role' => 'user', 'parts' => [{ 'text' => user_prompt }] }],
+        'generationConfig' => {
+          'temperature' => 0,
+          'maxOutputTokens' => 1024,
+          'responseMimeType' => 'application/json',
+          'responseSchema' => {
+            'type' => 'object',
+            'properties' => {
+              'rankings' => {
+                'type' => 'array',
+                'items' => {
+                  'type' => 'object',
+                  'properties' => {
+                    'id' => { 'type' => 'string' },
+                    'relevance' => { 'type' => 'number' },
+                    'category_alignment' => { 'type' => 'number' },
+                    'reasoning' => { 'type' => 'string' }
+                  },
+                  'required' => ['id', 'relevance', 'category_alignment']
+                }
+              }
+            },
+            'required' => ['rankings']
+          }
+        }
+      }
+      
+      loc = (model_path[/\/locations\/([^\/]+)/, 1] || 'global').to_s.downcase
+      url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
+      
+      resp = post(url)
+              .headers(call(:request_headers_auth, connection, corr || call(:build_correlation_id), 
+                            connection['user_project'], "model=#{model_path}"))
+              .payload(call(:json_compact, payload))
+      
+      text = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
+      JSON.parse(text) rescue { 'rankings' => [] }
+    end,
 
     # Preview pack
     request_preview_pack: lambda do |url, verb, headers, payload|
@@ -5875,8 +6662,323 @@ require 'securerandom'
           hint: 'Tracking ID across all stages' },
         { name: 'op_debug', type: 'boolean', optional: true }
       ]
-    end
+    end,
 
+    # --- Configuration Templates -----------------------------------
+    config_system_prompts: lambda do
+      {
+        'hr_assistant' => {
+          'label' => 'HR Assistant (Warm & Helpful)',
+          'prompt' => <<~PROMPT
+            You are a helpful HR assistant providing guidance to employees. Your tone should be:
+            - Warm and supportive, not procedural or cold
+            - Use "you can" or "you may want to" instead of "you must"
+            - Offer helpful next steps and additional context
+            - Acknowledge that transitions can be challenging
+          PROMPT
+        },
+        'it_support' => {
+          'label' => 'IT Support (Technical & Clear)',
+          'prompt' => <<~PROMPT
+            You are an IT support specialist. Your tone should be:
+            - Clear and technical but accessible
+            - Step-by-step guidance when appropriate
+            - Acknowledge urgency when systems are down
+            - Provide workarounds when available
+          PROMPT
+        },
+        'customer_service' => {
+          'label' => 'Customer Service (Professional & Empathetic)',
+          'prompt' => <<~PROMPT
+            You are a customer service representative. Your tone should be:
+            - Professional yet personable
+            - Empathetic to customer frustrations
+            - Solution-oriented
+            - Clear about next steps and timelines
+          PROMPT
+        },
+        'custom' => {
+          'label' => 'Custom Prompt',
+          'prompt' => ''
+        }
+      }
+    end,
+    config_threshold_presets: lambda do
+      {
+        'conservative' => {
+          'label' => 'Conservative (Higher confidence required)',
+          'values' => {
+            'min_confidence_for_keep' => 0.75,
+            'confidence_short_circuit' => 0.90,
+            'min_confidence' => 0.40,
+            'max_chunks' => 15,
+            'temperature' => 0
+          }
+        },
+        'balanced' => {
+          'label' => 'Balanced (Default settings)',
+          'values' => {
+            'min_confidence_for_keep' => 0.60,
+            'confidence_short_circuit' => 0.85,
+            'min_confidence' => 0.25,
+            'max_chunks' => 20,
+            'temperature' => 0.3
+          }
+        },
+        'aggressive' => {
+          'label' => 'Aggressive (Lower confidence accepted)',
+          'values' => {
+            'min_confidence_for_keep' => 0.45,
+            'confidence_short_circuit' => 0.75,
+            'min_confidence' => 0.15,
+            'max_chunks' => 25,
+            'temperature' => 0.5
+          }
+        }
+      }
+    end,
+    ui_prompt_config: lambda do |default_template = 'hr_assistant'|
+      # Helper to build prompt configuration UI
+      [
+        { name: 'prompt_template', 
+          label: 'Prompt Template',
+          control_type: 'select',
+          pick_list: 'prompt_templates',
+          default: default_template,
+          extends_schema: true,
+          hint: 'Choose a pre-configured prompt style or create custom' },
+        
+        { name: 'custom_system_prompt',
+          label: 'Custom System Prompt', 
+          control_type: 'text-area',
+          optional: true,
+          ngIf: 'input.prompt_template == "custom"',
+          hint: 'Define your custom system instructions' }
+      ]
+    end,  
+    ui_threshold_config: lambda do
+      # Helper to build threshold configuration UI  
+      [
+        { name: 'threshold_preset',
+          label: 'Confidence Thresholds',
+          control_type: 'select', 
+          pick_list: 'threshold_presets',
+          default: 'balanced',
+          extends_schema: true,
+          hint: 'Choose confidence level requirements' },
+          
+        { name: 'custom_thresholds',
+          label: 'Custom Threshold Settings',
+          type: 'object',
+          optional: true,
+          ngIf: 'input.threshold_preset == "custom"',
+          properties: [
+            { name: 'min_confidence_for_keep', type: 'number', 
+              hint: 'Min confidence to proceed (0.0-1.0)', default: 0.60 },
+            { name: 'confidence_short_circuit', type: 'number',
+              hint: 'Confidence to skip downstream (0.0-1.0)', default: 0.85 },
+            { name: 'min_confidence', type: 'number',
+              hint: 'Minimum acceptable confidence (0.0-1.0)', default: 0.25 }
+          ]
+        }
+      ]
+    end,
+    resolve_thresholds: lambda do |input|
+      # Get actual threshold values from preset or custom
+      preset = input['threshold_preset'] || 'balanced'
+      if preset == 'custom' && input['custom_thresholds']
+        input['custom_thresholds']
+      else
+        presets = call(:config_threshold_presets)
+        presets[preset]['values']
+      end
+    end,
+    resolve_prompt: lambda do |input, default_prompt|
+      # Get actual prompt from template or custom
+      template = input['prompt_template'] || 'hr_assistant'
+      if template == 'custom'
+        input['custom_system_prompt'] || default_prompt
+      else
+        templates = call(:config_system_prompts)
+        templates[template]['prompt'] || default_prompt
+      end
+    end,
+    get_intent_preset: lambda do |preset_type|
+      presets = {
+        'hr_intents' => [
+          { 'intent' => 'information_request', 'actionable' => true, 
+            'description' => 'Asking for information about policies, benefits, procedures' },
+          { 'intent' => 'action_request', 'actionable' => true,
+            'description' => 'Requesting specific action (approval, document, access)' },
+          { 'intent' => 'status_inquiry', 'actionable' => true,
+            'description' => 'Checking status of existing request or process' },
+          { 'intent' => 'complaint', 'actionable' => false,
+            'description' => 'Expressing dissatisfaction or grievance' },
+          { 'intent' => 'feedback', 'actionable' => false,
+            'description' => 'Providing suggestions or feedback' },
+          { 'intent' => 'escalation', 'actionable' => false,
+            'description' => 'Urgent issue requiring immediate attention' },
+          { 'intent' => 'auto_reply', 'actionable' => false,
+            'description' => 'Out-of-office or automated response' },
+          { 'intent' => 'unknown', 'actionable' => false,
+            'description' => 'Cannot determine clear intent' }
+        ],
+        
+        'it_intents' => [
+          { 'intent' => 'incident', 'actionable' => true,
+            'description' => 'System outage or malfunction' },
+          { 'intent' => 'service_request', 'actionable' => true,
+            'description' => 'Request for new service or access' },
+          { 'intent' => 'password_reset', 'actionable' => true,
+            'description' => 'Password or access credential issues' },
+          { 'intent' => 'how_to', 'actionable' => true,
+            'description' => 'Instructions or guidance needed' },
+          { 'intent' => 'change_request', 'actionable' => false,
+            'description' => 'Request to modify system or configuration' },
+          { 'intent' => 'problem_report', 'actionable' => false,
+            'description' => 'Reporting recurring or systematic issue' },
+          { 'intent' => 'security_concern', 'actionable' => false,
+            'description' => 'Security or compliance issue' },
+          { 'intent' => 'unknown', 'actionable' => false,
+            'description' => 'Cannot determine clear intent' }
+        ],
+        
+        'customer_intents' => [
+          { 'intent' => 'product_inquiry', 'actionable' => true,
+            'description' => 'Questions about products or services' },
+          { 'intent' => 'order_status', 'actionable' => true,
+            'description' => 'Checking order or delivery status' },
+          { 'intent' => 'billing_question', 'actionable' => true,
+            'description' => 'Invoice or payment questions' },
+          { 'intent' => 'technical_support', 'actionable' => true,
+            'description' => 'Product usage or troubleshooting' },
+          { 'intent' => 'complaint', 'actionable' => false,
+            'description' => 'Dissatisfaction with product or service' },
+          { 'intent' => 'return_request', 'actionable' => false,
+            'description' => 'Return or refund request' },
+          { 'intent' => 'feedback', 'actionable' => false,
+            'description' => 'Product or service feedback' },
+          { 'intent' => 'escalation', 'actionable' => false,
+            'description' => 'Request for manager or urgent help' },
+          { 'intent' => 'unknown', 'actionable' => false,
+            'description' => 'Cannot determine clear intent' }
+        ],
+        
+        'sales_intents' => [
+          { 'intent' => 'lead', 'actionable' => true,
+            'description' => 'New potential customer inquiry' },
+          { 'intent' => 'demo_request', 'actionable' => true,
+            'description' => 'Request for product demonstration' },
+          { 'intent' => 'quote_request', 'actionable' => true,
+            'description' => 'Request for pricing or proposal' },
+          { 'intent' => 'feature_question', 'actionable' => true,
+            'description' => 'Questions about capabilities' },
+          { 'intent' => 'contract_negotiation', 'actionable' => false,
+            'description' => 'Contract terms discussion' },
+          { 'intent' => 'competitor_comparison', 'actionable' => false,
+            'description' => 'Comparing to alternatives' },
+          { 'intent' => 'referral', 'actionable' => false,
+            'description' => 'Customer referral or introduction' },
+          { 'intent' => 'unknown', 'actionable' => false,
+            'description' => 'Cannot determine clear intent' }
+        ],
+        
+        'finance_intents' => [
+          { 'intent' => 'expense_submission', 'actionable' => true,
+            'description' => 'Submitting expense report or receipt' },
+          { 'intent' => 'budget_inquiry', 'actionable' => true,
+            'description' => 'Questions about budget or spending' },
+          { 'intent' => 'invoice_processing', 'actionable' => true,
+            'description' => 'Invoice submission or status' },
+          { 'intent' => 'payment_status', 'actionable' => true,
+            'description' => 'Payment or reimbursement status' },
+          { 'intent' => 'approval_request', 'actionable' => false,
+            'description' => 'Financial approval needed' },
+          { 'intent' => 'audit_query', 'actionable' => false,
+            'description' => 'Audit or compliance question' },
+          { 'intent' => 'policy_exception', 'actionable' => false,
+            'description' => 'Exception to financial policy' },
+          { 'intent' => 'unknown', 'actionable' => false,
+            'description' => 'Cannot determine clear intent' }
+        ],
+        
+        'legal_intents' => [
+          { 'intent' => 'contract_review', 'actionable' => false,
+            'description' => 'Contract review request' },
+          { 'intent' => 'compliance_question', 'actionable' => true,
+            'description' => 'Compliance or regulatory question' },
+          { 'intent' => 'nda_request', 'actionable' => true,
+            'description' => 'NDA or confidentiality agreement' },
+          { 'intent' => 'policy_clarification', 'actionable' => true,
+            'description' => 'Legal policy interpretation' },
+          { 'intent' => 'dispute', 'actionable' => false,
+            'description' => 'Legal dispute or claim' },
+          { 'intent' => 'investigation', 'actionable' => false,
+            'description' => 'Investigation or discovery request' },
+          { 'intent' => 'risk_assessment', 'actionable' => false,
+            'description' => 'Legal risk evaluation' },
+          { 'intent' => 'unknown', 'actionable' => false,
+            'description' => 'Cannot determine clear intent' }
+        ],
+        
+        'facilities_intents' => [
+          { 'intent' => 'maintenance_request', 'actionable' => true,
+            'description' => 'Repair or maintenance needed' },
+          { 'intent' => 'space_booking', 'actionable' => true,
+            'description' => 'Room or space reservation' },
+          { 'intent' => 'access_request', 'actionable' => true,
+            'description' => 'Building or area access' },
+          { 'intent' => 'supplies_request', 'actionable' => true,
+            'description' => 'Office supplies or equipment' },
+          { 'intent' => 'safety_issue', 'actionable' => false,
+            'description' => 'Safety or security concern' },
+          { 'intent' => 'move_request', 'actionable' => false,
+            'description' => 'Office relocation or setup' },
+          { 'intent' => 'environmental', 'actionable' => false,
+            'description' => 'Temperature, lighting, noise issue' },
+          { 'intent' => 'unknown', 'actionable' => false,
+            'description' => 'Cannot determine clear intent' }
+        ],
+        
+        # Generic/minimal preset for custom configuration
+        'minimal_intents' => [
+          { 'intent' => 'request', 'actionable' => true,
+            'description' => 'General request or inquiry' },
+          { 'intent' => 'issue', 'actionable' => false,
+            'description' => 'Problem or concern' },
+          { 'intent' => 'feedback', 'actionable' => false,
+            'description' => 'Feedback or comment' },
+          { 'intent' => 'unknown', 'actionable' => false,
+            'description' => 'Cannot determine intent' }
+        ]
+      }
+      
+      presets[preset_type] || presets['minimal_intents']
+    end,
+    get_actionable_intents: lambda do |intent_list|
+      # Helper method to extract actionable intents from a preset
+      Array(intent_list)
+        .select { |i| i['actionable'] == true }
+        .map { |i| i['intent'] }
+    end,
+    build_intent_prompt: lambda do |intent_list|
+      # Helper to build intent prompt instructions
+      instructions = intent_list.map do |intent|
+        desc = intent['description'] || ''
+        actionable = intent['actionable'] ? '(actionable)' : '(requires human)'
+        "- #{intent['intent']}: #{desc} #{actionable}"
+      end.join("\n")
+      
+      <<~PROMPT
+        You are an intent classification system. Determine what the user wants.
+        
+        INTENT TYPES:
+        #{instructions}
+        
+        Mark as actionable only if the intent can be fully automated.
+        Output MUST be valid JSON only.
+      PROMPT
+    end
   },
 
   # --------- TRIGGERS -----------------------------------------------------
