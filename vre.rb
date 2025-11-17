@@ -641,7 +641,8 @@ require 'securerandom'
                 'Soft scores above 6 typically indicate legitimate HR requests.',
           learn_more_url: 'https://cloud.google.com/vertex-ai/generative-ai/docs/rag-engine/rag-overview',
           learn_more_text: 'Learn about RAG pipelines'
-        },
+        }
+      end,
       config_fields: [
         { name: 'show_advanced', label: 'Show advanced options',
           type: 'boolean', control_type: 'checkbox',
@@ -1123,7 +1124,7 @@ require 'securerandom'
         model_path = call(:build_model_path_with_global_preview, connection, model)
         
         # System prompt focused on intent only
-        system_text = <<~SYS
+        default_system_text = <<~SYS
           You are an intent classification system. Determine what the user wants.
           
           INTENT TYPES:
@@ -1141,7 +1142,7 @@ require 'securerandom'
         # Use user-provided system prompt or fall back to default
         system_text = input['system_preamble'].presence || default_system_text
 
-        # Append any conditional instructions (existing logic)
+        # Append any conditional instructions
         system_text += "\n#{input['extract_entities'] ? 'Extract key entities mentioned.' : ''}"
         system_text += "\n#{input['detect_sentiment'] ? 'Detect overall sentiment.' : ''}"
         
@@ -1212,7 +1213,18 @@ require 'securerandom'
         
         # Parse response
         text = resp.dig('candidates',0,'content','parts',0,'text').to_s
-        parsed = (call(:json_parse_safe, text) rescue nil)
+        
+        # Parse JSON with proper error handling
+        parsed = if text.present?
+          begin
+            call(:json_parse_safe, text, type: :hash)
+          rescue => e
+            # If parsing fails, create minimal valid response
+            { 'intent' => 'unknown', 'confidence' => 0.0 }
+          end
+        else
+          { 'intent' => 'unknown', 'confidence' => 0.0 }
+        end
         
         intent = (parsed['intent'] || 'unknown').to_s
         confidence = [[call(:safe_float, parsed['confidence']) || 0.0, 0.0].max, 1.0].min
@@ -1279,7 +1291,6 @@ require 'securerandom'
           { name: 'facets', type: 'object', optional: true }
         ] + call(:standard_operational_outputs) 
       end,
-
       execute: lambda do |connection, input|
         ctx = call(:step_begin!, :embed_text_against_categories, input)
         # Select categories source (array vs JSON)
@@ -4774,7 +4785,7 @@ require 'securerandom'
     extract_google_error: lambda do |err|
       begin
         body = (err.respond_to?(:[]) && err.dig('response','body')).to_s
-        json = JSON.parse(body) rescue nil
+        json = (call(:json_parse_safe, body) rescue nil)
         if json
           # google.rpc.Status shape
           if json['error']
