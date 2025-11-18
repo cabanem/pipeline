@@ -103,6 +103,172 @@ require 'securerandom'
 
   # --------- OBJECT DEFINITIONS -------------------------------------------
   object_definitions: {
+    # Facet definitions
+    facets_deterministic_filter: {
+      fields: lambda do |_connection, _config_fields|
+        [
+          { name: 'hard_blocked', type: 'boolean', hint: 'True if email was hard blocked' },
+          { name: 'email_type', type: 'string', hint: 'Type of email detected' },
+          { name: 'soft_score', type: 'integer', hint: 'Soft signals total score' },
+          { name: 'rules_evaluated', type: 'boolean', hint: 'Whether rules were evaluated' },
+          { name: 'exclusion_source', type: 'string', hint: 'Source of exclusion rules' },
+          { name: 'patterns_count', type: 'integer', hint: 'Number of patterns checked' },
+          { name: 'threshold_preset', type: 'string', hint: 'Threshold preset used' },
+          { name: 'excluded_by', type: 'string', optional: true, hint: 'Pattern that excluded email' },
+          { name: 'correlation_id', type: 'string', optional: true }
+        ]
+      end
+    },
+    facets_ai_triage_filter: {
+      fields: lambda do |_connection, _config_fields|
+        [
+          { name: 'decision', type: 'string', hint: 'Triage decision' },
+          { name: 'confidence', type: 'number', hint: 'Decision confidence' },
+          { name: 'detected_domain', type: 'string', optional: true, hint: 'Detected email domain' },
+          { name: 'has_question', type: 'boolean', hint: 'Whether email contains a question' },
+          { name: 'should_continue', type: 'boolean', hint: 'Whether to continue pipeline' },
+          { name: 'short_circuit', type: 'boolean', hint: 'High-confidence irrelevant' },
+          { name: 'prompt_template', type: 'string', hint: 'Prompt template used' },
+          { name: 'threshold_preset', type: 'string', hint: 'Threshold preset used' },
+          { name: 'correlation_id', type: 'string', optional: true }
+        ]
+      end
+    },
+    facets_ai_intent_classifier: {
+      fields: lambda do |_connection, _config_fields|
+        [
+          { name: 'intent', type: 'string', hint: 'Detected intent' },
+          { name: 'confidence', type: 'number', hint: 'Intent confidence' },
+          { name: 'is_actionable', type: 'boolean', hint: 'Whether intent is actionable' },
+          { name: 'has_entities', type: 'boolean', hint: 'Whether entities were extracted' },
+          { name: 'sentiment', type: 'string', optional: true, hint: 'Detected sentiment' },
+          { name: 'intent_preset', type: 'string', hint: 'Intent preset used' },
+          { name: 'prompt_template', type: 'string', hint: 'Prompt template used' },
+          { name: 'correlation_id', type: 'string', optional: true }
+        ]
+      end
+    },
+    facets_embed_text_against_categories: {
+      fields: lambda do |_connection, _config_fields|
+        [
+          { name: 'k', type: 'integer', hint: 'Top K categories returned' },
+          { name: 'categories_count', type: 'integer', hint: 'Total categories evaluated' },
+          { name: 'shortlist_k', type: 'integer', hint: 'Shortlist size' },
+          { name: 'top_score', type: 'number', hint: 'Highest similarity score' },
+          { name: 'embedding_model', type: 'string', hint: 'Embedding model used' },
+          { name: 'categories_mode', type: 'string', hint: 'Categories input mode' },
+          { name: 'correlation_id', type: 'string', optional: true }
+        ]
+      end
+    },
+    facets_rerank_shortlist: {
+      fields: lambda do |_connection, _config_fields|
+        [
+          { name: 'mode', type: 'string', hint: 'Ranking mode used' },
+          { name: 'top_prob', type: 'number', optional: true, hint: 'Highest probability' },
+          { name: 'categories_ranked', type: 'integer', hint: 'Number of categories ranked' },
+          { name: 'generative_model', type: 'string', optional: true, hint: 'Model used for ranking' },
+          { name: 'categories_mode', type: 'string', hint: 'Categories input mode' },
+          { name: 'prompt_template', type: 'string', optional: true, hint: 'Prompt template used' },
+          { name: 'concentration', type: 'string', optional: true, hint: 'Distribution concentration' },
+          { name: 'temperature', type: 'number', optional: true, hint: 'Temperature setting' },
+          { name: 'correlation_id', type: 'string', optional: true }
+        ]
+      end
+    },
+    facets_llm_referee_with_contexts: {
+      fields: lambda do |_connection, _config_fields|
+        [
+          { name: 'chosen', type: 'string', hint: 'Chosen category' },
+          { name: 'confidence', type: 'number', hint: 'Category confidence' },
+          { name: 'salience_mode', type: 'string', optional: true, hint: 'Salience extraction mode' },
+          { name: 'salience_len', type: 'integer', optional: true, hint: 'Salience span length' },
+          { name: 'salience_importance', type: 'number', optional: true, hint: 'Salience importance score' },
+          { name: 'salience_source', type: 'string', optional: true, hint: 'Salience extraction source' },
+          { name: 'salience_err', type: 'string', optional: true, hint: 'Salience extraction error' },
+          { name: 'has_contexts', type: 'boolean', hint: 'Whether contexts were provided' },
+          { name: 'shortlist_size', type: 'integer', hint: 'Shortlist size' },
+          { name: 'generative_model', type: 'string', hint: 'Model used' },
+          { name: 'categories_mode', type: 'string', hint: 'Categories input mode' },
+          { name: 'referee_template', type: 'string', hint: 'Referee prompt template' },
+          { name: 'confidence_preset', type: 'string', hint: 'Confidence preset used' },
+          { name: 'min_confidence', type: 'number', hint: 'Minimum confidence threshold' },
+          { name: 'blocked_reason', type: 'string', optional: true, hint: 'Reason for blocking' },
+          { name: 'correlation_id', type: 'string', optional: true }
+        ]
+      end
+    },
+    facets_rag_retrieve_contexts_enhanced: {
+      fields: lambda do |_connection, _config_fields|
+        [
+          # Retrieval metrics
+          { name: 'top_k', type: 'integer', hint: 'Max contexts requested' },
+          { name: 'contexts_count', type: 'integer', hint: 'Contexts returned' },
+          { name: 'success_count', type: 'integer', hint: 'Successfully processed contexts' },
+          { name: 'error_count', type: 'integer', hint: 'Failed contexts' },
+          { name: 'pdf_contexts_count', type: 'integer', hint: 'PDF contexts detected' },
+          { name: 'partial_failure', type: 'boolean', hint: 'Whether some contexts failed' },
+          
+          # Filter settings
+          { name: 'filter_type', type: 'string', optional: true, hint: 'Filter type applied' },
+          { name: 'filter_value', type: 'number', optional: true, hint: 'Filter threshold value' },
+          
+          # Ranking
+          { name: 'rank_mode', type: 'string', optional: true, hint: 'Ranking mode' },
+          { name: 'rank_model', type: 'string', optional: true, hint: 'Ranking model' },
+          
+          # General
+          { name: 'retrieval_preset', type: 'string', hint: 'Retrieval preset used' },
+          { name: 'network_error', type: 'boolean', optional: true, hint: 'Network issues detected' },
+          { name: 'correlation_id', type: 'string', optional: true }
+        ]
+      end
+    },
+    facets_rank_texts_with_ranking_api: {
+      fields: lambda do |_connection, _config_fields|
+        [
+          { name: 'ranking_api', type: 'string', hint: 'Ranking API used' },
+          { name: 'category', type: 'string', optional: true, hint: 'Category for ranking' },
+          { name: 'llm_model', type: 'string', hint: 'LLM model used' },
+          { name: 'emit_shape', type: 'string', hint: 'Output format' },
+          { name: 'records_input', type: 'integer', hint: 'Input record count' },
+          { name: 'records_filtered', type: 'integer', hint: 'Filtered record count' },
+          { name: 'records_ranked', type: 'integer', hint: 'Ranked record count' },
+          { name: 'records_output', type: 'integer', hint: 'Output record count' },
+          { name: 'has_distribution', type: 'boolean', hint: 'Distribution included' },
+          { name: 'top_score', type: 'number', optional: true, hint: 'Highest score' },
+          { name: 'category_filtered', type: 'boolean', hint: 'Category filtering applied' },
+          { name: 'ranking_prompt', type: 'string', hint: 'Ranking prompt template' },
+          { name: 'weights_preset', type: 'string', hint: 'Score weights preset' },
+          { name: 'correlation_id', type: 'string', optional: true }
+        ]
+      end
+    },
+    facets_gen_generate: {
+      fields: lambda do |_connection, _config_fields|
+        [
+          { name: 'mode', type: 'string', hint: 'Generation mode' },
+          { name: 'model', type: 'string', hint: 'Model used' },
+          { name: 'finish_reason', type: 'string', optional: true, hint: 'Generation finish reason' },
+          { name: 'confidence', type: 'number', optional: true, hint: 'Response confidence' },
+          { name: 'has_citations', type: 'boolean', optional: true, hint: 'Citations included' },
+          { name: 'signals_used', type: 'boolean', optional: true, hint: 'Signals were applied' },
+          { name: 'contexts_returned', type: 'integer', optional: true, hint: 'Context count' },
+          
+          # Token usage
+          { name: 'tokens_prompt', type: 'integer', optional: true, hint: 'Prompt tokens' },
+          { name: 'tokens_candidates', type: 'integer', optional: true, hint: 'Candidate tokens' },
+          { name: 'tokens_total', type: 'integer', optional: true, hint: 'Total tokens' },
+          
+          # Additional metrics
+          { name: 'safety_blocked', type: 'boolean', optional: true, hint: 'Blocked by safety' },
+          { name: 'answered_unknown', type: 'boolean', optional: true, hint: 'Model answered unknown' },
+          { name: 'gen_finish_reason', type: 'string', optional: true, hint: 'Generation finish reason' },
+          { name: 'correlation_id', type: 'string', optional: true }
+        ]
+      end
+    },
+
     log_entry: {
       fields: lambda do |_connection, _config_fields|
         [
@@ -414,21 +580,6 @@ require 'securerandom'
           { name: 'resourcesConsumed', type: 'object' },
           { name: 'partialFailures', type: 'array', of: 'object' },
           { name: 'labels', type: 'object' }
-        ]
-      end
-    },
-    envelope_fields_1: {
-      fields: lambda do |_connection, _config_fields|
-        [
-          { name: 'ok', type: 'boolean' },
-          { name: 'telemetry', type: 'object', properties: [
-            { name: 'http_status', type: 'integer' },
-            { name: 'message', type: 'string' },
-            { name: 'duration_ms', type: 'integer' },
-            { name: 'correlation_id', type: 'string' },
-            { name: 'facets', type: 'object' },
-            { name: 'local_logs', type: 'array', of: 'object' }
-          ] }
         ]
       end
     },
@@ -771,7 +922,7 @@ require 'securerandom'
           { name: 'soft_score', type: 'integer', hint: 'Soft signals score if rules configured' },
           { name: 'gate', type: 'object', properties: object_definitions['pipeline_gate'] },
           { name: 'complete_output', type: 'object' },
-          { name: 'facets', type: 'object', optional: true }
+          { name: 'facets', type: 'object', properties: object_definitions['facets_deterministic_filter'] }
         ] + call(:standard_operational_outputs)
       end,  
       execute: lambda do |connection, input|
@@ -1070,7 +1221,7 @@ require 'securerandom'
           { name: 'signals_confidence', type: 'number' },
           { name: 'signals_domain', optional: true },
           { name: 'complete_output', type: 'object' },
-          { name: 'facets', type: 'object', optional: true }
+          { name: 'facets', type: 'object', properties: object_definitions['facets_ai_triage_filter'] }
         ] + call(:standard_operational_outputs)
       end,
       execute: lambda do |connection, input|
@@ -1295,7 +1446,7 @@ require 'securerandom'
           { name: 'signals_intent_confidence', type: 'number' },
           { name: 'signals_triage' },
           { name: 'complete_output', type: 'object' },
-          { name: 'facets', type: 'object', optional: true }
+          { name: 'facets', type: 'object', properties: object_definitions['facets_ai_intent_classifier'] }
         ] + call(:standard_operational_outputs)
       end, 
       execute: lambda do |connection, input|
@@ -1476,7 +1627,7 @@ require 'securerandom'
           
           # Standard fields
           { name: 'complete_output', type: 'object' },
-          { name: 'facets', type: 'object', optional: true }
+          { name: 'facets', type: 'object', properties: object_definitions['facets_embed_text_against_categories'] }
         ] + call(:standard_operational_outputs) 
       end,
       execute: lambda do |connection, input|
@@ -1695,7 +1846,8 @@ require 'securerandom'
           
           # Standard fields
           { name: 'complete_output', type: 'object' },
-          { name: 'facets', type: 'object', optional: true }
+          { name: 'facets', type: 'object', properties: object_definitions['facets_rerank_shortlist'] }
+
         ] + call(:standard_operational_outputs)
       end,
       execute: lambda do |connection, input|
@@ -1932,7 +2084,7 @@ require 'securerandom'
           
           # Standard fields
           { name: 'complete_output', type: 'object' },
-          { name: 'facets', type: 'object', optional: true }
+          { name: 'facets', type: 'object', properties: object_definitions['facets_llm_referee_with_contexts'] }
         ] + call(:standard_operational_outputs)
       end,
       execute: lambda do |connection, input|
@@ -2252,7 +2404,7 @@ require 'securerandom'
         # Retrieval configuration with presets
         retrieval_fields = [
           { name: 'retrieval_preset', label: 'Retrieval Configuration', control_type: 'select',
-            default: 'balanced', extends_schema: true, hint: 'Choose retrieval breadth and filtering'
+            default: 'balanced', extends_schema: true, hint: 'Choose retrieval breadth and filtering',
             options: [
               ['Narrow (10 contexts, high threshold)', 'narrow'],
               ['Balanced (20 contexts, medium threshold)', 'balanced'],
@@ -2327,6 +2479,7 @@ require 'securerandom'
             { name: 'error_count', type: 'integer' },
             { name: 'partial_failure', type: 'boolean' },
             { name: 'retrieval_preset' },
+            { name: 'facets', type: 'object', properties: object_definitions['facets_rag_retrieve_contexts_enhanced'] },
             { name: 'local_logs', type: 'array', of: 'object', optional: true }
           ]}
         ]
@@ -2751,7 +2904,7 @@ require 'securerandom'
             { name: 'score_weights', type: 'object' }
           ]},
           { name: 'complete_output', type: 'object' },
-          { name: 'facets', type: 'object', optional: true }
+          { name: 'facets', type: 'object', properties: object_definitions['facets_rank_texts_with_ranking_api'] }
         ] + call(:standard_operational_outputs)
       end,
       execute: lambda do |connection, input|
@@ -3087,7 +3240,7 @@ require 'securerandom'
           
           # Standard fields
           { name: 'complete_output', type: 'object' },
-          { name: 'facets', type: 'object', optional: true }
+          { name: 'facets', type: 'object', properties: od['facets_gen_generate'] }
         ] + call(:standard_operational_outputs)
       end,
       
@@ -3273,7 +3426,7 @@ require 'securerandom'
         ['Permissive (accepting lower confidence)', 'permissive'],
         ['Custom Instructions', 'custom']
       ]
-    end.
+    end,
     threshold_presets: lambda do |_connection|
       presets = call(:config_threshold_presets)
       presets.map { |k, v| [v['label'], k] } + [['Custom Settings', 'custom']]
