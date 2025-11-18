@@ -1511,176 +1511,195 @@ require 'securerandom'
         call(:rerank_shortlist_output_fields, object_definitions, connection)
       end,
       execute: lambda do |connection, input|
-        ctx = call(:step_begin!, :rerank_shortlist, input)
+        ctx  = call(:step_begin!, :rerank_shortlist, input)
         mode = (input['ranking_mode'] || 'none').to_s
-        
+
         # Pass through signals
         signals = {
-          'signals_category' => input['signals_category'],
+          'signals_category'   => input['signals_category'],
           'signals_confidence' => input['signals_confidence'],
-          'signals_intent' => input['signals_intent']
+          'signals_intent'     => input['signals_intent']
         }
 
+        # Mode: NONE → keep order, no probs
         if mode == 'none'
-          sl = call(:safe_array, input['shortlist'])
+          sl      = call(:safe_array, input['shortlist'])
           ranking = sl.map { |c| { 'category' => c, 'prob' => nil } }
-          out = { 'ranking' => ranking, 'shortlist' => sl }.merge(signals)
-          
-          return call(:step_ok!, ctx, out, 200, 'OK', { 
-            'mode' => 'none',
-            'categories_ranked' => sl.length
-          })
-        end
+          out     = { 'ranking' => ranking, 'shortlist' => sl }.merge(signals)
 
-        # Get categories
-        cats_raw = if input['categories_mode'].to_s == 'json' && input['categories_json'].present?
-          call(:json_parse_safe, input['categories_json'], type: :array, required: true, allow_wrapper: true)
-        else
-          input['categories']
-        end
-        cats = call(:norm_categories!, cats_raw)
-        
-        if mode == 'score_based'
-          # Simple score-based ranking (could be from upstream scores)
-          sl = call(:safe_array, input['shortlist'])
-          # For now, just preserve order but add uniform probabilities
-          prob = 1.0 / sl.length
-          ranking = sl.map { |c| { 'category' => c, 'prob' => prob } }
-          out = { 'ranking' => ranking, 'shortlist' => sl }.merge(signals)
-          
           return call(:step_ok!, ctx, out, 200, 'OK', {
-            'mode' => 'score_based',
-            'categories_ranked' => sl.length
+            'mode'             => 'none',
+            'categories_ranked'=> sl.length
           })
         end
-        
-        # LLM mode - build prompt based on template
-        prompt_config = input['ranking_prompt'] || {}
-        template = prompt_config['template'] || 'balanced'
-        
-        system_prompt = case template
-        when 'strict'
-          <<~PROMPT
-            You are a strict category classifier. Only assign high probabilities (>0.5) when extremely confident.
-            Most categories should receive low probabilities. Be conservative.
-            Output MUST be valid JSON only.
-          PROMPT
-        when 'inclusive'
-          <<~PROMPT
-            You are an inclusive category classifier. Distribute probabilities broadly across plausible categories.
-            Avoid concentrating all probability on one category unless absolutely certain.
-            Output MUST be valid JSON only.
-          PROMPT
-        when 'custom'
-          prompt_config['custom_instructions'] || <<~PROMPT
-            Rank the categories by relevance and provide a probability distribution.
-            Output MUST be valid JSON only.
-          PROMPT
-        else # balanced
-          <<~PROMPT
-            You are a balanced category classifier. Distribute probabilities based on relevance.
-            The most relevant category should have the highest probability, with others receiving proportional scores.
-            Output MUST be valid JSON only.
-          PROMPT
-        end
-        
-        # Get distribution configuration
-        dist_config = input['distribution_config'] || {}
-        concentration = dist_config['concentration'] || 'medium'
-        
-        # Adjust temperature based on concentration
-        temperature = if input['temperature'].present?
-          input['temperature'].to_f
-        else
-          case concentration
-          when 'low' then 0.5   # More spread out
-          when 'high' then 0.0  # More concentrated
-          else 0.2              # Medium
-          end
-        end
-        
-        # Call LLM referee with enhanced prompt
-        ref = call(:llm_referee_enhanced, 
-                  connection, 
-                  (input['generative_model'] || 'gemini-2.0-flash'),
-                  input['email_text'], 
-                  call(:safe_array, input['shortlist']), 
-                  cats, 
-                  nil, 
-                  ctx['cid'], 
-                  system_prompt,
-                  temperature,
-                  input['include_reasoning']),
-                  input['max_output_tokens']
-        
-        dist = []
-        raw_dist = ref['distribution']
-        
-        dist = call(:safe_distribution_array, ref['distribution']).map { |d| 
-          { 
-            'category' => d['category'], 
-            'prob' => d['prob'].to_f,
-            'reasoning' => d['reasoning']
-          } 
-        }
-        
-        # Apply distribution configuration
-        if dist_config['normalize'] != false
-          total = dist.sum { |d| d['prob'] }
-          if total > 0
-            dist.each { |d| d['prob'] = d['prob'] / total }
-          end
+
+        # Mode: SCORE-BASED → uniform probabilities over shortlist
+        if mode == 'score_based'
+          sl = call(:safe_array, input['shortlist'])
+          prob = sl.empty? ? 0.0 : (1.0 / sl.length.to_f)
+          ranking = sl.map { |c| { 'category' => c, 'prob' => prob } }
+          out     = { 'ranking' => ranking, 'shortlist' => sl }.merge(signals)
+
+          return call(:step_ok!, ctx, out, 200, 'OK', {
+            'mode'             => 'score_based',
+            'categories_ranked'=> sl.length
+          })
         end
 
-        # Apply minimum probability if configured
-        min_prob = dist_config['min_probability'] || 0.01
-        if min_prob > 0
-          dist.each do |d|
-            d['prob'] = [d['prob'], min_prob].max if d['prob'] > 0
+        # Mode: LLM
+        begin
+          # Get categories
+          cats_raw = if input['categories_mode'].to_s == 'json' && input['categories_json'].present?
+            call(:json_parse_safe, input['categories_json'], type: :array, required: true, allow_wrapper: true)
+          else
+            input['categories']
           end
-          
-          # Re-normalize after applying minimums
-          if dist_config['normalize'] != false
-            total = dist.sum { |d| d['prob'] }
-            if total > 0 && total != 1.0
-              dist.each { |d| d['prob'] = d['prob'] / total }
+          cats = call(:norm_categories!, cats_raw)
+
+          # LLM mode - build prompt based on template
+          prompt_config = input['ranking_prompt'] || {}
+          template      = (prompt_config['template'] || 'balanced').to_s
+
+          system_prompt = case template
+          when 'strict'
+            <<~PROMPT
+              You are a strict category classifier. Only assign high probabilities (>0.5) when extremely confident.
+              Most categories should receive low probabilities. Be conservative.
+              Output MUST be valid JSON only.
+            PROMPT
+          when 'inclusive'
+            <<~PROMPT
+              You are an inclusive category classifier. Distribute probabilities broadly across plausible categories.
+              Avoid concentrating all probability on one category unless absolutely certain.
+              Output MUST be valid JSON only.
+            PROMPT
+          when 'custom'
+            prompt_config['custom_instructions'] || <<~PROMPT
+              Rank the categories by relevance and provide a probability distribution.
+              Output MUST be valid JSON only.
+            PROMPT
+          else # balanced
+            <<~PROMPT
+              You are a balanced category classifier. Distribute probabilities based on relevance.
+              The most relevant category should have the highest probability, with others receiving proportional scores.
+              Output MUST be valid JSON only.
+            PROMPT
+          end
+
+          # Distribution configuration (normalize types)
+          raw_dist_config = call(:sanitize_hash, input['distribution_config']) || {}
+          normalize_dist  = ! (raw_dist_config.key?('normalize') && raw_dist_config['normalize'] == false)
+          min_prob        = raw_dist_config.key?('min_probability') ?
+                              raw_dist_config['min_probability'].to_f : 0.01
+          concentration   = (raw_dist_config['concentration'] || 'medium').to_s
+
+          # Adjust temperature based on concentration, unless explicitly set
+          temperature =
+            if input['temperature'].present?
+              input['temperature'].to_f
+            else
+              case concentration
+              when 'low'  then 0.5   # More spread out
+              when 'high' then 0.0   # More concentrated
+              else 0.2              # Medium
+              end
+            end
+
+          # Call LLM referee with enhanced prompt
+          shortlist = call(:safe_array, input['shortlist'])
+          generative_model = (input['generative_model'] || 'gemini-2.0-flash').to_s
+          max_tokens       = (input['max_output_tokens'] || 512).to_i
+          include_reasoning = (input['include_reasoning'] == true)
+
+          ref = call(
+            :llm_referee_enhanced,
+            connection,
+            generative_model,
+            input['email_text'],
+            shortlist,
+            cats,
+            nil,
+            ctx['cid'],
+            system_prompt,
+            temperature,
+            include_reasoning,
+            max_tokens
+          )
+
+          dist = call(:safe_distribution_array, ref['distribution']).map do |d|
+            {
+              'category'  => d['category'],
+              'prob'      => d['prob'].to_f,
+              'reasoning' => d['reasoning']
+            }
+          end
+
+          # Apply distribution configuration
+          if normalize_dist && dist.any?
+            total = dist.sum { |d| d['prob'].to_f }
+            total = 1.0 if total <= 0
+            dist.each { |d| d['prob'] = d['prob'].to_f / total }
+          end
+
+          # Apply minimum probability if configured (> 0)
+          if min_prob.to_f > 0.0 && dist.any?
+            dist.each do |d|
+              d['prob'] = [d['prob'].to_f, min_prob.to_f].max if d['prob'].to_f > 0.0
+            end
+
+            if normalize_dist
+              total = dist.sum { |d| d['prob'].to_f }
+              total = 1.0 if total <= 0
+              dist.each { |d| d['prob'] = d['prob'].to_f / total }
             end
           end
+
+          # Ensure all shortlist items present
+          missing = shortlist - dist.map { |d| d['category'] }
+          missing.each do |m|
+            dist << { 'category' => m, 'prob' => min_prob.to_f, 'reasoning' => nil }
+          end
+
+          # Final ranking
+          ranking = dist.sort_by { |h| -h['prob'].to_f }
+
+          # Calculate distribution statistics
+          probs    = ranking.map { |r| r['prob'].to_f }
+          entropy  = -probs.sum { |p| p > 0 ? p * Math.log(p) : 0.0 }
+          max_prob = probs.max || 0.0
+          min_prob_obs = probs.min || 0.0
+          conc_val = if probs.length > 1 && entropy > 0
+                       (1.0 - entropy / Math.log(probs.length)).round(4)
+                     else
+                       0.0
+                     end
+
+          dist_stats = {
+            'entropy'       => entropy.round(4),
+            'max_prob'      => max_prob,
+            'min_prob'      => min_prob_obs,
+            'concentration' => conc_val
+          }
+
+          out = {
+            'ranking'            => ranking,
+            'shortlist'          => ranking.map { |r| r['category'] },
+            'distribution_stats' => dist_stats
+          }.merge(signals)
+
+          call(:step_ok!, ctx, out, 200, 'OK', {
+            'mode'              => 'llm',
+            'top_prob'          => ranking.first ? ranking.first['prob'] : 0,
+            'categories_ranked' => ranking.length,
+            'generative_model'  => generative_model,
+            'categories_mode'   => input['categories_mode'] || 'array',
+            'prompt_template'   => template,
+            'concentration'     => concentration,
+            'temperature'       => temperature
+          })
+        rescue => e
+          call(:step_err!, ctx, e)
         end
-        
-        # Ensure all shortlist items present
-        missing = call(:safe_array, input['shortlist']) - dist.map { |d| d['category'] }
-        dist.concat(missing.map { |m| { 'category' => m, 'prob' => min_prob } })
-        
-        ranking = dist.sort_by { |h| -h['prob'].to_f }
-        
-        # Calculate distribution statistics
-        probs = ranking.map { |r| r['prob'] }
-        entropy = -probs.sum { |p| p > 0 ? p * Math.log(p) : 0 }
-        
-        dist_stats = {
-          'entropy' => entropy.round(4),
-          'max_prob' => probs.max,
-          'min_prob' => probs.min,
-          'concentration' => (1.0 - entropy / Math.log(probs.length)).round(4)
-        }
-        
-        out = { 
-          'ranking' => ranking, 
-          'shortlist' => ranking.map { |r| r['category'] },
-          'distribution_stats' => dist_stats
-        }.merge(signals)
-        
-        call(:step_ok!, ctx, out, 200, 'OK', { 
-          'mode' => 'llm',
-          'top_prob' => ranking.first ? ranking.first['prob'] : 0,
-          'categories_ranked' => ranking.length,
-          'generative_model' => input['generative_model'] || 'gemini-2.0-flash',
-          'categories_mode' => input['categories_mode'] || 'array',
-          'prompt_template' => template,
-          'concentration' => concentration,
-          'temperature' => temperature
-        })
       end,
       sample_output: lambda do
         call(:sample_rerank_shortlist)
