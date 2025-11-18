@@ -1366,8 +1366,10 @@ require 'securerandom'
         intent = (parsed['intent'] || 'unknown').to_s
         confidence = call(:clamp_confidence, parsed['confidence'] || 0.0)
         
-        # Check confidence threshold
-        conf_threshold = input['confidence_threshold'] || 0.70
+        # Check confidence threshold (ensure numeric)
+        raw_threshold = input['confidence_threshold']
+        conf_threshold = raw_threshold.present? ? raw_threshold.to_f : 0.70
+
         if confidence < conf_threshold
           intent = 'unknown'
         end
