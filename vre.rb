@@ -1610,7 +1610,8 @@ require 'securerandom'
                   ctx['cid'], 
                   system_prompt,
                   temperature,
-                  input['include_reasoning'])
+                  input['include_reasoning']),
+                  input['max_output_tokens']
         
         dist = call(:safe_array, ref['distribution']).map { |d| 
           { 
@@ -3860,7 +3861,7 @@ require 'securerandom'
         ],
         'generationConfig' => {
           'temperature' => temperature || 0,
-          'maxOutputTokens' => 256,
+          'maxOutputTokens' => max_tokens || 512,
           'responseMimeType' => 'application/json',
           'responseSchema' => {
             'type' => 'object',
@@ -4599,19 +4600,15 @@ require 'securerandom'
         if config_fields['show_advanced']
           [
             { name: 'generative_model', control_type: 'text', optional: true, 
-              default: 'gemini-2.0-flash',
-              ngIf: 'input.ranking_mode == "llm"' },
+              default: 'gemini-2.0-flash', ngIf: 'input.ranking_mode == "llm"' },
             { name: 'temperature', type: 'number', optional: true, default: 0,
-              ngIf: 'input.ranking_mode == "llm"',
-              hint: 'Temperature for LLM (0 = deterministic)' },
-            { name: 'categories_json', label: 'Categories JSON', 
-              control_type: 'text-area',
-              ngIf: 'input.categories_mode == "json"', optional: true,
-              hint: 'Paste categories array JSON for testing (overrides pills).' },
-            { name: 'include_reasoning', type: 'boolean', control_type: 'checkbox',
-              ngIf: 'input.ranking_mode == "llm"',
-              default: false,
-              hint: 'Include reasoning for each ranking' }
+              ngIf: 'input.ranking_mode == "llm"', hint: 'Temperature for LLM (0 = deterministic)' },
+            { name: 'max_output_tokens', type: 'integer', optional: true, default: 512, ngIf: 'input.ranking_mode == "llm"',
+              hint: 'Max tokens for ranking output (256-2048). Increase if distribution is requested.' },
+            { name: 'categories_json', label: 'Categories JSON', control_type: 'text-area', ngIf: 'input.categories_mode == "json"',
+              optional: true, hint: 'Paste categories array JSON for testing (overrides pills).' },
+            { name: 'include_reasoning', type: 'boolean', control_type: 'checkbox', ngIf: 'input.ranking_mode == "llm"',
+              default: false, hint: 'Include reasoning for each ranking' }
           ]
         else
           []
