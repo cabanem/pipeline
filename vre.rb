@@ -2818,9 +2818,7 @@ require 'securerandom'
       retry_on_request: ['GET','HEAD'],
       retry_on_response: [408,429,500,502,503,504],
       max_retries: 3,
-      
       input_fields: lambda { |od, c, cf| od['gen_generate_input'] },
-      
       output_fields: lambda do |od, c|
         [
           # Gemini API response structure
@@ -2864,7 +2862,6 @@ require 'securerandom'
           { name: 'facets', type: 'object', properties: od['facets_gen_generate'] }
         ] + call(:standard_operational_outputs)
       end,
-      
       execute: lambda do |connection, raw_input|
         ctx = call(:step_begin!, :gen_generate, raw_input)
         
@@ -2906,7 +2903,6 @@ require 'securerandom'
           call(:step_err!, ctx, e)
         end
       end,
-      
       sample_output: lambda do
         call(:sample_gen_generate)
       end
@@ -4738,7 +4734,6 @@ require 'securerandom'
       ] + call(:standard_operational_outputs)
     end,
 
-
     # Steps
     step_begin!: lambda do |action_id, input|
       { 'action'=>action_id.to_s, 'started_at'=>Time.now.utc.iso8601,
@@ -5535,106 +5530,150 @@ require 'securerandom'
       }
     end,
     gen_generate_process_response!: lambda do |resp, input, request_info, connection|
-      t0 = request_info['started_at']
-      corr = request_info['correlation_id']
-      mode = request_info['mode']
-      
-      code = call(:telemetry_success_code, resp)
-      
-      out = resp.merge(call(:telemetry_envelope, t0, corr, true, code, 'OK'))
-      
+      # Make this resilient to nil / mis-shaped request_info and resp
+      req  = request_info.is_a?(Hash) ? request_info : {}
+      t0   = req['started_at'] || Time.now
+      corr = req['correlation_id']
+      mode = (req['mode'] || input['mode'] || 'plain').to_s
+
+      # Ensure we always have a Hash to merge into
+      base_resp =
+        if resp.is_a?(Hash)
+          resp
+        else
+          { 'raw_response' => resp.to_s }
+        end
+
+      code = call(:telemetry_success_code, base_resp)
+
+      out  = base_resp.merge(
+              call(:telemetry_envelope, t0, corr, true, code, 'OK')
+            )
+
+      # RAG-specific post-processing
       if mode == 'rag_with_context'
-        text   = resp.dig('candidates',0,'content','parts',0,'text').to_s
-        parsed = (call(:json_parse_safe, text) rescue nil)
-        
-        # DEBUG: Log what we're working with
+        text   = out.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
+        parsed = begin
+          call(:json_parse_safe, text)
+        rescue
+          nil
+        end
+
         debug_info = {}
-        
-        # Check what chunks we received
-        debug_info['chunks_received'] = input['context_chunks'].is_a?(Array) ? input['context_chunks'].length : 0
-        debug_info['chunks_sample'] = input['context_chunks']&.first&.keys if input['context_chunks'].is_a?(Array)
-        
-        # Check what citations the LLM gave us
-        debug_info['citations_from_llm'] = parsed['citations']&.length || 0
-        debug_info['citation_ids'] = parsed['citations']&.map { |c| c['chunk_id'] } if parsed['citations'].is_a?(Array)
-        
-        # ENHANCEMENT: Build chunk map with multiple ID formats
-        chunk_map = {}
-        if input['context_chunks'].is_a?(Array)
-          input['context_chunks'].each_with_index do |chunk, idx|
-            # Try multiple ID fields
-            chunk_id = chunk['id'] || chunk['chunk_id'] || "ctx-#{idx+1}"
-            
-            # Also map without brackets in case LLM returns [ctx-1] as ctx-1
-            cleaned_id = chunk_id.to_s.gsub(/^\[|\]$/, '')
-            
-            # Map both the original and cleaned IDs
-            [chunk_id, cleaned_id, "[#{chunk_id}]", "[#{cleaned_id}]"].each do |id_variant|
-              chunk_map[id_variant] = {
-                'source' => chunk['source'] || chunk.dig('metadata', 'source') || chunk.dig('metadata', 'sourceDisplayName'),
-                'uri' => chunk['uri'] || chunk.dig('metadata', 'uri') || chunk.dig('metadata', 'sourceUri') || chunk.dig('metadata', 'url'),
-                'score' => chunk['score'] || chunk['relevanceScore'] || 0.0,
-                'original_id' => chunk_id
+
+        # What did we get from upstream?
+        contexts = input['context_chunks']
+        if contexts.is_a?(Array)
+          debug_info['chunks_received'] = contexts.length
+          debug_info['chunks_sample']   = contexts.first&.keys
+        else
+          debug_info['chunks_received'] = 0
+        end
+
+        if parsed.is_a?(Hash)
+          debug_info['citations_from_llm'] = Array(parsed['citations']).length
+          debug_info['citation_ids']       = Array(parsed['citations']).map { |c| c['chunk_id'] }
+
+          # Build a more tolerant chunk map that understands several id formats
+          chunk_map = {}
+          Array(contexts).each_with_index do |chunk, idx|
+            next unless chunk.is_a?(Hash)
+
+            base_id = chunk['id'] || chunk['chunk_id'] || "ctx-#{idx + 1}"
+            base_id = base_id.to_s
+
+            # Normalize some common variants
+            variants = [
+              base_id,
+              base_id.gsub(/^\[|\]$/, ''),         # strip surrounding brackets
+              "[#{base_id}]",
+              "[#{base_id.gsub(/^\[|\]$/, '')}]"
+            ].uniq
+
+            src  = chunk['source'] ||
+                  chunk.dig('metadata', 'source') ||
+                  chunk.dig('metadata', 'sourceDisplayName')
+            uri  = chunk['uri'] ||
+                  chunk.dig('metadata', 'uri') ||
+                  chunk.dig('metadata', 'sourceUri') ||
+                  chunk.dig('metadata', 'gcsUri') ||
+                  chunk.dig('metadata', 'url')
+            sc   = chunk['score'] || chunk['relevanceScore'] || 0.0
+
+            variants.each do |vid|
+              chunk_map[vid] = {
+                'source'      => src,
+                'uri'         => uri,
+                'score'       => sc,
+                'original_id' => base_id
               }
             end
           end
-          
-          debug_info['chunk_map_keys'] = chunk_map.keys.take(5)  # First 5 keys for debugging
-        end
-        
-        # Enrich citations
-        if parsed.is_a?(Hash) && parsed['citations'].is_a?(Array)
-          parsed['citations'] = parsed['citations'].map do |citation|
-            cited_id = citation['chunk_id']
-            
-            # Try to find chunk data with various ID formats
-            chunk_data = chunk_map[cited_id] || 
-                        chunk_map["[#{cited_id}]"] || 
-                        chunk_map[cited_id.to_s.gsub(/^\[|\]$/, '')]
-            
-            if chunk_data
-              enriched = {
-                'chunk_id' => citation['chunk_id'],
-                'source' => citation['source'].present? ? citation['source'] : chunk_data['source'],
-                'uri' => citation['uri'].present? ? citation['uri'] : chunk_data['uri'],
-                'score' => citation['score'] || chunk_data['score']
-              }
-              
-              debug_info["enriched_#{cited_id}"] = {
-                'had_uri_before' => citation['uri'].present?,
-                'has_uri_after' => enriched['uri'].present?,
-                'uri_value' => enriched['uri']
-              }
-              
-              enriched.compact
-            else
-              debug_info["missing_#{cited_id}"] = 'not_found_in_chunk_map'
-              citation
+
+          debug_info['chunk_map_keys'] = chunk_map.keys.first(5)
+
+          # Enrich citations with source/uri/score when we can
+          if parsed['citations'].is_a?(Array)
+            parsed['citations'] = parsed['citations'].map do |citation|
+              citation = citation.is_a?(Hash) ? citation.dup : {}
+              cited_id = citation['chunk_id'].to_s
+
+              cm = chunk_map[cited_id] ||
+                  chunk_map["[#{cited_id}]"] ||
+                  chunk_map[cited_id.gsub(/^\[|\]$/, '')]
+
+              if cm
+                enriched = {
+                  'chunk_id' => citation['chunk_id'],
+                  'source'   => citation['source'].presence || cm['source'],
+                  'uri'      => citation['uri'].presence    || cm['uri'],
+                  'score'    => citation['score'] || cm['score']
+                }.compact
+
+                debug_info["enriched_#{cited_id}"] = {
+                  'had_uri_before' => citation['uri'].present?,
+                  'has_uri_after'  => enriched['uri'].present?,
+                  'uri_value'      => enriched['uri']
+                }
+
+                enriched
+              else
+                debug_info["missing_#{cited_id}"] = 'not_found_in_chunk_map'
+                citation
+              end
             end
           end
         end
-        
-        # Add debug info to output if in debug mode
+
+        # Only attach debug blob when not in prod OR when input.debug is true
         if !call(:normalize_boolean, connection['prod_mode']) || input['debug']
           (out['debug'] ||= {})['citation_enrichment'] = debug_info
         end
-        
-        out['parsed'] = { 
-          'answer' => parsed['answer'] || text, 
-          'citations' => parsed['citations'] || [] 
-        }
-        
-        # Compute overall confidence from cited chunk scores
-        conf = call(:overall_confidence_from_citations, out['parsed']['citations'])
+
+        # Normalized parsed section
+        if parsed.is_a?(Hash)
+          out['parsed'] = {
+            'answer'    => parsed['answer'] || text,
+            'citations' => Array(parsed['citations'])
+          }
+        else
+          out['parsed'] = {
+            'answer'    => text,
+            'citations' => []
+          }
+        end
+
+        # Compute confidence from citations (your helper already handles empty)
+        conf = call(:overall_confidence_from_citations, out.dig('parsed', 'citations'))
         out['confidence'] = conf if conf
-        
-        (out['telemetry'] ||= {})['confidence'] = { 
-          'basis' => 'citations_topk_avg', 
-          'k' => 3,
-          'n' => Array(out.dig('parsed','citations')).length 
+
+        (out['telemetry'] ||= {})['confidence'] = {
+          'basis' => 'citations_topk_avg',
+          'k'     => 3,
+          'n'     => Array(out.dig('parsed', 'citations')).length
         }
       end
-      
+
       out
     end,
     gen_generate_handle_error!: lambda do |err, request_info, connection, input|
