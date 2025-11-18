@@ -1,350 +1,147 @@
-// PREAMBLE
-You are an HR information assistant that answers questions using ONLY provided context.
-
-CRITICAL RULES:
-1. Output ONLY valid JSON - no other text, no markdown, no explanations
-2. Use ONLY information explicitly provided in the context fields
-3. NEVER promise actions, approvals, updates, or system changes
-4. ONLY answer "what/how/where/when" questions about policies and procedures
-
-DECISION FLOW:
-
-Step 1: Check if this is an information request
-- Information request: Contains "what is", "how do I", "where can I", "when is", "tell me about"
-- NOT information: Contains "please do", "can you process", "approve", "submit", "update my"
-→ If NOT information request: Return {"status":"blocked","reason":"not_information_request"}
-
-Step 2: Check for blocking conditions
-- Email chain detected (Fwd:, >>> , Original Message)
-- Third person reference (this employee, this person)
-- Safety flags (legal, medical, crisis language)
-→ If blocked: Return {"status":"blocked","reason":"[specific reason]"}
-
-Step 3: Check context sufficiency
-Required context by category:
-- PTO: Must have pto_policy or pto_timeline
-- W2: Must have w2_availability AND tax_year
-- Payroll: Must have payroll_info or payroll_timeline
-- HRIS: Must have portal_link or access_instructions
-→ If missing: Return {"status":"insufficient_context","missing":["field1","field2"]}
-
-Step 4: Generate response (only if all checks pass)
-
-OUTPUT FORMAT:
 {
-  "status": "generated",
-  "response": {
-    "subject": "RE: [original subject]",
-    "body": "[see template below]",
-    "confidence": [0.60-1.0],
-    "category": "[PTO|W2|Payroll|Benefits|HRIS|Other]"
-  },
-  "context_used": ["field names from input that were used"],
-  "intent_confirmed": "information_request"
-}
-
-RESPONSE BODY TEMPLATE (maximum 150 words):
-Hello,
-
-Thank you for your inquiry about [specific topic].
-
-[Direct answer using only facts from context - 1-2 sentences]
-
-[If timeline provided: The typical timeline is X.]
-[If next steps provided: The next step is Y.]
-[If resource link provided: You can find more information at Z.]
-
-Best regards,
-HR Team
-
-BLOCKED RESPONSE FORMAT:
-{
-  "status": "blocked",
-  "reason": "not_information_request|forwarded_chain|safety_concern|third_person"
-}
-
-INSUFFICIENT CONTEXT FORMAT:
-{
-  "status": "insufficient_context", 
-  "missing": ["required_field_1", "required_field_2"],
-  "category_detected": "PTO|W2|etc"
-}
-
-EXAMPLE INPUT/OUTPUT:
-
-Input: {"email_body": "What is our PTO policy?", "category": "PTO", "confidence": 0.85, "pto_policy": "Employees get 15 days PTO per year"}
-Output: {"status":"generated","response":{"subject":"RE: PTO policy","body":"Hello,\n\nThank you for your inquiry about PTO policy.\n\nEmployees receive 15 days of PTO per year.\n\nBest regards,\nHR Team","confidence":0.85,"category":"PTO"},"context_used":["pto_policy"],"intent_confirmed":"information_request"}
-
-Input: {"email_body": "Please approve my PTO for next week", "category": "PTO", "confidence": 0.75}
-Output: {"status":"blocked","reason":"not_information_request"}
-
-Input: {"email_body": "Where can I find my W2?", "category": "W2", "confidence": 0.70}
-Output: {"status":"insufficient_context","missing":["w2_availability","tax_year"],"category_detected":"W2"}
-
-REMEMBER:
-- Facts only from context
-- No actions or promises
-- Maximum 150 words
-- Valid JSON only
-
-// SEMANTIC
-
-{
-  "semantic_config": {
-    "version": "2.0",
-    
-    "hard_rules": {
-      "forwarded_chain": {
-        "patterns": [
-          {"field": "subject", "match": "^(Fwd:|FW:|Re: Fwd)"},
-          {"field": "body", "match": "---- Original Message ----"},
-          {"field": "body", "match": "From:.*Sent:.*To:.*Subject:"}
-        ],
-        "action": "block",
-        "email_type": "forwarded_chain"
-      },
-      "internal_discussion": {
-        "patterns": [
-          {"field": "body", "match": "this employee"},
-          {"field": "body", "match": "please help this person"},
-          {"field": "body", "match": "FYI"}
-        ],
-        "action": "block", 
-        "email_type": "internal_discussion"
-      },
-      "auto_reply": {
-        "patterns": [
-          {"field": "headers.auto-submitted", "exists": true},
-          {"field": "subject", "match": "(Out of Office|Automatic Reply)"}
-        ],
-        "action": "ignore",
-        "email_type": "auto_reply"
-      },
-      "safety_block": {
-        "patterns": [
-          {"field": "body", "match": "(lawsuit|legal action|harassment|discrimination)"},
-          {"field": "body", "match": "(medical condition|diagnosis|disability)"}
-        ],
-        "action": "escalate",
-        "email_type": "direct_request"
-      }
-    },
-    
-    "scoring_signals": [
-      {
-        "id": "information_question",
-        "pattern": "\\b(what|how|where|when|why)\\b.*\\?",
-        "field": "body",
-        "weight": 4,
-        "intent": "information"
-      },
-      {
-        "id": "policy_question",
-        "pattern": "\\b(policy|procedure|process|guidelines?)\\b",
-        "field": "body", 
-        "weight": 3,
-        "intent": "information"
-      },
-      {
-        "id": "employee_sender",
-        "pattern": "@(company|subsidiary)\\.com$",
-        "field": "from",
-        "weight": 2,
-        "intent": null
-      },
-      {
-        "id": "hr_topic",
-        "pattern": "\\b(PTO|vacation|W-?2|payroll|benefits|timesheet)\\b",
-        "field": "body",
-        "weight": 2,
-        "intent": null
-      },
-      {
-        "id": "action_request",
-        "pattern": "\\b(please process|can you|could you|submit|approve)\\b",
-        "field": "body",
-        "weight": -4,
-        "intent": "action"
-      },
-      {
-        "id": "status_check",
-        "pattern": "\\b(status of|update on|where is my|has this been)\\b",
-        "field": "body",
-        "weight": -3,
-        "intent": "status"
-      },
-      {
-        "id": "chain_depth",
-        "pattern": "(>\\s*>|>{3,})",
-        "field": "body",
-        "weight": -5,
-        "intent": null
-      },
-      {
-        "id": "third_person",
-        "pattern": "\\b(this person|this employee|they need)\\b",
-        "field": "body",
-        "weight": -4,
-        "intent": null
-      }
-    ],
-    
-    "scoring_thresholds": {
-      "keep": 5,
-      "review": 2,
-      "irrelevant": 0
-    },
-    
-    "intent_classification": {
-      "information_threshold": 6,
-      "action_threshold": -2,
-      "default": "action"
-    },
-    
-    "category_detection": {
-      "keyword_matching": {
-        "PTO": ["pto", "paid time off", "vacation", "holiday"],
-        "W2": ["w-2", "w2", "tax form"],
-        "Payroll": ["payroll", "paycheck", "pay stub", "direct deposit"],
-        "Benefits": ["benefits", "insurance", "enrollment"],
-        "HRIS": ["workday", "adp", "portal", "login"],
-        "Other": []
-      },
-      "confidence_adjustments": {
-        "multiple_keywords": 0.1,
-        "subject_match": 0.15,
-        "no_keywords": -0.2
-      }
-    },
-    
-    "email_type_detection": {
-      "priority_order": [
-        "forwarded_chain",
-        "internal_discussion", 
-        "auto_reply",
-        "direct_request"
-      ],
-      "default": "direct_request"
-    }
-  }
-}
-
-// POLICY
-
-{
-  "policy_config": {
-    "version": "2.0",
-    "phase": "simplified_draft_only",
-    
-    "output_schema": {
-      "decision": {
-        "type": "string",
-        "enum": ["IRRELEVANT", "REVIEW", "KEEP"],
-        "required": true
-      },
-      "confidence": {
-        "type": "number",
-        "minimum": 0.0,
-        "maximum": 1.0,
-        "required": true
-      },
-      "category": {
-        "type": "string",
-        "enum": ["PTO", "W2", "Payroll", "Benefits", "HRIS", "Other"],
-        "required": true
-      },
-      "email_type": {
-        "type": "string",
-        "enum": ["direct_request", "forwarded_chain", "internal_discussion"],
-        "required": true
-      },
-      "is_information_request": {
-        "type": "boolean",
-        "required": true
-      },
-      "matched_signals": {
-        "type": "array",
-        "items": {"type": "string"},
-        "maxItems": 5,
-        "required": true
-      },
-      "block_reason": {
-        "type": "string",
-        "required": false
-      }
-    },
-    
-    "instructions": "Output ONLY valid JSON matching the schema. No additional text or fields.",
-    
-    "generation_gate": {
-      "confidence_threshold": 0.60,
-      "required_conditions": [
-        "decision == KEEP",
-        "confidence >= 0.60",
-        "email_type == direct_request",
-        "is_information_request == true",
-        "category != Other"
-      ],
-      "block_conditions": [
-        "forwarded_chain detected",
-        "internal_discussion detected", 
-        "safety_flag triggered",
-        "action_request detected"
+  "schema_name": "hr_email_categories",
+  "schema_version": "1.0.0",
+  "domain": "hr_employee_email",
+  "categories": [
+    {
+      "name": "PTO",
+      "description": "Questions or requests about paid time off, vacation, sick leave, or holidays.",
+      "examples": [
+        "How many PTO days do I have left this year?",
+        "I’d like to request vacation from March 10–14.",
+        "What is the policy for sick leave?",
+        "Do we get paid on company holidays?"
       ]
     },
-    
-    "intent_detection": {
-      "information_patterns": [
-        "what is", "how do I", "where can I", "when is",
-        "tell me about", "explain", "policy on",
-        "how does", "where do I find", "what are the"
-      ],
-      "action_patterns": [
-        "please process", "can you submit", "approve my",
-        "update my", "change my", "fix my", "send me",
-        "I need you to", "could you please"
-      ],
-      "default_classification": "action_request"
+    {
+      "name": "Benefits",
+      "description": "Benefits eligibility, enrollment, coverage details, and dependent questions.",
+      "examples": [
+        "How do I add my newborn to my health insurance?",
+        "When is the next open enrollment period?",
+        "What does our dental insurance cover?",
+        "Am I eligible for vision coverage as a part-time employee?"
+      ]
     },
-    
-    "categories": {
-      "PTO": {
-        "keywords": ["PTO", "paid time off", "vacation", "holiday", "sick leave"],
-        "required_context": ["pto_policy"],
-        "confidence_boost": 0.1
-      },
-      "W2": {
-        "keywords": ["W-2", "W2", "tax form", "tax document"],
-        "required_context": ["w2_availability", "tax_year"],
-        "confidence_boost": 0.1
-      },
-      "Payroll": {
-        "keywords": ["payroll", "paycheck", "salary", "direct deposit", "pay stub"],
-        "required_context": ["payroll_info"],
-        "confidence_boost": 0.05
-      },
-      "Benefits": {
-        "keywords": ["benefits", "insurance", "enrollment", "coverage"],
-        "required_context": ["benefits_info"],
-        "confidence_boost": 0.0
-      },
-      "HRIS": {
-        "keywords": ["Workday", "ADP", "portal", "login", "password", "access"],
-        "required_context": ["portal_link"],
-        "confidence_boost": 0.1
-      },
-      "Other": {
-        "keywords": [],
-        "required_context": [],
-        "confidence_boost": -0.2
-      }
+    {
+      "name": "Payroll",
+      "description": "Paychecks, taxes, deductions, direct deposit, and related pay issues.",
+      "examples": [
+        "My paycheck amount looks lower than usual this period.",
+        "How do I change my direct deposit information?",
+        "Where can I find my pay stubs?",
+        "Why were extra taxes taken out of my last check?"
+      ]
     },
-    
-    "safety_flags": {
-      "legal": ["lawsuit", "attorney", "legal action", "discrimination"],
-      "medical": ["diagnosis", "disability", "FMLA", "medical condition"],
-      "crisis": ["emergency", "urgent", "immediate"],
-      "sensitive": ["termination", "harassment", "complaint"]
+    {
+      "name": "W2_and_Tax_Forms",
+      "description": "W-2, 1095, and other tax documentation requests or issues.",
+      "examples": [
+        "Can you resend my W-2 from last year?",
+        "Where do I download my W-2 form?",
+        "My address was wrong on my W-2. How do I fix it?",
+        "Do we receive a 1095-C form for health coverage?"
+      ]
+    },
+    {
+      "name": "HRIS_Portal_and_Access",
+      "description": "Issues using the HR portal or requests for account access / troubleshooting.",
+      "examples": [
+        "I can’t log into the HR portal.",
+        "The HR system shows the wrong manager for me.",
+        "Where do I submit a PTO request in the system?",
+        "My account keeps getting locked out when I sign in."
+      ]
+    },
+    {
+      "name": "Personal_Information_Changes",
+      "description": "Requests to update personal or employment information in HR records.",
+      "examples": [
+        "I need to update my home address.",
+        "How do I change my legal name after marriage?",
+        "Can you update my emergency contact?",
+        "My marital status changed; what do I need to do?"
+      ]
+    },
+    {
+      "name": "Employment_Verification_and_Letters",
+      "description": "Employment verification, proof of income, and official letter requests.",
+      "examples": [
+        "I need an employment verification letter for my mortgage.",
+        "Can you confirm my salary for an apartment application?",
+        "How do I request a letter confirming my job title?",
+        "My lender sent an employment verification form—where should I send it?"
+      ]
+    },
+    {
+      "name": "Policy_and_General_HR_Info",
+      "description": "Questions about HR policies, handbooks, and general HR rules.",
+      "examples": [
+        "What is the company policy on remote work?",
+        "Where can I find the employee handbook?",
+        "What is our dress code policy?",
+        "How does the performance review process work?"
+      ]
+    },
+    {
+      "name": "Leave_of_Absence",
+      "description": "FMLA, parental leave, medical leave, and other extended leave topics.",
+      "examples": [
+        "How do I apply for maternity leave?",
+        "Am I eligible for FMLA?",
+        "What documentation is needed for a medical leave?",
+        "How long can I be out on leave and keep my benefits?"
+      ]
+    },
+    {
+      "name": "Onboarding_and_Offboarding",
+      "description": "New hire, transfer, and termination/exit logistics.",
+      "examples": [
+        "I haven’t received my onboarding paperwork.",
+        "What should I do with my equipment when I leave?",
+        "Is there a checklist for my first day?",
+        "I’m transferring to another department; what changes for me?"
+      ]
+    },
+    {
+      "name": "Timekeeping_and_Scheduling",
+      "description": "Timesheets, clock-in/out problems, schedules, and shift changes.",
+      "examples": [
+        "I forgot to clock out yesterday—how do I fix it?",
+        "My timesheet won’t submit in the system.",
+        "How do I see my work schedule for next week?",
+        "Who do I contact to change my regular shift?"
+      ]
+    },
+    {
+      "name": "Employee_Relations_and_Concerns",
+      "description": "Sensitive issues, workplace concerns, conflicts, or complaints.",
+      "examples": [
+        "I have a concern about how my manager is treating me.",
+        "I’d like to report a potential harassment issue.",
+        "What is the process for filing a formal complaint?",
+          "Who do I talk to about a conflict with a coworker?"
+      ]
+    },
+    {
+      "name": "Compliance_and_Required_Training",
+      "description": "Mandatory trainings, certifications, and compliance-related questions.",
+      "examples": [
+        "I received a notice about overdue compliance training.",
+        "How do I access the harassment prevention course?",
+        "Is this security training mandatory?",
+        "Do I get paid for required training time?"
+      ]
+    },
+    {
+      "name": "Other_or_Not_Classified",
+      "description": "HR-relevant emails that don’t clearly fit any other category.",
+      "examples": [
+        "I’m not sure who to contact about this issue.",
+        "General HR question that doesn’t match the listed topics.",
+        "Can you point me to the right HR contact?",
+        "Miscellaneous questions that are still HR-related."
+      ]
     }
-  }
+  ]
 }
