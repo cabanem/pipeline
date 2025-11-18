@@ -1243,14 +1243,32 @@ require 'securerandom'
         
         # Resolve prompt template
         default_prompt = <<~SYS
-        You are an email triage system. Classify emails carefully. 
-          Use only the decision types provided: #{decision_types.join(', ')}
+          You are triaging an HR mailbox that receives emails from employees
+          (PTO, benefits, payroll, HRIS access, policies, complaints, etc.).
           
-          Provide confidence scores between 0 and 1.
-          Include up to 3 brief reasons for your decision.
-          #{input['include_domain_detection'] != false ? 'Detect the email domain/topic.' : ''}
-
-          Output MUST be valid JSON only. No text before or after.
+          Your job is NOT to write a reply. Your job is ONLY to classify each email into
+          one of the allowed decision types and compute a confidence score.
+          
+          Use only the decision types provided: #{decision_types.join(', ')}.
+          
+          Requirements:
+          - Provide a calibrated confidence score between 0.0 and 1.0 (float).
+          - Include up to 3 brief reasons for your decision.
+          - #{input['include_domain_detection'] != false ? 'Detect the email domain/topic and include it as detected_domain.' : 'You may ignore domain detection.'}
+          - Set has_question = true if the email clearly asks at least one question.
+          
+          CRITICAL: Output MUST be valid JSON only, matching the response schema:
+          {
+            "decision": "<one of #{decision_types.join(', ')}>",
+            "confidence": <number between 0 and 1>,
+            "reasons": ["...", "..."],
+            "matched_signals": ["...", "..."],
+            "has_question": true or false#{input['include_domain_detection'] != false ? ', 
+            "detected_domain": "<short topic label>"' : ''}
+          }
+          
+          Do NOT include any extra top-level fields not defined above.
+          Do NOT output any prose before or after the JSON object.
         SYS
         
         system_text = call(:resolve_prompt, input, default_prompt)
@@ -6991,13 +7009,26 @@ require 'securerandom'
       end
     end,
     resolve_prompt: lambda do |input, default_prompt|
-      # Get actual prompt from template or custom
+      # Compose template prompt (tone/domain) with the action-specific default prompt.
+      # Template should NEVER erase the JSON/decision/schema instructions in default_prompt.
       template = input['prompt_template'] || 'hr_assistant'
+
       if template == 'custom'
-        input['custom_system_prompt'] || default_prompt
+        # Caller takes full responsibility when using custom; fall back to default_prompt if empty.
+        (input['custom_system_prompt'].presence || default_prompt).to_s
       else
         templates = call(:config_system_prompts)
-        templates[template]['prompt'] || default_prompt
+        base = templates[template]
+
+        # If template is missing or misconfigured, just use the action's default prompt.
+        template_text = base && base['prompt']
+
+        if template_text.present?
+          # Template first (tone/domain), then the action's own instructions (JSON schema, decisions, etc.)
+          "#{template_text.to_s.rstrip}\n\n#{default_prompt.to_s.lstrip}"
+        else
+          default_prompt.to_s
+        end
       end
     end,
     get_intent_preset: lambda do |preset_type|
