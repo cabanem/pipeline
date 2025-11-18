@@ -1333,7 +1333,16 @@ require 'securerandom'
         
         # Parse response
         text = resp.dig('candidates',0,'content','parts',0,'text').to_s
-        parsed = (call(:json_parse_safe, text) rescue {})
+
+        parse_error = nil
+        parsed = {}
+        begin
+          parsed = call(:json_parse_safe, text, type: :hash, required: true)
+        rescue => e
+          # Record the error but keep the pipeline alive (optional behavior).
+          parse_error = e.to_s
+          parsed = {}
+        end
         
         decision = (parsed['decision'] || 'HUMAN').to_s
         confidence = call(:clamp_confidence, parsed['confidence'] || 0.0)
@@ -1599,15 +1608,19 @@ require 'securerandom'
           'signals_triage' => input['signals_triage']
         }
         
-        call(:step_ok!, ctx, out, 200, 'OK', {
-          'intent' => intent,
+        extras = {
+          'decision' => decision,
           'confidence' => confidence,
-          'is_actionable' => out['is_actionable'],
-          'has_entities' => parsed['entities'].is_a?(Array) && parsed['entities'].any?,
-          'sentiment' => parsed['sentiment'],
-          'intent_preset' => input['intent_preset'] || 'hr_intents',
-          'prompt_template' => input['prompt_template'] || 'default'
-        })
+          'detected_domain' => parsed['detected_domain'],
+          'has_question' => parsed['has_question'],
+          'should_continue' => should_continue,
+          'short_circuit' => short_circuit,
+          'prompt_template' => input['prompt_template'] || 'default',
+          'threshold_preset' => input['threshold_preset'] || 'balanced'
+        }
+        extras['parse_error'] = parse_error if parse_error
+
+        call(:step_ok!, ctx, out, 200, 'OK', extras)
       end,
       sample_output: lambda do
         call(:sample_ai_intent_classifier)
@@ -4395,11 +4408,6 @@ require 'securerandom'
       # Check for common errors BEFORE parsing
       if s.include?('=>')
         error('Invalid JSON: looks like a Ruby hash (=>). Convert to JSON (":" and double quotes).')
-      end
-      
-      # Check for smart quotes (common copy-paste error)
-      if s.match(/[""''`´]/)
-        error('Invalid JSON: contains smart quotes or backticks. Use standard double quotes (").')
       end
       
       # Parse with error handling
