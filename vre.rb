@@ -5376,50 +5376,63 @@ require 'securerandom'
     gen_generate_prepare_request!: lambda do |connection, input, corr=nil|
       corr = (corr.to_s.strip.empty? ? call(:build_correlation_id) : corr.to_s.strip)
       mode = (input['mode'] || 'plain').to_s
-      
-      # Track which signals we're using
+
+      # Track which signals we're using (for facets + debugging)
       applied_signals = []
 
+      # Helper to fetch from hash with string OR symbol key
+      fetch = lambda do |h, key|
+        return nil unless h.is_a?(Hash)
+        h[key] || h[key.to_s] || h[key.to_sym] rescue nil
+      end
+
       # ----------------- Normalize nested configs -----------------
+
       # Signal config: support both nested signal_config and legacy flat fields
-      sig_cfg = input['signal_config'].is_a?(Hash) ? input['signal_config'] : {}
+      sig_cfg_raw = input['signal_config']
+      sig_cfg = sig_cfg_raw.is_a?(Hash) ? sig_cfg_raw : {}
+
       use_signal_enrichment =
-        if sig_cfg.key?('use_signal_enrichment')
-          sig_cfg['use_signal_enrichment']
+        if sig_cfg.key?('use_signal_enrichment') || sig_cfg.key?(:use_signal_enrichment)
+          fetch.call(sig_cfg, 'use_signal_enrichment')
         else
           input['use_signal_enrichment']
         end
 
-      signals_category   = sig_cfg['signals_category'].presence   || input['signals_category']
-      signals_confidence = sig_cfg['signals_confidence'].presence || input['signals_confidence']
-      signals_intent     = sig_cfg['signals_intent'].presence     || input['signals_intent']
+      signals_category   = (fetch.call(sig_cfg, 'signals_category')   || input['signals_category']).to_s
+      signals_confidence =  fetch.call(sig_cfg, 'signals_confidence') || input['signals_confidence']
+      signals_intent     = (fetch.call(sig_cfg, 'signals_intent')     || input['signals_intent']).to_s
 
       # RAG config for rag_with_context mode
-      rag_cfg              = input['rag_config'].is_a?(Hash) ? input['rag_config'] : {}
-      rag_limits           = rag_cfg['custom_limits'].is_a?(Hash) ? rag_cfg['custom_limits'] : {}
-      rag_threshold_preset = (rag_cfg['threshold_preset'] || 'balanced').to_s
+      rag_cfg_raw = input['rag_config']
+      rag_cfg     = rag_cfg_raw.is_a?(Hash) ? rag_cfg_raw : {}
+      rag_limits_raw = fetch.call(rag_cfg, 'custom_limits')
+      rag_limits     = rag_limits_raw.is_a?(Hash) ? rag_limits_raw : {}
+
+      rag_threshold_preset = (fetch.call(rag_cfg, 'threshold_preset') || 'balanced').to_s
 
       # Derive system_preamble from generation_prompt_config if not explicitly set
       system_preamble = input['system_preamble']
-      if system_preamble.blank? && input['generation_prompt_config'].is_a?(Hash)
-        gpc  = input['generation_prompt_config'] || {}
-        tmpl = (gpc['template'] || 'hr_assistant').to_s
+      if (system_preamble.nil? || system_preamble.to_s.strip.empty?) && input['generation_prompt_config'].is_a?(Hash)
+        gpc_raw = input['generation_prompt_config'] || {}
+        tmpl = (fetch.call(gpc_raw, 'template') || 'hr_assistant').to_s
         if tmpl == 'custom'
-          system_preamble = gpc['custom_prompt']
+          system_preamble = fetch.call(gpc_raw, 'custom_prompt')
         else
           templates = call(:config_system_prompts)
           base      = templates[tmpl] && templates[tmpl]['prompt']
-          system_preamble = base if base.present?
+          system_preamble = base if base
         end
       end
 
-      # Model + location
+      # ----------------- Base model / URL / common fields -----------------
+
       model_path     = call(:build_model_path_with_global_preview, connection, input['model'])
-      loc_from_model = (model_path[/\/locations\/([^\/]+)/,1] || (connection['location'].presence || 'global')).to_s.downcase
+      loc_from_model = (model_path[/\/locations\/([^\/]+)/, 1] || (connection['location'].presence || 'global')).to_s.downcase
       url            = call(:aipl_v1_url, connection, loc_from_model, "#{model_path}:generateContent")
       req_params     = "model=#{model_path}"
 
-      # Base fields (for non-RAG modes)
+      # Base fields (used directly for non-RAG modes, partially overridden for rag_with_context)
       contents = call(:sanitize_contents!, input['contents'])
       sys_inst = call(:system_instruction_from_text, system_preamble)
       gen_cfg  = call(:sanitize_generation_config, input['generation_config'])
@@ -5427,43 +5440,57 @@ require 'securerandom'
       tool_cfg = call(:safe_obj, input['toolConfig'])
       tools    = nil
 
+      # ----------------- Mode-specific behavior -----------------
+
       case mode
       when 'plain'
-        # no special tools
+        # no special tools; contents/system_preamble as-is
+
       when 'grounded_google'
-        tools = [ { 'googleSearch' => {} } ]
+        tools = [{ 'googleSearch' => {} }]
+
       when 'grounded_vertex'
         ds   = input['vertex_ai_search_datastore'].to_s
         scfg = input['vertex_ai_search_serving_config'].to_s
         error('Provide exactly one of vertex_ai_search_datastore OR vertex_ai_search_serving_config') \
-          if (ds.blank? && scfg.blank?) || (ds.present? && scfg.present?)
-        vas = {}; vas['datastore'] = ds unless ds.blank?; vas['servingConfig'] = scfg unless scfg.blank?
-        tools = [ { 'retrieval' => { 'vertexAiSearch' => vas } } ]
+          if (ds.empty? && scfg.empty?) || (!ds.empty? && !scfg.empty?)
+
+        vas = {}
+        vas['datastore']     = ds   unless ds.empty?
+        vas['servingConfig'] = scfg unless scfg.empty?
+
+        tools = [{ 'retrieval' => { 'vertexAiSearch' => vas } }]
+
       when 'grounded_rag_store'
         corpus = call(:normalize_rag_corpus, connection, input['rag_corpus'])
-        error('rag_corpus is required for grounded_rag_store') if corpus.blank?
+        error('rag_corpus is required for grounded_rag_store') if corpus.to_s.strip.empty?
 
         # Prefer nested rag_retrieval_config, fall back to legacy flat fields
-        rrc  = input['rag_retrieval_config'].is_a?(Hash) ? input['rag_retrieval_config'] : {}
-        flt  = rrc['filter'].is_a?(Hash)  ? rrc['filter']  : {}
-        rank = rrc['ranking'].is_a?(Hash) ? rrc['ranking'] : {}
+        rrc_raw = input['rag_retrieval_config']
+        rrc     = rrc_raw.is_a?(Hash) ? rrc_raw : {}
 
-        dist = flt['vector_distance_threshold']   || input['vector_distance_threshold']
-        sim  = flt['vector_similarity_threshold'] || input['vector_similarity_threshold']
+        flt_raw  = fetch.call(rrc, 'filter')
+        rank_raw = fetch.call(rrc, 'ranking')
 
-        rank_service_model = rank['rank_service_model'] || input['rank_service_model']
-        llm_ranker_model   = rank['llm_ranker_model']   || input['llm_ranker_model']
+        flt   = flt_raw.is_a?(Hash)  ? flt_raw  : {}
+        rank  = rank_raw.is_a?(Hash) ? rank_raw : {}
 
-        top_k = rrc['top_k'] || input['similarity_top_k']
+        dist = fetch.call(flt,  'vector_distance_threshold')   || input['vector_distance_threshold']
+        sim  = fetch.call(flt,  'vector_similarity_threshold') || input['vector_similarity_threshold']
+
+        rank_service_model = fetch.call(rank, 'rank_service_model') || input['rank_service_model']
+        llm_ranker_model   = fetch.call(rank, 'llm_ranker_model')   || input['llm_ranker_model']
+
+        top_k = fetch.call(rrc, 'top_k') || input['similarity_top_k']
 
         call(:guard_threshold_union!, dist, sim)
         call(:guard_ranker_union!, rank_service_model, llm_ranker_model)
 
-        vr = { 'ragResources' => [ { 'ragCorpus' => corpus } ] }
+        vr = { 'ragResources' => [{ 'ragCorpus' => corpus }] }
 
         filt = {}
-        filt['vectorDistanceThreshold']   = call(:safe_float, dist) if dist.present?
-        filt['vectorSimilarityThreshold'] = call(:safe_float, sim)  if sim.present?
+        filt['vectorDistanceThreshold']   = call(:safe_float, dist) if !dist.nil? && dist.to_s != ''
+        filt['vectorSimilarityThreshold'] = call(:safe_float, sim)  if !sim.nil?  && sim.to_s  != ''
 
         rconf = {}
         if rank_service_model.to_s.strip != ''
@@ -5473,19 +5500,17 @@ require 'securerandom'
         end
 
         retrieval_cfg = {}
-        retrieval_cfg['similarityTopK'] = call(:clamp_int, (top_k || 0), 1, 200) if top_k.present?
-        retrieval_cfg['filter']  = filt unless filt.empty?
+        retrieval_cfg['similarityTopK'] = call(:clamp_int, (top_k || 0), 1, 200) if !top_k.nil? && top_k.to_s != ''
+        retrieval_cfg['filter']  = filt  unless filt.empty?
         retrieval_cfg['ranking'] = rconf unless rconf.empty?
 
-        tools = [
-          {
-            'retrieval' => {
-              'vertexRagStore' => vr.merge(
-                retrieval_cfg.empty? ? {} : { 'ragRetrievalConfig' => retrieval_cfg }
-              )
-            }
+        tools = [{
+          'retrieval' => {
+            'vertexRagStore' => vr.merge(
+              retrieval_cfg.empty? ? {} : { 'ragRetrievalConfig' => retrieval_cfg }
+            )
           }
-        ]
+        }]
 
       when 'rag_with_context'
         # Technical validation: contexts are required for this mode
@@ -5493,8 +5518,8 @@ require 'securerandom'
         error('context_chunks are required for rag_with_context mode') if chunks.empty?
 
         # Build RAG prompt
-        q        = input['question'].to_s
-        error('question is required for rag_with_context mode') if q.blank?
+        q = input['question'].to_s
+        error('question is required for rag_with_context mode') if q.strip.empty?
 
         # Resolve RAG limits: preset → defaults → custom overrides → legacy fields
         defaults =
@@ -5507,43 +5532,43 @@ require 'securerandom'
             { 'max_chunks' => 20, 'max_prompt_tokens' => 3000, 'reserve_output_tokens' => 512 }
           end
 
-        maxn = call(
-          :clamp_int,
-          (rag_limits['max_chunks'] || input['max_chunks'] || defaults['max_chunks']),
-          1, 100
-        )
+        # Allow symbol or string keys inside rag_limits
+        max_chunks_val = fetch.call(rag_limits, 'max_chunks') || input['max_chunks'] || defaults['max_chunks']
+        maxn = call(:clamp_int, max_chunks_val, 1, 100)
         chunks = chunks.first(maxn)
 
-        items = chunks.map do |c|
-          c.merge('text' => call(:truncate_chunk_text, c['text'], 800))
-        end
+        items = chunks.map { |c| c.merge('text' => call(:truncate_chunk_text, c['text'], 800)) }
 
-        target_total =
-          (rag_limits['max_prompt_tokens'] ||
-          input['max_prompt_tokens'] ||
-          defaults['max_prompt_tokens']).to_i
+        max_prompt_tokens_val   = fetch.call(rag_limits, 'max_prompt_tokens')   || input['max_prompt_tokens']   || defaults['max_prompt_tokens']
+        reserve_output_tokens_val = fetch.call(rag_limits, 'reserve_output_tokens') || input['reserve_output_tokens'] || defaults['reserve_output_tokens']
 
-        reserve_out  =
-          (rag_limits['reserve_output_tokens'] ||
-          input['reserve_output_tokens'] ||
-          defaults['reserve_output_tokens']).to_i
-
+        target_total = max_prompt_tokens_val.to_i
+        reserve_out  = reserve_output_tokens_val.to_i
         budget_prompt = [target_total - reserve_out, 400].max
 
-        model_for_cnt =
-          (rag_cfg['count_tokens_model'].presence ||
-          input['count_tokens_model'].presence ||
-          input['model']).to_s
+        count_tokens_model_val =
+          fetch.call(rag_cfg, 'count_tokens_model') ||
+          input['count_tokens_model'] ||
+          input['model']
 
-        strategy =
-          (rag_cfg['trim_strategy'].presence ||
-          input['trim_strategy'].presence ||
-          'drop_low_score').to_s
+        model_for_cnt = count_tokens_model_val.to_s
+
+        trim_strategy_val =
+          fetch.call(rag_cfg, 'trim_strategy') ||
+          input['trim_strategy'] ||
+          'drop_low_score'
+
+        strategy = trim_strategy_val.to_s
 
         ordered = case strategy
-                  when 'diverse_mmr' then call(:mmr_diverse_order, items.sort_by { |c| [-(c['score']||0.0).to_f, c['id'].to_s] }, alpha: 0.7, per_source_cap: 3)
-                  when 'drop_low_score' then items.sort_by { |c| [-(c['score']||0.0).to_f, c['id'].to_s] }
-                  else items
+                  when 'diverse_mmr'
+                    call(:mmr_diverse_order,
+                        items.sort_by { |c| [-(c['score'] || 0.0).to_f, c['id'].to_s] },
+                        alpha: 0.7, per_source_cap: 3)
+                  when 'drop_low_score'
+                    items.sort_by { |c| [-(c['score'] || 0.0).to_f, c['id'].to_s] }
+                  else
+                    items
                   end
         ordered = call(:drop_near_duplicates, ordered, 0.9)
 
@@ -5568,10 +5593,9 @@ require 'securerandom'
             input['system_preamble'].to_s
           elsif input['generation_prompt_config'].is_a?(Hash)
             gpc = input['generation_prompt_config'] || {}
-            # Reuse resolve_prompt so tone template is *prepended* to the strict JSON instructions
             fake_input = {
-              'prompt_template'      => gpc['template'] || 'hr_assistant',
-              'custom_system_prompt' => gpc['custom_prompt']
+              'prompt_template'      => (fetch.call(gpc, 'template') || 'hr_assistant'),
+              'custom_system_prompt' =>  fetch.call(gpc, 'custom_prompt')
             }
             call(:resolve_prompt, fake_input, default_sys)
           else
@@ -5580,28 +5604,27 @@ require 'securerandom'
 
         # Apply signal enrichment if enabled
         if use_signal_enrichment != false
-          if signals_category.present?
+          if !signals_category.to_s.strip.empty?
             sys_text += "\n\nDomain context: This is a #{signals_category} inquiry."
             applied_signals << 'category'
           end
-          
-          if signals_intent.present?
+
+          if !signals_intent.to_s.strip.empty?
             intent_guidance = case signals_intent
-            when 'information_request' then 'Provide clear, factual information.'
-            when 'action_request'      then 'Focus on actionable steps or procedures.'
-            when 'status_inquiry'      then 'Provide current status and any relevant updates.'
-            else nil
-            end
+                              when 'information_request' then 'Provide clear, factual information.'
+                              when 'action_request'      then 'Focus on actionable steps or procedures.'
+                              when 'status_inquiry'      then 'Provide current status and any relevant updates.'
+                              else nil
+                              end
             if intent_guidance
               sys_text += "\nResponse style: #{intent_guidance}"
               applied_signals << 'intent'
             end
           end
-          
+
           # Adjust temperature based on confidence signal when generation_config is not already provided
-          if signals_confidence.present? && gen_cfg.nil?
+          if !signals_confidence.nil? && gen_cfg.nil?
             conf = signals_confidence.to_f
-            # Higher upstream confidence = lower temperature
             temp_adjustment =
               if conf > 0.8 then 0.0
               elsif conf > 0.6 then 0.3
@@ -5611,26 +5634,39 @@ require 'securerandom'
             applied_signals << 'confidence'
           end
         end
-        
-        kept = call(:select_prefix_by_budget, connection, ordered, q, sys_text, budget_prompt, model_for_cnt)
-        blob = call(:format_context_chunks, kept)
-        
+
+        kept  = call(:select_prefix_by_budget, connection, ordered, q, sys_text, budget_prompt, model_for_cnt)
+        blob  = call(:format_context_chunks, kept)
+
         gen_cfg ||= {}
-        gen_cfg['temperature'] = (input['temperature'].present? ? call(:safe_float, input['temperature']) : 0)
-        gen_cfg['maxOutputTokens'] = reserve_out
-        gen_cfg['responseMimeType'] = 'application/json'
-        gen_cfg['responseSchema'] = {
-          'type'=>'object','additionalProperties'=>false,
-          'properties'=>{
-            'answer'=>{'type'=>'string'},
-            'citations'=>{'type'=>'array','items'=>{'type'=>'object','additionalProperties'=>false,
-              'properties'=>{'chunk_id'=>{'type'=>'string'},'source'=>{'type'=>'string'},'uri'=>{'type'=>'string'},'score'=>{'type'=>'number'}}}}
+        gen_cfg['temperature']       = (input['temperature'].present? ? call(:safe_float, input['temperature']) : 0)
+        gen_cfg['maxOutputTokens']   = reserve_out
+        gen_cfg['responseMimeType']  = 'application/json'
+        gen_cfg['responseSchema']    = {
+          'type'                 => 'object',
+          'additionalProperties' => false,
+          'properties'           => {
+            'answer'    => { 'type' => 'string' },
+            'citations' => {
+              'type'  => 'array',
+              'items' => {
+                'type'                 => 'object',
+                'additionalProperties' => false,
+                'properties'           => {
+                  'chunk_id' => { 'type' => 'string' },
+                  'source'   => { 'type' => 'string' },
+                  'uri'      => { 'type' => 'string' },
+                  'score'    => { 'type' => 'number' }
+                }
+              }
+            }
           },
-          'required'=>['answer']
+          'required' => ['answer']
         }
-        
+
         sys_inst = call(:system_instruction_from_text, sys_text)
-        contents = [{ 'role'=>'user','parts'=>[{'text'=>"Question:\n#{q}\n\nContext:\n#{blob}"}]}]
+        contents = [{ 'role' => 'user', 'parts' => [{ 'text' => "Question:\n#{q}\n\nContext:\n#{blob}" }] }]
+
       else
         error("Unknown mode: #{mode}")
       end
@@ -5642,15 +5678,15 @@ require 'securerandom'
         'toolConfig'        => tool_cfg,
         'safetySettings'    => safety,
         'generationConfig'  => gen_cfg
-      }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
+      }.delete_if { |_k, v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
 
       {
-        'url' => url,
-        'headers' => call(:request_headers_auth, connection, corr, connection['user_project'], req_params),
-        'payload' => call(:json_compact, payload),
-        'mode' => mode,
-        'correlation_id' => corr,
-        'started_at' => Time.now,
+        'url'             => url,
+        'headers'         => call(:request_headers_auth, connection, corr, connection['user_project'], req_params),
+        'payload'         => call(:json_compact, payload),
+        'mode'            => mode,
+        'correlation_id'  => corr,
+        'started_at'      => Time.now,
         'applied_signals' => applied_signals
       }
     end,
