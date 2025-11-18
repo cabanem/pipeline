@@ -854,77 +854,11 @@ require 'securerandom'
           default: false, sticky: true, extends_schema: true, hint: 'Toggle to reveal advanced parameters.' }
       ],
       input_fields: lambda do |object_definitions, connection, config_fields|
-        base = call(:ui_df_inputs_simplified, object_definitions, config_fields)
-        
-        # Threshold configuration for soft scoring
-        threshold_fields = [
-          { name: 'scoring_thresholds', label: 'Scoring Configuration',
-            type: 'object',
-            optional: true,
-            properties: [
-              { name: 'use_preset', type: 'boolean', control_type: 'checkbox',
-                default: true, extends_schema: true,
-                hint: 'Use standard scoring thresholds' },
-              
-              { name: 'preset', control_type: 'select',
-                ngIf: 'input.scoring_thresholds.use_preset',
-                default: 'balanced',
-                options: [
-                  ['Conservative (8+ for KEEP)', 'conservative'],
-                  ['Balanced (6+ for KEEP)', 'balanced'],  
-                  ['Permissive (4+ for KEEP)', 'permissive']
-                ]
-              },
-              
-              { name: 'custom_values', type: 'object',
-                ngIf: '!input.scoring_thresholds.use_preset',
-                properties: [
-                  { name: 'keep_threshold', type: 'integer', default: 6,
-                    hint: 'Score needed to classify as HR-REQUEST' },
-                  { name: 'triage_min', type: 'integer', default: 4,
-                    hint: 'Minimum score for HUMAN review' },
-                  { name: 'triage_max', type: 'integer', default: 5,
-                    hint: 'Maximum score for HUMAN review' }
-                ]
-              }
-            ]
-          }
-        ]
-        
-        # Add configurable email type mappings
-        email_type_fields = config_fields['show_advanced'] ? [
-          { name: 'email_type_mapping', label: 'Email Type Decisions', type: 'object', optional: true,
-            properties: [
-              { name: 'forwarded_action', control_type: 'select',
-                default: 'HUMAN',
-                options: [['Send to Human', 'HUMAN'], ['Mark Irrelevant', 'IRRELEVANT'], ['Keep Processing', 'KEEP']],
-                hint: 'Action for forwarded chains' },
-              { name: 'automated_action', control_type: 'select', 
-                default: 'IRRELEVANT',
-                options: [['Send to Human', 'HUMAN'], ['Mark Irrelevant', 'IRRELEVANT'], ['Keep Processing', 'KEEP']],
-                hint: 'Action for automated emails' },
-              { name: 'newsletter_action', control_type: 'select',
-                default: 'IRRELEVANT', 
-                options: [['Send to Human', 'HUMAN'], ['Mark Irrelevant', 'IRRELEVANT'], ['Keep Processing', 'KEEP']],
-                hint: 'Action for newsletters' }
-            ] }
-        ] : []
-        
-        base + threshold_fields + email_type_fields + Array(object_definitions['observability_input_fields'])
+        call(:ui_deterministic_filter_input_fields, object_definitions, connection, config_fields)
       end,
       output_fields: lambda do |object_definitions, connection|
-        [
-          { name: 'passed', type: 'boolean', hint: 'True if email passes all hard rules' },
-          { name: 'hard_block', type: 'boolean', convert_output: 'boolean_conversion' },
-          { name: 'hard_reason', hint: 'e.g., forwarded_chain, safety_block' },
-          { name: 'email_type', hint: 'direct_request, forwarded_chain, etc.' },
-          { name: 'email_text' },
-          { name: 'soft_score', type: 'integer', hint: 'Soft signals score if rules configured' },
-          { name: 'gate', type: 'object', properties: object_definitions['pipeline_gate'] },
-          { name: 'complete_output', type: 'object' },
-          { name: 'facets', type: 'object', properties: object_definitions['facets_deterministic_filter'] }
-        ] + call(:standard_operational_outputs)
-      end,  
+        call(:deterministic_filter_output_fields, object_definitions, connection)
+      end,
       execute: lambda do |connection, input|
         ctx = call(:step_begin!, :deterministic_filter, input)
         
@@ -1118,111 +1052,10 @@ require 'securerandom'
           default: false, sticky: true, extends_schema: true }
       ],
       input_fields: lambda do |object_definitions, connection, config_fields|
-        base = [
-          { name: 'email_text', optional: false },
-          { name: 'email_type', optional: true, default: 'direct_request', 
-            hint: 'From deterministic filter' }
-        ]
-        
-        # Prompt configuration
-        prompt_fields = [
-          { name: 'prompt_template', 
-            label: 'Prompt Template',
-            control_type: 'select',
-            pick_list: 'prompt_templates',
-            default: 'hr_assistant',
-            extends_schema: true,
-            hint: 'Choose a pre-configured prompt style or create custom' },
-          
-          { name: 'custom_system_prompt',
-            label: 'Custom System Prompt', 
-            control_type: 'text-area',
-            optional: true,
-            ngIf: 'input.prompt_template == "custom"',
-            hint: 'Define your custom system instructions for triage' }
-        ]
-        
-        # Threshold configuration
-        threshold_fields = [
-          { name: 'threshold_preset',
-            label: 'Confidence Thresholds',
-            control_type: 'select', 
-            pick_list: 'threshold_presets',
-            default: 'balanced',
-            extends_schema: true,
-            hint: 'Choose confidence level requirements' },
-            
-          { name: 'custom_thresholds',
-            label: 'Custom Threshold Settings',
-            type: 'object',
-            optional: true,
-            ngIf: 'input.threshold_preset == "custom"',
-            properties: [
-              { name: 'min_confidence_for_keep', type: 'number', 
-                hint: 'Min confidence to mark as KEEP (0.0-1.0)', default: 0.60 },
-              { name: 'confidence_short_circuit', type: 'number',
-                hint: 'Confidence to skip downstream when IRRELEVANT (0.0-1.0)', default: 0.85 }
-            ]
-          }
-        ]
-        
-        # Configurable decision types
-        decision_fields = [
-          { name: 'decision_config',
-            label: 'Decision Categories',
-            type: 'object',
-            optional: true,
-            properties: [
-              { name: 'use_standard', type: 'boolean', control_type: 'checkbox',
-                default: true, extends_schema: true,
-                hint: 'Use standard IRRELEVANT/HUMAN/KEEP decisions' },
-              
-              { name: 'custom_decisions', type: 'array', of: 'object',
-                ngIf: '!input.decision_config.use_standard',
-                properties: [
-                  { name: 'decision', hint: 'Decision label' },
-                  { name: 'continues_pipeline', type: 'boolean', control_type: 'checkbox',
-                    hint: 'Should this decision continue to next step?' },
-                  { name: 'description', hint: 'When to use this decision' }
-                ],
-                default: [
-                  { 'decision' => 'IRRELEVANT', 'continues_pipeline' => false },
-                  { 'decision' => 'HUMAN', 'continues_pipeline' => true },
-                  { 'decision' => 'KEEP', 'continues_pipeline' => true }
-                ]
-              }
-            ]
-          }
-        ]
-        
-        adv = config_fields['show_advanced'] ? [
-          { name: 'model', default: 'gemini-2.0-flash' },
-          { name: 'temperature', type: 'number', default: 0 },
-          { name: 'custom_policy_json', control_type: 'text-area', 
-            optional: true, hint: 'Additional triage rules in JSON format' },
-          { name: 'include_domain_detection', type: 'boolean', control_type: 'checkbox',
-            default: true, hint: 'Detect email domain/topic' }
-        ] : []
-        
-        base + prompt_fields + threshold_fields + decision_fields + adv + 
-          Array(object_definitions['observability_input_fields'])
-      end,  
+        call(:ui_ai_triage_input_fields, object_definitions, connection, config_fields)
+      end,
       output_fields: lambda do |object_definitions, connection|
-        [
-          { name: 'decision', hint: 'IRRELEVANT, HUMAN, or KEEP' },
-          { name: 'confidence', type: 'number' },
-          { name: 'reasons', type: 'array', of: 'string' },
-          { name: 'matched_signals', type: 'array', of: 'string' },
-          { name: 'detected_domain', optional: true },
-          { name: 'has_question', type: 'boolean', convert_output: 'boolean_conversion',  optional: true },
-          { name: 'should_continue', type: 'boolean', convert_output: 'boolean_conversion', hint: 'True if pipeline should continue to next step' },
-          { name: 'short_circuit', type: 'boolean', convert_output: 'boolean_conversion', hint: 'True if high-confidence IRRELEVANT' },
-          { name: 'signals_triage', hint: 'Copy of decision for downstream' },
-          { name: 'signals_confidence', type: 'number' },
-          { name: 'signals_domain', optional: true },
-          { name: 'complete_output', type: 'object' },
-          { name: 'facets', type: 'object', properties: object_definitions['facets_ai_triage_filter'] }
-        ] + call(:standard_operational_outputs)
+        call(:ai_triage_output_fields, object_definitions, connection)
       end,
       execute: lambda do |connection, input|
         ctx = call(:step_begin!, :ai_triage_filter, input)
@@ -1311,7 +1144,7 @@ require 'securerandom'
           'required' => required
         }
         
-        # Make API call (unchanged)
+        # Make API call
         payload = {
           'systemInstruction' => { 'role' => 'system', 'parts' => [{'text' => system_text}] },
           'contents' => [{ 'role' => 'user', 'parts' => [{ 'text' => "Email:\n#{input['email_text']}" }] }],
@@ -1331,7 +1164,7 @@ require 'securerandom'
                             connection['user_project'], "model=#{model_path}"))
                 .payload(call(:json_compact, payload))
         
-        # Parse response
+        # Parse response with error capture
         text = resp.dig('candidates',0,'content','parts',0,'text').to_s
 
         parse_error = nil
@@ -1339,7 +1172,6 @@ require 'securerandom'
         begin
           parsed = call(:json_parse_safe, text, type: :hash, required: true)
         rescue => e
-          # Record the error but keep the pipeline alive (optional behavior).
           parse_error = e.to_s
           parsed = {}
         end
@@ -1377,7 +1209,8 @@ require 'securerandom'
           'signals_domain' => parsed['detected_domain']
         }
         
-        call(:step_ok!, ctx, out, 200, 'OK', {
+        # Extras for facets / telemetry
+        extras = {
           'decision' => decision,
           'confidence' => confidence,
           'detected_domain' => parsed['detected_domain'],
@@ -1386,7 +1219,13 @@ require 'securerandom'
           'short_circuit' => short_circuit,
           'prompt_template' => input['prompt_template'] || 'default',
           'threshold_preset' => input['threshold_preset'] || 'balanced'
-        })
+        }
+        if parse_error
+          extras['parse_error'] = parse_error
+          extras['raw_llm_text'] = text[0, 500] unless text.to_s.empty?
+        end
+
+        call(:step_ok!, ctx, out, 200, 'OK', extras)
       end,
       sample_output: lambda do
         call(:sample_ai_triage_filter)
@@ -1410,72 +1249,11 @@ require 'securerandom'
           default: false, sticky: true, extends_schema: true }
       ],
       input_fields: lambda do |object_definitions, connection, config_fields|
-        base = [
-          { name: 'email_text', optional: false }
-        ]
-        
-        # Prompt configuration
-        prompt_fields = [
-          { name: 'prompt_template', label: 'Prompt Template', control_type: 'select', pick_list: 'prompt_templates', 
-            default: 'hr_assistant', extends_schema: true, hint: 'Choose a pre-configured prompt style or create custom' },
-          { name: 'custom_system_prompt', label: 'Custom System Prompt',  control_type: 'text-area', optional: true,
-            ngIf: 'input.prompt_template == "custom"', hint: 'Define your custom system instructions for intent classification' }
-        ]
-        
-        # Intent configuration with presets
-        intent_fields = [
-          { name: 'intent_preset', label: 'Intent Categories', control_type: 'select', pick_list: 'intent_presets',
-            default: 'hr_intents', extends_schema: true, hint: 'Choose intent categories for your use case' },  
-          { name: 'custom_intents', type: 'array', of: 'object', ngIf: 'input.intent_preset == "custom_intents"',
-            properties: [
-              { name: 'intent', hint: 'Intent identifier (no spaces)' },
-              { name: 'description', hint: 'When to use this intent' },
-              { name: 'actionable', type: 'boolean', control_type: 'checkbox',
-                hint: 'Can this be automated?' }
-            ],
-            item_label: 'Intent',
-            add_item_label: 'Add Intent Type' }
-        ]
-        
-        # Pass-through from previous steps
-        pass_through = [
-          { name: 'signals_triage', optional: true, hint: 'Triage decision from previous step' },
-          { name: 'email_type', optional: true }
-        ]
-        
-        adv = config_fields['show_advanced'] ? [
-          { name: 'model', default: 'gemini-2.0-flash' },
-          { name: 'temperature', type: 'number', default: 0 },
-          { name: 'extract_entities', type: 'boolean', control_type: 'checkbox', default: false, hint: 'Extract named entities' },
-          { name: 'detect_sentiment', type: 'boolean', control_type: 'checkbox', default: false, hint: 'Detect emotional sentiment' },
-          { name: 'confidence_threshold', type: 'number', default: 0.70, hint: 'Minimum confidence for primary intent' }
-        ] : []
-        
-        base + prompt_fields + intent_fields + pass_through + adv + 
-          Array(object_definitions['observability_input_fields'])
+        call(:ui_ai_intent_input_fields, object_definitions, connection, config_fields)
       end,
       output_fields: lambda do |object_definitions, connection|
-        [
-          { name: 'intent', hint: 'Primary user intent' },
-          { name: 'confidence', type: 'number' },
-          { name: 'is_actionable', type: 'boolean', convert_output: 'boolean_conversion', hint: 'True if intent can be automated' },
-          { name: 'secondary_intents', type: 'array', of: 'string', optional: true },
-          { name: 'entities', type: 'array', of: 'object', optional: true,
-            properties: [
-              { name: 'type' },
-              { name: 'value' },
-              { name: 'context' }
-            ] },
-          { name: 'sentiment', optional: true, hint: 'positive, negative, or neutral' },
-          { name: 'requires_context', type: 'boolean', convert_output: 'boolean_conversion', hint: 'True if RAG retrieval recommended' },
-          { name: 'suggested_category', optional: true, hint: 'Hint for category classification' },
-          { name: 'signals_intent' },
-          { name: 'signals_intent_confidence', type: 'number' },
-          { name: 'signals_triage' },
-          { name: 'complete_output', type: 'object' },
-          { name: 'facets', type: 'object', properties: object_definitions['facets_ai_intent_classifier'] }
-        ] + call(:standard_operational_outputs)
-      end, 
+        call(:ai_intent_output_fields, object_definitions, connection)
+      end,
       execute: lambda do |connection, input|
         ctx = call(:step_begin!, :ai_intent_classifier, input)
         
@@ -1608,19 +1386,16 @@ require 'securerandom'
           'signals_triage' => input['signals_triage']
         }
         
-        extras = {
-          'decision' => decision,
+        call(:step_ok!, ctx, out, 200, 'OK', {
+          'intent' => intent,
           'confidence' => confidence,
-          'detected_domain' => parsed['detected_domain'],
-          'has_question' => parsed['has_question'],
-          'should_continue' => should_continue,
-          'short_circuit' => short_circuit,
-          'prompt_template' => input['prompt_template'] || 'default',
-          'threshold_preset' => input['threshold_preset'] || 'balanced'
-        }
-        extras['parse_error'] = parse_error if parse_error
+          'is_actionable' => out['is_actionable'],
+          'has_entities' => parsed['entities'].is_a?(Array) && parsed['entities'].any?,
+          'sentiment' => parsed['sentiment'],
+          'intent_preset' => input['intent_preset'] || 'hr_intents',
+          'prompt_template' => input['prompt_template'] || 'default'
+        })
 
-        call(:step_ok!, ctx, out, 200, 'OK', extras)
       end,
       sample_output: lambda do
         call(:sample_ai_intent_classifier)
@@ -1638,7 +1413,6 @@ require 'securerandom'
                 'Pipeline step 3 of 8. Scores above 0.7 indicate strong matches. Cosine ranges from -1 to 1.'
         }
       end,
-
       config_fields: [
         { name: 'show_advanced', label: 'Show advanced options',
           type: 'boolean', control_type: 'checkbox',
@@ -1646,20 +1420,10 @@ require 'securerandom'
           hint: 'Toggle to reveal advanced parameters.' }
       ],
       input_fields: lambda do |object_definitions, connection, config_fields|
-        call(:ui_embed_inputs, object_definitions, config_fields) +
-          Array(object_definitions['observability_input_fields'])
+        call(:embed_text_against_categories_input_fields, object_definitions, connection, config_fields)
       end,
-      output_fields: lambda do |object_definitions, _conn|
-        [
-          # Business outputs
-          { name: 'scores', type: 'array', of: 'object',
-            properties: object_definitions['scored_category'] },  # <-- Using object def
-          { name: 'shortlist', type: 'array', of: 'string' },
-          
-          # Standard fields
-          { name: 'complete_output', type: 'object' },
-          { name: 'facets', type: 'object', properties: object_definitions['facets_embed_text_against_categories'] }
-        ] + call(:standard_operational_outputs) 
+      output_fields: lambda do |object_definitions, connection|
+        call(:embed_text_against_categories_output_fields, object_definitions, connection)
       end,
       execute: lambda do |connection, input|
         ctx = call(:step_begin!, :embed_text_against_categories, input)
@@ -1735,158 +1499,14 @@ require 'securerandom'
         }
       end,
       config_fields: [
-        { name: 'show_advanced', label: 'Show advanced options',
-          type: 'boolean', control_type: 'checkbox',
-          default: false, sticky: true, extends_schema: true,
-          hint: 'Toggle to reveal advanced parameters.' }
+        { name: 'show_advanced', label: 'Show advanced options', type: 'boolean', control_type: 'checkbox',
+          default: false, sticky: true, extends_schema: true, hint: 'Toggle to reveal advanced parameters.' }
       ], 
       input_fields: lambda do |object_definitions, connection, config_fields|
-        base = [
-          { name: 'email_text', optional: false },
-          { name: 'shortlist', type: 'array', of: 'string', optional: false,
-            hint: 'Categories to rank (from embedding step)' }
-        ]
-        
-        # Mode configuration with enhanced options
-        mode_fields = [
-          { name: 'ranking_mode',
-            label: 'Ranking Mode',
-            control_type: 'select',
-            default: 'none',
-            extends_schema: true,
-            options: [
-              ['None (preserve order)', 'none'],
-              ['LLM Distribution', 'llm'],
-              ['Score-based', 'score_based']
-            ],
-            hint: 'How to reorder the shortlist' }
-        ]
-        
-        # Prompt configuration for LLM mode
-        prompt_fields = [
-          { name: 'ranking_prompt',
-            label: 'Ranking Instructions',
-            type: 'object',
-            ngIf: 'input.ranking_mode == "llm"',
-            properties: [
-              { name: 'template', control_type: 'select',
-                default: 'balanced',
-                options: [
-                  ['Strict (high confidence required)', 'strict'],
-                  ['Balanced (standard distribution)', 'balanced'],
-                  ['Inclusive (broader distribution)', 'inclusive'],
-                  ['Custom', 'custom']
-                ]
-              },
-              { name: 'custom_instructions', control_type: 'text-area',
-                ngIf: 'input.ranking_prompt.template == "custom"',
-                hint: 'Custom ranking instructions for LLM' }
-            ]
-          }
-        ]
-        
-        # Categories configuration
-        categories_fields = [
-          { name: 'categories_mode', label: 'Categories input mode', 
-            control_type: 'select',
-            options: [['Array (pills)','array'], ['JSON','json']], 
-            default: 'array',
-            optional: false, extends_schema: true, 
-            hint: 'Switch to paste categories as JSON.' },
-          { name: 'categories', type: 'array', of: 'object', optional: true,
-            ngIf: 'input.categories_mode == "array"',
-            properties: Array(object_definitions['category_def']) }
-        ]
-        
-        # Distribution configuration
-        distribution_fields = [
-          { name: 'distribution_config',
-            label: 'Probability Distribution',
-            type: 'object',
-            ngIf: 'input.ranking_mode == "llm"',
-            properties: [
-              { name: 'normalize', type: 'boolean', control_type: 'checkbox',
-                default: true,
-                hint: 'Ensure probabilities sum to 1.0' },
-              { name: 'min_probability', type: 'number',
-                default: 0.01,
-                hint: 'Minimum probability for any category (0-1)' },
-              { name: 'concentration', control_type: 'select',
-                default: 'medium',
-                options: [
-                  ['Low (spread out)', 'low'],
-                  ['Medium (balanced)', 'medium'],
-                  ['High (concentrated)', 'high']
-                ],
-                hint: 'How concentrated the distribution should be' }
-            ]
-          }
-        ]
-        
-        # Advanced options
-        adv = config_fields['show_advanced'] ? [
-          { name: 'generative_model', control_type: 'text', optional: true, 
-            default: 'gemini-2.0-flash',
-            ngIf: 'input.ranking_mode == "llm"' },
-          { name: 'temperature', type: 'number', optional: true, default: 0,
-            ngIf: 'input.ranking_mode == "llm"',
-            hint: 'Temperature for LLM (0 = deterministic)' },
-          { name: 'categories_json', label: 'Categories JSON', 
-            control_type: 'text-area',
-            ngIf: 'input.categories_mode == "json"', optional: true,
-            hint: 'Paste categories array JSON for testing (overrides pills).' },
-          { name: 'include_reasoning', type: 'boolean', control_type: 'checkbox',
-            ngIf: 'input.ranking_mode == "llm"',
-            default: false,
-            hint: 'Include reasoning for each ranking' }
-        ] : []
-        
-        # Pass-through signals
-        signal_fields = [
-          { name: 'signals_category', optional: true, sticky: true,
-            hint: 'Category signal from upstream' },
-          { name: 'signals_confidence', type: 'number', optional: true, sticky: true },
-          { name: 'signals_intent', optional: true, sticky: true }
-        ]
-        
-        base + mode_fields + prompt_fields + categories_fields + 
-          distribution_fields + adv + signal_fields +
-          Array(object_definitions['observability_input_fields'])
+        call(:rerank_shortlist_input_fields, object_definitions, connection, config_fields)
       end,
       output_fields: lambda do |object_definitions, connection|
-        [
-          # Business outputs
-          { name: 'ranking', type: 'array', of: 'object',
-            properties: [
-              { name: 'category' },
-              { name: 'prob', type: 'number' },
-              { name: 'score', type: 'number', optional: true },
-              { name: 'reasoning', optional: true }
-            ]
-          },
-          { name: 'shortlist', type: 'array', of: 'string',
-            hint: 'Reordered shortlist' },
-          
-          # Distribution metadata
-          { name: 'distribution_stats', type: 'object', optional: true,
-            properties: [
-              { name: 'entropy', type: 'number' },
-              { name: 'max_prob', type: 'number' },
-              { name: 'min_prob', type: 'number' },
-              { name: 'concentration', type: 'number' }
-            ]
-          },
-          
-          # Pass-through signals
-          { name: 'signals_category', optional: true },
-          { name: 'signals_confidence', type: 'number', optional: true },
-          { name: 'signals_intent', optional: true },
-          
-          # Standard fields
-          { name: 'complete_output', type: 'object' },
-          { name: 'facets', type: 'object', properties: object_definitions['facets_rerank_shortlist'] }
-
-        ] + call(:standard_operational_outputs)
+        call(:rerank_shortlist_output_fields, object_definitions, connection)
       end,
       execute: lambda do |connection, input|
         ctx = call(:step_begin!, :rerank_shortlist, input)
@@ -2074,66 +1694,10 @@ require 'securerandom'
           hint: 'Toggle to reveal advanced parameters.' }
       ], 
       input_fields: lambda do |object_definitions, connection, config_fields|
-         call(:ui_ref_inputs, object_definitions, config_fields) + [
-           # --- Salience sidecar (disabled by default; 2-call flow when LLM) ---
-           { name: 'salience_mode', label: 'Salience extraction',
-             control_type: 'select', optional: true, default: 'off', extends_schema: true,
-             options: [['Off','off'], ['Heuristic (no LLM)','heuristic'], ['LLM (extra API call)','llm']],
-             hint: 'Extract a salient sentence/paragraph before refereeing. LLM mode makes a separate API call.' },
-           { name: 'salience_append_to_prompt', label: 'Append salience to prompt',
-             type: 'boolean', control_type: 'checkbox', optional: true, default: true,
-             ngIf: 'input.salience_mode != "off"',
-             hint: 'If enabled, the salient span (and light metadata) is appended to the email text shown to the referee.' },
-           { name: 'salience_max_chars', label: 'Salience max chars', type: 'integer',
-             optional: true, default: 500, ngIf: 'input.salience_mode != "off"' },
-           { name: 'salience_include_entities', label: 'Salience: include entities',
-             type: 'boolean', control_type: 'checkbox', optional: true, default: true,
-             ngIf: 'input.salience_mode == "llm"' },
-           { name: 'salience_model', label: 'Salience model',
-             control_type: 'text', optional: true, default: 'gemini-2.0-flash',
-             ngIf: 'input.salience_mode == "llm"' },
-           { name: 'salience_temperature', label: 'Salience temperature',
-             type: 'number', optional: true, default: 0,
-             ngIf: 'input.salience_mode == "llm"' }
-         ] + Array(object_definitions['observability_input_fields'])
+        call(:llm_referee_with_contexts_input_fields, object_definitions, connection, config_fields)
       end,
       output_fields: lambda do |object_definitions, connection|
-        [
-          # Critical business outputs
-          { name: 'chosen', hint: 'CRITICAL: Used by steps 6-8' },
-          { name: 'confidence', type: 'number' },
-          
-          { name: 'referee', type: 'object', properties: [
-            { name: 'category' },
-            { name: 'confidence', type: 'number' },
-            { name: 'reasoning' },
-            { name: 'distribution', type: 'array', of: 'object',
-              properties: object_definitions['scored_category'] }  # Reuse for distribution
-          ]},
-          
-          # Optional salience
-          { name: 'salience', type: 'object', properties: [
-            { name: 'span' },
-            { name: 'reason' },
-            { name: 'importance', type: 'number' },
-            { name: 'tags', type: 'array', of: 'string' },
-            { name: 'entities', type: 'array', of: 'object' },
-            { name: 'cta' },
-            { name: 'deadline_iso' },
-            { name: 'focus_preview' },
-            { name: 'responseId' },
-            { name: 'usage', type: 'object' },
-            { name: 'span_source' }
-          ]},
-          
-          # Signal for downstream
-          { name: 'signals_category', hint: 'Copy of chosen for downstream' },
-          { name: 'signals_confidence', hint: 'Confidence for downstream use' },
-          
-          # Standard fields
-          { name: 'complete_output', type: 'object' },
-          { name: 'facets', type: 'object', properties: object_definitions['facets_llm_referee_with_contexts'] }
-        ] + call(:standard_operational_outputs)
+        call(:llm_referee_with_contexts_output_fields, object_definitions, connection)
       end,
       execute: lambda do |connection, input|
         ctx = call(:step_begin!, :llm_referee_with_contexts, input)
@@ -3944,7 +3508,6 @@ require 'securerandom'
       result
     end,
 
-
     # PDF handling
     sanitize_pdf_text: lambda do |raw_text|
       begin
@@ -4442,7 +4005,7 @@ require 'securerandom'
       parsed
     end,
 
-    # UI assembly helpers (schema-by-config)
+    # --- UI assembly helpers --------------------------------------------------
     ui_show_advanced_toggle: lambda do |default=false|
       { name: 'show_advanced', label: 'Show advanced options',
         type: 'boolean', control_type: 'checkbox',
@@ -4696,6 +4259,483 @@ require 'securerandom'
       end
       base
     end,
+
+    # --- Encapsulated I/O -----------------------------------------------------
+    # deterministic_filter
+    ui_deterministic_filter_input_fields: lambda do |object_definitions, connection, config_fields|
+      base = call(:ui_df_inputs_simplified, object_definitions, config_fields)
+
+      # Threshold configuration for soft scoring
+      threshold_fields = [
+        { name: 'scoring_thresholds', label: 'Scoring Configuration',
+          type: 'object',
+          optional: true,
+          properties: [
+            { name: 'use_preset', type: 'boolean', control_type: 'checkbox',
+              default: true, extends_schema: true,
+              hint: 'Use standard scoring thresholds' },
+
+            { name: 'preset', control_type: 'select',
+              ngIf: 'input.scoring_thresholds.use_preset',
+              default: 'balanced',
+              options: [
+                ['Conservative (8+ for KEEP)', 'conservative'],
+                ['Balanced (6+ for KEEP)', 'balanced'],  
+                ['Permissive (4+ for KEEP)', 'permissive']
+              ]
+            },
+
+            { name: 'custom_values', type: 'object',
+              ngIf: '!input.scoring_thresholds.use_preset',
+              properties: [
+                { name: 'keep_threshold', type: 'integer', default: 6,
+                  hint: 'Score needed to classify as HR-REQUEST' },
+                { name: 'triage_min', type: 'integer', default: 4,
+                  hint: 'Minimum score for HUMAN review' },
+                { name: 'triage_max', type: 'integer', default: 5,
+                  hint: 'Maximum score for HUMAN review' }
+              ]
+            }
+          ]
+        }
+      ]
+
+      # Add configurable email type mappings (advanced only)
+      email_type_fields =
+        if config_fields['show_advanced']
+          [
+            { name: 'email_type_mapping', label: 'Email Type Decisions', type: 'object', optional: true,
+              properties: [
+                { name: 'forwarded_action', control_type: 'select',
+                  default: 'HUMAN',
+                  options: [['Send to Human', 'HUMAN'], ['Mark Irrelevant', 'IRRELEVANT'], ['Keep Processing', 'KEEP']],
+                  hint: 'Action for forwarded chains' },
+                { name: 'automated_action', control_type: 'select', 
+                  default: 'IRRELEVANT',
+                  options: [['Send to Human', 'HUMAN'], ['Mark Irrelevant', 'IRRELEVANT'], ['Keep Processing', 'KEEP']],
+                  hint: 'Action for automated emails' },
+                { name: 'newsletter_action', control_type: 'select',
+                  default: 'IRRELEVANT', 
+                  options: [['Send to Human', 'HUMAN'], ['Mark Irrelevant', 'IRRELEVANT'], ['Keep Processing', 'KEEP']],
+                  hint: 'Action for newsletters' }
+              ]
+            }
+          ]
+        else
+          []
+        end
+
+      base + threshold_fields + email_type_fields + Array(object_definitions['observability_input_fields'])
+    end,
+    deterministic_filter_output_fields: lambda do |object_definitions, connection|
+      [
+        { name: 'passed', type: 'boolean', hint: 'True if email passes all hard rules' },
+        { name: 'hard_block', type: 'boolean', convert_output: 'boolean_conversion' },
+        { name: 'hard_reason', hint: 'e.g., forwarded_chain, safety_block' },
+        { name: 'email_type', hint: 'direct_request, forwarded_chain, etc.' },
+        { name: 'email_text' },
+        { name: 'soft_score', type: 'integer', hint: 'Soft signals score if rules configured' },
+        { name: 'gate', type: 'object', properties: object_definitions['pipeline_gate'] },
+        { name: 'complete_output', type: 'object' },
+        { name: 'facets', type: 'object', properties: object_definitions['facets_deterministic_filter'] }
+      ] + call(:standard_operational_outputs)
+    end,
+    # ai_triage_filter
+    ui_ai_triage_input_fields: lambda do |object_definitions, connection, config_fields|
+      base = [
+        { name: 'email_text', optional: false },
+        { name: 'email_type', optional: true, default: 'direct_request',
+          hint: 'From deterministic filter' }
+      ]
+
+      # Reuse generic prompt config helper
+      prompt_fields = call(:ui_prompt_config, 'hr_assistant')
+
+      # Reuse generic threshold config helper
+      threshold_fields = call(:ui_threshold_config)
+
+      # Configurable decision types
+      decision_fields = [
+        { name: 'decision_config',
+          label: 'Decision Categories',
+          type: 'object',
+          optional: true,
+          properties: [
+            { name: 'use_standard', type: 'boolean', control_type: 'checkbox',
+              default: true, extends_schema: true,
+              hint: 'Use standard IRRELEVANT/HUMAN/KEEP decisions' },
+
+            { name: 'custom_decisions', type: 'array', of: 'object',
+              ngIf: '!input.decision_config.use_standard',
+              properties: [
+                { name: 'decision', hint: 'Decision label' },
+                { name: 'continues_pipeline', type: 'boolean', control_type: 'checkbox',
+                  hint: 'Should this decision continue to next step?' },
+                { name: 'description', hint: 'When to use this decision' }
+              ],
+              default: [
+                { 'decision' => 'IRRELEVANT', 'continues_pipeline' => false },
+                { 'decision' => 'HUMAN', 'continues_pipeline' => true },
+                { 'decision' => 'KEEP', 'continues_pipeline' => true }
+              ]
+            }
+          ]
+        }
+      ]
+
+      # Advanced options
+      adv =
+        if config_fields['show_advanced']
+          [
+            { name: 'model', default: 'gemini-2.0-flash' },
+            { name: 'temperature', type: 'number', default: 0 },
+            { name: 'custom_policy_json', control_type: 'text-area', 
+              optional: true, hint: 'Additional triage rules in JSON format' },
+            { name: 'include_domain_detection', type: 'boolean', control_type: 'checkbox',
+              default: true, hint: 'Detect email domain/topic' }
+          ]
+        else
+          []
+        end
+
+      base +
+        prompt_fields +
+        threshold_fields +
+        decision_fields +
+        adv +
+        Array(object_definitions['observability_input_fields'])
+    end,
+    ai_triage_output_fields: lambda do |object_definitions, connection|
+      [
+        { name: 'decision', hint: 'IRRELEVANT, HUMAN, or KEEP' },
+        { name: 'confidence', type: 'number' },
+        { name: 'reasons', type: 'array', of: 'string' },
+        { name: 'matched_signals', type: 'array', of: 'string' },
+        { name: 'detected_domain', optional: true },
+        { name: 'has_question', type: 'boolean', convert_output: 'boolean_conversion', optional: true },
+        { name: 'should_continue', type: 'boolean', convert_output: 'boolean_conversion', hint: 'True if pipeline should continue to next step' },
+        { name: 'short_circuit', type: 'boolean', convert_output: 'boolean_conversion', hint: 'True if high-confidence IRRELEVANT' },
+        { name: 'signals_triage', hint: 'Copy of decision for downstream' },
+        { name: 'signals_confidence', type: 'number' },
+        { name: 'signals_domain', optional: true },
+        { name: 'complete_output', type: 'object' },
+        { name: 'facets', type: 'object', properties: object_definitions['facets_ai_triage_filter'] }
+      ] + call(:standard_operational_outputs)
+    end,
+    # ai_intent_classifier
+    ui_ai_intent_input_fields: lambda do |object_definitions, connection, config_fields|
+      base = [
+        { name: 'email_text', optional: false }
+      ]
+
+      # Reuse generic prompt config helper
+      prompt_fields = call(:ui_prompt_config, 'hr_assistant')
+
+      # Intent configuration with presets
+      intent_fields = [
+        { name: 'intent_preset', label: 'Intent Categories', control_type: 'select', pick_list: 'intent_presets',
+          default: 'hr_intents', extends_schema: true, hint: 'Choose intent categories for your use case' },
+        { name: 'custom_intents', type: 'array', of: 'object', ngIf: 'input.intent_preset == "custom_intents"',
+          properties: [
+            { name: 'intent', hint: 'Intent identifier (no spaces)' },
+            { name: 'description', hint: 'When to use this intent' },
+            { name: 'actionable', type: 'boolean', control_type: 'checkbox',
+              hint: 'Can this be automated?' }
+          ],
+          item_label: 'Intent',
+          add_item_label: 'Add Intent Type' }
+      ]
+
+      # Pass-through from previous steps
+      pass_through = [
+        { name: 'signals_triage', optional: true, hint: 'Triage decision from previous step' },
+        { name: 'email_type', optional: true }
+      ]
+
+      adv =
+        if config_fields['show_advanced']
+          [
+            { name: 'model', default: 'gemini-2.0-flash' },
+            { name: 'temperature', type: 'number', default: 0 },
+            { name: 'extract_entities', type: 'boolean', control_type: 'checkbox', default: false, hint: 'Extract named entities' },
+            { name: 'detect_sentiment', type: 'boolean', control_type: 'checkbox', default: false, hint: 'Detect emotional sentiment' },
+            { name: 'confidence_threshold', type: 'number', default: 0.70, hint: 'Minimum confidence for primary intent' }
+          ]
+        else
+          []
+        end
+
+      base +
+        prompt_fields +
+        intent_fields +
+        pass_through +
+        adv +
+        Array(object_definitions['observability_input_fields'])
+    end,
+    ai_intent_output_fields: lambda do |object_definitions, connection|
+      [
+        { name: 'intent', hint: 'Primary user intent' },
+        { name: 'confidence', type: 'number' },
+        { name: 'is_actionable', type: 'boolean', convert_output: 'boolean_conversion', hint: 'True if intent can be automated' },
+        { name: 'secondary_intents', type: 'array', of: 'string', optional: true },
+        { name: 'entities', type: 'array', of: 'object', optional: true,
+          properties: [
+            { name: 'type' },
+            { name: 'value' },
+            { name: 'context' }
+          ] },
+        { name: 'sentiment', optional: true, hint: 'positive, negative, or neutral' },
+        { name: 'requires_context', type: 'boolean', convert_output: 'boolean_conversion', hint: 'True if RAG retrieval recommended' },
+        { name: 'suggested_category', optional: true, hint: 'Hint for category classification' },
+        { name: 'signals_intent' },
+        { name: 'signals_intent_confidence', type: 'number' },
+        { name: 'signals_triage' },
+        { name: 'complete_output', type: 'object' },
+        { name: 'facets', type: 'object', properties: object_definitions['facets_ai_intent_classifier'] }
+      ] + call(:standard_operational_outputs)
+    end,
+    #embed_text_against_categories
+    embed_text_against_categories_input_fields: lambda do |object_definitions, connection, config_fields|
+      call(:ui_embed_inputs, object_definitions, config_fields) +
+        Array(object_definitions['observability_input_fields'])
+    end,
+    embed_text_against_categories_output_fields: lambda do |object_definitions, _connection|
+      [
+        # Business outputs
+        { name: 'scores', type: 'array', of: 'object',
+          properties: object_definitions['scored_category'] },
+        { name: 'shortlist', type: 'array', of: 'string' },
+
+        # Standard fields
+        { name: 'complete_output', type: 'object' },
+        { name: 'facets', type: 'object',
+          properties: object_definitions['facets_embed_text_against_categories'] }
+      ] + call(:standard_operational_outputs)
+    end,
+    # rerank_shortlist
+    rerank_shortlist_input_fields: lambda do |object_definitions, connection, config_fields|
+      base = [
+        { name: 'email_text', optional: false },
+        { name: 'shortlist', type: 'array', of: 'string', optional: false,
+          hint: 'Categories to rank (from embedding step)' }
+      ]
+
+      # Mode configuration with enhanced options
+      mode_fields = [
+        { name: 'ranking_mode',
+          label: 'Ranking Mode',
+          control_type: 'select',
+          default: 'none',
+          extends_schema: true,
+          options: [
+            ['None (preserve order)', 'none'],
+            ['LLM Distribution', 'llm'],
+            ['Score-based', 'score_based']
+          ],
+          hint: 'How to reorder the shortlist' }
+      ]
+
+      # Prompt configuration for LLM mode
+      prompt_fields = [
+        { name: 'ranking_prompt',
+          label: 'Ranking Instructions',
+          type: 'object',
+          ngIf: 'input.ranking_mode == "llm"',
+          properties: [
+            { name: 'template', control_type: 'select',
+              default: 'balanced',
+              options: [
+                ['Strict (high confidence required)', 'strict'],
+                ['Balanced (standard distribution)', 'balanced'],
+                ['Inclusive (broader distribution)', 'inclusive'],
+                ['Custom', 'custom']
+              ]
+            },
+            { name: 'custom_instructions', control_type: 'text-area',
+              ngIf: 'input.ranking_prompt.template == "custom"',
+              hint: 'Custom ranking instructions for LLM' }
+          ]
+        }
+      ]
+
+      # Categories configuration
+      categories_fields = [
+        { name: 'categories_mode', label: 'Categories input mode', 
+          control_type: 'select',
+          options: [['Array (pills)','array'], ['JSON','json']], 
+          default: 'array',
+          optional: false, extends_schema: true, 
+          hint: 'Switch to paste categories as JSON.' },
+        { name: 'categories', type: 'array', of: 'object', optional: true,
+          ngIf: 'input.categories_mode == "array"',
+          properties: Array(object_definitions['category_def']) }
+      ]
+
+      # Distribution configuration
+      distribution_fields = [
+        { name: 'distribution_config',
+          label: 'Probability Distribution',
+          type: 'object',
+          ngIf: 'input.ranking_mode == "llm"',
+          properties: [
+            { name: 'normalize', type: 'boolean', control_type: 'checkbox',
+              default: true,
+              hint: 'Ensure probabilities sum to 1.0' },
+            { name: 'min_probability', type: 'number',
+              default: 0.01,
+              hint: 'Minimum probability for any category (0-1)' },
+            { name: 'concentration', control_type: 'select',
+              default: 'medium',
+              options: [
+                ['Low (spread out)', 'low'],
+                ['Medium (balanced)', 'medium'],
+                ['High (concentrated)', 'high']
+              ],
+              hint: 'How concentrated the distribution should be' }
+          ]
+        }
+      ]
+
+      # Advanced options
+      adv =
+        if config_fields['show_advanced']
+          [
+            { name: 'generative_model', control_type: 'text', optional: true, 
+              default: 'gemini-2.0-flash',
+              ngIf: 'input.ranking_mode == "llm"' },
+            { name: 'temperature', type: 'number', optional: true, default: 0,
+              ngIf: 'input.ranking_mode == "llm"',
+              hint: 'Temperature for LLM (0 = deterministic)' },
+            { name: 'categories_json', label: 'Categories JSON', 
+              control_type: 'text-area',
+              ngIf: 'input.categories_mode == "json"', optional: true,
+              hint: 'Paste categories array JSON for testing (overrides pills).' },
+            { name: 'include_reasoning', type: 'boolean', control_type: 'checkbox',
+              ngIf: 'input.ranking_mode == "llm"',
+              default: false,
+              hint: 'Include reasoning for each ranking' }
+          ]
+        else
+          []
+        end
+
+      # Pass-through signals
+      signal_fields = [
+        { name: 'signals_category', optional: true, sticky: true,
+          hint: 'Category signal from upstream' },
+        { name: 'signals_confidence', type: 'number', optional: true, sticky: true },
+        { name: 'signals_intent', optional: true, sticky: true }
+      ]
+
+      base +
+        mode_fields +
+        prompt_fields +
+        categories_fields +
+        distribution_fields +
+        adv +
+        signal_fields +
+        Array(object_definitions['observability_input_fields'])
+    end,
+    rerank_shortlist_output_fields: lambda do |object_definitions, connection|
+      [
+        # Business outputs
+        { name: 'ranking', type: 'array', of: 'object',
+          properties: [
+            { name: 'category' },
+            { name: 'prob', type: 'number' },
+            { name: 'score', type: 'number', optional: true },
+            { name: 'reasoning', optional: true }
+          ]
+        },
+        { name: 'shortlist', type: 'array', of: 'string',
+          hint: 'Reordered shortlist' },
+
+        # Distribution metadata
+        { name: 'distribution_stats', type: 'object', optional: true,
+          properties: [
+            { name: 'entropy', type: 'number' },
+            { name: 'max_prob', type: 'number' },
+            { name: 'min_prob', type: 'number' },
+            { name: 'concentration', type: 'number' }
+          ]
+        },
+
+        # Pass-through signals
+        { name: 'signals_category', optional: true },
+        { name: 'signals_confidence', type: 'number', optional: true },
+        { name: 'signals_intent', optional: true },
+
+        # Standard fields
+        { name: 'complete_output', type: 'object' },
+        { name: 'facets', type: 'object',
+          properties: object_definitions['facets_rerank_shortlist'] }
+      ] + call(:standard_operational_outputs)
+    end,
+    # llm_referee_with_contexts
+    llm_referee_with_contexts_input_fields: lambda do |object_definitions, connection, config_fields|
+      call(:ui_ref_inputs, object_definitions, config_fields) + [
+        # --- Salience sidecar (disabled by default; 2-call flow when LLM) ---
+        { name: 'salience_mode', label: 'Salience extraction',
+          control_type: 'select', optional: true, default: 'off', extends_schema: true,
+          options: [['Off','off'], ['Heuristic (no LLM)','heuristic'], ['LLM (extra API call)','llm']],
+          hint: 'Extract a salient sentence/paragraph before refereeing. LLM mode makes a separate API call.' },
+        { name: 'salience_append_to_prompt', label: 'Append salience to prompt',
+          type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+          ngIf: 'input.salience_mode != "off"',
+          hint: 'If enabled, the salient span (and light metadata) is appended to the email text shown to the referee.' },
+        { name: 'salience_max_chars', label: 'Salience max chars', type: 'integer',
+          optional: true, default: 500, ngIf: 'input.salience_mode != "off"' },
+        { name: 'salience_include_entities', label: 'Salience: include entities',
+          type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+          ngIf: 'input.salience_mode == "llm"' },
+        { name: 'salience_model', label: 'Salience model',
+          control_type: 'text', optional: true, default: 'gemini-2.0-flash',
+          ngIf: 'input.salience_mode == "llm"' },
+        { name: 'salience_temperature', label: 'Salience temperature',
+          type: 'number', optional: true, default: 0,
+          ngIf: 'input.salience_mode == "llm"' }
+      ] + Array(object_definitions['observability_input_fields'])
+    end,
+    llm_referee_with_contexts_output_fields: lambda do |object_definitions, connection|
+      [
+        # Critical business outputs
+        { name: 'chosen', hint: 'CRITICAL: Used by steps 6-8' },
+        { name: 'confidence', type: 'number' },
+
+        { name: 'referee', type: 'object', properties: [
+          { name: 'category' },
+          { name: 'confidence', type: 'number' },
+          { name: 'reasoning' },
+          { name: 'distribution', type: 'array', of: 'object',
+            properties: object_definitions['scored_category'] }  # Reuse for distribution
+        ]},
+
+        # Optional salience
+        { name: 'salience', type: 'object', properties: [
+          { name: 'span' },
+          { name: 'reason' },
+          { name: 'importance', type: 'number' },
+          { name: 'tags', type: 'array', of: 'string' },
+          { name: 'entities', type: 'array', of: 'object' },
+          { name: 'cta' },
+          { name: 'deadline_iso' },
+          { name: 'focus_preview' },
+          { name: 'responseId' },
+          { name: 'usage', type: 'object' },
+          { name: 'span_source' }
+        ]},
+
+        # Signal for downstream
+        { name: 'signals_category', hint: 'Copy of chosen for downstream' },
+        { name: 'signals_confidence', hint: 'Confidence for downstream use' },
+
+        # Standard fields
+        { name: 'complete_output', type: 'object' },
+        { name: 'facets', type: 'object',
+          properties: object_definitions['facets_llm_referee_with_contexts'] }
+      ] + call(:standard_operational_outputs)
+    end,
+
 
     # Steps
     step_begin!: lambda do |action_id, input|
