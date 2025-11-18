@@ -2527,28 +2527,28 @@ require 'securerandom'
       end,
       execute: lambda do |connection, input|
         ctx = call(:step_begin!, :rank_texts_with_ranking_api, input)
-        
+
         begin
           call(:ensure_project_id!, connection)
           loc = call(:aiapps_loc_resolve, connection, input['ai_apps_location'])
-          
+
           # Extract category and prepare query
-          category = input['category'].to_s.strip || input['signals_category'] || ''
+          category     = (input['category'].presence || input['signals_category'] || '').to_s.strip
           category_ctx = input['category_context'].to_s.strip
-          query = input['query_text'].to_s
-          
+          query        = input['query_text'].to_s
+
           # Get ranking prompt
           default_prompt = <<~PROMPT
             You are an expert relevance scorer for a knowledge retrieval system.
             Given a query within a specific category, evaluate how well each context answers the query.
-            
+
             Scoring criteria:
             1. Relevance (0-1): How directly the context addresses the query
             2. Category Alignment (0-1): How well the context fits the category domain
-            
+
             Be precise and calibrated in your scoring. Output valid JSON only.
           PROMPT
-          
+
           ranking_prompt = case input['ranking_prompt_template']
           when 'query_only'
             <<~PROMPT
@@ -2567,62 +2567,65 @@ require 'securerandom'
           else # category_aware
             default_prompt
           end
-          
-          # Get score weights
-          weights_config = input.dig('ranking_config', 'score_weights') || {}
-          score_weights = if !weights_config['use_preset'] && weights_config['custom']
+
+          # --- Normalize ranking_config + score_weights safely --------------
+          ranking_config  = call(:sanitize_hash, input['ranking_config']) || {}
+          weights_config  = call(:sanitize_hash, ranking_config['score_weights']) || {}
+
+          score_weights = if weights_config['use_preset'] == false && weights_config['custom'].is_a?(Hash)
             custom = weights_config['custom']
             {
               'relevance' => (custom['relevance_weight'] || 0.8).to_f,
-              'category' => (custom['category_weight'] || 0.2).to_f
+              'category'  => (custom['category_weight']  || 0.2).to_f
             }
           else
-            preset = weights_config['preset'] || 'balanced'
+            preset = (weights_config['preset'] || 'balanced').to_s
             case preset
             when 'relevance_heavy'
               { 'relevance' => 0.9, 'category' => 0.1 }
             when 'category_heavy'
               { 'relevance' => 0.6, 'category' => 0.4 }
-            else # balanced
+            else # balanced / unknown
               { 'relevance' => 0.8, 'category' => 0.2 }
             end
           end
-          
-          # Normalize weight
-          weight_sum = score_weights['relevance'] + score_weights['category']
-          if weight_sum > 0 && weight_sum != 1.0
-            score_weights['relevance'] = score_weights['relevance'] / weight_sum
-            score_weights['category'] = score_weights['category'] / weight_sum
+
+          # Normalize weights to sum to 1.0 defensively
+          weight_sum = (score_weights['relevance'] || 0).to_f + (score_weights['category'] || 0).to_f
+          if weight_sum > 0 && (weight_sum - 1.0).abs > 1e-6
+            score_weights['relevance'] = score_weights['relevance'].to_f / weight_sum
+            score_weights['category']  = score_weights['category'].to_f  / weight_sum
           end
 
           # Enhance query with category context if requested
-          if category.present? && input['include_category_in_query'] == true
-            query_prefix = "Category: #{category}"
-            query_prefix += " (#{category_ctx})" if category_ctx.present?
-            enhanced_query = "#{query_prefix}\n\n#{query}"
-          else
-            enhanced_query = query
-          end
-          
+          enhanced_query =
+            if category.present? && input['include_category_in_query'] == true
+              prefix = "Category: #{category}"
+              prefix += " (#{category_ctx})" if category_ctx.present?
+              "#{prefix}\n\n#{query}"
+            else
+              query
+            end
+
           # Pre-filter contexts by category metadata if requested
           records_in = call(:safe_array, input['records'])
-          
-          # Validate records
+
+          # Validate records (fail fast with clear message)
           records_in.each_with_index do |r, i|
-            error("Record at index #{i} missing required 'id' field") unless r['id'].present?
+            error("Record at index #{i} missing required 'id' field")     unless r['id'].present?
             error("Record at index #{i} missing required 'content' field") unless r['content'].present?
           end
-          
+
           records_to_rank = records_in
-          
+
           if category.present? && input['filter_by_category_metadata'] == true
-            meta_key = input['category_metadata_key'] || 'category'
+            meta_key  = input['category_metadata_key'] || 'category'
             cat_lower = category.downcase
-            
+
             records_to_rank = records_in.select do |r|
-              md = r['metadata'].is_a?(Hash) ? r['metadata'] : {}
+              md        = r['metadata'].is_a?(Hash) ? r['metadata'] : {}
               cat_value = md[meta_key]
-              
+
               case cat_value
               when String
                 cat_value.downcase.include?(cat_lower)
@@ -2632,169 +2635,169 @@ require 'securerandom'
                 false
               end
             end
-            
+
             if records_to_rank.empty? && records_in.any?
               error("Category filtering removed all #{records_in.length} records. Check category metadata key '#{meta_key}' and value '#{category}'")
             end
           end
-          
-          # Get ranking configuration
-          ranking_config = input['ranking_config'] || {}
-          llm_model = ranking_config['llm_model'] || 'gemini-2.0-flash'
-          max_llm_contexts = (ranking_config['llm_max_contexts'] || 50).to_i
-          top_n = ranking_config['top_n']
-          
+
+          # Ranking parameters from normalized ranking_config
+          llm_model         = (ranking_config['llm_model'] || 'gemini-2.0-flash').to_s
+          max_llm_contexts  = (ranking_config['llm_max_contexts'] || 50).to_i
+          top_n             = ranking_config['top_n']
+
           distribution = nil
-          enriched = []
-          
+
           # Initialize all records with base scores
           enriched = records_to_rank.map do |orig|
             orig.merge(
-              'score' => orig['score'] || 0.0,
-              'rank' => 999,
+              'score'  => orig['score'] || 0.0,
+              'rank'   => 999,
               'source' => orig['source'],
-              'uri' => orig['uri']
+              'uri'    => orig['uri']
             )
           end
-          
-          # Perform LLM ranking if category is present OR if we have contexts to rank
+
+          # Perform LLM ranking if we have contexts (and optionally category)
           if category.present? || records_to_rank.any?
-            # Limit contexts for LLM processing
             contexts_for_llm = enriched.first(max_llm_contexts)
-            
-            # Enhanced LLM ranker call with custom prompt
-            llm_result = call(:llm_category_aware_ranker_enhanced,
-                            connection,
-                            llm_model,
-                            enhanced_query,
-                            category,
-                            category_ctx,
-                            contexts_for_llm,
-                            ranking_prompt,
-                            ctx['cid'])
-            
+
+            llm_result = call(
+              :llm_category_aware_ranker_enhanced,
+              connection,
+              llm_model,
+              enhanced_query,
+              category,
+              category_ctx,
+              contexts_for_llm,
+              ranking_prompt,
+              ctx['cid']
+            )
+
             if llm_result && llm_result['rankings']
-              # Process LLM rankings
               llm_scores = {}
               llm_result['rankings'].each do |r|
                 llm_scores[r['id']] = {
-                  'relevance' => r['relevance'].to_f,
+                  'relevance'          => r['relevance'].to_f,
                   'category_alignment' => r['category_alignment'].to_f,
-                  'reasoning' => r['reasoning']
+                  'reasoning'          => r['reasoning']
                 }
               end
-              
+
               # Apply LLM scores with configured weights
               enriched.each do |rec|
-                if llm_data = llm_scores[rec['id']]
-                  rec['llm_relevance'] = llm_data['relevance']
+                if (llm_data = llm_scores[rec['id']])
+                  rec['llm_relevance']      = llm_data['relevance']
                   rec['category_alignment'] = llm_data['category_alignment']
-                  # Apply configured weights
-                  rec['score'] = score_weights['relevance'] * llm_data['relevance'] + 
-                              score_weights['category'] * llm_data['category_alignment']
+                  rec['score'] = score_weights['relevance'] * llm_data['relevance'] +
+                                 score_weights['category']  * llm_data['category_alignment']
                 else
                   rec['score'] = 0.0
                 end
               end
-              
+
               # Build confidence distribution if requested
               if input['include_confidence_distribution'] == true
                 total_score = enriched.sum { |x| x['score'].to_f }
                 total_score = 0.001 if total_score <= 0
-                
-                distribution = enriched.map { |r|
+
+                distribution = enriched.map do |r|
                   llm_data = llm_scores[r['id']] || {}
                   {
-                    'id' => r['id'],
+                    'id'          => r['id'],
                     'probability' => r['score'].to_f / total_score,
-                    'reasoning' => llm_data['reasoning']
+                    'reasoning'   => llm_data['reasoning']
                   }
-                }.sort_by { |d| -d['probability'] }
+                end.sort_by { |d| -d['probability'] }
               end
             end
           end
-          
+
           # Re-rank by final scores
-          enriched = enriched.sort_by { |r| [-r['score'].to_f, r['id']] }
-                            .each_with_index { |r, i| r['rank'] = i + 1 }
-          
+          enriched = enriched
+                      .sort_by { |r| [-r['score'].to_f, r['id']] }
+                      .each_with_index { |r, i| r['rank'] = i + 1 }
+
           # Apply top_n limit if specified
           if top_n.present?
             enriched = enriched.first(top_n.to_i)
           end
-          
+
           # Shape Output
-          shape = input['emit_shape'] || 'context_chunks'
+          shape  = input['emit_shape'] || 'context_chunks'
           result = {}
-          
+
           case shape
           when 'records_only'
-            result['records'] = enriched.map { |r|
-              { 
-                'id' => r['id'], 
-                'score' => r['score'], 
-                'rank' => r['rank'],
-                'uri' => r['uri'],
-                'source' => r['source']
+            result['records'] = enriched.map do |r|
+              {
+                'id'    => r['id'],
+                'score' => r['score'],
+                'rank'  => r['rank'],
+                'uri'   => r['uri'],
+                'source'=> r['source']
               }
-            }
+            end
           when 'enriched_records'
             result['records'] = enriched
           else # context_chunks
-            chunks = enriched.map { |r|
-              md = r['metadata'] || {}
+            chunks = enriched.map do |r|
+              md         = r['metadata'] || {}
               source_key = input['source_key'] || 'source'
-              uri_key = input['uri_key'] || 'uri'
-              
+              uri_key    = input['uri_key']    || 'uri'
+
               chunk = {
-                'id' => r['id'],
-                'text' => r['content'].to_s,
-                'score' => r['score'].to_f,
-                'source' => r['source'] || md[source_key],
-                'uri' => r['uri'] || md[uri_key],
-                'metadata' => md,
-                'metadata_kv' => md.map { |k, v| { 'key' => k, 'value' => v } },
+                'id'            => r['id'],
+                'text'          => r['content'].to_s,
+                'score'         => r['score'].to_f,
+                'source'        => r['source'] || md[source_key],
+                'uri'           => r['uri']    || md[uri_key],
+                'metadata'      => md,
+                'metadata_kv'   => md.map { |k, v| { 'key' => k, 'value' => v } },
                 'metadata_json' => md.empty? ? nil : md.to_json
               }
-              
-              chunk['llm_relevance'] = r['llm_relevance'] if r['llm_relevance']
+
+              chunk['llm_relevance']      = r['llm_relevance']      if r['llm_relevance']
               chunk['category_alignment'] = r['category_alignment'] if r['category_alignment']
-              
+
               chunk
-            }
+            end
+
             result['context_chunks'] = chunks
-            result['records'] = enriched
+            result['records']        = enriched
           end
-          
+
           result['confidence_distribution'] = distribution if distribution
-          
+
           result['ranking_metadata'] = {
-            'category' => category.presence,
-            'llm_model' => llm_model,
+            'category'          => category.presence,
+            'llm_model'         => llm_model,
             'contexts_filtered' => records_in.length - records_to_rank.length,
-            'contexts_ranked' => records_to_rank.length,
-            'score_weights' => score_weights
+            'contexts_ranked'   => records_to_rank.length,
+            'score_weights'     => score_weights
           }.compact
-          
-          # Build facets
+
+          # Build facets (use normalized configs so we don't hit dig on strings)
+          weights_preset = (weights_config['preset'] || 'balanced').to_s
+
           facets = {
-            'ranking_api' => 'llm.category_ranker',
-            'category' => category.presence,
-            'llm_model' => llm_model,
-            'emit_shape' => shape,
-            'records_input' => records_in.length,
-            'records_filtered' => records_in.length - records_to_rank.length,
-            'records_ranked' => records_to_rank.length,
-            'records_output' => enriched.length,
-            'has_distribution' => distribution.present?,
-            'top_score' => enriched.first&.dig('score'),
+            'ranking_api'       => 'llm.category_ranker',
+            'category'          => category.presence,
+            'llm_model'         => llm_model,
+            'emit_shape'        => shape,
+            'records_input'     => records_in.length,
+            'records_filtered'  => records_in.length - records_to_rank.length,
+            'records_ranked'    => records_to_rank.length,
+            'records_output'    => enriched.length,
+            'has_distribution'  => !distribution.nil?,
+            'top_score'         => enriched.first&.dig('score'),
             'category_filtered' => input['filter_by_category_metadata'] == true,
-            'ranking_prompt' => input['ranking_prompt_template'] || 'category_aware',
-            'weights_preset' => input.dig('ranking_config', 'score_weights', 'preset') || 'balanced'
+            'ranking_prompt'    => input['ranking_prompt_template'] || 'category_aware',
+            'weights_preset'    => weights_preset
           }.compact
-          
+
           call(:step_ok!, ctx, result, 200, 'OK', facets)
-          
+
         rescue => e
           call(:step_err!, ctx, e)
         end
