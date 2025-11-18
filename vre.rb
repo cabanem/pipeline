@@ -1613,7 +1613,10 @@ require 'securerandom'
                   input['include_reasoning']),
                   input['max_output_tokens']
         
-        dist = call(:safe_array, ref['distribution']).map { |d| 
+        dist = []
+        raw_dist = ref['distribution']
+        
+        dist = call(:safe_distribution_array, ref['distribution']).map { |d| 
           { 
             'category' => d['category'], 
             'prob' => d['prob'].to_f,
@@ -3801,7 +3804,7 @@ require 'securerandom'
       text = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
       JSON.parse(text) rescue { 'rankings' => [] }
     end,
-    llm_referee_enhanced: lambda do |connection, model, email_text, shortlist_names, all_cats, fallback_category, corr, system_preamble, temperature, include_reasoning|
+    llm_referee_enhanced: lambda do |connection, model, email_text, shortlist_names, all_cats, fallback_category, corr, system_preamble, temperature, include_reasoning, max_tokens=512|
       # Enhanced version with temperature and reasoning control
       model_path = call(:build_model_path_with_global_preview, connection, model)
       req_params = "model=#{model_path}"
@@ -4002,6 +4005,10 @@ require 'securerandom'
       end
       
       parsed
+    end,
+    safe_distribution_array: lambda do |dist_raw|
+      return [] unless dist_raw.is_a?(Array)
+      dist_raw.select { |item| item.is_a?(Hash) }
     end,
 
     # --- UI assembly helpers --------------------------------------------------
