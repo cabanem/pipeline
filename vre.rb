@@ -1318,7 +1318,7 @@ require 'securerandom'
         parsed = (call(:json_parse_safe, text) rescue {})
         
         decision = (parsed['decision'] || 'HUMAN').to_s
-        confidence = [[call(:safe_float, parsed['confidence']) || 0.0, 0.0].max, 1.0].min
+        confidence = call(:clamp_confidence, parsed['confidence'] || 0.0)
         
         # Determine pipeline flow with configurable thresholds
         min_conf = thresholds['min_confidence_for_keep'] || 0.60
@@ -1559,7 +1559,7 @@ require 'securerandom'
         end
         
         intent = (parsed['intent'] || 'unknown').to_s
-        confidence = [[call(:safe_float, parsed['confidence']) || 0.0, 0.0].max, 1.0].min
+        confidence = call(:clamp_confidence, parsed['confidence'] || 0.0)
         
         # Check confidence threshold
         conf_threshold = input['confidence_threshold'] || 0.70
@@ -1664,6 +1664,13 @@ require 'securerandom'
         shortlist = scores.first(k).map { |h| h['category'] }
 
         out = { 'scores'=>scores, 'shortlist'=>shortlist }
+
+        # Check for low confidence match
+        top_score = scores.first ? scores.first['score'] : 0
+        if top_score < 0.5  # All cosines were negative
+          out['low_confidence_match'] = true
+        end        
+
         # Pass through signals
         out['signals_category'] = input['signals_category']
         out['signals_confidence'] = input['signals_confidence']
@@ -1967,11 +1974,21 @@ require 'securerandom'
             dist.each { |d| d['prob'] = d['prob'] / total }
           end
         end
-        
+
         # Apply minimum probability if configured
         min_prob = dist_config['min_probability'] || 0.01
-        dist.each do |d|
-          d['prob'] = [d['prob'], min_prob].max if d['prob'] > 0
+        if min_prob > 0
+          dist.each do |d|
+            d['prob'] = [d['prob'], min_prob].max if d['prob'] > 0
+          end
+          
+          # Re-normalize after applying minimums
+          if dist_config['normalize'] != false
+            total = dist.sum { |d| d['prob'] }
+            if total > 0 && total != 1.0
+              dist.each { |d| d['prob'] = d['prob'] / total }
+            end
+          end
         end
         
         # Ensure all shortlist items present
@@ -2314,7 +2331,7 @@ require 'securerandom'
 
         # Handle low confidence based on behavior setting
         chosen = ref['category']
-        confidence = [ref['confidence'], 0.0].compact.first.to_f
+        confidence = call(:clamp_confidence, ref['confidence'] || 0.0)
         
         if confidence < min_conf
           case fallback_behavior
@@ -2970,6 +2987,13 @@ require 'securerandom'
             end
           end
           
+          # Normalize weight
+          weight_sum = score_weights['relevance'] + score_weights['category']
+          if weight_sum > 0 && weight_sum != 1.0
+            score_weights['relevance'] = score_weights['relevance'] / weight_sum
+            score_weights['category'] = score_weights['category'] / weight_sum
+          end
+
           # Enhance query with category context if requested
           if category.present? && input['include_category_in_query'] == true
             query_prefix = "Category: #{category}"
@@ -3098,7 +3122,7 @@ require 'securerandom'
             enriched = enriched.first(top_n.to_i)
           end
           
-          # Shape Output (unchanged)
+          # Shape Output
           shape = input['emit_shape'] || 'context_chunks'
           result = {}
           
@@ -4917,7 +4941,9 @@ require 'securerandom'
     end,
     hr_eval_soft: lambda do |email, signals|
       f = call(:hr_pick, email)
-      score = 0; hits = []
+      score = 0
+      hits = []
+      signal_counts = Hash.new(0)  # ADD: Track count per signal
 
       signals.each do |s|
         field = (s['field'] || 'any')
@@ -4947,8 +4973,17 @@ require 'securerandom'
           end
 
         if matched
+          signal_name = s['name'] || 'signal'
+          cap = s['cap_per_email']
+          
+          # ADD: Apply cap if specified
+          if cap && signal_counts[signal_name] >= cap.to_i
+            next  # Skip this signal as it's already at cap
+          end
+          
           score += s['weight'].to_i
-          hits << (s['name'] || 'signal')
+          hits << signal_name  # CHANGED: Use signal_name variable
+          signal_counts[signal_name] += 1  # ADD: Increment counter
         end
       end
 
@@ -4958,6 +4993,12 @@ require 'securerandom'
       keep = (thr['keep'] || 6).to_i
       lo   = (thr['triage_min'] || 4).to_i
       hi   = (thr['triage_max'] || 5).to_i
+
+      # Ensure lo <= hi
+      if lo > hi
+        lo, hi = hi, lo  # Swap if reversed
+      end      
+
       if score >= keep then 'HR-REQUEST'
       elsif score >= lo && score <= hi then 'HUMAN'
       else 'IRRELEVANT'
@@ -6153,6 +6194,9 @@ require 'securerandom'
     end,
     clamp_int: lambda do |n, min, max|
       [[n.to_i, min].max, max].min
+    end,
+    clamp_confidence: lambda do |conf|
+      [[conf.to_f, 0.0].max, 1.0].min
     end,
     sanitize_embedding_params: lambda do |raw|
       h = {}
