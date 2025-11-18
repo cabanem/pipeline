@@ -319,15 +319,12 @@ require 'securerandom'
         ]
         
         model_field = [
-          { name: 'model', optional: false, control_type: 'text',
-            default: 'gemini-2.0-flash' }
+          { name: 'model', optional: false, control_type: 'text', default: 'gemini-2.0-flash' }
         ]
         
         # Prompt configuration for generation
         prompt_fields = [
-          { name: 'generation_prompt_config',
-            label: 'Response Style',
-            type: 'object',
+          { name: 'generation_prompt_config', label: 'Response Style', type: 'object',
             properties: [
               { name: 'template', control_type: 'select',
                 default: 'hr_assistant',
@@ -337,8 +334,7 @@ require 'securerandom'
               { name: 'custom_prompt', control_type: 'text-area',
                 ngIf: 'input.generation_prompt_config.template == "custom"',
                 hint: 'Custom system instructions for generation' }
-            ]
-          }
+            ] }
         ]
         
         # Signal enrichment configuration
@@ -357,28 +353,21 @@ require 'securerandom'
               { name: 'signals_intent', optional: true, sticky: true,
                 ngIf: 'input.signal_config.use_signal_enrichment',
                 hint: 'Intent classification (customizes style)' }
-            ]
-          }
+            ] }
         ]
         
         # RAG configuration with thresholds
         rag_fields = [
-          { name: 'rag_config',
-            label: 'RAG Configuration',
-            type: 'object',
-            ngIf: 'input.mode == "rag_with_context"',
+          { name: 'rag_config', label: 'RAG Configuration', type: 'object', ngIf: 'input.mode == "rag_with_context"',
             properties: [
-              { name: 'threshold_preset', control_type: 'select',
-                default: 'balanced',
+              { name: 'threshold_preset', control_type: 'select', default: 'balanced',
                 options: [
                   ['Conservative (fewer chunks, strict tokens)', 'conservative'],
                   ['Balanced (moderate chunks/tokens)', 'balanced'],
                   ['Generous (more chunks, more tokens)', 'generous'],
                   ['Custom', 'custom']
-                ]
-              },
-              { name: 'custom_limits', type: 'object',
-                ngIf: 'input.rag_config.threshold_preset == "custom"',
+                ] },
+              { name: 'custom_limits', type: 'object', ngIf: 'input.rag_config.threshold_preset == "custom"',
                 properties: [
                   { name: 'max_chunks', type: 'integer', default: 20,
                     hint: 'Max context chunks to use' },
@@ -386,14 +375,10 @@ require 'securerandom'
                     hint: 'Token budget for prompt' },
                   { name: 'reserve_output_tokens', type: 'integer', default: 512,
                     hint: 'Tokens reserved for response' }
-                ]
-              },
-              { name: 'trim_strategy', control_type: 'select',
-                pick_list: 'trim_strategies',
-                default: 'drop_low_score',
+                ] },
+              { name: 'trim_strategy', control_type: 'select', pick_list: 'trim_strategies', default: 'drop_low_score',
                 hint: 'How to select chunks when over limit' },
-              { name: 'count_tokens_model', optional: true,
-                hint: 'Model for token counting (defaults to generation model)' }
+              { name: 'count_tokens_model', optional: true, hint: 'Model for token counting (defaults to generation model)' }
             ]
           }
         ]
@@ -798,7 +783,11 @@ require 'securerandom'
           { name: 'metadata_kv', type: 'array', of: 'object' },
           { name: 'metadata_json' },
           { name: 'is_pdf', type: 'boolean', optional: true },
-          { name: 'processing_error', type: 'boolean', optional: true }
+          { name: 'processing_error', type: 'boolean', optional: true },
+
+          # Added for LLM ranking outputs so all ranked context chunks share one schema
+          { name: 'llm_relevance', type: 'number', optional: true },
+          { name: 'category_alignment', type: 'number', optional: true }
         ]
       end
     },
@@ -2522,12 +2511,8 @@ require 'securerandom'
             { name: 'llm_relevance', type: 'number' },
             { name: 'category_alignment', type: 'number' }
           ]},
-          { name: 'context_chunks', type: 'array', of: 'object', 
-            properties: object_definitions['context_chunk_standard'] + [
-              { name: 'llm_relevance', type: 'number' },
-              { name: 'category_alignment', type: 'number' }
-            ]
-          },
+          { name: 'context_chunks', type: 'array', of: 'object', properties: object_definitions['context_chunk_standard'] }
+
           { name: 'confidence_distribution', type: 'array', of: 'object', properties: [
             { name: 'id' },
             { name: 'probability', type: 'number' },
@@ -4768,6 +4753,11 @@ require 'securerandom'
     step_ok!: lambda do |ctx, result, code=200, msg='OK', extras=nil|
       env = call(:telemetry_envelope, ctx['t0'], ctx['cid'], true, code, msg)
       out = (result || {}).merge(env)
+
+      # Bridge to standard_operational_outputs (op_correlation_id/op_telemetry)
+      tel = out['telemetry'] || {}
+      out['op_correlation_id'] ||= tel['correlation_id']
+      out['op_telemetry']      ||= tel unless tel.empty?
       
       # Build complete output
       out = call(:build_complete_output, out, ctx['action'], (extras || {}))
@@ -4779,6 +4769,12 @@ require 'securerandom'
       g   = call(:extract_google_error, err)
       msg = [err.to_s, (g['message'] || nil)].compact.join(' | ')
       env = call(:telemetry_envelope, ctx['t0'], ctx['cid'], false, call(:telemetry_parse_error_code, err), msg)
+
+      # Bridge to standard_operational_outputs (op_correlation_id/op_telemetry)
+      tel = env['telemetry'] || {}
+      env['op_correlation_id'] ||= tel['correlation_id']
+      env['op_telemetry']      ||= tel unless tel.empty?
+
       call(:local_log_attach!, env,
         call(:local_log_entry, ctx['action'], ctx['started_at'], ctx['t0'], nil, err, { 'google_error'=>g }))
       error(env)
@@ -5384,15 +5380,48 @@ require 'securerandom'
       # Track which signals we're using
       applied_signals = []
 
+      # ----------------- Normalize nested configs -----------------
+      # Signal config: support both nested signal_config and legacy flat fields
+      sig_cfg = input['signal_config'].is_a?(Hash) ? input['signal_config'] : {}
+      use_signal_enrichment =
+        if sig_cfg.key?('use_signal_enrichment')
+          sig_cfg['use_signal_enrichment']
+        else
+          input['use_signal_enrichment']
+        end
+
+      signals_category   = sig_cfg['signals_category'].presence   || input['signals_category']
+      signals_confidence = sig_cfg['signals_confidence'].presence || input['signals_confidence']
+      signals_intent     = sig_cfg['signals_intent'].presence     || input['signals_intent']
+
+      # RAG config for rag_with_context mode
+      rag_cfg              = input['rag_config'].is_a?(Hash) ? input['rag_config'] : {}
+      rag_limits           = rag_cfg['custom_limits'].is_a?(Hash) ? rag_cfg['custom_limits'] : {}
+      rag_threshold_preset = (rag_cfg['threshold_preset'] || 'balanced').to_s
+
+      # Derive system_preamble from generation_prompt_config if not explicitly set
+      system_preamble = input['system_preamble']
+      if system_preamble.blank? && input['generation_prompt_config'].is_a?(Hash)
+        gpc  = input['generation_prompt_config'] || {}
+        tmpl = (gpc['template'] || 'hr_assistant').to_s
+        if tmpl == 'custom'
+          system_preamble = gpc['custom_prompt']
+        else
+          templates = call(:config_system_prompts)
+          base      = templates[tmpl] && templates[tmpl]['prompt']
+          system_preamble = base if base.present?
+        end
+      end
+
       # Model + location
       model_path     = call(:build_model_path_with_global_preview, connection, input['model'])
       loc_from_model = (model_path[/\/locations\/([^\/]+)/,1] || (connection['location'].presence || 'global')).to_s.downcase
       url            = call(:aipl_v1_url, connection, loc_from_model, "#{model_path}:generateContent")
       req_params     = "model=#{model_path}"
 
-      # Base fields
+      # Base fields (for non-RAG modes)
       contents = call(:sanitize_contents!, input['contents'])
-      sys_inst = call(:system_instruction_from_text, input['system_preamble'])
+      sys_inst = call(:system_instruction_from_text, system_preamble)
       gen_cfg  = call(:sanitize_generation_config, input['generation_config'])
       safety   = call(:sanitize_safety!, input['safetySettings'])
       tool_cfg = call(:safe_obj, input['toolConfig'])
@@ -5413,51 +5442,103 @@ require 'securerandom'
       when 'grounded_rag_store'
         corpus = call(:normalize_rag_corpus, connection, input['rag_corpus'])
         error('rag_corpus is required for grounded_rag_store') if corpus.blank?
-        
-        call(:guard_threshold_union!, input['vector_distance_threshold'], input['vector_similarity_threshold'])
-        call(:guard_ranker_union!, input['rank_service_model'], input['llm_ranker_model'])
+
+        # Prefer nested rag_retrieval_config, fall back to legacy flat fields
+        rrc  = input['rag_retrieval_config'].is_a?(Hash) ? input['rag_retrieval_config'] : {}
+        flt  = rrc['filter'].is_a?(Hash)  ? rrc['filter']  : {}
+        rank = rrc['ranking'].is_a?(Hash) ? rrc['ranking'] : {}
+
+        dist = flt['vector_distance_threshold']   || input['vector_distance_threshold']
+        sim  = flt['vector_similarity_threshold'] || input['vector_similarity_threshold']
+
+        rank_service_model = rank['rank_service_model'] || input['rank_service_model']
+        llm_ranker_model   = rank['llm_ranker_model']   || input['llm_ranker_model']
+
+        top_k = rrc['top_k'] || input['similarity_top_k']
+
+        call(:guard_threshold_union!, dist, sim)
+        call(:guard_ranker_union!, rank_service_model, llm_ranker_model)
 
         vr = { 'ragResources' => [ { 'ragCorpus' => corpus } ] }
+
         filt = {}
-        if input['vector_distance_threshold'].present?
-          filt['vectorDistanceThreshold'] = call(:safe_float, input['vector_distance_threshold'])
-        elsif input['vector_similarity_threshold'].present?
-          filt['vectorSimilarityThreshold'] = call(:safe_float, input['vector_similarity_threshold'])
-        end
+        filt['vectorDistanceThreshold']   = call(:safe_float, dist) if dist.present?
+        filt['vectorSimilarityThreshold'] = call(:safe_float, sim)  if sim.present?
+
         rconf = {}
-        if input['rank_service_model'].to_s.strip != ''
-          rconf['rankService'] = { 'modelName' => input['rank_service_model'].to_s.strip }
-        elsif input['llm_ranker_model'].to_s.strip != ''
-          rconf['llmRanker']   = { 'modelName' => input['llm_ranker_model'].to_s.strip }
+        if rank_service_model.to_s.strip != ''
+          rconf['rankService'] = { 'modelName' => rank_service_model.to_s.strip }
+        elsif llm_ranker_model.to_s.strip != ''
+          rconf['llmRanker']   = { 'modelName' => llm_ranker_model.to_s.strip }
         end
+
         retrieval_cfg = {}
-        retrieval_cfg['similarityTopK'] = call(:clamp_int, (input['similarity_top_k'] || 0), 1, 200) if input['similarity_top_k'].present?
+        retrieval_cfg['similarityTopK'] = call(:clamp_int, (top_k || 0), 1, 200) if top_k.present?
         retrieval_cfg['filter']  = filt unless filt.empty?
         retrieval_cfg['ranking'] = rconf unless rconf.empty?
 
-        tools = [ { 'retrieval' => { 'vertexRagStore' => vr.merge( (retrieval_cfg.empty? ? {} : { 'ragRetrievalConfig' => retrieval_cfg }) ) } } ]
-        
+        tools = [
+          {
+            'retrieval' => {
+              'vertexRagStore' => vr.merge(
+                retrieval_cfg.empty? ? {} : { 'ragRetrievalConfig' => retrieval_cfg }
+              )
+            }
+          }
+        ]
+
       when 'rag_with_context'
         # Technical validation: contexts are required for this mode
         chunks = call(:safe_array, input['context_chunks'])
         error('context_chunks are required for rag_with_context mode') if chunks.empty?
-        
+
         # Build RAG prompt
         q        = input['question'].to_s
         error('question is required for rag_with_context mode') if q.blank?
-        
-        maxn     = call(:clamp_int, (input['max_chunks'] || 20), 1, 100)
-        chunks   = chunks.first(maxn)
-        
-        items = chunks.map { |c| 
-          c.merge('text' => call(:truncate_chunk_text, c['text'], 800)) 
-        }
-        
-        target_total  = (input['max_prompt_tokens'].presence || 3000).to_i
-        reserve_out   = (input['reserve_output_tokens'].presence || 512).to_i
+
+        # Resolve RAG limits: preset → defaults → custom overrides → legacy fields
+        defaults =
+          case rag_threshold_preset
+          when 'conservative'
+            { 'max_chunks' => 15, 'max_prompt_tokens' => 2500, 'reserve_output_tokens' => 400 }
+          when 'generous'
+            { 'max_chunks' => 25, 'max_prompt_tokens' => 4000, 'reserve_output_tokens' => 800 }
+          else # 'balanced' or unknown
+            { 'max_chunks' => 20, 'max_prompt_tokens' => 3000, 'reserve_output_tokens' => 512 }
+          end
+
+        maxn = call(
+          :clamp_int,
+          (rag_limits['max_chunks'] || input['max_chunks'] || defaults['max_chunks']),
+          1, 100
+        )
+        chunks = chunks.first(maxn)
+
+        items = chunks.map do |c|
+          c.merge('text' => call(:truncate_chunk_text, c['text'], 800))
+        end
+
+        target_total =
+          (rag_limits['max_prompt_tokens'] ||
+          input['max_prompt_tokens'] ||
+          defaults['max_prompt_tokens']).to_i
+
+        reserve_out  =
+          (rag_limits['reserve_output_tokens'] ||
+          input['reserve_output_tokens'] ||
+          defaults['reserve_output_tokens']).to_i
+
         budget_prompt = [target_total - reserve_out, 400].max
-        model_for_cnt = (input['count_tokens_model'].presence || input['model']).to_s
-        strategy      = (input['trim_strategy'].presence || 'drop_low_score').to_s
+
+        model_for_cnt =
+          (rag_cfg['count_tokens_model'].presence ||
+          input['count_tokens_model'].presence ||
+          input['model']).to_s
+
+        strategy =
+          (rag_cfg['trim_strategy'].presence ||
+          input['trim_strategy'].presence ||
+          'drop_low_score').to_s
 
         ordered = case strategy
                   when 'diverse_mmr' then call(:mmr_diverse_order, items.sort_by { |c| [-(c['score']||0.0).to_f, c['id'].to_s] }, alpha: 0.7, per_source_cap: 3)
@@ -5466,35 +5547,49 @@ require 'securerandom'
                   end
         ordered = call(:drop_near_duplicates, ordered, 0.9)
 
-        # Build system prompt with optional signal enrichment
-        sys_text = input['system_preamble'].presence ||
-          <<~SYSPROMPT
-            You are a helpful HR assistant providing guidance to employees. Your tone should be:
-            - Warm and supportive, not procedural or cold
-            - Use "you can" or "you may want to" instead of "you must" or "you are responsible for"
-            - Offer helpful next steps and additional context when available
-            - Acknowledge that transitions can be challenging
-            - Include practical tips from the context when relevant
-            
-            CRITICAL OUTPUT REQUIREMENTS:
-            1. Your ENTIRE response must be valid JSON - no text before or after
-            2. Use EXACTLY the schema provided - no extra fields
-            3. Answer using ONLY the provided context chunks
-            4. Maintain a conversational, helpful tone while being accurate
-          SYSPROMPT
-        
+        # Build system prompt with optional signal enrichment + templates
+        default_sys = <<~SYSPROMPT
+          You are a helpful HR assistant providing guidance to employees. Your tone should be:
+          - Warm and supportive, not procedural or cold
+          - Use "you can" or "you may want to" instead of "you must" or "you are responsible for"
+          - Offer helpful next steps and additional context when available
+          - Acknowledge that transitions can be challenging
+          - Include practical tips from the context when relevant
+          
+          CRITICAL OUTPUT REQUIREMENTS:
+          1. Your ENTIRE response must be valid JSON - no text before or after
+          2. Use EXACTLY the schema provided - no extra fields
+          3. Answer using ONLY the provided context chunks
+          4. Maintain a conversational, helpful tone while being accurate
+        SYSPROMPT
+
+        sys_text =
+          if input['system_preamble'].present?
+            input['system_preamble'].to_s
+          elsif input['generation_prompt_config'].is_a?(Hash)
+            gpc = input['generation_prompt_config'] || {}
+            # Reuse resolve_prompt so tone template is *prepended* to the strict JSON instructions
+            fake_input = {
+              'prompt_template'      => gpc['template'] || 'hr_assistant',
+              'custom_system_prompt' => gpc['custom_prompt']
+            }
+            call(:resolve_prompt, fake_input, default_sys)
+          else
+            default_sys
+          end
+
         # Apply signal enrichment if enabled
-        if input['use_signal_enrichment'] != false
-          if input['signals_category'].present?
-            sys_text += "\n\nDomain context: This is a #{input['signals_category']} inquiry."
+        if use_signal_enrichment != false
+          if signals_category.present?
+            sys_text += "\n\nDomain context: This is a #{signals_category} inquiry."
             applied_signals << 'category'
           end
           
-          if input['signals_intent'].present?
-            intent_guidance = case input['signals_intent']
+          if signals_intent.present?
+            intent_guidance = case signals_intent
             when 'information_request' then 'Provide clear, factual information.'
-            when 'action_request' then 'Focus on actionable steps or procedures.'
-            when 'status_inquiry' then 'Provide current status and any relevant updates.'
+            when 'action_request'      then 'Focus on actionable steps or procedures.'
+            when 'status_inquiry'      then 'Provide current status and any relevant updates.'
             else nil
             end
             if intent_guidance
@@ -5503,11 +5598,15 @@ require 'securerandom'
             end
           end
           
-          # Adjust temperature based on confidence signal
-          if input['signals_confidence'].present? && gen_cfg.nil?
-            conf = input['signals_confidence'].to_f
+          # Adjust temperature based on confidence signal when generation_config is not already provided
+          if signals_confidence.present? && gen_cfg.nil?
+            conf = signals_confidence.to_f
             # Higher upstream confidence = lower temperature
-            temp_adjustment = conf > 0.8 ? 0.0 : (conf > 0.6 ? 0.3 : 0.5)
+            temp_adjustment =
+              if conf > 0.8 then 0.0
+              elsif conf > 0.6 then 0.3
+              else 0.5
+              end
             gen_cfg = { 'temperature' => temp_adjustment }
             applied_signals << 'confidence'
           end
@@ -6134,10 +6233,18 @@ require 'securerandom'
     # --- Guards, normalization --------------------------------------------
     ensure_project_id!: lambda do |connection|
       # Method mutates caller-visible state, but this is a known and desired side effect. 
-      pid = (connection['project_id'].presence ||
-              (JSON.parse(connection['service_account_key_json'].to_s)['project_id'] rescue nil)).to_s
+      pid = (
+        connection['project_id'].presence ||
+        connection['project'].presence || # legacy alias
+        (JSON.parse(connection['service_account_key_json'].to_s)['project_id'] rescue nil)
+      ).to_s
+
       error('Project ID is required (not found in connection or key)') if pid.blank?
+
+      # Normalize into project_id, keep project as a mirror for backward-compatible helpers
       connection['project_id'] = pid
+      connection['project']    = pid if connection['project'].to_s.strip.empty?
+
       pid
     end,
     ensure_regional_location!: lambda do |connection|
