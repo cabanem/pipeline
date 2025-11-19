@@ -268,26 +268,6 @@ require 'securerandom'
         ]
       end
     },
-
-    log_entry: {
-      fields: lambda do |_connection, _config_fields|
-        [
-          { name: 'ts' },
-          { name: 'action' },
-          { name: 'started_at' },
-          { name: 'ended_at' },
-          { name: 'latency_ms', type: 'integer' },
-          { name: 'status' },
-          { name: 'correlation' },
-          { name: 'http_status', type: 'integer' },
-          { name: 'message' },
-          { name: 'error_class' },
-          { name: 'error_msg' },
-          # extras is where you already stash compact, action-specific metrics
-          { name: 'extras', type: 'object' }
-        ]
-      end
-    },
     content_part: {
       fields: lambda do |connection, config_fields|
         [
@@ -310,7 +290,6 @@ require 'securerandom'
         ]
       end
     },
-
     gen_generate_input: {
       fields: lambda do |connection, config_fields, object_definitions|
         mode_field = [
@@ -439,42 +418,6 @@ require 'securerandom'
           mode_specific + gen_params + debug_fields
       end
     },
-    gen_generate_content_input: {
-      fields: lambda do |_connection, config_fields, object_definitions|
-        show_adv = (config_fields['show_advanced'] == true)
-
-        base = [
-          # UX toggle
-          { name: 'show_advanced', label: 'Show advanced options',
-            type: 'boolean', control_type: 'checkbox', optional: true, default: false },
-          # Model (free-text only)
-          { name: 'model', label: 'Model', optional: false, control_type: 'text' },
-
-          # Contract-friendly content
-          { name: 'contents', type: 'array', of: 'object',
-            properties: object_definitions['content'], optional: false },
-          # Simple system text that we convert to systemInstruction object
-          { name: 'system_preamble', label: 'System preamble (text)', optional: true,
-            hint: 'Optional; becomes systemInstruction.parts[0].text' }
-        ]
-        adv = [
-          { name: 'tools', type: 'array', of: 'object', properties: [
-              { name: 'googleSearch',    type: 'object' },
-              { name: 'retrieval',       type: 'object' },
-              { name: 'codeExecution',   type: 'object' },
-              { name: 'functionDeclarations', type: 'array', of: 'object' }
-            ]
-          },
-          { name: 'toolConfig',      type: 'object' },
-          { name: 'safetySettings',  type: 'array', of: 'object',
-            properties: object_definitions['safety_setting'] },
-          { name: 'generationConfig', type: 'object',
-            properties: object_definitions['generation_config'] }
-        ]
-
-        show_adv ? (base + adv) : base
-      end
-    },
     generation_config: {
       fields: lambda do |_connection, _config_fields|
         [
@@ -489,85 +432,6 @@ require 'securerandom'
         ]
       end
     },
-    generate_content_output: {
-      fields: lambda do |_connection, _config_fields|
-        [
-          { name: 'responseId' },
-          { name: 'modelVersion' },
-          { name: 'usageMetadata', type: 'object', properties: [
-              { name: 'promptTokenCount',     type: 'integer' },
-              { name: 'candidatesTokenCount', type: 'integer' },
-              { name: 'totalTokenCount',      type: 'integer' }
-            ]
-          },
-          { name: 'candidates', type: 'array', of: 'object', properties: [
-            { name: 'finishReason' },
-            { name: 'safetyRatings', type: 'array', of: 'object', properties: [
-                { name: 'category' }, { name: 'probability' }, { name: 'blocked', type: 'boolean' }
-            ]},
-            { name: 'groundingMetadata', type: 'object', properties: [
-                { name: 'citationSources', type: 'array', of: 'object', properties: [
-                    { name: 'uri' }, { name: 'license' }, { name: 'title' }, { name: 'publicationDate' }
-                ]}
-            ]},
-            { name: 'content', type: 'object', properties: [
-                { name: 'role' },
-                { name: 'parts', type: 'array', of: 'object', properties: [
-                    { name: 'text' }, { name: 'inlineData', type: 'object' }, { name: 'fileData', type: 'object' }
-                ]}
-            ]}
-          ]}
-        ]
-      end
-    },
-    embed_output: {
-      # Align to contract: embeddings object, not array
-      fields: lambda do |_connection, _config_fields|
-        [
-          { name: 'predictions', type: 'array', of: 'object', properties: [
-              { name: 'embeddings', type: 'object', properties: [
-                  { name: 'values', type: 'array', of: 'number' },
-                  { name: 'statistics', type: 'object', properties: [
-                      { name: 'truncated',   type: 'boolean' },
-                      { name: 'token_count', type: 'number' } # sometimes returned as decimal place, e.g., 7.0
-                    ]
-                  }
-                ]
-              }
-            ]
-          },
-          # NEW: surface billing metadata from the REST response
-          { name: 'metadata', type: 'object', properties: [
-              { name: 'billableCharacterCount', type: 'integer' }
-            ]
-          }
-        ]
-      end
-    },
-    predict_output: {
-      fields: lambda do |_connection, _config_fields|
-        [
-          { name: 'predictions', type: 'array', of: 'object' },
-          { name: 'deployedModelId' }
-        ]
-      end
-    },
-    batch_job: {
-      fields: lambda do |_connection, _config_fields|
-        [
-          { name: 'name' },
-          { name: 'displayName' },
-          { name: 'state' },
-          { name: 'model' },
-          { name: 'modelVersionId' },
-          { name: 'error', type: 'object' },
-          { name: 'outputInfo', type: 'object' },
-          { name: 'resourcesConsumed', type: 'object' },
-          { name: 'partialFailures', type: 'array', of: 'object' },
-          { name: 'labels', type: 'object' }
-        ]
-      end
-    },
     safety_setting: {
       fields: lambda do |_connection, _config_fields|
         [
@@ -576,16 +440,6 @@ require 'securerandom'
         ]
       end
     },
-    kv_pair: {
-      fields: lambda do |_connection, _config_fields|
-        [
-          { name: 'key' },
-          { name: 'value' }
-        ]
-      end
-    },
-    # -- NEW ---
-    # Shared envelope for all action outputs (ok, telemetry, optional debug)
     envelope_fields: {
       fields: lambda do |_connection, _config_fields|
         [
@@ -602,7 +456,6 @@ require 'securerandom'
         ]
       end
     },
-    # Tiny reusable input group for observability
     observability_input_fields: {
       fields: lambda do |_connection, _config_fields|
         [
@@ -612,18 +465,6 @@ require 'securerandom'
             hint: 'Adds request/response preview to output in non-prod connections.' }
         ]
       end
-    }, 
-    email_envelope: {
-      fields: lambda do |_connection, _config_fields|
-        [
-          { name: 'subject' }, { name: 'body' }, { name: 'from' },
-          { name: 'headers', type: 'object' },
-          { name: 'attachments', type: 'array', of: 'object', properties: [
-              { name: 'filename' }, { name: 'mimeType' }, { name: 'size' }
-          ]},
-          { name: 'auth', type: 'object' }
-        ]
-      end
     },
     category_def: {
       fields: lambda do |_connection, _config_fields|
@@ -631,71 +472,6 @@ require 'securerandom'
           { name: 'name', optional: false },
           { name: 'description' },
           { name: 'examples', type: 'array', of: 'string' }
-        ]
-      end
-    },
-    rule_rows_table: {
-      fields: lambda do |_connection, _config_fields|
-        [
-          { name: 'rule_id' }, { name: 'family' }, { name: 'field' }, { name: 'operator' },
-          { name: 'pattern' }, { name: 'weight' }, { name: 'action' }, { name: 'cap_per_email' },
-          { name: 'category' }, { name: 'flag_a' }, { name: 'flag_b' },
-          { name: 'enabled' }, { name: 'priority' }, { name: 'notes' }
-        ]
-      end
-    },
-    rulepack_compiled: {
-      fields: lambda do |_connection, _config_fields|
-        [
-          { name: 'hard_exclude', type: 'object' },
-          { name: 'soft_signals', type: 'array', of: 'object' },
-          { name: 'thresholds',   type: 'object' },
-          { name: 'guards',       type: 'object' }
-        ]
-      end
-    },
-    contexts_ranked: {
-      fields: lambda do |_connection, _config_fields|
-        [
-          { name: 'id' }, { name: 'text' }, { name: 'score', type: 'number' },
-          { name: 'source' }, { name: 'uri' }, { name: 'metadata', type: 'object' }
-        ]
-      end
-    },
-    context_chunk: {
-      fields: lambda do |connection, config_fields|
-        [
-          { name: 'id' },
-          { name: 'uri', optional: true },
-          { name: 'content', control_type: 'text-area' },
-          { name: 'score', type: :number, optional: true },
-          { name: 'metadata', type: :object, optional: true }
-        ]
-      end,
-      sample_output: { id: 'c1', uri: 'gs://bucket/a.txt', content: '...', score: 0.83 },
-      additional_properties: false
-    },
-    intent_out: {
-      fields: lambda do |_connection, _config_fields|
-        [ { name: 'label' }, { name: 'confidence', type: 'number' }, { name: 'basis' } ]
-      end
-    },
-    policy_out: {
-      fields: lambda do |_connection, _config_fields|
-        [
-          { name: 'decision' }, { name: 'confidence', type: 'number' },
-          { name: 'matched_signals', type: 'array', of: 'string' },
-          { name: 'reasons', type: 'array', of: 'string' }
-        ]
-      end
-    },
-    referee_out: {
-      fields: lambda do |_connection, _config_fields|
-        [
-          { name: 'category' }, { name: 'confidence', type: 'number' }, { name: 'reasoning' },
-          { name: 'distribution', type: 'array', of: 'object', properties: [
-              { name: 'category' }, { name: 'prob', type: 'number' }
-          ]}
         ]
       end
     },
@@ -762,15 +538,6 @@ require 'securerandom'
         ]
       end
     },
-    intent_classification: {
-      fields: lambda do |c, cf|
-        [
-          { name: 'label' },
-          { name: 'confidence', type: 'number' },
-          { name: 'basis' }
-        ]
-      end
-    },
     context_chunk_standard: {
       fields: lambda do |c, cf|
         [
@@ -788,33 +555,6 @@ require 'securerandom'
           # Added for LLM ranking outputs so all ranked context chunks share one schema
           { name: 'llm_relevance', type: 'number', optional: true },
           { name: 'category_alignment', type: 'number', optional: true }
-        ]
-      end
-    },
-    # Enhanced intent classification with richer types
-    intent_classification_enhanced: {
-      fields: lambda do |_connection, _config_fields|
-        [
-          { name: 'label', hint: 'Intent type detected' },
-          { name: 'confidence', type: 'number' },
-          { name: 'basis', hint: 'How intent was determined' },
-          { name: 'sub_type', optional: true, hint: 'More specific intent category' }
-        ]
-      end
-    },
-    # Combined policy + intent response
-    policy_with_intent: {
-      fields: lambda do |_connection, _config_fields|
-        [
-          { name: 'decision', hint: 'IRRELEVANT/HUMAN/KEEP' },
-          { name: 'confidence', type: 'number' },
-          { name: 'intent', type: 'object', properties: [
-            { name: 'label' },
-            { name: 'confidence', type: 'number' },
-            { name: 'sub_type', optional: true }
-          ]},
-          { name: 'matched_signals', type: 'array', of: 'string' },
-          { name: 'reasons', type: 'array', of: 'string' }
         ]
       end
     }
@@ -2939,31 +2679,11 @@ require 'securerandom'
         ['Support ticket updates', 'ticket_updates']
       ]
     end,
-    response_templates: lambda do |_connection|
-      [
-        ['PTO Approved', 'pto_approved'],
-        ['PTO Pending Manager', 'pto_pending_manager'],
-        ['W-2 Resend', 'w2_resend'],
-        ['Escalation to Human', 'escalation_human'],
-        ['Benefits Enrollment Confirmation', 'benefits_enrolled'],
-        ['Password Reset', 'password_reset'],
-        ['Policy Information', 'pto_policy_info'],
-        ['Process Information', 'pto_process_info'],
-        ['W2 Access Info', 'w2_access_info'],
-        ['W2 Timeline Info', 'w2_timeline_info'],
-        ['Payroll Process Info', 'payroll_process_info'],
-        ['HRIS Portal Access', 'hris_portal_access_info'],
-        ['Verification Letters', 'verification_letters_info'],
-        ['Generic Policy Info', 'generic_policy_info'],
-        ['Custom Template', 'custom']
-      ]
-    end,
     modes_classification: lambda do |_connection|
       [ ['Embedding (deterministic)', 'embedding'],
         ['Generative (LLM only)',     'generative'],
         ['Hybrid (embed + referee)',  'hybrid'] ]
     end,
-    # rules
     rules_modes: lambda do |_connection|
       [ ['None', 'none'], ['Rows (Lookup Table)', 'rows'], ['Compiled JSON', 'json'] ]
     end,
@@ -2992,50 +2712,12 @@ require 'securerandom'
       ['Diverse (MMR-like)','diverse_mmr'],
       ['Truncate by characters','truncate_chars']]
     end,
-    discovery_hosts: lambda do |_connection|
-      [
-        ['Discovery Engine (global)', 'discoveryengine.googleapis.com'],
-        ['Discovery Engine (US multi-region)', 'us-discoveryengine.googleapis.com']
-      ]
-    end,
     modes_classification: lambda do |_connection|
       [%w[Embedding embedding], %w[Generative generative], %w[Hybrid hybrid]]
-    end,
-    modes_grounding: lambda do |_connection|
-      [%w[Google\ Search google_search], %w[Vertex\ AI\ Search vertex_ai_search]]
     end,
     roles: lambda do |_connection|
       # Contract-conformant roles (system handled via system_preamble)
       [['user','user'], ['model','model']]
-    end,
-    rag_source_families: lambda do |_connection|
-      [
-        ['Google Cloud Storage', 'gcs'],
-        ['Google Drive', 'drive']
-      ]
-    end,
-    drive_input_type: lambda do |_connection|
-      [
-        ['Drive Files', 'files'],
-        ['Drive Folder', 'folder']
-      ]
-    end,
-    distance_measures: lambda do |_connection|
-      [
-        ['Cosine distance', 'COSINE_DISTANCE'],
-        ['Dot product',     'DOT_PRODUCT'],
-        ['Euclidean',       'EUCLIDEAN_DISTANCE']
-      ]
-    end,
-    iam_services: lambda do |_connection|
-      [['Vertex AI','vertex'], ['AI Applications (Discovery)','discovery']]
-    end,
-    discovery_versions: lambda do |_connection|
-      [
-        ['v1alpha', 'v1alpha'],
-        ['v1beta',  'v1beta'],
-        ['v1',      'v1']
-      ]
     end,
     ai_apps_locations: lambda do |_connection|
       [
@@ -3741,80 +3423,6 @@ require 'securerandom'
         []
       end
     end,
-    llm_category_aware_ranker: lambda do |connection, model, query, category, category_context, contexts, corr=nil|
-      model_path = call(:build_model_path_with_global_preview, connection, model)
-      
-      system_text = <<~SYS
-        You are an expert relevance scorer for a knowledge retrieval system.
-        Given a query within a specific category, evaluate how well each context answers the query.
-        
-        Scoring criteria:
-        1. Relevance (0-1): How directly the context addresses the query
-        2. Category Alignment (0-1): How well the context fits the category domain
-        
-        Be precise and calibrated in your scoring. Output valid JSON only.
-      SYS
-      
-      # Build context descriptions
-      context_list = contexts.map { |c|
-        text_preview = (c['content'] || c['text']).to_s[0..400]
-        source = (c['metadata'] || {})['source'] || 'unknown'
-        
-        "ID: #{c['id']}\nSource: #{source}\nContent: #{text_preview}"
-      }.join("\n\n---\n\n")
-      
-      user_prompt = <<~USR
-        Category: #{category}
-        #{category_context.present? ? "Category Context: #{category_context}" : ""}
-        
-        Query: #{query}
-        
-        Contexts to evaluate:
-        #{context_list}
-        
-        Score each context for relevance to the query and alignment with the category.
-      USR
-      
-      payload = {
-        'systemInstruction' => { 'role' => 'system', 'parts' => [{ 'text' => system_text }] },
-        'contents' => [{ 'role' => 'user', 'parts' => [{ 'text' => user_prompt }] }],
-        'generationConfig' => {
-          'temperature' => 0,
-          'maxOutputTokens' => 1024,
-          'responseMimeType' => 'application/json',
-          'responseSchema' => {
-            'type' => 'object',
-            'properties' => {
-              'rankings' => {
-                'type' => 'array',
-                'items' => {
-                  'type' => 'object',
-                  'properties' => {
-                    'id' => { 'type' => 'string' },
-                    'relevance' => { 'type' => 'number' },
-                    'category_alignment' => { 'type' => 'number' },
-                    'reasoning' => { 'type' => 'string' }
-                  },
-                  'required' => ['id', 'relevance', 'category_alignment']
-                }
-              }
-            },
-            'required' => ['rankings']
-          }
-        }
-      }
-      
-      loc = (model_path[/\/locations\/([^\/]+)/, 1] || 'global').to_s.downcase
-      url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
-      
-      resp = post(url)
-              .headers(call(:request_headers_auth, connection, corr || call(:build_correlation_id), 
-                            connection['user_project'], "model=#{model_path}"))
-              .payload(call(:json_compact, payload))
-      
-      text = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
-      JSON.parse(text) rescue { 'rankings' => [] }
-    end,
     llm_referee_enhanced: lambda do |connection, model, email_text, shortlist_names, all_cats, fallback_category, corr, system_preamble, temperature, include_reasoning, max_tokens=512|
       # Enhanced version with temperature and reasoning control
       model_path = call(:build_model_path_with_global_preview, connection, model)
@@ -3919,23 +3527,10 @@ require 'securerandom'
     coerce_integer: lambda do |v, fallback|
       Integer(v) rescue fallback
     end,
-    path_rag_retrieve_contexts: lambda do |connection|
-      "/v1/projects/#{call(:ensure_project_id!, connection)}/locations/#{call(:ensure_location!, connection)}:retrieveContexts"
-    end,
     ensure_location!: lambda do |connection|
       loc = connection['location'].to_s.strip
       error('Location is required') if loc.empty?
       loc
-    end,
-    default_headers: lambda do |connection|
-      # Deliberately keep these minimal to avoid duplication of headers
-      {
-      'Content-Type' => 'application/json; charset=utf-8',
-      'Accept' => 'application/json'
-      }
-    end,
-    aiplatform_host: lambda do |connection|
-      "#{call(:ensure_location!, connection)}-aiplatform.googleapis.com"
     end,
 
     # --- JSON helpers (gentle, friendly errors) -------------------------------
@@ -4112,55 +3707,6 @@ require 'securerandom'
         base + advanced_rules
       end
     end,
-    ui_policy_inputs_enhanced: lambda do |object_definitions, cfg|
-      adv = call(:ui_truthy, cfg['show_advanced'])
-      
-      base = [
-        { name: 'email_text', optional: false },
-        { name: 'email_type', optional: true, default: 'direct_request',
-          hint: 'From deterministic filter (direct_request, forwarded_chain, etc.)' },
-        
-        # Intent configuration
-        { name: 'intent_types', label: 'Intent Types', type: 'array', of: 'string',
-          default: ['information_request', 'action_request', 'status_inquiry', 
-                  'complaint', 'auto_reply', 'unknown'],
-          hint: 'Intent categories to detect' },
-        
-        { name: 'actionable_intents', label: 'Actionable Intents', 
-          type: 'array', of: 'string',
-          default: ['information_request', 'action_request'],
-          hint: 'Intents that can proceed to generation' },
-        
-        { name: 'require_actionable_intent', type: 'boolean', 
-          control_type: 'checkbox', default: true,
-          hint: 'Block generation for non-actionable intents' },
-        
-        # Confidence thresholds
-        { name: 'min_confidence_for_generation', type: 'number', 
-          default: 0.60, hint: 'Minimum confidence to pass to generator' },
-        
-        { name: 'confidence_short_circuit', type: 'number', 
-          default: 0.85, hint: 'Confidence to skip downstream when IRRELEVANT' }
-      ]
-      
-      if adv
-        base + [
-          { name: 'model', default: 'gemini-2.0-flash' },
-          { name: 'temperature', type: 'number', default: 0 },
-          
-          { name: 'policy_mode', control_type: 'select',
-            options: [['None','none'], ['JSON','json']], 
-            default: 'none', extends_schema: true },
-            
-          { name: 'policy_json', label: 'Policy JSON',
-            ngIf: 'input.policy_mode == "json"', optional: true,
-            control_type: 'text-area',
-            hint: 'Additional policy rules in JSON format' }
-        ]
-      else
-        base
-      end
-    end,
     ui_embed_inputs: lambda do |object_definitions, cfg|
       adv = call(:ui_truthy, cfg['show_advanced'])
       base = [
@@ -4244,32 +3790,6 @@ require 'securerandom'
       else
         base
       end
-    end,
-    ui_retrieve_inputs: lambda do |object_definitions, cfg|
-      adv = call(:ui_truthy, cfg['show_advanced'])
-      base = [
-        { name: 'email_text', optional: false, hint: 'Free text query (use norm_email_envelope upstream if you have subject/body).' },
-        { name: 'rag_corpus', label: 'RAG corpus ID', optional: false, hint: 'Vertex RAG corpus name/id.' }
-      ]
-      if adv
-        props = Array(object_definitions['rag_retrieval_config'])
-        if props.empty?
-          props = [
-            { name: 'top_k', type: 'integer', hint: 'Max contexts to return (default 6).' },
-            { name: 'filter', type: 'object', properties: [
-                { name: 'vector_distance_threshold', type: 'number' },
-                { name: 'vector_similarity_threshold', type: 'number' }
-            ]},
-            { name: 'ranking', type: 'object', properties: [
-                { name: 'rank_service_model' },
-                { name: 'llm_ranker_model' }
-            ]}
-          ]
-        end
-        base << { name: 'rag_retrieval_config', label: 'Retrieval config', type: 'object', optional: true,
-                  properties: props }
-      end
-      base
     end,
 
     # --- Encapsulated I/O -----------------------------------------------------
@@ -5808,20 +5328,6 @@ require 'securerandom'
       
       out
     end,
-    gen_generate_handle_error!: lambda do |err, request_info, connection, input|
-      t0 = request_info['started_at']
-      corr = request_info['correlation_id']
-      
-      g   = call(:extract_google_error, err)
-      msg = [err.to_s, (g['message'] || nil)].compact.join(' | ')
-      env = call(:telemetry_envelope, t0, corr, false, call(:telemetry_parse_error_code, err), msg)
-      
-      if !call(:normalize_boolean, connection['prod_mode']) && call(:normalize_boolean, input['debug'])
-        env['debug'] = call(:debug_pack, true, request_info['url'], request_info['payload'], g)
-      end
-      
-      error(env)
-    end,
     llm_category_aware_ranker_enhanced: lambda do |connection, model, query, category, category_context, contexts, custom_prompt, corr=nil|
       model_path = call(:build_model_path_with_global_preview, connection, model)
       
@@ -5896,18 +5402,6 @@ require 'securerandom'
       
       text = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
       JSON.parse(text) rescue { 'rankings' => [] }
-    end,
-
-    # Preview pack
-    request_preview_pack: lambda do |url, verb, headers, payload|
-      {
-        'request_preview' => {
-          'method'  => verb.to_s.upcase,
-          'url'     => url.to_s,
-          'headers' => headers || {},
-          'payload' => call(:redact_json, payload)
-        }
-      }
     end,
 
     # ---------- Rerank helpers (tidy + reusable) --------------------------
@@ -6502,9 +5996,6 @@ require 'securerandom'
       error("Invalid Drive ID in #{label}: #{bad}") if bad
       norm
     end,
-    sanitize_feature_vector: lambda do |arr|
-      call(:safe_array, arr).map { |x| call(:safe_float, x) }.reject { |x| x.nil? }
-    end,
 
     # --- Embeddings -------------------------------------------------------
     extract_embedding_vector: lambda do |pred|
@@ -6787,98 +6278,6 @@ require 'securerandom'
         { 'role' => role, 'parts' => parts }
       end.compact
     end,
-    # Strip HTML → text, collapse whitespace, normalize dashes/quotes a bit
-    email_minify: lambda do |subject, body|
-      txt = body.to_s.dup
-
-      # crude HTML to text (Workato runtime lacks Nokogiri; keep it simple)
-      txt = txt.gsub(/<\/(p|div|br)>/i, "\n")
-              .gsub(/<[^>]+>/, ' ')
-              .gsub(/\r/, '')
-              .gsub(/[ \t]+/, ' ')
-              .gsub(/\n{3,}/, "\n\n")
-              .strip
-
-      # prepend subject if useful for salience
-      if subject.to_s.strip.length > 0
-        "Subject: #{subject.to_s.strip}\n\n#{txt}"
-      else
-        txt
-      end
-    end,
-    # Remove reply chains, signatures, legal footers; keep top-most author content
-    email_focus_trim: lambda do |plain_text, max_chars = 8000|
-      t = plain_text.to_s
-
-      # Remove common quoted-reply sections
-      t = t.split(/\n-{2,}\s*Original Message\s*-{2,}\n/i).first || t
-      t = t.split(/\nOn .* wrote:\n/).first       || t
-      t = t.split(/\nFrom: .*?\nSent: .*?\nTo:/m).first || t
-      t = t.gsub(/(^|\n)>[^\n]*\n?/, "\n")        # strip lines starting with '>'
-
-      # Drop common signature delimiters / legal footers
-      t = t.split(/\n--\s*\n/).first || t
-      t = t.gsub(/\nThis message .*? confidentiality.*$/mi, '') # rough legal footer killer
-
-      t = t.strip
-      # Keep head of the message if extremely long
-      t.length > max_chars ? t[0, max_chars] : t
-    end,
-    extract_salient_span!: lambda do |connection, subject, body, model='gemini-2.0-flash', max_span=500, temperature=0, corr=nil, system_preamble=nil|
-      plain = call(:email_minify, subject, body)
-      focus = call(:email_focus_trim, plain, 8000)
-
-      # System Prompt (overrideable per-run)
-      system_text = system_preamble.presence || (
-        "Extract the single most important sentence or short paragraph from an email. " \
-        "Return valid JSON only. Keep the extracted span under #{max_span} characters. " \
-        "importance is a calibrated score in [0,1]."
-      )
-
-      gen_cfg = {
-        'temperature'      => temperature.to_f,
-        'maxOutputTokens'  => 512,
-        'responseMimeType' => 'application/json',
-        'responseSchema'   => {
-          'type' => 'object', 'additionalProperties' => false,
-          'properties' => {
-            'salient_span' => { 'type' => 'string' },
-            'reason'       => { 'type' => 'string' },
-            'importance'   => { 'type' => 'number' }
-          },
-          'required' => ['salient_span','importance']
-        }
-      }
-
-      model_path = call(:build_model_path_with_global_preview, connection, model)
-      req_params = "model=#{model_path}"
-      contents = [
-        { 'role' => 'user', 'parts' => [ { 'text' =>
-          [
-            (subject.to_s.strip.empty? ? nil : "Subject: #{subject.to_s.strip}"),
-            "Email (trimmed):\n#{focus}"
-          ].compact.join("\n\n")
-        } ] }
-      ]
-      loc = (connection['location'].presence || 'global').to_s.downcase
-      url = call(:aipl_v1_url, connection, loc, "#{model_path}:generateContent")
-      resp = post(url)
-               .headers(call(:request_headers_auth, connection, (corr || call(:build_correlation_id)), nil, req_params))
-               .payload({
-                  'contents' => contents,
-                  'systemInstruction' => { 'role' => 'system', 'parts' => [ { 'text' => system_text } ] },
-                  'generationConfig'  => gen_cfg
-                })
-
-      text   = resp.dig('candidates',0,'content','parts',0,'text').to_s
-      parsed = (call(:json_parse_safe, text) rescue nil)
-      {
-        'focus_preview' => focus,
-        'salient_span'  => parsed['salient_span'].to_s,
-        'reason'        => parsed['reason'],
-        'importance'    => parsed['importance'].to_f
-      }
-    end,
     count_tokens_quick!: lambda do |connection, model_id, contents, system_text=nil, corr=nil|
       # Build path for whichever model we’re counting
       model_path = call(:build_model_path_with_global_preview, connection, model_id)
@@ -6980,112 +6379,6 @@ require 'securerandom'
         end
       end
       ordered_items.first(lo)
-    end,
-
-    # --- Log-assemble helpers --------------------------------------------
-    la_json_parse_safe!: lambda do |text|
-      return [] unless text.is_a?(String) && text.strip != ''
-      begin
-        j = call(:json_parse_safe, text)
-        j.is_a?(Array) ? j : [j]
-      rescue
-        text.lines.map(&:strip).reject(&:empty?).map { |ln| JSON.parse(ln) rescue nil }.compact
-      end
-    end,
-    la_parse_ts: lambda do |v|
-      case v
-      when Integer then Time.at(v / 1000.0).utc
-      when Float   then Time.at(v / 1000.0).utc
-      when String
-        begin Time.parse(v).utc rescue nil end
-      else nil
-      end
-    end,
-    la_ms_between: lambda do |t1, t2|
-      return nil unless t1 && t2
-      ((t2 - t1) * 1000.0).round
-    end,
-    la_flatten_hash: lambda do |h, prefix=''|
-      return {} unless h.is_a?(Hash)
-      flat = {}
-      h.each do |k,v|
-        key = prefix == '' ? k.to_s : "#{prefix}.#{k}"
-        if v.is_a?(Hash)
-          flat.merge!(call(:la_flatten_hash, v, key))
-        else
-          flat[key] = v
-        end
-      end
-      flat
-    end,
-    la_norm_entry!: lambda do |raw|
-      h = raw.is_a?(Hash) ? raw.dup : {}
-      # Lift common aliases
-      h['ts']            ||= h['timestamp'] || h['time'] || h['t']
-      h['level']         ||= (h['severity'] || 'INFO').to_s.upcase
-      h['action']        ||= h['action_name'] || h['actor'] || 'unknown'
-      h['event']         ||= h['stage'] || h['step'] || 'event'
-      h['status']        ||= (h['ok'] == false || h['error'] ? 'error' : 'ok')
-      h['correlation_id']||= h['correlation'] || h['trace_id'] || h.dig('telemetry','correlation_id')
-      # Timestamps
-      t = call(:la_parse_ts, h['ts'])
-      h['ts'] = (t || Time.now.utc).iso8601(3)
-      # Latency
-      if h['latency_ms'].is_a?(String) then h['latency_ms'] = h['latency_ms'].to_i end
-      if !h['latency_ms'] && (h['t_start'] || h['t_end'])
-        t1 = call(:la_parse_ts, h['t_start']); t2 = call(:la_parse_ts, h['t_end'])
-        h['latency_ms'] = call(:la_ms_between, t1, t2)
-      end
-      # Error normalization
-      err = h['error']
-      if err.is_a?(String)
-        h['error'] = { 'message' => err }
-      elsif err.is_a?(Hash)
-        h['error'] = {
-          'message' => err['message'] || err['msg'],
-          'code'    => err['code'] || err['status'],
-          'where'   => err['where'] || h['action'],
-          'raw'     => err
-        }
-      end
-      # Facets: prefer telemetry.facets if present
-      h['facets'] ||= h.dig('telemetry','facets') || h['context'] || h['meta'] || {}
-      h
-    end,
-    la_group_by: lambda do |arr, key|
-      out = Hash.new { |hh,k| hh[k] = [] }
-      Array(arr).each { |e| out[(e[key].to_s rescue '')] << e }
-      out
-    end,
-    la_build_summary: lambda do |cid, events|
-      sorted = Array(events).sort_by { |e| e['ts'].to_s }
-      t_first = Time.parse(sorted.first['ts']) rescue nil
-      t_last  = Time.parse(sorted.last['ts'])  rescue nil
-      counts = Hash.new(0)
-      by_event = Hash.new(0)
-      errs = []
-      facets_merged = {}
-      sorted.each do |e|
-        counts[e['level']] += 1 if e['level']
-        by_event[e['event']] += 1 if e['event']
-        if e['error'].is_a?(Hash)
-          sig = [e['error']['message'], e['error']['where']].compact.join('|')
-          errs << e['error'] unless errs.any? { |x| [x['message'], x['where']].compact.join('|') == sig }
-        end
-        if e['facets'].is_a?(Hash)
-          e['facets'].each { |k,v| facets_merged[k] ||= v }
-        end
-      end
-      {
-        'correlation_id' => (cid == '' ? nil : cid),
-        't_first'        => (t_first&.iso8601(3)),
-        't_last'         => (t_last&.iso8601(3)),
-        'duration_ms'    => (call(:la_ms_between, t_first, t_last) || 0),
-        'counts'         => counts,
-        'by_event'       => by_event,
-        'errors'         => errs,
-        'facets'         => facets_merged
-      }.delete_if { |_k,v| v.nil? || (v.respond_to?(:empty?) && v.empty?) }
     end,
 
     # Standard field groups
