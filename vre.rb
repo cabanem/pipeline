@@ -1736,12 +1736,37 @@ require 'securerandom'
           email_text = "#{email_text}\n\nContext:\n#{blob}"
         end
         
-        # Handle salience extraction
+         # Handle salience extraction
         salience = nil
         sal_err = nil
-        sal_config = input['salience_config'] || {}
+
+        # Normalize salience_config from flat fields for backward-compat
+        sal_config = (input['salience_config'].is_a?(Hash) ? input['salience_config'] : {}).dup
+
+        # Flat fields from UI (take precedence over nested config)
+        ui_mode       = input['salience_mode']
+        ui_max_chars  = input['salience_max_chars']
+        ui_append     = input.key?('salience_append_to_prompt') ? input['salience_append_to_prompt'] : nil
+        ui_entities   = input.key?('salience_include_entities') ? input['salience_include_entities'] : nil
+        ui_model      = input['salience_model']
+        ui_temp       = input.key?('salience_temperature') ? input['salience_temperature'] : nil
+
+        # Mode (off / heuristic / llm)
+        sal_config['mode'] = (ui_mode.presence || sal_config['mode'] || 'off')
+
+        # Core knobs
+        sal_config['max_chars']        = ui_max_chars.to_i if ui_max_chars
+        sal_config['append_to_prompt'] = ui_append unless ui_append.nil?
+        sal_config['include_entities'] = ui_entities unless ui_entities.nil?
+
+        # LLM sub-config
+        llm_cfg = sal_config['llm_config'].is_a?(Hash) ? sal_config['llm_config'].dup : {}
+        llm_cfg['model']       = ui_model if ui_model.present?
+        llm_cfg['temperature'] = ui_temp.to_f if !ui_temp.nil?
+        sal_config['llm_config'] = llm_cfg if llm_cfg.any?
+
         mode = sal_config['mode'] || 'off'
-        
+
         if mode != 'off'
           begin
             max_span = (sal_config['max_chars'] || 500).to_i
@@ -1770,7 +1795,7 @@ require 'securerandom'
               # LLM extraction with configurable model
               llm_cfg = sal_config['llm_config'] || {}
               model = llm_cfg['model'] || 'gemini-2.0-flash'
-              temp = llm_cfg['temperature'] || 0
+              temp  = llm_cfg['temperature'] || 0
               
               model_path = call(:build_model_path_with_global_preview, connection, model)
               loc = (model_path[/\/locations\/([^\/]+)/, 1] || 'global').to_s.downcase
@@ -1778,12 +1803,12 @@ require 'securerandom'
               req_params = "model=#{model_path}"
 
               schema_props = {
-                'salient_span' => { 'type' => 'string', 'minLength' => 12 },
-                'reason' => { 'type' => 'string' },
-                'importance' => { 'type' => 'number' },
-                'tags' => { 'type' => 'array', 'items' => { 'type' => 'string' } },
+                'salient_span'   => { 'type' => 'string', 'minLength' => 12 },
+                'reason'         => { 'type' => 'string' },
+                'importance'     => { 'type' => 'number' },
+                'tags'           => { 'type' => 'array', 'items' => { 'type' => 'string' } },
                 'call_to_action' => { 'type' => 'string' },
-                'deadline_iso' => { 'type' => 'string' }
+                'deadline_iso'   => { 'type' => 'string' }
               }
               
               if sal_config['include_entities']
@@ -1802,65 +1827,65 @@ require 'securerandom'
               end
 
               system_text = "You extract the single most important sentence or short paragraph from an email. " \
-                          "Rules: (1) Return VALID JSON only. (2) Do NOT output greetings, signatures, legal footers, " \
-                          "auto-replies, or vague pleasantries. (3) Keep under #{max_span} characters; do not truncate mid-sentence. " \
-                          "(4) importance is in [0,1]; set call_to_action/deadline_iso when clearly present."
+                            "Rules: (1) Return VALID JSON only. (2) Do NOT output greetings, signatures, legal footers, " \
+                            "auto-replies, or vague pleasantries. (3) Keep under #{max_span} characters; do not truncate mid-sentence. " \
+                            "(4) importance is in [0,1]; set call_to_action/deadline_iso when clearly present."
 
               gen_cfg = {
-                'temperature' => temp.to_f,
-                'maxOutputTokens' => 512,
+                'temperature'      => temp.to_f,
+                'maxOutputTokens'  => 512,
                 'responseMimeType' => 'application/json',
-                'responseSchema' => {
-                  'type' => 'object',
+                'responseSchema'   => {
+                  'type'                 => 'object',
                   'additionalProperties' => false,
-                  'properties' => schema_props,
-                  'required' => ['salient_span']
+                  'properties'           => schema_props,
+                  'required'             => ['salient_span']
                 }
               }
               
               contents = [{ 'role' => 'user', 'parts' => [{ 'text' => "Email (trimmed):\n#{email_text.to_s[0,8000]}" }]}]
               payload = {
-                'contents' => contents,
-                'systemInstruction' => { 'role' => 'system', 'parts' => [{ 'text' => system_text }]},
+                'contents'         => contents,
+                'systemInstruction'=> { 'role' => 'system', 'parts' => [{ 'text' => system_text }]},
                 'generationConfig' => gen_cfg
               }
               
               resp = post(url)
                       .headers(call(:request_headers_auth, connection, ctx['cid'], 
-                                  connection['user_project'], req_params))
+                                    connection['user_project'], req_params))
                       .payload(call(:json_compact, payload))
 
-              txt = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
+              txt    = resp.dig('candidates', 0, 'content', 'parts', 0, 'text').to_s
               parsed = call(:json_parse_safe, txt)
-              span = parsed['salient_span'].to_s.strip
+              span   = parsed['salient_span'].to_s.strip
               
               if span.empty? || span =~ /\A(hi|hello|hey)\b[:,\s]*\z/i || span.length < 8
                 focus = email_text.to_s[0, 8000]
                 focus = focus.sub(/\A\s*(subject:\s*[^\n]+\n+)?\s*(hi|hello|hey)[^a-z0-9]*\n+/i, '')
-                cand = focus.split(/(?<=[.!?])\s+/).find { |s| s.strip.length >= 12 && s !~ /\A(hi|hello|hey)\b/i } || focus[0, max_span]
-                span = cand.to_s.strip[0, max_span]
+                cand  = focus.split(/(?<=[.!?])\s+/).find { |s| s.strip.length >= 12 && s !~ /\A(hi|hello|hey)\b/i } || focus[0, max_span]
+                span  = cand.to_s.strip[0, max_span]
               end
               
               salience = {
-                'span' => span,
-                'reason' => parsed['reason'],
-                'importance' => parsed['importance'],
-                'tags' => parsed['tags'],
-                'entities' => parsed['entities'],
-                'cta' => parsed['call_to_action'],
-                'deadline_iso' => parsed['deadline_iso'],
+                'span'          => span,
+                'reason'        => parsed['reason'],
+                'importance'    => parsed['importance'],
+                'tags'          => parsed['tags'],
+                'entities'      => parsed['entities'],
+                'cta'           => parsed['call_to_action'],
+                'deadline_iso'  => parsed['deadline_iso'],
                 'focus_preview' => email_text.to_s[0,8000],
-                'responseId' => resp['responseId'],
-                'usage' => resp['usageMetadata'],
-                'span_source' => 'llm'
+                'responseId'    => resp['responseId'],
+                'usage'         => resp['usageMetadata'],
+                'span_source'   => 'llm'
               }
             end
           rescue => e
-            sal_err = e.to_s
+            sal_err  = e.to_s
             salience = nil
           end
         end
-        
+
         # Optionally append salience to prompt
         if salience && sal_config['append_to_prompt'] != false
           email_text = call(:maybe_append_salience, email_text, salience, salience['importance'])
@@ -4769,26 +4794,18 @@ require 'securerandom'
                 { name: 'text' }
               ],
               hint: 'Lightweight entities detected in the salient span (type + text).' },
-            { name: 'cta',
-              hint: 'Detected call-to-action text, if any.' },
-            { name: 'deadline_iso',
-              hint: 'Detected deadline in ISO-8601 format, if any.' },
-            { name: 'focus_preview',
-              hint: 'Trimmed email text used for salience extraction.' },
-            { name: 'responseId',
-              hint: 'Vertex response ID from the salience LLM call, when mode = LLM.' },
-            { name: 'usage',
-              type: 'object',
-              hint: 'Token usage metadata for the salience LLM call, when available.' },
-            { name: 'span_source',
-              hint: 'How the span was obtained: "heuristic" or "llm".' }
+            { name: 'cta', hint: 'Detected call-to-action text, if any.' },
+            { name: 'deadline_iso', hint: 'Detected deadline in ISO-8601 format, if any.' },
+            { name: 'focus_preview', hint: 'Trimmed email text used for salience extraction.' },
+            { name: 'responseId', hint: 'Vertex response ID from the salience LLM call, when mode = LLM.' },
+            { name: 'usage', type: 'object', hint: 'Token usage metadata for the salience LLM call, when available.' },
+            { name: 'span_source', hint: 'How the span was obtained: "heuristic" or "llm".' }
           ]},
 
         # Generator gate: advisory signal for downstream responder
-        { name: 'generator_gate',  stype: 'object',
+        { name: 'generator_gate',  type: 'object',
           properties: [
-            { name: 'pass_to_responder', type: 'boolean',
-              hint: 'True when confidence is at/above the configured threshold; suggested to pass to responder.' },
+            { name: 'pass_to_responder', type: 'boolean', hint: 'True when confidence is at/above the configured threshold; suggested to pass to responder.' },
             { name: 'reason', hint: 'Reason for blocking or caution (e.g., "low_confidence").' },
             { name: 'generator_hint', hint: 'High-level hint for downstream logic (e.g., "proceed", "check_fallback").' }
           ]},
@@ -4799,7 +4816,7 @@ require 'securerandom'
 
         # Standard fields
         { name: 'complete_output', type: 'object',  hint: 'Convenience copy of all business outputs for logging/inspection.' },
-        { name: 'facets', type: 'object', roperties: object_definitions['facets_llm_referee_with_contexts'],
+        { name: 'facets', type: 'object', properties: object_definitions['facets_llm_referee_with_contexts'],
           hint: 'Compact, redaction-safe telemetry facets for this action.' }
       ] + call(:standard_operational_outputs)
     end,
