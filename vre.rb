@@ -334,7 +334,14 @@ require 'securerandom'
                 hint: 'Intent classification (customizes style)' }
             ] }
         ]
-        
+
+        # Channel / mailbox context
+        channel_context_fields = [
+          { name: 'channel_context', label: 'Channel / mailbox context', type: 'object',
+            properties: object_definitions['channel_context'], optional: true,
+            hint: 'Identify which mailbox/channel is replying so the model does not tell users to email this same address.' }
+        ]
+
         # RAG configuration with thresholds
         rag_fields = [
           { name: 'rag_config', label: 'RAG Configuration', type: 'object', ngIf: 'input.mode == "rag_with_context"',
@@ -502,7 +509,21 @@ require 'securerandom'
         ]
       end
     },
-    # NEW 2025-11-14
+    channel_context: {
+      fields: lambda do |_connection, _config_fields|
+        [
+          { name: 'mailbox_address',
+            label: 'Mailbox address',
+            hint: 'e.g. hr@company.com' },
+          { name: 'mailbox_role',
+            label: 'Mailbox role',
+            hint: 'e.g. "HR shared mailbox for employees"' },
+          { name: 'channel_name',
+            label: 'Channel / queue name',
+            hint: 'e.g. "HR Helpdesk"' }
+        ]
+      end
+    },
     pipeline_gate: {
       fields: lambda do |c, cf|
         [
@@ -1844,20 +1865,25 @@ require 'securerandom'
           { name: 'question' },
           { name: 'contexts', type: 'array', of: 'object',
             properties: object_definitions['context_chunk_standard'] },
+
           { name: 'ok', type: 'boolean', convert_output: 'boolean_conversion' },
+
+          # Telemetry stays lean – http_status/message/duration/correlation/local_logs
           { name: 'telemetry', type: 'object', properties: [
             { name: 'http_status', type: 'integer' },
             { name: 'message' },
             { name: 'duration_ms', type: 'integer' },
             { name: 'correlation_id' },
-            { name: 'success_count', type: 'integer' },
-            { name: 'error_count', type: 'integer' },
-            { name: 'partial_failure', type: 'boolean' },
-            { name: 'retrieval_preset' },
-            { name: 'facets', type: 'object', properties: object_definitions['facets_rag_retrieve_contexts_enhanced'] },
+            { name: 'facets', type: 'object',
+              properties: object_definitions['facets_rag_retrieve_contexts_enhanced'] },
             { name: 'local_logs', type: 'array', of: 'object', optional: true }
-          ]}
-        ]
+          ]},
+
+          # Standard pattern: business snapshot + facets at top-level
+          { name: 'complete_output', type: 'object' },
+          { name: 'facets', type: 'object',
+            properties: object_definitions['facets_rag_retrieve_contexts_enhanced'] }
+        ] + call(:standard_operational_outputs)
       end,
       execute: lambda do |connection, input|
         ctx = call(:step_begin!, :rag_retrieve_contexts_enhanced, input)
@@ -3167,24 +3193,36 @@ require 'securerandom'
           'processing_error' => false
         }
       ]
-      
+
       business_data = {
         'question' => 'What is our PTO policy?',
         'contexts' => contexts
       }
-      
-      # Enhanced telemetry with extra fields from the action
-      telemetry = call(:sample_telemetry, 45).merge({
+
+      telemetry = call(:sample_telemetry, 45)
+
+      facets = {
+        'top_k' => 20,
+        'contexts_count' => 2,
         'success_count' => 2,
         'error_count' => 0,
-        'partial_failure' => false
-      })
-      
+        'pdf_contexts_count' => 2,
+        'partial_failure' => false,
+        'retrieval_preset' => 'balanced',
+        'network_error' => false,
+        'correlation_id' => telemetry['correlation_id']
+      }
+
       business_data.merge({
         'ok' => true,
-        'telemetry' => telemetry
+        'complete_output' => business_data.dup,
+        'telemetry' => telemetry.merge('facets' => facets),
+        'facets' => facets,
+        'op_correlation_id' => telemetry['correlation_id'],
+        'op_telemetry' => telemetry
       })
     end,
+
     # Output
     build_complete_output: lambda do |result, action_id, extras={}|
       return result unless result.is_a?(Hash)
@@ -3198,7 +3236,17 @@ require 'securerandom'
       
       # Add complete_output as a clean package
       result['complete_output'] = business_fields
-      result['facets'] = facets if facets.any?
+      
+      if facets.any?
+        # Standard pattern: top-level facets for all actions
+        result['facets'] = facets
+        
+        # Special-case: rag_retrieve_contexts_enhanced exposes facets under telemetry.facets
+        if action_id.to_s == 'rag_retrieve_contexts_enhanced'
+          tel = (result['telemetry'] ||= {})
+          tel['facets'] ||= facets
+        end
+      end
       
       result
     end,
@@ -5017,6 +5065,26 @@ require 'securerandom'
           templates = call(:config_system_prompts)
           base      = templates[tmpl] && templates[tmpl]['prompt']
           system_preamble = base if base
+        end
+      end
+
+      # --- Channel / mailbox context (optional) ---------------------------
+      ch_ctx = input['channel_context']
+      if ch_ctx.is_a?(Hash)
+        mailbox = ch_ctx['mailbox_address'].to_s.strip
+        role    = ch_ctx['mailbox_role'].to_s.strip
+        channel = ch_ctx['channel_name'].to_s.strip
+
+        if !mailbox.empty? || !role.empty? || !channel.empty?
+          channel_text = <<~CH
+            CHANNEL CONTEXT:
+            - You are responding on behalf of #{role.empty? ? 'an internal mailbox' : role}#{mailbox.empty? ? '' : " (#{mailbox})"}.
+            - The employee has already contacted this mailbox.
+            - Never tell them to "email this mailbox" or "contact this email address" – they already did.
+            - When referring to this channel, say "reply to this email" or "our HR/support team" instead of repeating the address.
+          CH
+
+          system_preamble = [system_preamble, channel_text].compact.join("\n\n")
         end
       end
 
