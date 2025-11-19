@@ -1715,28 +1715,12 @@ require 'securerandom'
       end,
       execute: lambda do |connection, input|
         ctx = call(:step_begin!, :llm_referee_with_contexts, input)
-
-        # Add intent gate check
-        if input['intent_kind'].present? && input['intent_kind'] != 'information_request'
-          fallback = input.dig('confidence_config', 'fallback_category') || 'Other'
-          out = {
-            'referee' => { 
-              'category' => fallback,
-              'confidence' => 0.0,
-              'reasoning' => 'Non-information intent blocked',
-              'distribution' => []
-            },
-            'chosen' => fallback,
-            'confidence' => 0.0,
-            'generator_gate' => {
-              'pass_to_responder' => false,
-              'reason' => 'non_information_intent',
-              'generator_hint' => 'blocked'
-            }
-          }
-          return call(:step_ok!, ctx, out, 200, 'OK', { 'blocked_reason' => 'non_information_intent' })
-        end
-
+        # NOTE:
+        # This action no longer enforces intent-based blocking.
+        # Intent (e.g., information_request / action_request / complaint)
+        # should be handled by upstream policy/triage steps and by the recipe,
+        # not by the referee itself.
+        
         # Get categories
         cats_raw = if input['categories_mode'].to_s == 'json' && input['categories_json'].present?
           call(:json_parse_safe, input['categories_json'], type: :array, required: true, allow_wrapper: true)
