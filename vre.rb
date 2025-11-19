@@ -1720,7 +1720,7 @@ require 'securerandom'
         # Intent (e.g., information_request / action_request / complaint)
         # should be handled by upstream policy/triage steps and by the recipe,
         # not by the referee itself.
-        
+
         # Get categories
         cats_raw = if input['categories_mode'].to_s == 'json' && input['categories_json'].present?
           call(:json_parse_safe, input['categories_json'], type: :array, required: true, allow_wrapper: true)
@@ -2495,7 +2495,7 @@ require 'securerandom'
             { name: 'llm_relevance', type: 'number' },
             { name: 'category_alignment', type: 'number' }
           ]},
-          { name: 'context_chunks', type: 'array', of: 'object', properties: object_definitions['context_chunk_standard'] }
+          { name: 'context_chunks', type: 'array', of: 'object', properties: object_definitions['context_chunk_standard'] },
 
           { name: 'confidence_distribution', type: 'array', of: 'object', properties: [
             { name: 'id' },
@@ -3897,11 +3897,6 @@ require 'securerandom'
     path_rag_retrieve_contexts: lambda do |connection|
       "/v1/projects/#{call(:ensure_project_id!, connection)}/locations/#{call(:ensure_location!, connection)}:retrieveContexts"
     end,
-    ensure_project_id!: lambda do |connection|
-      pid = connection['project'].to_s.strip
-      error('Project is required') if pid.empty?
-      pid
-    end,
     ensure_location!: lambda do |connection|
       loc = connection['location'].to_s.strip
       error('Location is required') if loc.empty?
@@ -4661,69 +4656,153 @@ require 'securerandom'
     end,
     # llm_referee_with_contexts
     llm_referee_with_contexts_input_fields: lambda do |object_definitions, connection, config_fields|
-      call(:ui_ref_inputs, object_definitions, config_fields) + [
-        # --- Salience sidecar (disabled by default; 2-call flow when LLM) ---
-        { name: 'salience_mode', label: 'Salience extraction',
-          control_type: 'select', optional: true, default: 'off', extends_schema: true,
-          options: [['Off','off'], ['Heuristic (no LLM)','heuristic'], ['LLM (extra API call)','llm']],
-          hint: 'Extract a salient sentence/paragraph before refereeing. LLM mode makes a separate API call.' },
-        { name: 'salience_append_to_prompt', label: 'Append salience to prompt',
-          type: 'boolean', control_type: 'checkbox', optional: true, default: true,
-          ngIf: 'input.salience_mode != "off"',
-          hint: 'If enabled, the salient span (and light metadata) is appended to the email text shown to the referee.' },
-        { name: 'salience_max_chars', label: 'Salience max chars', type: 'integer',
-          optional: true, default: 500, ngIf: 'input.salience_mode != "off"' },
-        { name: 'salience_include_entities', label: 'Salience: include entities',
-          type: 'boolean', control_type: 'checkbox', optional: true, default: true,
-          ngIf: 'input.salience_mode == "llm"' },
-        { name: 'salience_model', label: 'Salience model',
-          control_type: 'text', optional: true, default: 'gemini-2.0-flash',
-          ngIf: 'input.salience_mode == "llm"' },
-        { name: 'salience_temperature', label: 'Salience temperature',
-          type: 'number', optional: true, default: 0,
-          ngIf: 'input.salience_mode == "llm"' }
-      ] + Array(object_definitions['observability_input_fields'])
+      # Base referee inputs (email_text, categories, shortlist, generative_model, etc.)
+      base = call(:ui_ref_inputs, object_definitions, config_fields)
+
+      show_adv = call(:ui_truthy, config_fields['show_advanced'])
+
+      # --- Salience sidecar (optional; LLM mode is extra API call) ----------
+      salience_fields = [
+        { name: 'salience_mode', label: 'Salience extraction mode', control_type: 'select', optional: true, default: 'off', extends_schema: true,
+          options: [
+            ['Off (no salience extraction)', 'off'],
+            ['Heuristic (no LLM call)', 'heuristic'],
+            ['LLM (extra API call)', 'llm']
+          ],
+          hint: 'Optionally extract a salient sentence/paragraph before refereeing. LLM mode issues a separate generateContent call.' },
+        { name: 'salience_append_to_prompt', label: 'Append salience to prompt', type: 'boolean',
+          control_type: 'checkbox', optional: true, default: true, ngIf: 'input.salience_mode != "off"',
+          hint: 'If enabled, appends the salient span (and light metadata) to the email text shown to the referee.' },
+        { name: 'salience_max_chars', label: 'Salience max characters', type: 'integer', optional: true, default: 500, ngIf: 'input.salience_mode != "off"',
+          hint: 'Maximum length of salient span. The model is instructed not to truncate mid-sentence.' },
+        { name: 'salience_include_entities', label: 'Salience: include entities', type: 'boolean', control_type: 'checkbox', optional: true, default: true,
+          ngIf: 'input.salience_mode == "llm"', hint: 'When using LLM salience, also extract simple entity mentions (type + text).' },
+        { name: 'salience_model', label: 'Salience model', control_type: 'text', optional: true,
+          default: 'gemini-2.0-flash',
+          ngIf: 'input.salience_mode == "llm"', hint: 'Gemini model used for salience extraction when mode = LLM.' },
+        { name: 'salience_temperature', label: 'Salience temperature', type: 'number', optional: true, default: 0,
+          ngIf: 'input.salience_mode == "llm"', hint: 'Temperature used for the salience LLM call (0 = deterministic).' }
+      ]
+
+      # --- Referee prompt + confidence configuration (advanced) -------------
+      referee_config_fields =
+        if show_adv
+          [
+            { name: 'referee_prompt', label: 'Referee prompt configuration', type: 'object', optional: true,
+              properties: [
+                { name: 'template', label: 'Prompt style', control_type: 'select', default: 'balanced',
+                  options: [
+                    ['Strict (high confidence required)', 'strict'],
+                    ['Balanced (single best category)', 'balanced'],
+                    ['Permissive (try to pick best fit)', 'permissive'],
+                    ['Custom system prompt', 'custom']
+                  ],
+                  hint: 'Controls how conservative the referee should be when choosing a category.' },
+                { name: 'custom_prompt', label: 'Custom referee system prompt', control_type: 'text-area', optional: true, ngIf: "input.referee_prompt.template == 'custom'",
+                  hint: 'Override the default system prompt for the referee. Must still instruct the model to output JSON only.' }
+              ] },
+            { name: 'confidence_config', label: 'Confidence & fallback behavior', type: 'object', optional: true,
+              properties: [
+                { name: 'preset', label: 'Threshold preset', control_type: 'select',
+                  default: 'balanced', hint: 'Controls the minimum confidence required to treat the decision as “safe to use”.',
+                  options: [
+                    ['Strict (higher confidence required)', 'strict'],
+                    ['Balanced', 'balanced'],
+                    ['Permissive (accept lower confidence)', 'permissive'],
+                    ['Custom threshold', 'custom']
+                  ] },
+                { name: 'custom_threshold', label: 'Custom min confidence', type: 'number', optional: true, 
+                  ngIf: "input.confidence_config.preset == 'custom'", hint: 'Minimum confidence in [0.0–1.0] required to consider the category reliable.' },
+                { name: 'fallback_category', label: 'Fallback category', optional: true,
+                  hint: 'Category to use when the referee is unsure or below threshold. Defaults to "Other" when not set.' },
+                { name: 'fallback_behavior', label: 'When below threshold', control_type: 'select', optional: true,
+                  default: 'use_fallback', hint: 'How to behave when confidence is below the configured threshold.',
+                  options: [
+                    ['Use fallback category', 'use_fallback'],
+                    ['Return low-confidence result', 'return_low'],
+                    ['Raise an error', 'error']
+                  ] }
+              ] }
+          ]
+        else
+          []
+        end
+
+      base +
+        salience_fields +
+        referee_config_fields +
+        Array(object_definitions['observability_input_fields'])
     end,
     llm_referee_with_contexts_output_fields: lambda do |object_definitions, connection|
       [
-        # Critical business outputs
-        { name: 'chosen', hint: 'CRITICAL: Used by steps 6-8' },
-        { name: 'confidence', type: 'number' },
+        # Primary decision used by downstream steps
+        { name: 'chosen', hint: 'Final chosen category for the email (after applying thresholds/fallbacks).' },
+        { name: 'confidence', type: 'number', hint: 'Referee confidence in the chosen category, clamped to [0,1].' },
 
-        { name: 'referee', type: 'object', properties: [
-          { name: 'category' },
-          { name: 'confidence', type: 'number' },
-          { name: 'reasoning' },
-          { name: 'distribution', type: 'array', of: 'object',
-            properties: object_definitions['scored_category'] }  # Reuse for distribution
-        ]},
+        # Raw referee output
+        { name: 'referee', type: 'object',
+          properties: [
+            { name: 'category',
+              hint: 'Category selected directly by the referee model before fallback logic.' },
+            { name: 'confidence',
+              type: 'number',
+              hint: 'Raw confidence reported by the referee model.' },
+            { name: 'reasoning',
+              hint: 'Short explanation of why the category was chosen.' },
+            { name: 'distribution',
+              type: 'array',
+              of: 'object',
+              properties: object_definitions['scored_category'],
+              hint: 'Optional probability-like distribution over categories (category + prob).' }
+          ]},
 
-        # Optional salience
-        { name: 'salience', type: 'object', properties: [
-          { name: 'span' },
-          { name: 'reason' },
-          { name: 'importance', type: 'number' },
-          { name: 'tags', type: 'array', of: 'string' },
-          { name: 'entities', type: 'array', of: 'object' },
-          { name: 'cta' },
-          { name: 'deadline_iso' },
-          { name: 'focus_preview' },
-          { name: 'responseId' },
-          { name: 'usage', type: 'object' },
-          { name: 'span_source' }
-        ]},
+        # Optional salience sidecar
+        { name: 'salience', type: 'object',
+          properties: [
+            { name: 'span', hint: 'Most important sentence/paragraph extracted from the email.' },
+            { name: 'reason', hint: 'Why this span was selected as salient.' },
+            { name: 'importance', type: 'number', hint: 'Importance score in [0,1] as estimated by the model.' },
+            { name: 'tags', type: 'array', of: 'string', hint: 'Optional tags associated with the salient span.' },
+            { name: 'entities', type: 'array', of: 'object',
+              properties: [
+                { name: 'type' },
+                { name: 'text' }
+              ],
+              hint: 'Lightweight entities detected in the salient span (type + text).' },
+            { name: 'cta',
+              hint: 'Detected call-to-action text, if any.' },
+            { name: 'deadline_iso',
+              hint: 'Detected deadline in ISO-8601 format, if any.' },
+            { name: 'focus_preview',
+              hint: 'Trimmed email text used for salience extraction.' },
+            { name: 'responseId',
+              hint: 'Vertex response ID from the salience LLM call, when mode = LLM.' },
+            { name: 'usage',
+              type: 'object',
+              hint: 'Token usage metadata for the salience LLM call, when available.' },
+            { name: 'span_source',
+              hint: 'How the span was obtained: "heuristic" or "llm".' }
+          ]},
 
-        # Signal for downstream
-        { name: 'signals_category', hint: 'Copy of chosen for downstream' },
-        { name: 'signals_confidence', hint: 'Confidence for downstream use' },
+        # Generator gate: advisory signal for downstream responder
+        { name: 'generator_gate',  stype: 'object',
+          properties: [
+            { name: 'pass_to_responder', type: 'boolean',
+              hint: 'True when confidence is at/above the configured threshold; suggested to pass to responder.' },
+            { name: 'reason', hint: 'Reason for blocking or caution (e.g., "low_confidence").' },
+            { name: 'generator_hint', hint: 'High-level hint for downstream logic (e.g., "proceed", "check_fallback").' }
+          ]},
+
+        # Signals surfaced for pipeline use
+        { name: 'signals_category', hint: 'Copy of chosen category for downstream stages.' },
+        { name: 'signals_confidence', type: 'number', hint: 'Copy of confidence for downstream stages.' },
 
         # Standard fields
-        { name: 'complete_output', type: 'object' },
-        { name: 'facets', type: 'object',
-          properties: object_definitions['facets_llm_referee_with_contexts'] }
+        { name: 'complete_output', type: 'object',  hint: 'Convenience copy of all business outputs for logging/inspection.' },
+        { name: 'facets', type: 'object', roperties: object_definitions['facets_llm_referee_with_contexts'],
+          hint: 'Compact, redaction-safe telemetry facets for this action.' }
       ] + call(:standard_operational_outputs)
     end,
-
     # Steps
     step_begin!: lambda do |action_id, input|
       { 'action'=>action_id.to_s, 'started_at'=>Time.now.utc.iso8601,
