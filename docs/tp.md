@@ -1,252 +1,263 @@
-# Alpha / Shadow-Testing Plan — RAG Email Responder (Vertex AI + Workato)
-
-## 1) Goals, scope, and guardrails
-
-**Primary goals**
-
-* Validate end-to-end correctness on *real* incoming emails in shadow mode.
-* Prove baseline **quality**, **latency**, **cost**, and **operability** with strong telemetry.
-* Shake out auth/permissions, object shape mismatches, retry/idempotency, and logging.
-
-**In scope**
-
-* Actions: `rag_retrieve_contexts`, `rag_answer`, `gen_generate`, `rank_texts_with_ranking_api`, `gen_categorize_email`, `email_extract_salient_span`.
-* Ingestion path (Drive → GCS → chunk/embeds → index upsert) and serving path (query → retrieve → (optional re-rank) → generate).
-* Observability via **Cloud Logging** tail calls (one log per outcome), correlation IDs, sampling.
-
-**Out of scope (alpha)**
-
-* Managed rollout to production inboxes.
-* Cost optimization beyond obvious quick wins.
-* Corpus-wide taxonomy/ontology work.
-
-**Guardrails**
-
-* Never auto-send. Shadow only: log proposed reply + confidence + citations.
-* Strict PII handling: redact before logs; no payloads with secrets in Cloud Logging.
+Nice, greenfield-ish systems project with just enough spreadsheet chaos to be fun. Let’s load you up so that first call actually sets you up, not just generates more tabs.
 
 ---
 
-## 2) Entry & exit criteria
+## 1. What you’re trying to get out of the intake call
 
-**Entry**
+You don’t have to say all this out loud, but these are your internal goals:
 
-* Service account scopes validated; Vertex & Logging APIs enabled.
-* Connectors load cleanly; required `object_definitions` present; sample outputs render pills.
-* Tail logger wired (`tail_log_begin!` / `tail_log_end!` or equivalent) and **does not raise** on failure.
-
-**Exit (ship to limited beta if all true)**
-
-* ≥ **85%** of golden emails scored **Good or better** by rubric below.
-* **P50 latency ≤ 3.0s**, **P95 ≤ 7.0s** end-to-end per email (receive → candidate reply).
-* **Hallucination rate ≤ 5%** (any non-supported factual claim).
-* **No data-loss bugs**, **no auth regressions**, **no schema breakages** for one week.
-* **Cost per shadowed email ≤ $0.015** (rough ceiling; adjust once measured).
+* Understand **why** they track contractor performance (business outcomes, not just “because we always have”).
+* Map **how work actually flows** today (not just what’s on the spreadsheet).
+* Nail down **what “good” looks like** for the future system (MVP + “in a perfect world”).
+* Surface **landmines** early: sensitive notes, politics, legal/HR constraints, timezones, renewals, etc.
 
 ---
 
-## 3) Test data & evaluation artifacts
+## 2. Simple agenda for a 60-min intake
 
-**Golden set (truth data)**
+You can roughly timebox like this:
 
-* 150–250 real historical emails (or synthetic mirrors) across top 8–10 categories you care about.
-* For each: a **golden reply** + **allowed sources** (doc IDs) + **must-cite items** (facts/links).
-* Negative controls: 15–25 emails with **no answerable content** (expect refusal/clarifying question).
+1. **Context + goals (5–10 min)**
 
-**Shadow stream**
+   * Why we’re here, what problem we’re solving, what success would look like.
 
-* Live emails from selected inbox(es) copied to a “shadow” label or forwarding rule.
-* System produces candidate reply + confidence + citations, but **does not send**.
+2. **Current process + spreadsheet tour (15–20 min)**
 
-**Annotation rubric (per email)**
+   * Walk through the master tab and one real employee tab.
+   * Have them narrate how they actually use it.
 
-* **Factuality** (Attributable to sources) 0–2
-* **Coverage** (addresses user intent) 0–2
-* **Style fit** (concise, actionable) 0–1
-* **Safety/Policy** (no leaks/toxicity) pass/fail
-  Overall: **Excellent (5), Good (4), Borderline (3), Poor (≤2)**
+3. **What they wish they had (15–20 min)**
 
----
+   * Reporting, alerts, workflows, automation.
+   * Gaps and annoyances.
 
-## 4) Metrics to track (daily roll-ups)
+4. **Constraints, risks, and adoption (10–15 min)**
 
-**Quality**
-
-* Golden accuracy: % Excellent/Good.
-* **Faithfulness**: % claims verifiably supported by cited contexts.
-* **Hallucination**: % with unsupported claims.
-* **Refusal correctness** on negatives.
-
-**Retrieval**
-
-* **Recall@k** vs golden sources (did required doc IDs appear in retrieved set?).
-* **MRR / nDCG** on doc ranking when a ranker is used.
-
-**Latency (ms)**
-
-* Breakdown: retrieve → rank → generate → total. Track **P50/P90/P95/MAX**.
-
-**Cost**
-
-* Per email: embedding + retrieval + ranking + generation token costs (approximate from model usage).
-* **Cost per correct** reply.
-
-**Ops**
-
-* Error rate (by category), retry rate, timeout rate.
-* Tail-logger success rate (should be ≥99.9% and never block).
+   * Who needs access, what’s sensitive, what’s non-negotiable.
+   * Phasing: MVP vs later dreams.
 
 ---
 
-## 5) Test matrix (what to actually run)
+## 3. Concrete questions you can ask
 
-**A. Functional**
+### A. Outcomes: why does this system exist at all?
 
-* Each action executes with valid inputs; schema emits expected shapes (including `emit_parts`).
-* Retry/idempotency doesn’t duplicate logs or GCS transfers.
-* Permissions: shared drives, nested folders, MIME types (PDF, DOCX, email threads), large files.
+You’re trying to zoom out from “we have tabs” to “we’re managing risk and performance.”
 
-**B. Retrieval quality**
+* “If this system were **working perfectly** a year from now, what would be different in your day-to-day?”
+* “When you say ‘performance’ for contractors, what do you *actually* care about?
 
-* Vary `top_k`, threshold (`vector_distance_threshold` or `vector_similarity_threshold`) independently.
-* Constrain by `restrict_to_file_ids` and confirm limits respected.
+  * Quality of work?
+  * Reliability/attendance?
+  * Speed?
+  * Communication?
+  * Cultural fit?”
+* “What are the **scary scenarios** this system should help you catch early? (e.g., underperformers, missed deadlines, missed renewals, legal/compliance risk)”
+* “Who outside your team cares about this data? Leadership, HR, finance, vendor management?”
 
-**C. Ranking**
-
-* Compare **no ranker** vs **ranking API** vs **LLM ranker** on golden recall and nDCG.
-* Measure ranker overhead (ms) and net quality delta.
-
-**D. Generation**
-
-* System prompt variants, citation styles (inline vs footnote), max tokens.
-* **Confidence pill** emitted and sensible (e.g., calibrated to retrieval scores + heuristics).
-
-**E. Categorization & extraction**
-
-* `gen_categorize_email` accuracy on policy labels.
-* `email_extract_salient_span` correctness for fields you’ll later automate.
-
-**F. Robustness**
-
-* Timeouts from Vertex; upstream 429/5xx; Workato transient faults.
-* Oversized inputs; malformed HTML; empty/ambiguous emails; multi-language.
-* Backpressure: queue 50–100 emails rapidly → no meltdown, graceful tail latency.
-
-**G. Safety**
-
-* Toxic content, prompt injection attempts, “answer beyond corpus” tests → safe refusals.
+These answers define your *north star* and later what you prioritize.
 
 ---
 
-## 6) Shadow-mode flow (wire-level)
+### B. Current process: how do they really use the spreadsheet?
 
-1. **Ingestion sanity** (daily): Drive→GCS→chunk→embed→upsert jobs complete; log counts match.
-2. **Shadow intake**: Gmail label/forward → Workato recipe triggers.
-3. **Pipeline**: categorize → retrieve → (optional rank) → generate → produce **candidate** reply.
-4. **Emit**: log envelope (one per outcome), store candidate in Data Table + Sheet row.
-5. **Human review**: annotators rate and, if needed, hand-edit reply (logged).
-6. **Feedback**: collect scores, reasons, doc gaps → weekly patch to corpus or prompts.
+You already know the structure; dig into behavior:
 
----
+* “Walk me through a typical **new contractor**:
 
-## 7) Telemetry & logging (Cloud Logging)
+  * Where do they first get added?
+  * Who fills in the master tab fields?
+  * When does their individual tab get created?”
+* “How do 1:1 notes actually get used?
 
-**Envelope (minimum)**
+  * Do people refer back to them before reviews?
+  * Or is it more ‘write once, never look again’?”
+* “What triggers someone to **open** an employee’s tab?
 
-* `correlation_id`, `action_id`, `recipe_id`, `email_msg_id`, `severity`
-* `begun_at`, `ended_at`, `latency_ms`
-* `component` (ingest/retrieve/rank/generate/respond)
-* `model`, `index_endpoint`, `top_k`, `threshold`, `ranker`
-* `result_meta` (token counts, retrieved_doc_ids[], citation_doc_ids[])
-* `outcome` (success|failure|refusal), `error_class`, `error_message_shrunk`
+  * Scheduled 1:1s?
+  * Performance concerns?
+  * Vendor review cycles?”
+* “What parts of the spreadsheet do you **trust** vs **ignore**?
 
-**Explorer quick filters (paste-ready)**
+  * Any columns or tabs that are basically dead?”
+* “Where does this process **break down** today?
 
-* `resource.type="global" AND jsonPayload.component="generate" | stats quantile(latency_ms,50), quantile(latency_ms,95)`
-* `jsonPayload.outcome="failure" | count by error_class`
-* `jsonPayload.component="retrieve" | top 20 jsonPayload.index_endpoint`
-* `jsonPayload.component="retrieve" | histogram jsonPayload.latency_ms`
-* `jsonPayload.outcome="success" AND jsonPayload.component="generate" | avg jsonPayload.result_meta.token_output`
+  * People forget to update?
+  * Conflicting info between tabs?
+  * Hard to find someone?
+  * No clear history?”
 
-**Rules**
+If you want to be slightly spicy:
 
-* **One log per outcome**. Logging must **never raise** or block.
-* Non-canonical severities prefixed `NONSTANDARD/…`, but normalize to `DEBUG|INFO|WARNING|ERROR`.
+> “If I deleted this entire spreadsheet tomorrow, what would you actually be upset about losing?”
 
----
-
-## 8) Evaluation harness (fast and lightweight)
-
-**Google Sheet (Shadow Eval) — columns**
-
-* `timestamp`, `email_msg_id`, `from`, `subject`, `category`, `candidate_reply`, `citations`, `confidence`, `golden_reply? (Y/N)`, `annotator_rating (0–5)`, `hallucination? (Y/N)`, `notes`, `correlation_id`, `latency_ms`, `cost_estimate_usd`
-
-**Apps Script**
-
-* Import daily Cloud Logging export (or webhook) → append rows.
-* Simple dashboard: counts by rating, latency percentiles, error classes.
-* Weekly snapshot tab for trending.
+That tells you the true critical fields.
 
 ---
 
-## 9) Tuning plan (tight loop)
+### C. Data model: what are these fields *really* meant to represent?
 
-1. **Week 1 (stabilize)**
+You can use the existing sheet as your starter schema.
 
-   * Focus: schema breaks, permissions, tail logging, timeouts.
-   * Tune: `top_k` to 12, add similarity threshold (start 0.75 for cosine-like), no ranker.
-   * Target: minimize failures, get P95 < 8s.
+**Master tab fields:**
 
-2. **Week 2 (quality push)**
+* “Master tab: which columns are **mandatory** vs ‘nice-to-have’?”
+* “Is there anything important you track **outside** this sheet (HRIS, vendor portal, time tracking) that we should consider linking to?”
+* “Is ‘group’ and ‘role’ a fixed list, or does it change constantly?”
+* “Do you ever need **history** for master data? e.g., role changes, lead changes, group changes.”
 
-   * A/B: Add ranking API vs no ranker; test one LLM ranker pass.
-   * Prompt: tighten system preamble, enforce “answer only from citations”.
-   * Target: ≥85% Good+, hallucination ≤5%, cost ≤$0.015/email.
+**Per-employee tab fields:**
 
-(If you need tighter timing, compress to 7–10 days; same sequence.)
+* “For the per-employee tabs, what decisions do you make using:
 
----
+  * `notes`
+  * `personal notes`
+  * `reminders`
+  * `metrics`?”
+* “Are `personal notes` things we’d *never* want widely shared?
 
-## 10) Risk register (alpha-relevant)
+  * How sensitive is that: coaching notes, health issues, ‘vibes’, escalation history?”
+* “What goes into `metrics` today?
 
-* **Auth drift** (projects/regions/env) → enforce `ensure_project_id!`, `ensure_regional_location!`.
-* **Schema mismatches** (Workato pills) → freeze `object_definitions` and version increment on change.
-* **Long-tail formats** (scanned PDFs) → OCR fallback or mark unanswerable.
-* **Ranker overhead** inflates latency → keep switchable and sample only 20–30% initially.
-* **Prompt injection** → strict refusal if no supporting context; never browse external links at gen time.
+  * Is it numeric KPIs, qualitative ratings, or a mix?
+  * Are metrics consistent across employees, or does each lead freestyle?”
 
----
-
-## 11) Triage, bug bar, and ownership
-
-**Priority**
-
-* P0: data loss, auth failure, sending email by mistake, P95 > 15s sustained.
-* P1: hallucination >10%, schema/pill breakage in any action.
-* P2: cosmetic, rare edge formats.
-
-**Owners (suggested)**
-
-* Ingestion & indexing: You (+ backup)
-* Serving path & ranking: You
-* Observability (logs/Sheets): You
-* Annotation & rubric: trusted reviewer(s)
+This gives you a clean path to a normalized data model later.
 
 ---
 
-## 12) What to decide now (so we can execute)
+### D. Workflow: what’s the lifecycle of a contractor?
 
-* **Confidence pill** formula (for display): combine normalized retrieval score + ranker agreement + citation density. Start with simple min-max of top-3 similarity and clamp to [0.0–1.0]; label **Low <0.45 / Med 0.45–0.7 / High >0.7**.
-* **Ranker sampling**: 30% of emails in Week 2.
-* **Refusal policy**: If **no retrieved contexts pass threshold**, output friendly clarification with 0.00 confidence.
+Think in phases: **onboard → active → flagged → offboarded/ended**.
+
+* “At what points in a contractor’s lifecycle do you **need to log something**?
+
+  * Day 1?
+  * First 30/60/90 days?
+  * After every 1:1?
+  * When performance concerns arise?
+  * When you decide to renew / not renew?”
+* “When someone is **struggling**, how does that show up in the current system?
+
+  * Is there a flag?
+  * More notes?
+  * Different meeting cadence?”
+* “Do you have any **formal checkpoints** (e.g., at contract renewal time) where you wish you had better data?”
+* “What are the **typical actions** you take based on this data?
+
+  * Coaching plans?
+  * Contract termination?
+  * Changing teams/roles?
+  * Vendor feedback?”
+
+You’re fishing for triggers, statuses, and events that will later become workflow steps and states.
 
 ---
 
-## 13) Minimal task list to kick off (today)
+### E. Reporting: what questions do they want answered at a glance?
 
-* Wire tail logs across all listed actions (verify one-per-outcome).
-* Export Logging sinks to BigQuery **or** pull to Sheets nightly.
-* Finalize the 200-email golden set + rubric.
-* Add ranker toggle + threshold fields in actions (with hints that enforce ONE threshold at a time).
-* Create the Shadow Eval Sheet + Apps Script stub.
-* Start Week-1 run; review daily at fixed time with metrics snapshot.
+This is where you steer them from “rows” to “views.”
+
+* “What are the **top 5 questions** you ask of this data that currently take too long to answer?”
+
+  * “Who is at risk?”
+  * “Who is up for renewal soon?”
+  * “Who are our top performers in X region/role/vendor?”
+  * “Which leads have too many direct reports?”
+* “Do you have any **recurring meetings** where you manually prep data from this sheet?
+
+  * 1:1s, leadership reviews, vendor check-ins?”
+* “If you had a **single dashboard**, what would absolutely need to be on it?”
+
+Good litmus test:
+
+> “What’s the last screenshot of this sheet you dropped into a slide or email? Why that view?”
+
+---
+
+### F. Roles, access, and sensitive information
+
+You’ve got `personal notes`, `reminders`, maybe sensitive stuff. Better to surface this early.
+
+* “Who should be able to **see everything** vs only their own team?”
+* “Should leads see each other’s `personal notes`? Or is that restricted?”
+* “Do contractors *ever* see anything from this system? (Now or in the future?)”
+* “Any legal or HR constraints we should be aware of around:
+
+  * documenting performance,
+  * documenting health/personal issues,
+  * retaining notes for X years?”
+
+This is the difference between “cute dashboard” and “please enjoy your regulatory problem.”
+
+---
+
+### G. Integrations & tech constraints (light-touch on intake call)
+
+You don’t need to architect on call, just map reality:
+
+* “What systems already know about these people?
+
+  * HRIS?
+  * Vendor / MSP system?
+  * Time-tracking or ticketing (Jira, ServiceNow, etc.)?”
+* “Do you have any **non-starters**?
+
+  * ‘No new logins’
+  * ‘Must stay in Google Workspace / Sheets’
+  * ‘Cannot store X data outside our region’”
+* “Are there IT/security folks we should pull in early for data and access questions?”
+
+---
+
+### H. MVP vs later phases
+
+You want them to *prioritize*, not dump a wish list.
+
+* “If we only shipped something small in **4–6 weeks**, what would be the most valuable thing it could do?”
+
+  * Example prompts:
+
+    * “Even just standardized 1:1 notes + reminders?”
+    * “Or a clean dashboard of who’s at risk and who’s up for renewal?”
+* “What belongs in **v2 or v3**?
+
+  * Fancy analytics, automated nudges, integration with HRIS, vendor scorecards, etc.”
+
+You’re drawing a line between “must have to replace your current sheet” and “nice future candy.”
+
+---
+
+## 4. A quick “opening spiel” you can adapt
+
+Steal and tweak:
+
+> “Today I want to understand how you’re actually managing contractor performance today – beyond what the spreadsheet *says* you do – and where it’s failing you.
+> I’m especially interested in:
+>
+> * what decisions you need to make,
+> * what information you trust or don’t trust in the current sheet,
+> * and what a realistic ‘version 1’ of a better system would look like.
+>
+> By the end of the call, I’d like us to have:
+>
+> * a shared picture of your current process,
+> * your top success criteria,
+> * and a rough idea of what’s MVP vs ‘future nice-to-have’.”
+
+Short, honest, and makes them feel like co-designers, not survey respondents.
+
+---
+
+## 5. One “fun” question to end on
+
+Close with something slightly more human:
+
+* “If this new system had a **superpower** your spreadsheet never had, what would it be?”
+* “What’s one thing you’d *love* to stop doing manually?”
+
+That often surfaces the thing they really care about but didn’t know how to frame.
+
+---
+
+From this intake, you’ll have enough to sketch: entities (contractor, lead, group), lifecycle states, events (1:1, concern raised, renewal), and the early shape of metrics and dashboards. That’s the backbone of something a lot more robust than “master tab + chaos.”
