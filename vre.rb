@@ -612,6 +612,20 @@ require 'securerandom'
       execute: lambda do |connection, input|
         ctx = call(:step_begin!, :deterministic_filter, input)
         
+        # 1. Resolve decision labels
+        labels = call(:resolve_decision_lables, input)
+
+        # Get email type action mappings
+        type_mappings = input['email_type_mapping'] || {}
+        resolve_action = lambda do |configured_val, default_label|
+          case configured_val
+          when 'HUMAN' then labels['review']
+          when 'IRRELEVANT' then labels['drop']
+          when 'KEEP' then labels['keep']
+          else default_label
+          end
+        end
+
         env = call(:norm_email_envelope!, (input['email'] || input))
         subj, body, email_text = env['subject'], env['body'], env['email_text']
 
@@ -642,9 +656,6 @@ require 'securerandom'
             { 'keep' => 6, 'triage_min' => 4, 'triage_max' => 5 }
           end
         end
-        
-        # Get email type action mappings
-        type_mappings = input['email_type_mapping'] || {}
 
         # Defaults
         email_type = 'direct_request'
@@ -3880,6 +3891,16 @@ require 'securerandom'
         }
       ]
 
+      decision_label_fields = [
+        { name: 'decision_labels', label: 'Decision terminology', type: 'object', optional: true,
+          hint: 'Customize the output strings (default: KEEP, IRRELEVANT, HUMAN)',
+          properties: [
+            { name: 'keep_label', default: 'KEEP'},
+            { name: 'review_label', default: 'HUMAN'},
+            { name: 'drop_label', default: 'IRRELEVANT'}
+          ]
+        }
+      ]
       # Add configurable email type mappings (advanced only)
       email_type_fields =
         if config_fields['show_advanced']
@@ -3905,7 +3926,7 @@ require 'securerandom'
           []
         end
 
-      base + threshold_fields + email_type_fields + Array(object_definitions['observability_input_fields'])
+      base + threshold_fields + decision_label_fields + email_type_fields + Array(object_definitions['observability_input_fields'])
     end,
     deterministic_filter_output_fields: lambda do |object_definitions, connection|
       [
@@ -4717,19 +4738,22 @@ require 'securerandom'
 
       { score: score, matched: hits }
     end,
-    hr_eval_decide: lambda do |score, thr|
-      keep = (thr['keep'] || 6).to_i
+    hr_eval_decide: lambda do |score, thr, labels|
+      # Resolve threshold values
+      keep_val = (thr['keep'] || 6).to_i
       lo   = (thr['triage_min'] || 4).to_i
       hi   = (thr['triage_max'] || 5).to_i
 
-      # Ensure lo <= hi
-      if lo > hi
-        lo, hi = hi, lo  # Swap if reversed
-      end      
+      # Swap if reversed
+      lo, hi = hi, lo if lo > hi
 
-      if score >= keep then 'HR-REQUEST'
-      elsif score >= lo && score <= hi then 'HUMAN'
-      else 'IRRELEVANT'
+      # Logic using dynamic labels
+      if score >= keep_val
+        labels['keep']
+      elsif score >= lo && score <= hi
+        labels['review']
+      else
+        labels['drop']
       end
     end,
     hr_eval_guards_ok?: lambda do |category, email, guards|
@@ -6467,6 +6491,21 @@ require 'securerandom'
           hint: 'Tracking ID across all stages' },
         { name: 'op_debug', type: 'boolean', optional: true }
       ]
+    end,
+
+    resolve_decision_lables: lambda do |input|
+      # Default fallbacks
+      defaults = { 'keep' => 'KEEP', 'review' => 'HUMAN', 'drop' => 'IRRELEVANT' }
+
+      # Override if input includes custom labels
+      if input['decision_labels'].is_a?(Hash)
+        user = input['decision_labels']
+        defaults['keep'] = user['keep_label'] if user['keep_label'].present?
+        defaults['review'] = user['review_label'] if user['review_label'].present?
+        defaults['drop'] = user['drop_label'] if user['drop_label'].present?
+      end
+
+      defaults
     end,
 
     # --- Configuration Templates -----------------------------------
