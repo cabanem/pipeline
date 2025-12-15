@@ -170,8 +170,11 @@ require 'securerandom'
           { name: 'generative_model', type: 'string', optional: true, hint: 'Model used for ranking' },
           { name: 'categories_mode', type: 'string', hint: 'Categories input mode' },
           { name: 'prompt_template', type: 'string', optional: true, hint: 'Prompt template used' },
-          { name: 'concentration', type: 'string', optional: true, hint: 'Distribution concentration' },
+          { name: 'concentration', type: 'string', optional: true, hint: 'Distribution concentration setting' },
           { name: 'temperature', type: 'number', optional: true, hint: 'Temperature setting' },
+          { name: 'distribution_source', type: 'string', hint: 'llm, fallback, uniform, or none' },
+          { name: 'distribution_count', type: 'integer', hint: 'Number of items in distribution' },
+          { name: 'distribution_entropy', type: 'number', optional: true, hint: 'Distribution entropy' },
           { name: 'correlation_id', type: 'string', optional: true }
         ]
       end
@@ -240,6 +243,10 @@ require 'securerandom'
           { name: 'category_filtered', type: 'boolean', hint: 'Category filtering applied' },
           { name: 'ranking_prompt', type: 'string', hint: 'Ranking prompt template' },
           { name: 'weights_preset', type: 'string', hint: 'Score weights preset' },
+          { name: 'coverage_signal', type: 'string', hint: 'strong, moderate, weak, or gap' },
+          { name: 'distribution_entropy', type: 'number', optional: true, hint: 'Distribution entropy' },
+          { name: 'distribution_max_prob', type: 'number', optional: true, hint: 'Maximum probability' },
+          { name: 'distribution_concentration', type: 'number', optional: true, hint: 'Distribution concentration' },
           { name: 'correlation_id', type: 'string', optional: true }
         ]
       end
@@ -1289,8 +1296,9 @@ require 'securerandom'
           out     = { 'ranking' => ranking, 'shortlist' => sl }.merge(signals)
 
           return call(:step_ok!, ctx, out, 200, 'OK', {
-            'mode'             => 'none',
-            'categories_ranked'=> sl.length
+            'mode'              => 'none',
+            'categories_ranked' => sl.length,
+            'distribution_source' => 'none'
           })
         end
 
@@ -1299,11 +1307,25 @@ require 'securerandom'
           sl = call(:safe_array, input['shortlist'])
           prob = sl.empty? ? 0.0 : (1.0 / sl.length.to_f)
           ranking = sl.map { |c| { 'category' => c, 'prob' => prob } }
-          out     = { 'ranking' => ranking, 'shortlist' => sl }.merge(signals)
+          
+          # Compute distribution stats for score-based mode
+          dist_stats = {
+            'entropy'       => sl.empty? ? 0.0 : Math.log(sl.length).round(4),
+            'max_prob'      => prob,
+            'min_prob'      => prob,
+            'concentration' => 0.0  # Uniform distribution has zero concentration
+          }
+          
+          out = { 
+            'ranking' => ranking, 
+            'shortlist' => sl,
+            'distribution_stats' => dist_stats
+          }.merge(signals)
 
           return call(:step_ok!, ctx, out, 200, 'OK', {
-            'mode'             => 'score_based',
-            'categories_ranked'=> sl.length
+            'mode'               => 'score_based',
+            'categories_ranked'  => sl.length,
+            'distribution_source' => 'uniform'
           })
         end
 
@@ -1387,19 +1409,16 @@ require 'securerandom'
             max_tokens
           )
 
-          dist = call(:safe_distribution_array, ref['distribution']).map do |d|
-            {
-              'category'  => d['category'],
-              'prob'      => d['prob'].to_f,
-              'reasoning' => d['reasoning']
-            }
-          end
+          # Use ensure_distribution helper for robust distribution extraction
+          dist_result = call(:ensure_distribution, ref, shortlist)
+          dist = dist_result['distribution']
+          distribution_source = dist_result['source']
 
           # Apply distribution configuration
           if normalize_dist && dist.any?
             total = dist.sum { |d| d['prob'].to_f }
             total = 1.0 if total <= 0
-            dist.each { |d| d['prob'] = d['prob'].to_f / total }
+            dist.each { |d| d['prob'] = (d['prob'].to_f / total).round(6) }
           end
 
           # Apply minimum probability if configured (> 0)
@@ -1411,14 +1430,14 @@ require 'securerandom'
             if normalize_dist
               total = dist.sum { |d| d['prob'].to_f }
               total = 1.0 if total <= 0
-              dist.each { |d| d['prob'] = d['prob'].to_f / total }
+              dist.each { |d| d['prob'] = (d['prob'].to_f / total).round(6) }
             end
           end
 
           # Ensure all shortlist items present
           missing = shortlist - dist.map { |d| d['category'] }
           missing.each do |m|
-            dist << { 'category' => m, 'prob' => min_prob.to_f, 'reasoning' => nil }
+            dist << { 'category' => m, 'prob' => min_prob.to_f, 'reasoning' => nil, 'source' => 'added_missing' }
           end
 
           # Final ranking
@@ -1430,10 +1449,10 @@ require 'securerandom'
           max_prob = probs.max || 0.0
           min_prob_obs = probs.min || 0.0
           conc_val = if probs.length > 1 && entropy > 0
-                       (1.0 - entropy / Math.log(probs.length)).round(4)
-                     else
-                       0.0
-                     end
+                      (1.0 - entropy / Math.log(probs.length)).round(4)
+                    else
+                      0.0
+                    end
 
           dist_stats = {
             'entropy'       => entropy.round(4),
@@ -1445,18 +1464,22 @@ require 'securerandom'
           out = {
             'ranking'            => ranking,
             'shortlist'          => ranking.map { |r| r['category'] },
-            'distribution_stats' => dist_stats
+            'distribution_stats' => dist_stats,
+            'distribution_source' => distribution_source
           }.merge(signals)
 
           call(:step_ok!, ctx, out, 200, 'OK', {
-            'mode'              => 'llm',
-            'top_prob'          => ranking.first ? ranking.first['prob'] : 0,
-            'categories_ranked' => ranking.length,
-            'generative_model'  => generative_model,
-            'categories_mode'   => input['categories_mode'] || 'array',
-            'prompt_template'   => template,
-            'concentration'     => concentration,
-            'temperature'       => temperature
+            'mode'               => 'llm',
+            'top_prob'           => ranking.first ? ranking.first['prob'] : 0,
+            'categories_ranked'  => ranking.length,
+            'generative_model'   => generative_model,
+            'categories_mode'    => input['categories_mode'] || 'array',
+            'prompt_template'    => template,
+            'concentration'      => concentration,
+            'temperature'        => temperature,
+            'distribution_source' => distribution_source,
+            'distribution_count' => dist.length,
+            'distribution_entropy' => entropy.round(4)
           })
         rescue => e
           call(:step_err!, ctx, e)
@@ -2299,17 +2322,33 @@ require 'securerandom'
           ]},
           { name: 'context_chunks', type: 'array', of: 'object', properties: object_definitions['context_chunk_standard'] },
 
+          # Distribution (always present)
           { name: 'confidence_distribution', type: 'array', of: 'object', properties: [
             { name: 'id' },
             { name: 'probability', type: 'number' },
+            { name: 'score', type: 'number' },
             { name: 'reasoning' }
           ]},
+          
+          # Distribution statistics (always present)
+          { name: 'distribution_stats', type: 'object', properties: [
+            { name: 'entropy', type: 'number', hint: 'Higher entropy = more spread out distribution' },
+            { name: 'max_prob', type: 'number' },
+            { name: 'min_prob', type: 'number' },
+            { name: 'concentration', type: 'number', hint: '0 = uniform, 1 = peaked' },
+            { name: 'count', type: 'integer' }
+          ]},
+          
+          # Coverage signal for gap analysis
+          { name: 'coverage_signal', hint: 'strong, moderate, weak, or gap' },
+          
           { name: 'ranking_metadata', type: 'object', properties: [
             { name: 'category' },
             { name: 'llm_model' },
             { name: 'contexts_filtered', type: 'integer' },
             { name: 'contexts_ranked', type: 'integer' },
-            { name: 'score_weights', type: 'object' }
+            { name: 'score_weights', type: 'object' },
+            { name: 'coverage_signal' }
           ]},
           { name: 'complete_output', type: 'object' },
           { name: 'facets', type: 'object', properties: object_definitions['facets_rank_texts_with_ranking_api'] }
@@ -2436,7 +2475,8 @@ require 'securerandom'
           max_llm_contexts  = (ranking_config['llm_max_contexts'] || 50).to_i
           top_n             = ranking_config['top_n']
 
-          distribution = nil
+          # Initialize LLM scores tracker
+          llm_scores = {}
 
           # Initialize all records with base scores
           enriched = records_to_rank.map do |orig|
@@ -2465,7 +2505,6 @@ require 'securerandom'
             )
 
             if llm_result && llm_result['rankings']
-              llm_scores = {}
               llm_result['rankings'].each do |r|
                 llm_scores[r['id']] = {
                   'relevance'          => r['relevance'].to_f,
@@ -2480,25 +2519,10 @@ require 'securerandom'
                   rec['llm_relevance']      = llm_data['relevance']
                   rec['category_alignment'] = llm_data['category_alignment']
                   rec['score'] = score_weights['relevance'] * llm_data['relevance'] +
-                                 score_weights['category']  * llm_data['category_alignment']
+                                score_weights['category']  * llm_data['category_alignment']
                 else
                   rec['score'] = 0.0
                 end
-              end
-
-              # Build confidence distribution if requested
-              if input['include_confidence_distribution'] == true
-                total_score = enriched.sum { |x| x['score'].to_f }
-                total_score = 0.001 if total_score <= 0
-
-                distribution = enriched.map do |r|
-                  llm_data = llm_scores[r['id']] || {}
-                  {
-                    'id'          => r['id'],
-                    'probability' => r['score'].to_f / total_score,
-                    'reasoning'   => llm_data['reasoning']
-                  }
-                end.sort_by { |d| -d['probability'] }
               end
             end
           end
@@ -2511,6 +2535,48 @@ require 'securerandom'
           # Apply top_n limit if specified
           if top_n.present?
             enriched = enriched.first(top_n.to_i)
+          end
+
+          # --- Always compute confidence distribution (for gap analysis) ---
+          total_score = enriched.sum { |x| x['score'].to_f }
+          total_score = 0.001 if total_score <= 0
+
+          distribution = enriched.map do |r|
+            llm_data = llm_scores[r['id']] || {}
+            {
+              'id'          => r['id'],
+              'probability' => (r['score'].to_f / total_score).round(6),
+              'score'       => r['score'].to_f.round(6),
+              'reasoning'   => llm_data['reasoning']
+            }
+          end.sort_by { |d| -d['probability'] }
+
+          # Calculate distribution statistics (always computed for telemetry)
+          probs = distribution.map { |d| d['probability'].to_f }
+          dist_entropy = probs.any? ? -probs.sum { |p| p > 0 ? p * Math.log(p) : 0.0 } : 0.0
+          dist_max_prob = probs.max || 0.0
+          dist_min_prob = probs.min || 0.0
+          dist_concentration = if probs.length > 1 && dist_entropy > 0
+                                (1.0 - dist_entropy / Math.log(probs.length)).round(4)
+                              else
+                                0.0
+                              end
+
+          distribution_stats = {
+            'entropy'       => dist_entropy.round(4),
+            'max_prob'      => dist_max_prob.round(6),
+            'min_prob'      => dist_min_prob.round(6),
+            'concentration' => dist_concentration,
+            'count'         => distribution.length
+          }
+
+          # Coverage signal for gap analysis
+          top_score = enriched.first&.dig('score') || 0.0
+          coverage_signal = case top_score
+            when 0.85..1.0  then 'strong'
+            when 0.65..0.85 then 'moderate'
+            when 0.45..0.65 then 'weak'
+            else 'gap'
           end
 
           # Shape Output
@@ -2557,33 +2623,41 @@ require 'securerandom'
             result['records']        = enriched
           end
 
-          result['confidence_distribution'] = distribution if distribution
+          # Always include distribution in output (for gap analysis)
+          result['confidence_distribution'] = distribution
+          result['distribution_stats']      = distribution_stats
+          result['coverage_signal']         = coverage_signal
 
           result['ranking_metadata'] = {
             'category'          => category.presence,
             'llm_model'         => llm_model,
             'contexts_filtered' => records_in.length - records_to_rank.length,
             'contexts_ranked'   => records_to_rank.length,
-            'score_weights'     => score_weights
+            'score_weights'     => score_weights,
+            'coverage_signal'   => coverage_signal
           }.compact
 
           # Build facets (use normalized configs so we don't hit dig on strings)
           weights_preset = (weights_config['preset'] || 'balanced').to_s
 
           facets = {
-            'ranking_api'       => 'llm.category_ranker',
-            'category'          => category.presence,
-            'llm_model'         => llm_model,
-            'emit_shape'        => shape,
-            'records_input'     => records_in.length,
-            'records_filtered'  => records_in.length - records_to_rank.length,
-            'records_ranked'    => records_to_rank.length,
-            'records_output'    => enriched.length,
-            'has_distribution'  => !distribution.nil?,
-            'top_score'         => enriched.first&.dig('score'),
-            'category_filtered' => input['filter_by_category_metadata'] == true,
-            'ranking_prompt'    => input['ranking_prompt_template'] || 'category_aware',
-            'weights_preset'    => weights_preset
+            'ranking_api'            => 'llm.category_ranker',
+            'category'               => category.presence,
+            'llm_model'              => llm_model,
+            'emit_shape'             => shape,
+            'records_input'          => records_in.length,
+            'records_filtered'       => records_in.length - records_to_rank.length,
+            'records_ranked'         => records_to_rank.length,
+            'records_output'         => enriched.length,
+            'has_distribution'       => true,
+            'top_score'              => enriched.first&.dig('score'),
+            'category_filtered'      => input['filter_by_category_metadata'] == true,
+            'ranking_prompt'         => input['ranking_prompt_template'] || 'category_aware',
+            'weights_preset'         => weights_preset,
+            'coverage_signal'        => coverage_signal,
+            'distribution_entropy'   => dist_entropy.round(4),
+            'distribution_max_prob'  => dist_max_prob.round(6),
+            'distribution_concentration' => dist_concentration
           }.compact
 
           call(:step_ok!, ctx, result, 200, 'OK', facets)
@@ -2935,14 +3009,23 @@ require 'securerandom'
     end,
     sample_rerank_shortlist: lambda do
       ranking = [
-        { 'category' => 'Billing', 'prob' => 0.86 },
-        { 'category' => 'Support', 'prob' => 0.10 },
-        { 'category' => 'Sales', 'prob' => 0.04 }
+        { 'category' => 'Billing', 'prob' => 0.86, 'reasoning' => 'Invoice reference detected', 'source' => 'llm' },
+        { 'category' => 'Support', 'prob' => 0.10, 'reasoning' => 'Minor support indicators', 'source' => 'llm' },
+        { 'category' => 'Sales', 'prob' => 0.04, 'reasoning' => 'Low relevance', 'source' => 'llm' }
       ]
+      
+      distribution_stats = {
+        'entropy'       => 0.5765,
+        'max_prob'      => 0.86,
+        'min_prob'      => 0.04,
+        'concentration' => 0.4752
+      }
       
       business_data = {
         'ranking' => ranking,
         'shortlist' => ['Billing', 'Support', 'Sales'],
+        'distribution_stats' => distribution_stats,
+        'distribution_source' => 'llm',
         'signals_category' => 'Billing',
         'signals_confidence' => 0.86,
         'signals_intent' => 'information_request'
@@ -2956,6 +3039,12 @@ require 'securerandom'
           'categories_ranked' => 3,
           'generative_model' => 'gemini-2.0-flash',
           'categories_mode' => 'array',
+          'prompt_template' => 'balanced',
+          'concentration' => 'medium',
+          'temperature' => 0.2,
+          'distribution_source' => 'llm',
+          'distribution_count' => 3,
+          'distribution_entropy' => 0.5765,
           'correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
         },
         'ok' => true,
@@ -3075,14 +3164,32 @@ require 'securerandom'
         }
       ]
       
+      confidence_distribution = [
+        { 'id' => 'doc-1', 'probability' => 0.514, 'score' => 0.92, 'reasoning' => 'Direct policy statement' },
+        { 'id' => 'doc-2', 'probability' => 0.486, 'score' => 0.87, 'reasoning' => 'Procedural guidance' }
+      ]
+      
+      distribution_stats = {
+        'entropy'       => 0.6929,
+        'max_prob'      => 0.514,
+        'min_prob'      => 0.486,
+        'concentration' => 0.0003,
+        'count'         => 2
+      }
+      
       business_data = {
         'records' => records,
         'context_chunks' => context_chunks,
+        'confidence_distribution' => confidence_distribution,
+        'distribution_stats' => distribution_stats,
+        'coverage_signal' => 'strong',
         'ranking_metadata' => {
           'category' => 'PTO',
           'llm_model' => 'gemini-2.0-flash',
           'contexts_filtered' => 0,
-          'contexts_ranked' => 2
+          'contexts_ranked' => 2,
+          'score_weights' => { 'relevance' => 0.8, 'category' => 0.2 },
+          'coverage_signal' => 'strong'
         }
       }
       
@@ -3097,9 +3204,15 @@ require 'securerandom'
           'records_filtered' => 0,
           'records_ranked' => 2,
           'records_output' => 2,
-          'has_distribution' => false,
+          'has_distribution' => true,
           'top_score' => 0.92,
           'category_filtered' => false,
+          'ranking_prompt' => 'category_aware',
+          'weights_preset' => 'balanced',
+          'coverage_signal' => 'strong',
+          'distribution_entropy' => 0.6929,
+          'distribution_max_prob' => 0.514,
+          'distribution_concentration' => 0.0003,
           'correlation_id' => 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
         },
         'ok' => true,
@@ -3556,7 +3669,7 @@ require 'securerandom'
                 'items' => distribution_item
               }
             },
-            'required' => ['category']
+            'required' => ['category', 'distribution']
           }
         }
       }
@@ -4241,21 +4354,24 @@ require 'securerandom'
             { name: 'category' },
             { name: 'prob', type: 'number' },
             { name: 'score', type: 'number', optional: true },
-            { name: 'reasoning', optional: true }
+            { name: 'reasoning', optional: true },
+            { name: 'source', optional: true, hint: 'llm, fallback, or added_missing' }
           ]
         },
         { name: 'shortlist', type: 'array', of: 'string',
           hint: 'Reordered shortlist' },
 
-        # Distribution metadata
-        { name: 'distribution_stats', type: 'object', optional: true,
+        # Distribution metadata (always present)
+        { name: 'distribution_stats', type: 'object',
           properties: [
-            { name: 'entropy', type: 'number' },
+            { name: 'entropy', type: 'number', hint: 'Higher entropy = more spread out' },
             { name: 'max_prob', type: 'number' },
             { name: 'min_prob', type: 'number' },
-            { name: 'concentration', type: 'number' }
+            { name: 'concentration', type: 'number', hint: '0 = uniform, 1 = peaked' }
           ]
         },
+        
+        { name: 'distribution_source', hint: 'llm, fallback, uniform, or none' },
 
         # Pass-through signals
         { name: 'signals_category', optional: true },
@@ -5496,7 +5612,7 @@ require 'securerandom'
       JSON.parse(text) rescue { 'rankings' => [] }
     end,
 
-    # ---------- Rerank helpers (tidy + reusable) --------------------------
+    # ---------- Rerank helpers --------------------------------------------
     rerank_enrich_records: lambda do |input_records, ranked_min|
       # Build index of caller-provided records by id
       idx = {}
@@ -5537,6 +5653,53 @@ require 'securerandom'
           'metadata_kv'   => md.map { |k,v| { 'key' => k.to_s, 'value' => v } },
           'metadata_json' => (md.nil? || md.empty?) ? nil : md.to_json
         }
+      end
+    end,
+    ensure_distribution: lambda do |llm_response, shortlist, fallback_confidence = 0.5|
+      # Attempts to extract distribution from LLM response
+      # Falls back to computed distribution if missing or malformed
+      
+      raw = llm_response['distribution']
+      
+      # Validate: must be array with category/prob pairs
+      valid = raw.is_a?(Array) && 
+              raw.length > 0 && 
+              raw.all? { |d| d.is_a?(Hash) && d['category'].present? && d['prob'].is_a?(Numeric) }
+      
+      if valid
+        # Normalize probabilities to sum to 1.0
+        total = raw.sum { |d| d['prob'].to_f }
+        total = 1.0 if total <= 0
+        
+        normalized = raw.map do |d|
+          {
+            'category'  => d['category'],
+            'prob'      => (d['prob'].to_f / total).round(6),
+            'reasoning' => d['reasoning'],
+            'source'    => 'llm'
+          }
+        end
+        
+        { 'distribution' => normalized, 'source' => 'llm' }
+      else
+        # Fallback computation
+        chosen = llm_response['category']
+        conf = (llm_response['confidence'] || fallback_confidence).to_f
+        conf = [[conf, 0.1].max, 0.99].min  # Clamp to reasonable range
+        
+        others = (shortlist || []).reject { |c| c == chosen }
+        other_prob = others.any? ? ((1.0 - conf) / others.length).round(6) : 0.0
+        
+        computed = (shortlist || [chosen]).map do |cat|
+          {
+            'category'  => cat,
+            'prob'      => (cat == chosen) ? conf.round(6) : other_prob,
+            'reasoning' => nil,
+            'source'    => 'fallback'
+          }
+        end
+        
+        { 'distribution' => computed, 'source' => 'fallback' }
       end
     end,
 
