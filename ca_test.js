@@ -26,6 +26,7 @@ function runAllTests() {
     test_Headers_ColumnShift(harness);
     test_Deduplication_Logic(harness); // TC-07
     test_CriticalAlert_Logic(harness);
+    test_Infrastructure_Policies(harness);
     
     console.log("✅ ALL TESTS PASSED");
     
@@ -46,22 +47,25 @@ function runAllTests() {
 class TestContext {
   constructor() {
     this.ss = SpreadsheetApp.getActiveSpreadsheet();
-    this.sheetName = `TEST_ENV_${Date.now()}`;
-    this.sheet = null;
+    // Use a specific prefix so we can easily identify leftover test artifacts
+    this.sheetName = `TEST_SRC_${Date.now()}`; 
+    this.sheet = null; // Reference to the main source sheet
     this.propService = PropertiesService.getScriptProperties();
-    // Track keys created during test for cleanup
+    
     this.usedPropKeys = []; 
+    this.createdSheets = []; // NEW: Track all sheets for cleanup
   }
 
   /**
    * Creates a fresh environment:
-   * 1. A new sheet with valid headers
-   * 2. A clean property store interface
+   * 1. A new source sheet with valid headers
+   * 2. Registers it for cleanup
    */
   setup() {
-    console.log(`Creating temp sheet: ${this.sheetName}`);
+    console.log(`Creating temp source sheet: ${this.sheetName}`);
     this.sheet = this.ss.insertSheet(this.sheetName);
-    
+    this.createdSheets.push(this.sheet); // Register for teardown
+
     // Build a valid header row based on CONFIG
     // We create a sparse array up to column 30 (AC)
     const headers = new Array(30).fill("");
@@ -80,14 +84,20 @@ class TestContext {
   }
 
   /**
-   * Cleans up sheets and properties
+   * Cleans up ALL sheets and properties created during the test run
    */
   teardown() {
     console.log("Cleaning up...");
-    // 1. Delete Temp Sheet
-    if (this.sheet) {
-      this.ss.deleteSheet(this.sheet);
-    }
+    
+    // 1. Delete ALL Test Sheets
+    this.createdSheets.forEach(sheet => {
+      try {
+        console.log(`Deleting sheet: ${sheet.getName()}`);
+        this.ss.deleteSheet(sheet);
+      } catch (e) {
+        console.warn(`Could not delete ${sheet.getName()}: ${e.message}`);
+      }
+    });
 
     // 2. Delete Test Properties
     if (this.usedPropKeys.length > 0) {
@@ -125,8 +135,8 @@ class TestContext {
 // TEST CASES
 // ===================================================================================
 
-/**
- * TC-01: Verifies that the correct headers pass validation.
+/** * TC-01: test_Headers_HappyPath
+ * Verifies that the correct headers pass validation.
  */
 function test_Headers_HappyPath(h) {
   console.log("\n🧪 Running: test_Headers_HappyPath");
@@ -138,8 +148,8 @@ function test_Headers_HappyPath(h) {
   h.assert(result.errors.length === 0, "Error list should be empty");
 }
 
-/**
- * TC-02: Verifies that shifting columns causes validation failure.
+/** * TC-02: test_Headers_ColumnShift
+ * Verifies that shifting columns causes validation failure.
  */
 function test_Headers_ColumnShift(h) {
   console.log("\n🧪 Running: test_Headers_ColumnShift");
@@ -157,8 +167,8 @@ function test_Headers_ColumnShift(h) {
   h.sheet.deleteColumn(1);
 }
 
-/**
- * TC-07: Verifies Alert Deduplication Logic (The "Server" Memory)
+/** * TC-07: test_Deduplication_Logic
+ * Verifies Alert Deduplication Logic (The "Server" Memory)
  */
 function test_Deduplication_Logic(h) {
   console.log("\n🧪 Running: test_Deduplication_Logic (TC-07)");
@@ -215,8 +225,8 @@ function test_Deduplication_Logic(h) {
   h.assert(result3 === true, "Expired TTL should allow alert to fire again");
 }
 
-/**
- * TC-04: Verifies Critical Alert Business Logic
+/** * TC-04: test_CriticalAlert_Logic
+ * Verifies Critical Alert Business Logic
  * Direct checks against row processing logic
  */
 function test_CriticalAlert_Logic(h) {
@@ -248,4 +258,77 @@ function test_CriticalAlert_Logic(h) {
   // Logic check
   const shouldAlert = flags.critical && (parsed.overdueMinutes >= CONFIG.ALERTS.MIN_OVERDUE_MINUTES);
   h.assert(shouldAlert === true, "Logic should dictate an alert for this row");
+}
+
+/** * TC-I: test_Infrastructure_Policies
+ * Infrastructure testing: Verifies Sheet Creation Policies.
+ * 1. Loggers MUST create sheets if missing (Self-Healing).
+ * 2. Sheets MUST be created with the exact headers defined in the classes.
+ * 3. Readers (Source) MUST NOT create sheets if missing (Read-Only Safety).
+ */
+function test_Infrastructure_Policies(h) {
+  console.log("\n🧪 Running: test_Infrastructure_Policies");
+  const repo = new SheetsRepo(h.ss);
+  const ts = Date.now();
+
+  // Helper to verify headers match exactly
+  const verifyHeaders = (sheetName, expectedHeaders) => {
+    const sh = h.ss.getSheetByName(sheetName);
+    h.assert(sh !== null, `Sheet ${sheetName} should have been created`);
+    h.createdSheets.push(sh); // Register for teardown
+
+    const actual = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
+    h.assert(
+      JSON.stringify(actual) === JSON.stringify(expectedHeaders),
+      `Headers for ${sheetName} must match class definition`
+    );
+  };
+
+  // --- SUB-TEST 1: EventLogs Creation ---
+  const eventSheetName = `TEST_Events_${ts}`;
+  const eventLogger = new EventsLogger(repo, eventSheetName);
+  
+  eventLogger.log("Test", "A", "B", "Details");
+  eventLogger.flush(); // Should trigger creation
+  
+  verifyHeaders(eventSheetName, eventLogger.header);
+
+
+  // --- SUB-TEST 2: Observations Creation ---
+  const obsSheetName = `TEST_Obs_${ts}`;
+  const obsLogger = new ObservationsLogger(repo, obsSheetName);
+  
+  // Create dummy data to flush
+  const dummyRow = {
+    scheduleName: "Test", machineName: "Test", ifRanToday: "Yes",
+    lastExpectedRun: new Date(), overdueMinutes: 0, currentStatus: "OK",
+    currentDuration: 0, maxRunHoursExpected: 1, notRanReason: ""
+  };
+  obsLogger.append(1, dummyRow, {critical:false, extended:false});
+  obsLogger.flush(); // Should trigger creation
+
+  verifyHeaders(obsSheetName, obsLogger.header);
+
+
+  // --- SUB-TEST 3: TrendMetrics Creation ---
+  const trendSheetName = `TEST_Trends_${ts}`;
+  // To test trends, we need the OBSERVATIONS sheet (obsSheetName) to exist and have data
+  // (We created and populated it in Sub-Test 2, so we reuse it here)
+  
+  const trendAgg = new TrendAggregator(repo, obsSheetName, trendSheetName);
+  trendAgg.buildDaily(); // Should read Obs, calc stats, and create Trends sheet
+
+  // Trend header is defined inside buildDaily, so we define the expectation here
+  const expectedTrendHeader = ["Day","Schedule","Machine","Samples","Missed","Extended","AvgOverdue"];
+  verifyHeaders(trendSheetName, expectedTrendHeader);
+
+
+  // --- SUB-TEST 4: Source Safety Check ---
+  // Ensure we NEVER auto-create the source logic sheet if it's missing
+  const missingSource = "NON_EXISTENT_SOURCE_SHEET";
+  const data = repo.readData(missingSource);
+  
+  h.assert(data.length === 0, "Reading missing source should return empty");
+  const checkSh = h.ss.getSheetByName(missingSource);
+  h.assert(checkSh === null, "System must NEVER auto-create the Source Logic sheet");
 }
