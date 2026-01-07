@@ -174,7 +174,6 @@ function test_Deduplication_Logic(h) {
   console.log("\n🧪 Running: test_Deduplication_Logic (TC-07)");
 
   // 1. Mock the Property Service
-  // We wrap the real service to intercept keys and prefix them with "TEST::"
   const mockProps = {
     getProperty: (k) => h.getProperty(k),
     setProperty: (k, v) => h.setProperty(k, v),
@@ -184,7 +183,6 @@ function test_Deduplication_Logic(h) {
   };
 
   // 2. Initialize Cache with 60 min TTL
-  // We use an empty object {} for memoryCache to simulate a fresh run
   const dedupe = new AlertDedupeCache(mockProps, 60, {}); 
 
   const schedule = "Backup_DB";
@@ -199,12 +197,14 @@ function test_Deduplication_Logic(h) {
   dedupe.flush();
 
   // B. Immediate Retry -> Should NOT Fire
-  // We create a NEW instance to simulate a fresh script execution (serverless state)
-  // We must re-read the properties we just flushed
   const memoryReload = {};
-  // Manually mimicking the "load all properties" optimization step
-  // In real life, the key is constructed inside the class, so we reconstruct it here for the test setup
-  const expectedKey = `alert::${alertType}::${schedule}::${machine}`;
+  
+  // FIX: Sanitize the inputs to match the Class logic
+  // The class strips underscores, so we must too when looking up the key
+  const safeSched = schedule.replace(/[^a-zA-Z0-9]/g, "");
+  const safeMach = machine.replace(/[^a-zA-Z0-9]/g, "");
+  const expectedKey = `alert::${alertType}::${safeSched}::${safeMach}`;
+  
   memoryReload[expectedKey] = h.getProperty(expectedKey);
 
   const dedupeRun2 = new AlertDedupeCache(mockProps, 60, memoryReload);
