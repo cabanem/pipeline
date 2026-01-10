@@ -1,684 +1,580 @@
-/* eslint-disable no-var */
-"use strict";
-
 /**
- * @file Schedule Monitor v3.1 (Robust Simplicity + Optimized)
- * @description
- * Monitors automation schedules in Google Sheets for missed or extended runs.
- * * ARCHITECTURE OVERVIEW:
- * 1. Batch Processing: Reads all data once, processes in memory, writes results in bulk.
- * 2. Fail-Safe: Uses a `try...finally` block to ensure logs are saved even if the script crashes.
- * 3. Validation: Checks headers before processing to prevent reading misaligned columns.
- * 4. Optimization: Uses in-memory caching to reduce PropertyStore API calls by ~99%.
- * * @author Emily Cabaniss
- * @since Jan 2026
+ * @file Workato Inventory Sync
+ * @description Fetches all resources from Workato and logs them to a dedicated Google Sheet.
+ * @author Emily Cabaniss
+ * @see DOCS (Workato API - Folders): "https://docs.workato.com/en/workato-api/folders.html"
+ * @see DOCS (Workato API - Recipes): "https://docs.workato.com/en/workato-api/recipes.html"
+ * @see DOCS (Workato API - Project): "https://docs.workato.com/en/workato-api/project-properties.html"
+ * 
  */
 
-// ===================================================================================
-// 1. CONFIGURATION (Single Source of Truth)
-// ===================================================================================
-
 /**
- * Main configuration object.
- * Adjusting values here propagates through the entire system.
- * @constant
+ * @typedef {Object} AppConfig
+ * @property {Object} API - API connection settings.
+ * @property {string} API.TOKEN - The Workato API bearer token.
+ * @property {string} API.BASE_URL - The Workato API endpoint.
+ * @property {number} API.PER_PAGE - Records per request.
+ * @property {number} API.MAX_CALLS - Safety limit for API calls.
+ * @property {Object} SHEETS - Mapping of resource types to sheet names.
+ * @property {boolean} VERBOSE - Toggle for detailed logging.
  */
+
+/** @type {AppConfig} */
 const CONFIG = {
-  /** Core system settings including sheet names and timeouts */
-  CORE: {
-    SHEET_NAME: "Notifications Logic", // The source tab to monitor
-    DEBOUNCE_MINUTES: 1,               // Minimum cooldown between execution runs
-    LAST_PROCESSED_PROP: "lastProcessedTime", // Key for storing last run timestamp
-    TIMEZONE: "America/New_York"       // Fallback timezone
+  API: {
+    TOKEN: PropertiesService.getScriptProperties().getProperty('WORKATO_TOKEN'),
+    BASE_URL: 'https://app.eu.workato.com/api',
+    PER_PAGE: 100,
+    MAX_CALLS: 500,
   },
-
-  /** * Column Mappings (1-based indices to match SpreadsheetApp convention).
-   * Used by getRowData to map array indices to named properties.
-   */
-  COLUMNS: {
-    SCHEDULE_NAME: 1,            // Column A
-    MACHINE: 7,                  // Column G
-    IF_RAN_TODAY: 10,            // Column J
-    LAST_EXPECTED_RUN: 11,       // Column L
-    CURRENT_STATUS: 15,          // Column O
-    CURRENT_DURATION: 17,        // Column Q
-    MAX_RUN_HOURS: 19,           // Column S
-    NOT_RAN_REASON: 21,          // Column U
-    NOW_DIFF: 27,                // Column AA (Minutes Overdue)
-    CRITICAL_ALERT: 28,          // Column AB
-    EXTENDED_ALERT: 29           // Column AC
+  SHEETS: {
+    RECIPES: 'recipes',
+    FOLDERS: 'folders',
+    PROJECTS: 'projects',
+    PROPERTIES: 'properties'
   },
-
-  /**
-   * Validation Rules: Map of { ColumnIndex: ["Allowed Header Name"] }.
-   * The script will abort if these specific columns do not match the sheet.
-   */
-  EXPECTED_HEADERS: {
-    1: ["Schedule Name", "Schedule"],
-    7: ["Machine", "Server"],
-    28: ["Critical Item Alert"],
-    29: ["Extended Execution Alert"]
-  },
-
-  /** Alert Logic Configuration */
-  ALERTS: {
-    TTL_MINUTES: 60,             // Alert deduplication window (don't spam every minute)
-    MIN_OVERDUE_MINUTES: 15,     // Grace period before alerting on missed schedule
-    CRITICAL_VALUE: "NOT RAN ALERT",
-    EXTENDED_VALUE: "DURATION ALERT"
-  },
-
-  /** Logging and Retention Configuration */
-  LOGGING: {
-    MODE: "changes",             // 'changes' = log only when status changes; 'all' = log every run
-    RETENTION_DAYS: 60,          // Auto-delete rows older than this
-    SHEETS: {
-      EVENTS: "EventLogs",       // System audits (alerts sent, errors)
-      OBSERVATIONS: "Observations", // Snapshot of schedule states
-      TRENDS: "TrendMetrics"     // Daily aggregated stats
-    }
-  },
-
-  /** External Service Integration Keys (loaded from Script Properties) */
-  SERVICES: {
-    CHAT_WEBHOOK_URL: PropertiesService.getScriptProperties().getProperty("CHAT_WEBHOOK_URL"),
-    FAILURE_EMAIL: PropertiesService.getScriptProperties().getProperty("FAILURE_EMAIL_RECIPIENT")
-  }
+  VERBOSE: true
 };
-
-// Freeze to prevent accidental modification during runtime
 Object.freeze(CONFIG);
 
-
-// ===================================================================================
-// 2. CORE LOGIC (The Engine)
-// ===================================================================================
-
+// -------------------------------------------------------------------------------------------------------
+// ENTRYPOINT
+// -------------------------------------------------------------------------------------------------------
 /**
- * PRIMARY ENTRY POINT.
- * Orchestrates the entire monitoring workflow.
- * * Logic Flow:
- * 1. Lock Check (Concurrency protection)
- * 2. Property Load (Memory Optimization)
- * 3. Header Validation (Data Integrity)
- * 4. Data Processing Loop (Business Logic)
- * 5. Flush (Data Persistence via `finally` block)
- * * @returns {void}
+ * Primary entry point for the script. Coordinates the fetching of projects,
+ * folders, recipes, and properties, then orchestrates the sheet writing process.
+ * @returns {void}
  */
-function runScheduleMonitor() {
-  const lock = LockService.getScriptLock();
-  // 1. Concurrency Check: Prevent two executions from running effectively at once
-  try { lock.waitLock(10000); } catch (e) { console.warn("Script is locked/busy."); return; }
-
-  const props = PropertiesService.getScriptProperties();
-  
-  // OPTIMIZATION 1: Load ALL properties into memory once.
-  // Google's PropertiesService is slow. Reading once reduces API calls from ~1000 to 1.
-  const allProps = props.getProperties();
-  const lastRun = Number(allProps[CONFIG.CORE.LAST_PROCESSED_PROP] || 0);
-  const now = Date.now();
-
-  // 2. Debounce Check: Ensure we respect the minimum interval
-  if (now - lastRun < CONFIG.CORE.DEBOUNCE_MINUTES * 60 * 1000) { 
-    lock.releaseLock(); 
-    return; 
-  }
-
-  // Initialize Services
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const repo = new SheetsRepo(ss);
-  const events = new EventsLogger(repo, CONFIG.LOGGING.SHEETS.EVENTS);
-  const obs = new ObservationsLogger(repo, CONFIG.LOGGING.SHEETS.OBSERVATIONS);
-  const notifier = new NotificationManager(CONFIG.SERVICES.CHAT_WEBHOOK_URL);
-  
-  // Initialize caches with the pre-loaded 'allProps' memory object
-  const dedupe = new AlertDedupeCache(props, CONFIG.ALERTS.TTL_MINUTES, allProps);
-  const stateCache = new ObservationStateCache(props, allProps);
-
+function syncWorkatoWorkspace() {
   try {
-    // 3. Validation Phase (Fail Fast)
-    // We check headers BEFORE reading data. If columns shifted, we crash now rather than sending bad alerts.
-    const validation = validateHeaders(repo, CONFIG.CORE.SHEET_NAME, CONFIG.EXPECTED_HEADERS);
-    if (!validation.valid) throw new Error(`Header Validation Failed: ${validation.errors.join(", ")}`);
+    logVerbose("Starting full workspace sync...");
 
-    // OPTIMIZATION 2: Narrow Read
-    // Only reads columns A through AC (or whatever is max in CONFIG). Skips columns AD -> ZZ.
-    const data = repo.readData(CONFIG.CORE.SHEET_NAME);
-    if (data.length === 0) return;
-
-    // 4. Processing Loop
-    // Start at i=1 to skip the header row
-    for (let i = 1; i < data.length; i++) {
-      try {
-        const row = data[i];
-        
-        // Skip completely empty rows or rows missing a Schedule Name (Performance)
-        if (!row[0] && !row[6]) continue; 
-
-        const rowData = getRowData(row);
-        const flags = getAlertFlags(row);
-
-        // A. Log Observations
-        // Checks in-memory cache to see if state changed since last run
-        if (stateCache.checkChange(rowData)) {
-          obs.append(i + 1, rowData, flags);
-        }
-
-        // B. Critical Alerts (Missed Schedule)
-        // Logic: Must be flagged critical AND be overdue by threshold (15 mins)
-        if (flags.critical && (rowData.overdueMinutes || 0) >= CONFIG.ALERTS.MIN_OVERDUE_MINUTES) {
-          if (dedupe.shouldFire(rowData.scheduleName, rowData.machineName, "missed")) {
-            notifier.sendMissedSchedule(rowData);
-            events.log("MissedScheduleNotification", rowData.scheduleName, rowData.machineName, "Sent Alert");
-          }
-        }
-
-        // C. Extended Execution Alerts
-        if (flags.extended) {
-          if (dedupe.shouldFire(rowData.scheduleName, rowData.machineName, "extended")) {
-            notifier.sendExtendedExecution(rowData);
-            events.log("ExtendedExecutionNotification", rowData.scheduleName, rowData.machineName, "Sent Alert");
-          }
-        }
-
-      } catch (rowError) {
-        // Row-level error handling: Log it, but don't kill the whole batch.
-        console.error(`Row ${i+1} Error: ${rowError.message}`);
-        events.log("RowProcessingError", "Unknown", "Unknown", `Row ${i+1}: ${rowError.message}`);
-      }
+    // 1. Identify present workspace
+    const currentUser = fetchCurrentUser();
+    if (currentUser) {
+      const workspaceName = currentUser.current_account_name || "Unknown workspace";
+      const userName = currentUser.name || "Unknown user";
+      console.log(`Authenticated as ${userName}`);
+      console.log(`Connected to workspace: ${workspaceName}`);
+    }
+    
+    // 2. Fetch all raw data
+    const projects = fetchResource('projects');
+    const folders = fetchAllFoldersRecursively(projects); 
+    const recipes = fetchResource('recipes');
+    
+    let properties = [];
+    try {
+      properties = fetchResource('properties');
+    } catch (propError) {
+      console.warn(`SKIPPING PROPERTIES: The API rejected the request (${propError.message}).`);
+      properties = [];
     }
 
-    // Mark run as successful in memory (will be flushed in 'finally')
-    props.setProperty(CONFIG.CORE.LAST_PROCESSED_PROP, String(Date.now()));
+    logVerbose(`Fetched totals: ${projects.length} projects, ${folders.length} folders, ${recipes.length} recipes, ${properties.length} properties`);
 
-  } catch (fatalError) {
-    // Script-level error handling: Notify dev team
-    console.error("Fatal Script Error", fatalError);
-    notifier.sendSystemFailure(fatalError);
-    events.log("FatalError", "System", "System", fatalError.message);
+    // 3. Create lookup maps
+    const projectMap = Object.fromEntries(projects.map(p => [p.id, p.name]));
+    const folderMap = Object.fromEntries(folders.map(f => [f.id, f.name]));
 
-  } finally {
-    // 5. The Safety Net (Flush)
-    // This executes whether the script succeeded OR crashed.
-    // It guarantees that whatever logs/properties we queued get written to disk.
-    obs.flush();       // Write observation rows
-    events.flush();    // Write event rows
-    dedupe.flush();    // Write alert dedupe timestamps
-    stateCache.flush(); // Write observation state hashes
-    lock.releaseLock();
+    // 4. Prep data for sheets
+    const projectRows = [["ID", "Name", "Description", "Created at"]].concat(
+      projects.map(p => [p.id, p.name, p.description, p.created_at])
+    );
+
+    const folderRows = [["ID", "Name", "Parent folder", "Project name"]].concat(
+      folders.map(f => {
+        let parentName = "TOP LEVEL";
+        if (f.is_project) {
+          parentName = "Workspace Root (Home)";
+        } else if (f.parent_id) {
+          parentName = folderMap[f.parent_id] || `[ID: ${f.parent_id}] (not found)`;
+        }
+        const projectName = projectMap[f.project_id] || `[ID: ${f.project_id}]`;
+        return [f.id, f.name, parentName, projectName];
+      })
+    );
+
+    const recipeRows = [["ID", "Name", "Status", "Project", "Folder", "Last Run"]].concat(
+      recipes.map(r => [
+        r.id,
+        r.name,
+        r.running ? "ACTIVE" : "STOPPED",
+        projectMap[r.project_id] || r.project_id,
+        folderMap[r.folder_id] || `[Unknown/Deleted: ${r.folder_id}]`,
+        r.last_run_at || "NEVER"
+      ])
+    );
+
+    const propertyRows = [["ID", "Name", "Value", "Created at", "Updated at"]].concat(
+      properties.map(p => [p.id, p.name, p.value, p.created_at, p.updated_at])
+    );
+
+    // 5. Write to sheets
+    logVerbose("Writing to Sheets...");
+    writeToSheet(CONFIG.SHEETS.PROJECTS, projectRows);
+    writeToSheet(CONFIG.SHEETS.FOLDERS, folderRows);
+    writeToSheet(CONFIG.SHEETS.RECIPES, recipeRows);
+    writeToSheet(CONFIG.SHEETS.PROPERTIES, propertyRows); 
+
+    notifyUser("Sync complete. Workspace inventory updated...", false);
+
+  } catch (e) {
+    let errorMsg = `Sync failed: ${e.message}`;
+    if (e.message.includes("Unexpected token")) {
+      errorMsg = "Authentication error: Check your WORKATO_TOKEN, and BASE_URL";
+    }
+    notifyUser(errorMsg, true);
+    console.error(e.stack);
   }
 }
 
+// -------------------------------------------------------------------------------------------------------
+// UTILITIES
+// -------------------------------------------------------------------------------------------------------
 /**
- * Maintenance Trigger.
- * Should be scheduled to run once daily (e.g., 2:00 AM).
- * Handles log rotation/deletion and trend aggregation.
+ * Generic fetcher for Workato Resources. Handles pagination logic and 
+ * normalizes differences between root arrays and paginated objects.
+ * @param {string} resourcePath - The API endpoint path (e.g., 'recipes', 'projects').
+ * @returns {Array<Object>} An array of resource objects retrieved from the API.
+ * @throws {Error} If the API returns a non-200 status code.
  */
-function runDailyMaintenance() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const repo = new SheetsRepo(ss);
-  
-  // 1. Cleanup old logs
-  const cleaner = new LogRetentionManager(repo, CONFIG.LOGGING.RETENTION_DAYS);
-  cleaner.cleanSheet(CONFIG.LOGGING.SHEETS.OBSERVATIONS);
-  cleaner.cleanSheet(CONFIG.LOGGING.SHEETS.EVENTS);
-  
-  // 2. Build Trend Report
-  const trend = new TrendAggregator(repo, CONFIG.LOGGING.SHEETS.OBSERVATIONS, CONFIG.LOGGING.SHEETS.TRENDS);
-  trend.buildDaily();
+function fetchResource(resourcePath) {
+  let results = [];
+  let page = 1;
+  let hasMore = true;
+
+  while (hasMore) {
+    const cleanPath = resourcePath.startsWith('/') ? resourcePath : `/${resourcePath}`;
+    const url = `${CONFIG.API.BASE_URL}${cleanPath}?page=${page}&per_page=${CONFIG.API.PER_PAGE}`;
+
+    const options = {
+      method: 'get',
+      headers: {
+        'Authorization': `Bearer ${CONFIG.API.TOKEN}`,
+        'Content-Type': 'application/json'
+      },
+      muteHttpExceptions: true
+    };
+
+    const response = UrlFetchApp.fetch(url, options);
+
+    if (response.getResponseCode() !== 200) {
+      throw new Error(`API Error [${resourcePath}]: ${response.getResponseCode()} - ${response.getContentText()}`);
+    }
+
+    const json = JSON.parse(response.getContentText());
+    let records = Array.isArray(json) ? json : (json.items || json.result || []);
+
+    if (records.length > 0) {
+      results = results.concat(records);
+      if (records.length < CONFIG.API.PER_PAGE) {
+        hasMore = false;
+      } else {
+        page++;
+      }
+    } else {
+      hasMore = false;
+    }
+
+    if (page % 5 === 0) logVerbose(`...fetched ${page} pages of ${resourcePath}`);
+    if (page > 200) break;
+  }
+
+  console.log(`Fetched ${results.length} records for ${resourcePath}`);
+  return results;
 }
-
-
-// ===================================================================================
-// 3. SERVICE CLASSES
-// ===================================================================================
-
 /**
- * Abstraction layer for Google Sheets operations.
- * Separates data access from business logic.
+ * Recursively fetches all folders by bridging Project IDs to Folder IDs 
+ * and scanning the Workspace Root.
+ * @param {Array<Object>} availableProjects - List of project objects to scan for roots.
+ * @returns {Array<Object>} Comprehensive list of all folder objects.
  */
-class SheetsRepo {
-  /**
-   * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss 
-   */
-  constructor(ss) {
-    this.ss = ss;
-    this.tz = ss.getSpreadsheetTimeZone() || CONFIG.CORE.TIMEZONE;
+function fetchAllFoldersRecursively(availableProjects) {
+  let allFolders = [];
+  let queue = []; 
+  let processedIds = new Set();
+
+  console.log(`Starting Hybrid Sync for ${availableProjects.length} Projects + Workspace Root...`);
+
+  // PHASE 1: Project Roots
+  for (const project of availableProjects) {
+    const url = `${CONFIG.API.BASE_URL}/folders?project_id=${project.id}`;
+    const potentialRoots = fetchFolderBatch(url);
+    const rootFolder = potentialRoots.find(f => f.project_id === project.id && f.is_project === true);
+
+    if (rootFolder && !processedIds.has(rootFolder.id)) {
+      allFolders.push(rootFolder);
+      processedIds.add(rootFolder.id);
+      queue.push(rootFolder.id); 
+    }
   }
 
-  /**
-   * Gets a sheet or creates it if missing. Appends header if empty.
-   * @param {string} name - The sheet name to find or create.
-   * @param {Array<string>} header - The header row to append if created.
-   * @returns {GoogleAppsScript.Spreadsheet.Sheet}
-   */
-  ensureSheet(name, header) {
-    let sh = this.ss.getSheetByName(name);
-    if (!sh) { sh = this.ss.insertSheet(name); sh.appendRow(header); }
-    else if (sh.getLastRow() === 0) { sh.appendRow(header); }
-    return sh;
-  }
-
-  /**
-   * Optimized read that only fetches up to the maximum column defined in CONFIG.
-   * Prevents reading thousands of empty columns in large sheets.
-   * @param {string} name - The sheet name to read.
-   * @returns {Array<Array<any>>} The data values (2D array).
-   */
-  readData(name) {
-    const sh = this.ss.getSheetByName(name);
-    if (!sh) return [];
-    
-    // OPTIMIZATION: Only read necessary columns + small buffer
-    const maxCol = Math.max(...Object.values(CONFIG.COLUMNS));
-    const lastCol = Math.min(maxCol + 2, sh.getLastColumn()); 
-    
-    return sh.getRange(1, 1, sh.getLastRow(), lastCol).getValues();
-  }
-
-  /**
-   * Formats a date object to ISO string using the sheet's timezone.
-   * @param {Date} [d=new Date()] 
-   * @returns {string} ISO-8601 formatted string.
-   */
-  timestampISO(d = new Date()) {
-    return Utilities.formatDate(d, this.tz, "yyyy-MM-dd'T'HH:mm:ssXXX");
-  }
-}
-
-/**
- * Validates that specific columns contain specific header text.
- * Used to ensure columns haven't been shifted/deleted by users.
- * * @param {SheetsRepo} repo - Data access repository.
- * @param {string} sheetName - The sheet to check.
- * @param {Object} rules - Map of {colIndex: [allowedNames]}.
- * @returns {{valid: boolean, errors: Array<string>}}
- */
-function validateHeaders(repo, sheetName, rules) {
-  const sheet = repo.ss.getSheetByName(sheetName);
-  if (!sheet) return { valid: false, errors: [`Sheet "${sheetName}" missing`] };
-
-  const actualHeaders = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-  const errors = [];
-
-  Object.entries(rules).forEach(([colIndex, allowedNames]) => {
-    const idx = Number(colIndex) - 1; // Convert to 0-based
-    const actual = String(actualHeaders[idx] || "").trim().toLowerCase();
-    
-    // Check if actual header matches any of the allowed variants
-    const match = allowedNames.some(name => actual === name.toLowerCase());
-    
-    if (!match) {
-      errors.push(`Column ${colIndex}: Expected [${allowedNames.join(", ")}], found "${actualHeaders[idx]}"`);
+  // PHASE 2: Home Folders
+  const globalFolders = fetchFolderBatch(`${CONFIG.API.BASE_URL}/folders`);
+  globalFolders.forEach(f => {
+    if (!processedIds.has(f.id)) {
+      allFolders.push(f);
+      processedIds.add(f.id);
+      queue.push(f.id);
     }
   });
 
-  return { valid: errors.length === 0, errors };
+  // PHASE 3: Recursion
+  let safetyCounter = 0;
+  while (queue.length > 0 && safetyCounter < CONFIG.API.MAX_CALLS) {
+    let parentId = queue.shift();
+    let page = 1;
+    let hasMore = true;
+
+    while (hasMore) {
+      let url = `${CONFIG.API.BASE_URL}/folders?parent_id=${parentId}&page=${page}&per_page=${CONFIG.API.PER_PAGE}`;
+      const items = fetchFolderBatch(url);
+
+      if (items.length > 0) {
+        const newItems = items.filter(f => !processedIds.has(f.id));
+        if (newItems.length > 0) {
+          allFolders = allFolders.concat(newItems);
+          newItems.forEach(f => {
+            processedIds.add(f.id);
+            queue.push(f.id); 
+          });
+        }
+        if (items.length < CONFIG.API.PER_PAGE) hasMore = false;
+        else page++;
+      } else {
+        hasMore = false;
+      }
+      safetyCounter++;
+    }
+    if (safetyCounter % 20 === 0) Utilities.sleep(50); 
+  }
+
+  console.log(`Sync complete. Found ${allFolders.length} total folders.`);
+  return allFolders;
 }
-
 /**
- * Buffers observations in memory and writes them in a single batch.
- * Reducing write operations significantly improves execution speed.
+ * Helper to fetch a single batch of folders from a specific URL.
+ * @param {string} url - The constructed API URL for folders.
+ * @returns {Array<Object>} Array of folder objects (empty if error).
  */
-class ObservationsLogger {
-  /**
-   * @param {SheetsRepo} repo 
-   * @param {string} sheetName 
-   */
-  constructor(repo, sheetName) {
-    this.repo = repo;
-    this.sheetName = sheetName;
-    this.queue = [];
-    this.header = [
-      "TimestampISO","RowIndex","Schedule","Machine","IfRanToday",
-      "LastExpectedRunISO","OverdueMinutes","CurrentStatus",
-      "CurrentDurationMin","MaxRunHours","CriticalFlag","ExtendedFlag"
-    ];
-  }
+function fetchFolderBatch(url) {
+  try {
+    const options = {
+      method: 'get',
+      headers: {
+        'Authorization': `Bearer ${CONFIG.API.TOKEN}`,
+        'Content-Type': 'application/json'
+      },
+      muteHttpExceptions: true
+    };
 
-  /**
-   * Adds an observation to the memory queue.
-   * @param {number} rowIndex - Source row index.
-   * @param {Object} d - Normalized row data.
-   * @param {Object} f - Alert flags.
-   */
-  append(rowIndex, d, f) {
-    const iso = (d.lastExpectedRun instanceof Date) ? d.lastExpectedRun.toISOString() : "";
-    this.queue.push([
-      this.repo.timestampISO(), rowIndex, d.scheduleName, d.machineName, d.ifRanToday,
-      iso, d.overdueMinutes ?? "", d.currentStatus, d.currentDuration,
-      d.maxRunHoursExpected, f.critical ? 1 : 0, f.extended ? 1 : 0
-    ]);
-  }
+    const response = UrlFetchApp.fetch(url, options);
+    if (response.getResponseCode() !== 200) return [];
 
-  /** Writes queued rows to the sheet in one operation. */
-  flush() {
-    if (this.queue.length === 0) return;
+    const json = JSON.parse(response.getContentText());
+    return Array.isArray(json) ? json : (json.items || json.result || []);
+  } catch (e) {
+    console.error("Fetch Error: " + e.message);
+    return [];
+  }
+}
+/**
+ * Retrieves details about the authenticated user and the active workspace.
+ * @returns {Object|null} User/Account data object, or null if fetch fails.
+ */
+function fetchCurrentUser() {
+  const url = `${CONFIG.API.BASE_URL}/users/me`;
+  const options = {
+    method: 'get',
+    headers: {
+      'Authorization': `Bearer ${CONFIG.API.TOKEN}`,
+      'Content-Type': 'application/json'
+    },
+    muteHttpExceptions: true
+  };
+
+  const response = UrlFetchApp.fetch(url, options);
+  if (response.getResponseCode() !== 200) return null;
+
+  return JSON.parse(response.getContentText());
+}
+/**
+ * Writes a 2D array of data to a Google Sheet. Clears existing data and 
+ * applies basic header formatting.
+ * * @param {string} sheetName - The name of the target sheet.
+ * @param {Array<Array<any>>} data - The rows and columns to write.
+ * @returns {void}
+ */
+function writeToSheet(sheetName, data) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(sheetName) || ss.insertSheet(sheetName);
+
+  sheet.clear();
+
+  if (data.length > 0) {
+    sheet.getRange(1, 1, data.length, data[0].length).setValues(data);
+    sheet.getRange(1, 1, 1, data[0].length).setFontWeight("bold").setBackground("#efefef");
+    sheet.setFrozenRows(1);
+  }
+}
+/**
+ * Displays a toast notification in the Google Sheet UI and logs to the console.
+ * @param {string} message - The message to display.
+ * @param {boolean} isError - True if the message should be treated as an error.
+ * @returns {void}
+ */
+function notifyUser(message, isError) {
+  if (isError) console.error(message);
+  else console.log(message);
+
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    if (ss) ss.toast(message, isError ? "Error" : "Success", 5);
+  } catch (e) {
+    console.log("UI notification skipped.");
+  }
+}
+/**
+ * Logs a message to the console if CONFIG.VERBOSE is enabled.
+ * @param {string} msg - The message to log.
+ * @returns {void}
+ */
+function logVerbose(msg) {
+  if (CONFIG.VERBOSE) console.log(`[VERBOSE] ${msg}`);
+}
+// -------------------------------------------------------------------------------------------------------
+// DIAGNOSTIC
+// -------------------------------------------------------------------------------------------------------
+/** * testWorkatoConnectivity
+ * Validates the connection to the Workato API across all primary endpoints.
+ * @description Iterates through 'projects', 'folders', 'recipes', and 'properties' to verify:
+ * 1. The Auth Token is valid.
+ * 2. The Base URL is correct (EU vs US).
+ * 3. The API returns a 200 OK status.
+ * Useful for "Smoke Testing" the configuration before running a full sync.
+ * @returns {void} Logs success/error snapshots to the Execution Transcript.
+ */
+function testWorkatoConnectivity() {
+  const endpoints = ['projects', 'folders', 'recipes', 'properties'];
+
+  console.log("--- TESTING CONNECTIVITY ---");
+  console.log(`Target: ${CONFIG.API.BASE_URL}`);
+
+  endpoints.forEach(endpoint => {
     try {
-      const sheet = this.repo.ensureSheet(this.sheetName, this.header);
-      sheet.getRange(sheet.getLastRow() + 1, 1, this.queue.length, this.queue[0].length).setValues(this.queue);
-      this.queue = []; // Clear buffer
-    } catch (e) {
-      console.error("Failed to flush observations:", e);
-    }
-  }
-}
+      const url = `${CONFIG.API.BASE_URL}/${endpoint}?page=1&per_page=1`;
 
-/**
- * Buffers system events (Audit Trail).
- * Handles structured JSON details in the final column.
- */
-class EventsLogger {
-  /**
-   * @param {SheetsRepo} repo 
-   * @param {string} sheetName 
-   */
-  constructor(repo, sheetName) {
-    this.repo = repo;
-    this.sheetName = sheetName;
-    this.queue = [];
-    this.header = ["TimestampISO","EventType","Schedule","Machine","DetailsJSON"];
-  }
-
-  /**
-   * Logs a system event to the queue.
-   * @param {string} type - Event Type (e.g. "Error", "AlertSent").
-   * @param {string} schedule 
-   * @param {string} machine 
-   * @param {string|Object} details - Will be JSON stringified if object.
-   */
-  log(type, schedule, machine, details) {
-    this.queue.push([
-      this.repo.timestampISO(), type, schedule, machine,
-      (typeof details === "object") ? JSON.stringify(details) : String(details)
-    ]);
-  }
-
-  /** Writes queued events to the sheet. */
-  flush() {
-    if (this.queue.length === 0) return;
-    try {
-      const sheet = this.repo.ensureSheet(this.sheetName, this.header);
-      sheet.getRange(sheet.getLastRow() + 1, 1, this.queue.length, this.queue[0].length).setValues(this.queue);
-      this.queue = [];
-    } catch (e) {
-      console.error("Failed to flush events:", e);
-    }
-  }
-}
-
-/** * OPTIMIZED: In-Memory Alert Deduplication.
- * Prevents spamming alerts by checking last sent timestamp.
- * Reads from memory, queues writes, flushes to PropertyStore at end.
- */
-class AlertDedupeCache {
-  /**
-   * @param {GoogleAppsScript.Properties.Properties} service - PropertyStore service.
-   * @param {number} ttlMinutes - How long to silence repeat alerts.
-   * @param {Object} memoryCache - Pre-loaded properties object for instant reads.
-   */
-  constructor(service, ttlMinutes, memoryCache) {
-    this.service = service;
-    this.ttl = ttlMinutes * 60 * 1000;
-    this.cache = memoryCache || {}; // Read from pre-loaded memory
-    this.pending = {};              // Queue for batch writing
-  }
-  
-  /**
-   * Checks if an alert should fire based on TTL.
-   * @returns {boolean} True if alert should send, False if suppressed.
-   */
-  shouldFire(schedule, machine, type) {
-    const s = (schedule||"").replace(/[^a-zA-Z0-9]/g, "");
-    const m = (machine||"").replace(/[^a-zA-Z0-9]/g, "");
-    const key = `alert::${type}::${s}::${m}`;
-    
-    // Read from Memory (Instant)
-    const last = Number(this.cache[key] || 0);
-    const now = Date.now();
-    
-    if (now - last < this.ttl) return false;
-    
-    // Update Memory immediately & Queue for disk write
-    this.cache[key] = String(now);
-    this.pending[key] = String(now);
-    return true;
-  }
-
-  /** Performs a batch write to Script Properties */
-  flush() {
-    if (Object.keys(this.pending).length > 0) {
-      this.service.setProperties(this.pending);
-    }
-  }
-}
-
-/**
- * OPTIMIZED: In-Memory Observation State Tracking.
- * Detects if a row's data has changed since the last run to avoid logging duplicate states.
- */
-class ObservationStateCache {
-  /**
-   * @param {GoogleAppsScript.Properties.Properties} service 
-   * @param {Object} memoryCache 
-   */
-  constructor(service, memoryCache) {
-    this.service = service;
-    this.cache = memoryCache || {};
-    this.pending = {};
-  }
-
-  /**
-   * Compares current row data against stored hash.
-   * @param {Object} d - Row data object.
-   * @returns {boolean} True if state has changed (log it), False if identical.
-   */
-  checkChange(d) {
-    if (CONFIG.LOGGING.MODE === "all") return true;
-    
-    const key = `obs_sig::${d.scheduleName}::${d.machineName}`;
-    // Compute hash of current state
-    const sig = Utilities.base64Encode(Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, 
-      [d.ifRanToday, d.currentStatus, d.overdueMinutes, d.notRanReason].join("|")
-    ));
-
-    // Compare with Memory (Instant)
-    const last = this.cache[key];
-    if (last !== sig) {
-      // State changed: Update Memory & Queue
-      this.cache[key] = sig;
-      this.pending[key] = sig;
-      return true;
-    }
-    return false;
-  }
-
-  /** Performs a batch write to Script Properties */
-  flush() {
-    if (Object.keys(this.pending).length > 0) {
-      this.service.setProperties(this.pending);
-    }
-  }
-}
-
-/**
- * Handles communication with Google Chat via Webhook.
- */
-class NotificationManager {
-  constructor(webhookUrl) { this.url = webhookUrl; }
-
-  sendMissedSchedule(d) {
-    this.send({ text: `*Missed Schedule Alert*\nSchedule: ${d.scheduleName}\nMachine: ${d.machineName}\nOverdue: ${d.overdueMinutes} mins` });
-  }
-
-  sendExtendedExecution(d) {
-    this.send({ text: `*Extended Execution Alert*\nSchedule: ${d.scheduleName}\nMachine: ${d.machineName}\nRunning: ${formatDuration(d.currentDuration)}\nLimit: ${d.maxRunHoursExpected}h` });
-  }
-
-  sendSystemFailure(error) {
-    this.send({ text: `🚨 *Monitor Script Failed*\nError: ${error.message}` });
-  }
-
-  /**
-   * Executes the HTTP request to the chat webhook.
-   * @param {Object} payload - The chat message payload.
-   */
-  send(payload) {
-    if (!this.url) return;
-    try {
-      UrlFetchApp.fetch(this.url, {
-        method: "post",
-        contentType: "application/json",
-        payload: JSON.stringify(payload),
+      const options = {
+        method: 'get',
+        headers: {
+          'Authorization': `Bearer ${CONFIG.API.TOKEN}`,
+          'Content-Type': 'application/json'
+        },
         muteHttpExceptions: true
-      });
+      };
+
+      const response = UrlFetchApp.fetch(url, options);
+      const code = response.getResponseCode();
+      const text = response.getContentText();
+
+      console.log(`\n--- [${endpoint.toUpperCase()}] Status: ${code} ---`);
+
+      if (code === 200) {
+        const json = JSON.parse(text);
+        console.log(JSON.stringify(json, null, 2));
+      } else {
+        console.error("ERROR RESPONSE:");
+        console.error(text.substring(0, 500));
+      }
     } catch (e) {
-      console.error("Chat send failed", e);
+      console.error(`EXCEPTION calling /${endpoint}: ${e.message}`);
     }
-  }
+  });
+
+  console.log("\nDIAGNOSTIC COMPLETE")
 }
-
-/**
- * Aggregates daily statistics from Observations.
- * Buckets data by Day+Schedule+Machine.
+/** * debugProjectFolders
+ * @description Deep-dive diagnostic for diagnosing "Missing Sub-folder" issues.
+ * It specifically targets projects named "Holiday Request" and "Onboarding" to:
+ * 1. Verify the Projects exist.
+ * 2. Fetch the Project's root folders via `?project_id=ID`.
+ * 3. Analyze the JSON structure (Array vs Object) returned by the API.
+ * @note If the API returns a raw Array `[]`, the main script must use `Array.isArray()` checks.
+ * @returns {void} Logs the hierarchy structure of the target projects.
  */
-class TrendAggregator {
-  constructor(repo, obsSheet, outSheet) { this.repo = repo; this.obsSheet = obsSheet; this.outSheet = outSheet; }
+function debugProjectFolders() {
+  console.log("STARTING DIAGNOSTIC: Project Root Folders");
 
-  /** Reads raw observations and writes aggregated metrics to the Trend sheet. */
-  buildDaily() {
-    const sheet = this.repo.ss.getSheetByName(this.obsSheet);
-    if (!sheet || sheet.getLastRow() < 2) return;
-    
-    // Read all observations
-    const data = sheet.getDataRange().getValues();
-    const headers = data[0];
-    const H = {}; headers.forEach((h,i)=>H[h]=i);
-    
-    const buckets = {};
-    for (let i=1; i<data.length; i++) {
-      const r = data[i];
-      const day = String(r[H["TimestampISO"]] || "").slice(0,10);
-      if (day.length !== 10) continue;
-      
-      const key = `${day}|${r[H["Schedule"]]}|${r[H["Machine"]]}`;
-      if (!buckets[key]) buckets[key] = { day, sched: r[H["Schedule"]], mach: r[H["Machine"]], samples:0, missed:0, extended:0, overdueSum:0 };
-      
-      const b = buckets[key];
-      b.samples++;
-      if (r[H["CriticalFlag"]] == 1) b.missed++;
-      if (r[H["ExtendedFlag"]] == 1) b.extended++;
-      b.overdueSum += Number(r[H["OverdueMinutes"]]||0);
-    }
-    
-    const out = [["Day","Schedule","Machine","Samples","Missed","Extended","AvgOverdue"]];
-    Object.values(buckets).forEach(b => {
-      out.push([b.day, b.sched, b.mach, b.samples, b.missed, b.extended, Math.round(b.overdueSum/b.samples)]);
-    });
-    
-    const outSh = this.repo.ensureSheet(this.outSheet, out[0]);
-    outSh.clearContents();
-    if(out.length > 1) outSh.getRange(1,1,out.length,out[0].length).setValues(out);
-  }
-}
-
-/**
- * Deletes log rows older than retention period to prevent sheet overflow.
- * Reads timestamps (Column A) and deletes logic rows.
- */
-class LogRetentionManager {
-  constructor(repo, retentionDays) {
-    this.repo = repo;
-    this.cutoff = new Date();
-    this.cutoff.setDate(this.cutoff.getDate() - retentionDays);
-  }
+  // 1. Fetch Projects to get IDs
+  // We use a simplified inline fetch here to ensure this test is standalone
+  console.log("... Fetching Project List");
+  const projectsUrl = `${CONFIG.API.BASE_URL}/projects`;
+  const options = {
+      method: 'get',
+      headers: { 
+        'Authorization': `Bearer ${CONFIG.API.TOKEN}`,
+        'Content-Type': 'application/json' 
+      },
+      muteHttpExceptions: true
+  };
   
-  /**
-   * Scans the sheet and deletes old rows.
-   * Assumes logs are chronological (oldest at top).
-   * @param {string} sheetName 
-   */
-  cleanSheet(sheetName) {
-    const sheet = this.repo.ss.getSheetByName(sheetName);
-    if (!sheet || sheet.getLastRow() < 2) return;
+  const projRes = UrlFetchApp.fetch(projectsUrl, options);
+  const allProjects = JSON.parse(projRes.getContentText());
+  console.log(`Found ${allProjects.length} total projects.`);
+
+  // 2. Filter for the specific projects you mentioned
+  // (We use toLowerCase() to be safe with casing)
+  const targets = ["Holiday Request", "Onboarding"];
+  
+  const targetProjects = allProjects.filter(p => 
+    targets.some(t => p.name.toLowerCase().includes(t.toLowerCase()))
+  );
+
+  if (targetProjects.length === 0) {
+    console.error("Could not find projects named 'Holiday Request' or 'Onboarding'. Check exact spelling.");
+    return;
+  }
+
+  // 3. Test the Folder Endpoint for these specific projects
+  targetProjects.forEach(p => {
+    console.log(`\n---------------------------------------------------`);
+    console.log(`TESTING PROJECT: "${p.name}" (ID: ${p.id})`);
     
-    // Optimistic Check: Only check first 100 rows (since logs are chronological)
-    const rowsToCheck = Math.min(sheet.getLastRow()-1, 100);
-    const dates = sheet.getRange(2, 1, rowsToCheck, 1).getValues();
-    let deleteCount = 0;
-    
-    for (let i=0; i<dates.length; i++) {
-      const d = new Date(dates[i][0]);
-      if (!isNaN(d.getTime()) && d < this.cutoff) deleteCount++;
-      else break; // Stop as soon as we hit a new date
+    // Construct the URL specifically for this project's root
+    const folderUrl = `${CONFIG.API.BASE_URL}/folders?project_id=${p.id}`;
+    console.log(`   URL: ${folderUrl}`);
+
+    const folderRes = UrlFetchApp.fetch(folderUrl, options);
+    const text = folderRes.getContentText();
+    const status = folderRes.getResponseCode();
+
+    console.log(`   HTTP Status: ${status}`);
+
+    if (status === 200) {
+      const json = JSON.parse(text);
+      
+      // Determine if it's an Array or Object (The core issue we suspect)
+      let items = [];
+      let dataType = "Unknown";
+      
+      if (Array.isArray(json)) {
+        items = json;
+        dataType = "Raw Array []";
+      } else if (json.items) {
+        items = json.items;
+        dataType = "Object with .items {}";
+      } else if (json.result) {
+        items = json.result;
+        dataType = "Object with .result {}";
+      }
+
+      console.log(`   Data Structure: ${dataType}`);
+      console.log(`   Folder Count: ${items.length}`);
+
+      // Log the actual names found to verify "API Recipes" or "Testing" appear
+      if (items.length > 0) {
+        console.log(`   Found Folders:`);
+        items.forEach(f => console.log(`     - [ID: ${f.id}] "${f.name}" (Parent: ${f.parent_id})`));
+      } else {
+        console.warn(`Returned 0 folders. Check if folders exist at the TOP LEVEL of this project.`);
+      }
+      
+      // Dump raw snippet for deeper inspection
+      console.log(`   \n   [RAW SNAPSHOT]: ${text.substring(0, 1000)}...`);
+
+    } else {
+      console.error(`API ERROR: ${text}`);
     }
+  });
+  
+  console.log("\nDIAGNOSTIC COMPLETE");
+}
+/** * inspectSpecificFolder
+ * * @description Probes a specific ID against the Workato `/folders/{id}` endpoint.
+ * This is used to determine if a "Mystery ID" (like a parent_id found in logs)
+ * is actually a valid folder, or if it returns "API Not Found".
+ * @const {number} targetId - The ID to inspect (Hardcoded for manual testing).
+ * @returns {void} Logs the metadata of the ID if found, or the specific error message if not.
+ */
+function inspectSpecificFolder() {
+  const targetId = 616442; // The ID you want to verify
+  
+  console.log(`INSPECTING ID: ${targetId}...`);
+  
+  const url = `${CONFIG.API.BASE_URL}/folders/${targetId}`;
+  const options = {
+      method: 'get',
+      headers: { 
+        'Authorization': `Bearer ${CONFIG.API.TOKEN}`,
+        'Content-Type': 'application/json' 
+      },
+      muteHttpExceptions: true
+  };
+
+  const response = UrlFetchApp.fetch(url, options);
+  
+  if (response.getResponseCode() === 200) {
+    const folder = JSON.parse(response.getContentText());
     
-    if (deleteCount > 0) {
-      sheet.deleteRows(2, deleteCount);
-      console.log(`Cleaned ${deleteCount} rows from ${sheetName}`);
+    console.log(`\nRESULTS:`);
+    console.log(`   Name:      "${folder.name}"`); // Expect "Home"
+    console.log(`   Parent ID: ${folder.parent_id}`); // Expect null
+    console.log(`   Is Project:${folder.is_project || false}`);
+    
+    if (folder.parent_id === null) {
+      console.log(`\nCONFIRMED: This is a Root Level folder.`);
     }
+  } else {
+    console.error(`Error: ${response.getContentText()}`);
   }
 }
-
-// ===================================================================================
-// 4. HELPERS
-// ===================================================================================
-
-/** * Safe extractor for row data. Handles mapping indices to named properties.
- * @param {Array} row - Raw row data from sheet.
- * @returns {Object} Structured data.
+/** * confirmWorkspaceId
+ * * @description Fetches the authenticated User and Account details. 
+ * Can optionally compare a specific ID against these details to identify its origin.
+ * @param {number|string} [targetId] - (Optional) An ID to check (e.g., a "mystery" parent_id found in logs).
+ * @returns {Object} An object containing the userId and accountId for further use.
  */
-function getRowData(row) {
-  const get = (idx) => (row[idx-1] === undefined) ? "" : row[idx-1];
-  const num = (idx) => {
-    const n = Number(get(idx));
-    return isFinite(n) ? n : null;
-  };
+function confirmWorkspaceID(targetId = null) {
+  console.log("Checking Current User & Workspace Context...");
+  
+  const user = fetchCurrentUser(); // Uses the main helper function
+  
+  if (!user) {
+    console.error("Could not fetch user details. Check Auth Token.");
+    return null;
+  }
+
+  // Normalize IDs to strings for safe comparison
+  const userId = String(user.id);
+  const accountId = String(user.current_account_id);
+  const targetStr = targetId ? String(targetId) : null;
+
+  console.log("-----------------------------------------");
+  console.log(`User name:   ${user.name}`);
+  console.log(`User email:  ${user.email}`);
+  console.log(`User ID:     ${userId}`); 
+  console.log(`Account ID:  ${accountId || "N/A (Not provided by API)"}`);
+  console.log(`Workspace:   ${user.current_account_name}`);
+  console.log("-----------------------------------------");
+
+  // If a target ID was passed, check for matches
+  if (targetStr) {
+    console.log(`Comparing target ID [${targetStr}]...`);
+    
+    if (userId === targetStr) {
+      console.log(`MATCH FOUND: [${targetStr}] is your USER ID.`);
+    } else if (accountId === targetStr) {
+      console.log(`MATCH FOUND: [${targetStr}] is your ACCOUNT (Workspace) ID.`);
+      console.log("   (This ID acts as the 'Root' parent for top-level projects).");
+    } else {
+      console.log(`NO MATCH: [${targetStr}] is neither your User ID nor Account ID.`);
+    }
+  }
 
   return {
-    scheduleName: String(get(CONFIG.COLUMNS.SCHEDULE_NAME)).trim(),
-    machineName: String(get(CONFIG.COLUMNS.MACHINE)).trim(),
-    ifRanToday: String(get(CONFIG.COLUMNS.IF_RAN_TODAY)).trim(),
-    lastExpectedRun: get(CONFIG.COLUMNS.LAST_EXPECTED_RUN),
-    currentStatus: String(get(CONFIG.COLUMNS.CURRENT_STATUS)).trim(),
-    currentDuration: num(CONFIG.COLUMNS.CURRENT_DURATION) || 0,
-    maxRunHoursExpected: num(CONFIG.COLUMNS.MAX_RUN_HOURS) || 0,
-    overdueMinutes: num(CONFIG.COLUMNS.NOW_DIFF),
-    notRanReason: String(get(CONFIG.COLUMNS.NOT_RAN_REASON)).trim()
+    userId: user.id,
+    accountId: user.current_account_id,
+    workspaceName: user.current_account_name
   };
-}
-
-/** * Parses trigger flags from the sheet columns.
- * @returns {{critical: boolean, extended: boolean}} 
- */
-function getAlertFlags(row) {
-  const crit = String(row[CONFIG.COLUMNS.CRITICAL_ALERT - 1] || "").toUpperCase();
-  const ext = String(row[CONFIG.COLUMNS.EXTENDED_ALERT - 1] || "").toUpperCase();
-  return {
-    critical: crit === CONFIG.ALERTS.CRITICAL_VALUE,
-    extended: crit === CONFIG.ALERTS.EXTENDED_VALUE || ext === CONFIG.ALERTS.EXTENDED_VALUE
-  };
-}
-
-/**
- * Formats minutes into human readable string.
- * @param {number} m - Minutes.
- * @returns {string} e.g. "1h 30m".
- */
-function formatDuration(m) {
-  const h = Math.floor(m/60);
-  const min = Math.floor(m%60);
-  return h ? `${h}h ${min}m` : `${min}m`;
-}
-
-// ===================================================================================
-// 5. UI
-// ===================================================================================
-
-/** Creates custom menu on open */
-function onOpen() {
-  SpreadsheetApp.getUi().createMenu('Schedule Monitor')
-    .addItem('▶ Run Monitor Now', 'runScheduleMonitor')
-    .addItem('🧹 Run Maintenance', 'runDailyMaintenance')
-    .addToUi();
 }
