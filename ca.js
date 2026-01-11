@@ -31,7 +31,8 @@ const CONFIG = {
     RECIPES: 'recipes',
     FOLDERS: 'folders',
     PROJECTS: 'projects',
-    PROPERTIES: 'properties'
+    PROPERTIES: 'properties',
+    DEPENDENCIES: 'recipe_dependencies'
   },
   VERBOSE: true
 };
@@ -105,6 +106,28 @@ function syncWorkatoWorkspace() {
         r.last_run_at || "NEVER"
       ])
     );
+
+    const dependencyRows = [["Parent Recipe ID", "Dependency Type", "Dependency ID", "Dependency Name"]];
+
+    // Limit this to a subset or ensure it stays within MAX_CALLS
+    recipes.forEach((recipe, index) => {
+      if (index < 100) { // Example safety cap for testing
+        const deps = fetchRecipeDependencies(recipe.id);
+        deps.forEach(dep => {
+          dependencyRows.push([
+            recipe.id,
+            dep.type,
+            dep.id,
+            dep.name
+          ]);
+        });
+        
+        // Minimal throttle to avoid rate limiting
+        if (index % 5 === 0) Utilities.sleep(100); 
+      }
+    });
+
+    writeToSheet(CONFIG.SHEETS.DEPENDENCIES, dependencyRows);
 
     const propertyRows = [["ID", "Name", "Value", "Created at", "Updated at"]].concat(
       properties.map(p => [p.id, p.name, p.value, p.created_at, p.updated_at])
@@ -298,6 +321,32 @@ function fetchCurrentUser() {
   if (response.getResponseCode() !== 200) return null;
 
   return JSON.parse(response.getContentText());
+}
+/**
+ * Fetches dependencies for a specific recipe.
+ * @param {number|string} recipeId - The ID of the recipe.
+ * @returns {Array<Object>} List of dependency objects.
+ */
+function fetchRecipeDependencies(recipeId) {
+  const url = `${CONFIG.API.BASE_URL}/recipes/${recipeId}/dependencies`;
+  const options = {
+    method: 'get',
+    headers: {
+      'Authorization': `Bearer ${CONFIG.API.TOKEN}`,
+      'Content-Type': 'application/json'
+    },
+    muteHttpExceptions: true
+  };
+
+  const response = UrlFetchApp.fetch(url, options);
+  if (response.getResponseCode() !== 200) {
+    console.warn(`Could not fetch dependencies for recipe ${recipeId}`);
+    return [];
+  }
+
+  const json = JSON.parse(response.getContentText());
+  // The API returns an object with a "dependencies" key
+  return json.dependencies || [];
 }
 /**
  * Writes a 2D array of data to a Google Sheet. Clears existing data and 
