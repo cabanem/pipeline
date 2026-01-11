@@ -2,9 +2,15 @@
  * @file Workato Inventory Sync
  * @description Fetches all resources from Workato and logs them to a dedicated Google Sheet.
  * @author Emily Cabaniss
- * @see DOCS (Workato developer API): "https://docs.workato.com/en/workato-api.html"
+ * 
+ * @see - README ("https://docs.google.com/document/d/18mk8sphXwC7bTRrDj09rnL4FNVuiBNS1oVeM3zuyUcg/edit?tab=t.0")
+ * @see - Diagrams ("https://lucid.app/lucidchart/8af28952-b1ae-4eb2-a486-343a0162a587/edit?viewport_loc=-2621%2C-29%2C4037%2C1896%2C-4lm-29-aRvB&invitationId=inv_66f2e22a-b1f9-49b6-b036-ed97b5af2d39")
+ * @see - Documentation for the Workato developer API: "https://docs.workato.com/en/workato-api.html"
  */
 
+// -------------------------------------------------------------------------------------------------------
+// CONFIGURATION
+// -------------------------------------------------------------------------------------------------------
 /**
  * @typedef {Object} APIConfig
  * @property {string} TOKEN - The Workato API bearer token.
@@ -49,14 +55,18 @@ class AppConfig {
         FOLDERS: 'folders',
         PROJECTS: 'projects',
         PROPERTIES: 'properties',
-        DEPENDENCIES: 'recipe_dependencies'
+        DEPENDENCIES: 'recipe_dependencies',
+        LOGIC: 'recipe_logic',
+        LOGIC_INPUT: 'logic_requests'
       },
       HEADERS: {
         PROJECTS: ["ID", "Name", "Description", "Created at"],
         FOLDERS: ["ID", "Name", "Parent folder", "Project name"],
         RECIPES: ["ID", "Name", "Status", "Project", "Folder", "Last Run"],
-        DEPENDENCIES: ["Parent Recipe ID", "Dependency Type", "Dependency ID", "Dependency Name"],
-        PROPERTIES: ["ID", "Name", "Value", "Created at", "Updated at"]
+        DEPENDENCIES: ["Parent Recipe ID", "Project", "Folder", "Dependency Type", "Dependency ID", "Dependency Name"],
+        PROPERTIES: ["ID", "Name", "Value", "Created at", "Updated at"],
+        LOGIC: ["Recipe ID", "Recipe Name", "Step Number", "Indent", "Provider", "Action/Name", "Description"],
+        LOGIC_INPUT: ["Enter recipe IDs below (one per row)"]
       },
       CONSTANTS: {
         RECIPE_PROVIDERS: ['workato_recipe_function', 'workato_callable_recipe'],
@@ -67,6 +77,10 @@ class AppConfig {
     };
   }
 }
+
+// -------------------------------------------------------------------------------------------------------
+// LOGGING
+// // -------------------------------------------------------------------------------------------------------
 /**
  * @class
  * @classdesc Static utility for logging to both Apps Script console and Sheets UI.
@@ -95,6 +109,10 @@ class Logger {
     }
   }
 }
+
+// -------------------------------------------------------------------------------------------------------
+// WORKATO CLIENT
+// -------------------------------------------------------------------------------------------------------
 /**
  * @class
  * @classdesc Low-level HTTP wrapper for the Workato API.
@@ -169,6 +187,7 @@ class WorkatoClient {
     return results;
   }
 }
+
 // -------------------------------------------------------------------------------------------------------
 // DOMAIN SERVICE CLASSES
 // -------------------------------------------------------------------------------------------------------
@@ -419,15 +438,14 @@ class SheetService {
   constructor() {
     this.config = AppConfig.get();
   }
+
   /**
    * Writes a 2D array of data to a specific Google Sheet.
    * Clears existing data and applies header formatting.
-   * * @param {string} sheetKey - Key corresponding to CONFIG.SHEETS (e.g., 'RECIPES').
+   * @param {string} sheetKey - Key corresponding to CONFIG.SHEETS.
    * @param {Array<Array<any>>} rows - The data to write.
-   * @throws {Error} If the sheetKey does not exist in the configuration.
    */
   write(sheetKey, rows) {
-    // sheetKey matches keys in CONFIG.SHEETS (e.g., 'RECIPES', 'FOLDERS')
     const sheetName = this.config.SHEETS[sheetKey];
     if (!sheetName) throw new Error(`Sheet key ${sheetKey} not found in config.`);
 
@@ -439,16 +457,120 @@ class SheetService {
     sheet.clear();
 
     if (rows.length > 0) {
-      // Perform the write
-      sheet.getRange(1, 1, rows.length, rows[0].length).setValues(rows);
+      const numRows = rows.length;
+      const numCols = rows[0].length;
       
-      // Apply Formatting
-      sheet.getRange(1, 1, 1, rows[0].length)
+      // 1. Get the full range for all data
+      const fullRange = sheet.getRange(1, 1, numRows, numCols);
+      
+      // 2. Write values and apply global Left Alignment
+      fullRange.setValues(rows)
+               .setHorizontalAlignment("left");
+      
+      // 3. Apply Header Formatting (Bold, Background, Vertical Middle)
+      sheet.getRange(1, 1, 1, numCols)
            .setFontWeight("bold")
-           .setBackground(this.config.CONSTANTS.STYLE_HEADER_BG);
+           .setBackground(this.config.CONSTANTS.STYLE_HEADER_BG)
+           .setVerticalAlignment("middle"); // <--- Added this
       
       sheet.setFrozenRows(1);
     }
+  }
+  /**
+   * Reads a list of IDs from the request sheet.
+   * @returns {string[]} Array of Recipe IDs found in column A.
+   */
+  readRequests() {
+    const sheetName = this.config.SHEETS.LOGIC_INPUT;
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName(sheetName);
+
+    // If sheet doesn't exist, create it and add headers
+    if (!sheet) {
+      const newSheet = ss.insertSheet(sheetName);
+      newSheet.getRange(1, 1).setValue(this.config.HEADERS.LOGIC_INPUT[0])
+              .setFontWeight("bold").setBackground("#fff2cc"); // Yellow to indicate input
+      return [];
+    }
+
+    const lastRow = sheet.getLastRow();
+    if (lastRow < 2) return []; // No data
+
+    // Get all values in Column A (excluding header)
+    const values = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+    
+    // Flatten array and filter out empty strings
+    return values.flat().filter(id => id).map(String);
+  }
+}
+
+/**
+ * @class
+ * @classdesc Service for translating raw recipe code into human-readable logic summaries.
+ */
+class LogicService {
+  /**
+   * Generates a flat list of steps for a given recipe.
+   * @param {Object} recipe - The recipe object (must include 'code').
+   * @returns {Array<Array<string>>} Rows for the spreadsheet.
+   */
+  parseLogic(recipe) {
+    if (!recipe.code) return [];
+
+    let rows = [];
+    try {
+      const codeObj = JSON.parse(recipe.code);
+      // Determine the root block (API variations exist)
+      const rootBlock = codeObj.block || codeObj.line || [];
+      
+      // Start recursive scan at indentation level 0
+      this._scanBlock(rootBlock, 0, recipe.id, recipe.name, rows);
+    } catch (e) {
+      console.warn(`Error parsing logic for recipe ${recipe.id}: ${e.message}`);
+    }
+    return rows;
+  }
+
+  /**
+   * Recursive helper to traverse steps and formatting them.
+   * @private
+   */
+  _scanBlock(steps, indentLevel, recipeId, recipeName, rows) {
+    if (!Array.isArray(steps)) return;
+
+    steps.forEach((step, index) => {
+      // 1. Format the visual indent (e.g., ">> ")
+      const visualIndent = "> ".repeat(indentLevel);
+      
+      // 2. Determine a friendly name for the action
+      // Use the user-defined name if it exists, otherwise the system action name
+      let actionName = step.name || step.as || "Unknown Action";
+      
+      // 3. Extract a description (optional)
+      // Some steps have a 'description' field or comment
+      let description = step.description || "";
+      
+      // If it's a conditional step (If/Else), make it clear
+      if (step.keyword) {
+         actionName = `[${step.keyword.toUpperCase()}] ${actionName}`;
+      }
+
+      // 4. Push row
+      rows.push([
+        String(recipeId),
+        recipeName,
+        index + 1,        // Step number in current block
+        visualIndent,     // Visual hierarchy
+        step.provider || "System",
+        actionName,
+        description
+      ]);
+
+      // 5. Recurse into nested blocks (If, Else, Loop, Try/Catch)
+      if (step.block)       this._scanBlock(step.block, indentLevel + 1, recipeId, recipeName, rows);
+      if (step.else_block)  this._scanBlock(step.else_block, indentLevel + 1, recipeId, recipeName, rows);
+      if (step.error_block) this._scanBlock(step.error_block, indentLevel + 1, recipeId, recipeName, rows);
+    });
   }
 }
 
@@ -468,6 +590,7 @@ class WorkatoSyncApp {
     const client = new WorkatoClient();
     this.inventoryService = new InventoryService(client);
     this.dependencyService = new DependencyService(client);
+    this.logicService = new LogicService();
     this.sheetService = new SheetService();
   }
   /**
@@ -475,18 +598,15 @@ class WorkatoSyncApp {
    * Performs authentication check, fetches all resources, transforms data, 
    * resolves dependencies, and writes to Sheets.
    */
-  run() {
+  runInventorySync() {
     try {
       Logger.verbose("Starting full workspace sync...");
 
       // 1. Identify present workspace
       const currentUser = this.inventoryService.getCurrentUser();
-      if (currentUser) {
-        console.log(`Authenticated as ${currentUser.name || "Unknown user"}`);
-        console.log(`Connected to workspace: ${currentUser.current_account_name || "Unknown workspace"}`);
-      }
+      if (currentUser) console.log(`Authenticated as ${currentUser.name || "Unknown user"}`);
 
-      // 2. Fetch all raw data
+      // 2. Fetch raw data
       const projects = this.inventoryService.getProjects();
       const folders = this.inventoryService.getFoldersRecursive(projects);
       const recipes = this.inventoryService.getRecipes();
@@ -504,9 +624,7 @@ class WorkatoSyncApp {
       const folderRows = this._transformFolders(folders, folderMap, projectMap);
       const recipeRows = this._transformRecipes(recipes, projectMap, folderMap);
       const propertyRows = this._transformProperties(properties);
-      
-      // 5. Dependency Logic (Complex processing)
-      const dependencyRows = this._processDependencies(recipes, recipeMap);
+      const dependencyRows = this._processDependencies(recipes, recipeMap, projectMap, folderMap);
 
       // 6. Write to Sheets
       Logger.verbose("Writing to Sheets...");
@@ -519,19 +637,68 @@ class WorkatoSyncApp {
       Logger.notify("Sync complete. Workspace inventory updated...", false);
 
     } catch (e) {
-      let errorMsg = `Sync failed: ${e.message}`;
-      if (e.message.includes("Unexpected token")) {
-        errorMsg = "Authentication error: Check your WORKATO_TOKEN, and BASE_URL";
-      }
-      Logger.notify(errorMsg, true);
-      console.error(e.stack);
+      this._handleError(e);
     }
   }
 
-  // --- INTERNAL TRANSFORMATION HELPERS ---
+  /**
+   * Reads specific IDs from the input sheet and fetches step-by-step logic.
+   */
+  runLogicDebug() {
+    try {
+      Logger.verbose("=== STARTING LOGIC DEBUGGER ===");
+
+      // 1. Read input
+      const requestedIds = this.sheetService.readRequests();
+      if (requestedIds.length === 0) {
+        Logger.notify("No IDs found in the 'logic_requests' sheet.", true);
+        return;
+      }
+      Logger.notify(`Fetching logic for ${requestedIds.length} recipes...`);
+
+      // 2. Fetch and parse Llgic
+      const rows = [this.config.HEADERS.LOGIC];
+      
+      requestedIds.forEach((reqId, index) => {
+        try {
+           // Fetch fresh details for this specific ID
+           const fullRecipe = this.dependencyService.client.get(`recipes/${reqId}`);
+           const logicRows = this.logicService.parseLogic(fullRecipe);
+           
+           rows.push(...logicRows);
+           Logger.verbose(`Parsed: ${fullRecipe.name || reqId}`);
+
+        } catch (e) {
+           console.warn(`Failed ID ${reqId}: ${e.message}`);
+           rows.push([reqId, "ERROR", "-", "-", "-", e.message, "-"]);
+        }
+        
+        // Slight throttle
+        if (index % 5 === 0) Utilities.sleep(this.config.API.THROTTLE_MS);
+      });
+
+      // 3. Write Output
+      this.sheetService.write('LOGIC', rows);
+      Logger.notify("Logic Debug Complete.");
+
+    } catch (e) {
+      this._handleError(e);
+    }
+  }
+
+  // --- INTERNAL HELPERS ---
   /** @private */
   _createLookupMap(items) {
-    return Object.fromEntries(items.map(i => [i.id, i.name]));
+    return Object.fromEntries(items.map(i => [String(i.id), i.name]));
+  }
+  /** @private */
+  _handleError(e) {
+    let errorMsg = `Sync failed: ${e.message}`;
+    if (e.message.includes("Unexpected token")) {
+      errorMsg = "Auth Error: Check WORKATO_TOKEN and BASE_URL";
+    }
+    Logger.notify(errorMsg, true);
+    console.error(e.stack);
   }
   /** @private */
   _transformProjects(projects) {
@@ -578,13 +745,16 @@ class WorkatoSyncApp {
    * Applies throttling and safety limits to avoid execution timeouts.
    * @private
    */
-  _processDependencies(recipes, recipeMap) {
+  _processDependencies(recipes, recipeMap, projectMap, folderMap) {
     const rows = [this.config.HEADERS.DEPENDENCIES];
     const limit = this.config.API.RECIPE_LIMIT_DEBUG;
     const throttle = this.config.API.THROTTLE_MS;
 
     recipes.forEach((recipe, index) => {
       if (index < limit) {
+        // Lookup context
+        const projectName = projectMap[String(recipe.project_id)] || `[ID: ${recipe.project_id}]`;
+        const folderName = folderMap[String(recipe.folder_id)] || `[ID: ${recipe.folder_id}]`;
         // Delegate fetching to the service
         const deps = this.dependencyService.getForRecipe(recipe.id);
         
@@ -592,7 +762,7 @@ class WorkatoSyncApp {
           let finalName = dep.name;
           
           if (dep.type === 'RECIPE CALL') {
-            const childRecipeName = recipeMap[dep.id];
+            const childRecipeName = recipeMap[Striing(dep.id)];
             if (childRecipeName) {
               finalName = childRecipeName;
             } else {
@@ -601,6 +771,8 @@ class WorkatoSyncApp {
           }
           rows.push([
             recipe.id,
+            projectName,
+            folderName,
             dep.type,
             dep.id,
             finalName
@@ -614,6 +786,52 @@ class WorkatoSyncApp {
 
     return rows;
   }
+  /** * Fetches logic ONLY for recipes requested in the 'logic_requests' sheet.
+   * @private 
+   */
+  _processLogic(allRecipes) {
+    // 1. Get requested IDs from the Sheet
+    const requestedIds = this.sheetService.readRequests();
+    
+    if (requestedIds.length === 0) {
+      Logger.verbose("No specific recipes requested for Logic Dump. Skipping.");
+      return [];
+    }
+
+    Logger.verbose(`Processing Logic for ${requestedIds.length} requested recipes...`);
+    
+    const rows = [this.config.HEADERS.LOGIC];
+    const throttle = this.config.API.THROTTLE_MS;
+
+    // 2. Iterate only through the requested IDs
+    requestedIds.forEach((reqId, index) => {
+      // Find the recipe metadata in our full list (optional, for name lookup)
+      // We use String() comparison to be safe
+      const recipeMeta = allRecipes.find(r => String(r.id) === String(reqId));
+      const recipeName = recipeMeta ? recipeMeta.name : "Unknown / Not in Sync";
+
+      try {
+         // Fetch the FULL recipe (including code) directly from API
+         // We do this individually because 'allRecipes' usually doesn't have the 'code' block
+         const fullRecipe = this.dependencyService.client.get(`recipes/${reqId}`);
+         
+         // Parse
+         const logicRows = this.logicService.parseLogic(fullRecipe);
+         rows.push(...logicRows);
+         
+         Logger.verbose(`Parsed logic for: ${recipeName} (${reqId})`);
+
+      } catch (e) {
+         console.warn(`Could not fetch logic for ID ${reqId}: ${e.message}`);
+         rows.push([reqId, recipeName, "-", "-", "ERROR", e.message, "-"]);
+      }
+      
+      // Throttle to be kind to the API
+      if (index % 5 === 0) Utilities.sleep(throttle);
+    });
+
+    return rows;
+  }
 }
 
 // -------------------------------------------------------------------------------------------------------
@@ -623,9 +841,17 @@ class WorkatoSyncApp {
  * Primary entry point for the script. 
  * Initializes the WorkatoSyncApp controller and runs the sync.
  */
-function syncWorkatoWorkspace() {
+function syncInventory() {
   const app = new WorkatoSyncApp();
-  app.run();
+  app.runInventorySync();
+}
+/**
+ * Recipe logic debugger
+ * Run this to update the 'recipe_logic' tab based on IDs in 'logic_requests'.
+ */
+function fetchRecipeLogic() {
+  const app = new WorkatoSyncApp();
+  app.runLogicDebug();
 }
 /**
  * Validates the connection to the Workato API across all primary endpoints.
