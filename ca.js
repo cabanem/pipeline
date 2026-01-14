@@ -1,4 +1,301 @@
 /** ****************************************************************************************
+ * FILE: TEST_Assert.gs
+ * Minimal assertion + test runner utilities for Google Apps Script (V8).
+ ******************************************************************************************/
+
+class Assert {
+  static _fmt(v) {
+    try { return JSON.stringify(v, null, 2); } catch (_) { return String(v); }
+  }
+
+  static ok(value, msg) {
+    if (!value) throw new Error(msg || `Expected truthy but got: ${Assert._fmt(value)}`);
+  }
+
+  static equal(actual, expected, msg) {
+    if (actual !== expected) {
+      throw new Error(msg || `Expected ${Assert._fmt(expected)} but got ${Assert._fmt(actual)}`);
+    }
+  }
+
+  static notEqual(actual, expected, msg) {
+    if (actual === expected) {
+      throw new Error(msg || `Expected value to differ, but both were ${Assert._fmt(actual)}`);
+    }
+  }
+
+  static contains(haystack, needle, msg) {
+    const h = String(haystack ?? "");
+    const n = String(needle ?? "");
+    if (!h.includes(n)) {
+      throw new Error(msg || `Expected string to contain "${n}", got:\n${h}`);
+    }
+  }
+
+  static deepEqual(actual, expected, msg) {
+    const a = Assert._fmt(actual);
+    const e = Assert._fmt(expected);
+    if (a !== e) {
+      throw new Error(msg || `Expected deepEqual.\nExpected:\n${e}\nActual:\n${a}`);
+    }
+  }
+
+  static throws(fn, msgContains) {
+    let threw = false;
+    try {
+      fn();
+    } catch (e) {
+      threw = true;
+      if (msgContains) Assert.contains(e.message, msgContains);
+    }
+    if (!threw) throw new Error("Expected function to throw, but it did not.");
+  }
+}
+
+class TestRunner {
+  constructor() {
+    /** @type {Array<{name:string, fn:Function}>} */
+    this.tests = [];
+  }
+
+  add(name, fn) {
+    this.tests.push({ name, fn });
+    return this;
+  }
+
+  run(options = {}) {
+    const writeToSheet = Boolean(options.writeToSheet);
+    const results = [];
+    const startedAt = new Date();
+
+    for (const t of this.tests) {
+      const t0 = Date.now();
+      try {
+        t.fn();
+        results.push({
+          name: t.name,
+          status: "PASS",
+          ms: Date.now() - t0,
+          error: ""
+        });
+      } catch (e) {
+        results.push({
+          name: t.name,
+          status: "FAIL",
+          ms: Date.now() - t0,
+          error: (e && e.stack) ? e.stack : String(e)
+        });
+      }
+    }
+
+    const pass = results.filter(r => r.status === "PASS").length;
+    const fail = results.length - pass;
+    const duration = Date.now() - startedAt.getTime();
+
+    console.log(`TESTS COMPLETE: ${pass} passed, ${fail} failed in ${duration}ms`);
+
+    results.forEach(r => {
+      const prefix = r.status === "PASS" ? "✅" : "❌";
+      console.log(`${prefix} ${r.name} (${r.ms}ms)`);
+      if (r.status === "FAIL") console.log(r.error);
+    });
+
+    if (writeToSheet) {
+      try {
+        const ss = SpreadsheetApp.getActiveSpreadsheet();
+        const sheetName = "test_results";
+        let sheet = ss.getSheetByName(sheetName) || ss.insertSheet(sheetName);
+        sheet.clear();
+        sheet.getRange(1, 1, 1, 5).setValues([["Timestamp", "Test", "Status", "Duration (ms)", "Error"]])
+          .setFontWeight("bold")
+          .setBackground("#efefef");
+        const ts = new Date().toISOString();
+        const rows = results.map(r => [ts, r.name, r.status, r.ms, r.error]);
+        if (rows.length) sheet.getRange(2, 1, rows.length, 5).setValues(rows);
+        sheet.setFrozenRows(1);
+      } catch (e) {
+        console.log("Could not write test results sheet: " + e.message);
+      }
+    }
+
+    if (fail > 0) {
+      throw new Error(`Test suite failed: ${fail} failing tests.`);
+    }
+    return results;
+  }
+}
+
+/** ****************************************************************************************
+ * FILE: TEST_Fixtures.gs
+ * Deterministic fixtures for recipe code scanning, branching, cycles, and mermaid rendering.
+ ******************************************************************************************/
+
+class Fixtures {
+  /**
+   * A realistic-ish Workato step tree with:
+   * - recipe calls via flow_id, recipe_id, callable_recipe_id
+   * - if/else + error blocks
+   * - data pill strings in conditions
+   */
+  static recipeCodeBlock_withBranchesAndCalls() {
+    const dpLabel = "#{_dp('{\\\"label\\\":\\\"Ticket ID\\\",\\\"path\\\":[\\\"ticket\\\",\\\"id\\\"]}')}";
+    return {
+      block: [
+        { provider: "gmail", name: "Trigger: New email", input: { subject: "Hello" } },
+        {
+          keyword: "if",
+          name: "Is urgent?",
+          input: {
+            operand: "and",
+            conditions: [
+              { lhs: dpLabel, operand: "=", rhs: "P1" }
+            ]
+          },
+          block: [
+            {
+              provider: "workato_recipe_function",
+              name: "Call Escalation",
+              input: { flow_id: "200" }
+            }
+          ],
+          else_block: [
+            {
+              provider: "workato_recipe_function",
+              name: "Call Triage",
+              input: { recipe_id: "300" }
+            }
+          ],
+          error_block: [
+            {
+              provider: "workato_callable_recipe",
+              name: "Fallback callable",
+              input: { callable_recipe_id: "400" }
+            }
+          ]
+        },
+        {
+          provider: "workato_recipe_function",
+          name: "Call Billing helper",
+          input: { flow_id: "500" }
+        }
+      ]
+    };
+  }
+
+  static recipePayload(id, name, project_id, folder_id, codeObj) {
+    return {
+      id: String(id),
+      name,
+      project_id: String(project_id || "p1"),
+      folder_id: String(folder_id || "f1"),
+      code: JSON.stringify(codeObj)
+    };
+  }
+
+  /**
+   * Graph fixtures for transitive expansion and cycle detection:
+   * 100 -> 200 -> 300 -> 200 (cycle)
+   */
+  static graphRecipes_cycle() {
+    const r100 = Fixtures.recipePayload(
+      "100",
+      "Root",
+      "p1",
+      "f1",
+      { block: [{ provider: "workato_recipe_function", name: "Call 200", input: { flow_id: "200" } }] }
+    );
+
+    const r200 = Fixtures.recipePayload(
+      "200",
+      "Child A",
+      "p1",
+      "f1",
+      { block: [{ provider: "workato_recipe_function", name: "Call 300", input: { flow_id: "300" } }] }
+    );
+
+    const r300 = Fixtures.recipePayload(
+      "300",
+      "Child B",
+      "p1",
+      "f1",
+      { block: [{ provider: "workato_recipe_function", name: "Call 200 again", input: { flow_id: "200" } }] }
+    );
+
+    return { r100, r200, r300 };
+  }
+}
+/** ****************************************************************************************
+ * FILE: TEST_Doubles.gs
+ * Test doubles (fakes) so we can run tests without touching real Sheets/Drive/Workato.
+ ******************************************************************************************/
+
+class FakeWorkatoClient {
+  constructor(recipeById) {
+    this._recipes = recipeById || {};
+  }
+
+  get(endpoint) {
+    const m = String(endpoint).match(/^recipes\/(\d+|[a-zA-Z0-9_-]+)$/);
+    if (m) {
+      const id = String(m[1]);
+      if (!this._recipes[id]) throw new Error(`404 recipe not found: ${id}`);
+      return this._recipes[id];
+    }
+    throw new Error(`FakeWorkatoClient only supports recipes/{id}. Got: ${endpoint}`);
+  }
+
+  fetchPaginated(resourcePath) {
+    throw new Error("FakeWorkatoClient.fetchPaginated not implemented in tests.");
+  }
+}
+
+class FakeSheetService {
+  constructor(requestIds) {
+    this._requestIds = (requestIds || []).map(String);
+    this.writes = {}; // sheetKey -> rows
+    this.appendedDebug = [];
+  }
+
+  readRequests() { return this._requestIds.slice(); }
+
+  write(sheetKey, rows) {
+    this.writes[sheetKey] = rows;
+  }
+
+  appendDebugRows(rows) {
+    this.appendedDebug = this.appendedDebug.concat(rows);
+  }
+}
+
+class FakeDriveService {
+  constructor() {
+    this.saved = []; // {id,name,ext,content}
+    this.nextUrl = "https://drive.fake/file/123";
+  }
+
+  saveText(id, name, ext, content) {
+    this.saved.push({ id: String(id), name, ext, content: String(content || "") });
+    return this.nextUrl;
+  }
+
+  saveLog(id, name, jsonObject) {
+    // Optional: used by runLogicDebug in your app; not needed for these tests.
+    return this.nextUrl;
+  }
+}
+
+/**
+ * Temporarily override AppConfig.get() for tests; always restores afterward.
+ * @param {Object} testConfig
+ * @param {Function} fn
+ */
+function withTestConfig(testConfig, fn) {
+  const original = AppConfig.get;
+  AppConfig.get = function () { return testConfig; };
+  try { return fn(); } finally { AppConfig.get = original; }
+}
+
+/** ****************************************************************************************
  * FILE: TEST_Suite.gs
  * Comprehensive suite focused on the new functionality:
  * - call edges extraction (step path, branch context, id keys)
