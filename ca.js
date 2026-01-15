@@ -1,614 +1,2241 @@
-/** ****************************************************************************************
- * FILE: TEST_Assert.gs
- * Minimal assertion + test runner utilities for Google Apps Script (V8).
- ******************************************************************************************/
+/**
+ * @file Workato Inventory Sync
+ * @description Fetches all resources from Workato and logs them to a dedicated Google Sheet.
+ * @author Emily Cabaniss
+ * 
+ * @see - README ("https://docs.google.com/document/d/18mk8sphXwC7bTRrDj09rnL4FNVuiBNS1oVeM3zuyUcg/edit?tab=t.0")
+ * @see - Diagrams ("https://lucid.app/lucidchart/8af28952-b1ae-4eb2-a486-343a0162a587/edit?viewport_loc=-2621%2C-29%2C4037%2C1896%2C-4lm-29-aRvB&invitationId=inv_66f2e22a-b1f9-49b6-b036-ed97b5af2d39")
+ * @see - Documentation for the Workato developer API: "https://docs.workato.com/en/workato-api.html"
+ */
 
-class Assert {
-  static _fmt(v) {
-    try { return JSON.stringify(v, null, 2); } catch (_) { return String(v); }
-  }
+// -------------------------------------------------------------------------------------------------------
+// CONFIGURATION
+// -------------------------------------------------------------------------------------------------------
+/**
+ * @typedef {Object} APIConfig
+ * @property {string} TOKEN - The Workato API bearer token.
+ * @property {string} BASE_URL - The Workato API endpoint.
+ * @property {number} PER_PAGE - Records per request.
+ * @property {number} MAX_CALLS - Safety limit for recursive API calls.
+ * @property {number} THROTTLE_MS - Delay (ms) between heavy processing loops.
+ * @property {number} RECIPE_LIMIT_DEBUG - Limit on how many recipes to process.
+ */
 
-  static ok(value, msg) {
-    if (!value) throw new Error(msg || `Expected truthy but got: ${Assert._fmt(value)}`);
-  }
+/**
+ * @typedef {Object} AppConfigObject
+ * @property {APIConfig} API - API connection settings.
+ * @property {Object.<string, string>} SHEETS - Mapping of resource types to sheet names.
+ * @property {Object.<string, string[]>} HEADERS - Definitions of column headers.
+ * @property {Object} CONSTANTS - Internal constants for parsing logic and styling.
+ * @property {boolean} VERBOSE - Toggle for detailed logging.
+ */
 
-  static equal(actual, expected, msg) {
-    if (actual !== expected) {
-      throw new Error(msg || `Expected ${Assert._fmt(expected)} but got ${Assert._fmt(actual)}`);
-    }
-  }
+/**
+ * @class
+ * @classdesc Static configuration container.
+ * * Centralizes all settings, constants, and API parameters.
+ */
+class AppConfig {
+  /**
+   * Retrieves the current configuration object.
+   * @returns {AppConfigObject} The full application configuration.
+   */
+  static get() {
+    const props = PropertiesService.getScriptProperties();
 
-  static notEqual(actual, expected, msg) {
-    if (actual === expected) {
-      throw new Error(msg || `Expected value to differ, but both were ${Assert._fmt(actual)}`);
-    }
-  }
+    return {
+      API: {
+        TOKEN: props.getProperty('WORKATO_TOKEN'),
+        BASE_URL: (props.getProperty('WORKATO_BASE_URL') || 'https://app.eu.workato.com/api').replace(/\/$/, '') ,
+        PER_PAGE: 100,
+        MAX_CALLS: 500,
+        THROTTLE_MS: 100,       
+        RECIPE_LIMIT_DEBUG: 100,
+        // Transitive recipe-call depth
+        PROCESS_MAP_DEPTH: 3,
 
-  static contains(haystack, needle, msg) {
-    const h = String(haystack ?? "");
-    const n = String(needle ?? "");
-    if (!h.includes(n)) {
-      throw new Error(msg || `Expected string to contain "${n}", got:\n${h}`);
-    }
-  }
+        // Full process maps (step-level)
+        PROCESS_MAP_MODE_DEFAULT: "calls+full", // "calls" | "full" | "calls+full"
+        PROCESS_MAP_MAX_NODES: 250,            // safety cap for step-graph size
+        PROCESS_MAP_EXPORT_TABLES: true,       // write PROCESS_NODES/PROCESS_EDGES sheets
 
-  static deepEqual(actual, expected, msg) {
-    const a = Assert._fmt(actual);
-    const e = Assert._fmt(expected);
-    if (a !== e) {
-      throw new Error(msg || `Expected deepEqual.\nExpected:\n${e}\nActual:\n${a}`);
-    }
-  }
-
-  static throws(fn, msgContains) {
-    let threw = false;
-    try {
-      fn();
-    } catch (e) {
-      threw = true;
-      if (msgContains) Assert.contains(e.message, msgContains);
-    }
-    if (!threw) throw new Error("Expected function to throw, but it did not.");
+        MAX_RETRIES: 3
+      },
+      SHEETS: {
+        RECIPES: 'recipes',
+        FOLDERS: 'folders',
+        PROJECTS: 'projects',
+        PROPERTIES: 'properties',
+        DEPENDENCIES: 'recipe_dependencies',
+        LOGIC: 'recipe_logic',
+        LOGIC_INPUT: 'logic_requests',
+        CALL_EDGES: 'recipe_call_edges',
+        PROCESS_MAPS: 'process_maps',
+        PROCESS_NODES: 'process_nodes',
+        PROCESS_EDGES: 'process_edges',
+        DEBUG: 'debugging_log'
+      },
+      HEADERS: {
+        PROJECTS: ["ID", "Name", "Description", "Created at"],
+        FOLDERS: ["ID", "Name", "Parent folder", "Project name"],
+        RECIPES: ["ID", "Name", "Status", "Project", "Folder", "Last run"],
+        DEPENDENCIES: ["Parent recipe ID", "Project", "Folder", "Dependency type", "Dependency ID", "Dependency name"],
+        PROPERTIES: ["ID", "Name", "Value", "Created at", "Updated at"],
+        LOGIC: ["Recipe ID", "Recipe name", "Step number", "Indent", "Provider", "Action/Name", "Description", "Input / Details"],
+        LOGIC_INPUT: ["Enter recipe IDs below (one per row)"],
+        CALL_EDGES: ["Parent recipe ID", "Parent recipe name", "Project", "Folder", "Step path", "Step name", "Branch context", "Provider", "Child recipe ID", "Child recipe name", "ID key"],
+        PROCESS_MAPS: ["Root recipe ID", "Root recipe name", "Mode", "Call depth", "Mermaid (calls)", "Mermaid (full process)", "Notes", "Drive link (calls)", "Drive link (full)", "Generated at"],
+        PROCESS_NODES: ["Root recipe ID", "Root recipe name", "Node ID", "Step path", "Kind", "Provider", "Label", "Branch context"],
+        PROCESS_EDGES: ["Root recipe ID", "From node", "To node", "Edge label", "Edge kind"],
+        DEBUG: ["Timestamp", "Recipe ID", "Recipe name", "Status", "Drive link"]
+      },
+      CONSTANTS: {
+        RECIPE_PROVIDERS: ['workato_recipe_function', 'workato_callable_recipe'],
+        FLOW_ID_KEYS: ['flow_id', 'recipe_id', 'callable_recipe_id'],
+        STYLE_HEADER_BG: "#efefef",
+        CELL_CHAR_LIMIT: 48000,
+        MERMAID_LABEL_MAX: 80
+      },
+      DEBUG: {
+        ENABLE_LOGGING: true,
+        LOG_TO_SHEET: true,
+        LOG_TO_DRIVE: true,
+        DRIVE_FOLDER_NAME: "workato_workspace_debug_logs"
+      },
+      VERTEX: {
+        GOOGLE_CLOUD_PROJECT_ID: props.getProperty('GOOGLE_CLOUD_PROJECT_ID'),
+        MODEL_ID: 'gemini-2.5-pro',
+        LOCATION: 'us-central1',
+        GENERATION_CONFIG: {
+          TEMPERATURE: 0.2,
+          MAX_OUTPUT_TOKENS: 10000 // 5000 is too few
+        },
+      },
+      VERBOSE: true
+    };
   }
 }
 
-class TestRunner {
+// -------------------------------------------------------------------------------------------------------
+// LOGGING
+//-------------------------------------------------------------------------------------------------------
+/**
+ * @class
+ * @classdesc Static utility for logging to both Apps Script console and Sheets UI.
+ */
+class Logger {
+  /**
+   * Logs a message to the console only if VERBOSE mode is enabled in Config.
+   * @param {string} msg - The message to log.
+   */
+  static verbose(msg) {
+    if (AppConfig.get().VERBOSE) console.log(`[VERBOSE] ${msg}`);
+  }
+  /**
+   * Logs to console and displays a Toast notification in the active Spreadsheet.
+   * @param {string} msg - The message to display.
+   * @param {boolean} [isError=false] - If true, logs as console.error and styles toast as error.
+   */
+  static notify(msg, isError = false) {
+    if (isError) console.error(msg);
+    else console.log(msg);
+    try {
+      const ss = SpreadsheetApp.getActiveSpreadsheet();
+      if (ss) ss.toast(msg, isError ? "Error" : "Success", 5);
+    } catch (e) {
+      // console.log("UI notification skipped.");
+    }
+  }
+}
+
+// -------------------------------------------------------------------------------------------------------
+// WORKATO CLIENT
+// -------------------------------------------------------------------------------------------------------
+/**
+ * @class
+ * @classdesc Low-level HTTP wrapper for the Workato API.
+ * * Handles Authentication, Base URL construction, and Pagination loops.
+ */
+class WorkatoClient {
   constructor() {
-    /** @type {Array<{name:string, fn:Function}>} */
-    this.tests = [];
+    /** @type {APIConfig} */
+    this.config = AppConfig.get().API;
+    if (!this.config.TOKEN) {
+      throw new Error("Missing 'WORKATO_TOKEN' in Script Properties.");
+    }
   }
 
-  add(name, fn) {
-    this.tests.push({ name, fn });
-    return this;
+  /**
+   * Executes a single GET request to the Workato API.
+   * @param {string} endpoint - The relative API path (e.g., 'recipes' or '/users/me').
+   * @returns {Object|Array} The parsed JSON response.
+   * @throws {Error} If the API returns a non-200 status code.
+   */
+  get(endpoint) {
+    const cleanPath = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
+    const url = `${this.config.BASE_URL}${cleanPath}`;
+    
+    const options = {
+      method: 'get',
+      headers: {
+        'Authorization': `Bearer ${this.config.TOKEN}`,
+        'Content-Type': 'application/json'
+      },
+      muteHttpExceptions: true
+    };
+
+    let attempts = 0;
+    const maxRetries = this.config.MAX_RETRIES || 3;
+
+    while (attempts <= maxRetries) {
+      try {
+        const response = UrlFetchApp.fetch(url, options);
+        const code = response.getResponseCode(); 
+
+        if (code === 200) {
+          return JSON.parse(response.getContentText());
+        }
+
+        // Handle rate limits or server errors
+        if (code === 429 || code >= 500) {
+          if (attempts === maxRetries) {
+            throw new Error(`API Failed after ${attempts} retries: ${code} - ${response.getContentText()}`);
+          }
+          Logger.verbose(`API ${code} on ${endpoint}. Retrying in ${Math.pow(2, attempts)}s...`);
+          Utilities.sleep(Math.pow(2, attempts) * 1000); // Exponential backoff: 1s, 2s, 4s
+          attempts++;
+          continue;
+        }
+
+        // Fatal Client Errors (400, 401, 403, 404) - Do not retry
+        throw new Error(`API Error [${code}]: ${response.getContentText()}`);
+
+      } catch (e) {
+        if (attempts === maxRetries) throw e;
+        Logger.verbose(`Network/Fetch Error: ${e.message}. Retrying...`);
+        Utilities.sleep(1000);
+        attempts++;
+      }
+    }
   }
+  /**
+   * Fetches all records from a resource by automatically following pagination.
+   * @param {string} resourcePath - The resource endpoint (e.g., 'recipes').
+   * @returns {Array<Object>} An aggregated array of all items across all pages.
+   */
+  fetchPaginated(resourcePath) {
+    let results = [];
+    let page = 1;
+    let hasMore = true;
 
-  run(options = {}) {
-    const writeToSheet = Boolean(options.writeToSheet);
-    const results = [];
-    const startedAt = new Date();
+    while (hasMore) {
+      const separator = resourcePath.includes('?') ? '&' : '?';
+      const pathWithParams = `${resourcePath}${separator}page=${page}&per_page=${this.config.PER_PAGE}`;
+      
+      const json = this.get(pathWithParams);
+      let records = Array.isArray(json) ? json : (json.items || json.result || []);
 
-    for (const t of this.tests) {
-      const t0 = Date.now();
-      try {
-        t.fn();
-        results.push({
-          name: t.name,
-          status: "PASS",
-          ms: Date.now() - t0,
-          error: ""
-        });
-      } catch (e) {
-        results.push({
-          name: t.name,
-          status: "FAIL",
-          ms: Date.now() - t0,
-          error: (e && e.stack) ? e.stack : String(e)
-        });
+      if (records.length > 0) {
+        results = results.concat(records);
+        if (records.length < this.config.PER_PAGE) {
+          hasMore = false;
+        } else {
+          page++;
+        }
+      } else {
+        hasMore = false;
+      }
+
+      if (page % 5 === 0) Logger.verbose(`...fetched ${page} pages of ${resourcePath}`);
+      if (page > 500) {
+        Logger.notify(`Pagination limit reached for ${resourcePath}. Stopping at 50,000 records.`, true);
+        break; 
       }
     }
-
-    const pass = results.filter(r => r.status === "PASS").length;
-    const fail = results.length - pass;
-    const duration = Date.now() - startedAt.getTime();
-
-    console.log(`TESTS COMPLETE: ${pass} passed, ${fail} failed in ${duration}ms`);
-
-    results.forEach(r => {
-      const prefix = r.status === "PASS" ? "✅" : "❌";
-      console.log(`${prefix} ${r.name} (${r.ms}ms)`);
-      if (r.status === "FAIL") console.log(r.error);
-    });
-
-    if (writeToSheet) {
-      try {
-        const ss = SpreadsheetApp.getActiveSpreadsheet();
-        const sheetName = "test_results";
-        let sheet = ss.getSheetByName(sheetName) || ss.insertSheet(sheetName);
-        sheet.clear();
-        sheet.getRange(1, 1, 1, 5).setValues([["Timestamp", "Test", "Status", "Duration (ms)", "Error"]])
-          .setFontWeight("bold")
-          .setBackground("#efefef");
-        const ts = new Date().toISOString();
-        const rows = results.map(r => [ts, r.name, r.status, r.ms, r.error]);
-        if (rows.length) sheet.getRange(2, 1, rows.length, 5).setValues(rows);
-        sheet.setFrozenRows(1);
-      } catch (e) {
-        console.log("Could not write test results sheet: " + e.message);
-      }
-    }
-
-    if (fail > 0) {
-      throw new Error(`Test suite failed: ${fail} failing tests.`);
-    }
+    
+    console.log(`Fetched ${results.length} records for ${resourcePath}`);
     return results;
   }
 }
 
-/** ****************************************************************************************
- * FILE: TEST_Fixtures.gs
- * Deterministic fixtures for recipe code scanning, branching, cycles, and mermaid rendering.
- ******************************************************************************************/
-
-class Fixtures {
-  /**
-   * A realistic-ish Workato step tree with:
-   * - recipe calls via flow_id, recipe_id, callable_recipe_id
-   * - if/else + error blocks
-   * - data pill strings in conditions
-   */
-  static recipeCodeBlock_withBranchesAndCalls() {
-    const dpLabel = "#{_dp('{\\\"label\\\":\\\"Ticket ID\\\",\\\"path\\\":[\\\"ticket\\\",\\\"id\\\"]}')}";
-    return {
-      block: [
-        { provider: "gmail", name: "Trigger: New email", input: { subject: "Hello" } },
-        {
-          keyword: "if",
-          name: "Is urgent?",
-          input: {
-            operand: "and",
-            conditions: [
-              { lhs: dpLabel, operand: "=", rhs: "P1" }
-            ]
-          },
-          block: [
-            {
-              provider: "workato_recipe_function",
-              name: "Call Escalation",
-              input: { flow_id: "200" }
-            }
-          ],
-          else_block: [
-            {
-              provider: "workato_recipe_function",
-              name: "Call Triage",
-              input: { recipe_id: "300" }
-            }
-          ],
-          error_block: [
-            {
-              provider: "workato_callable_recipe",
-              name: "Fallback callable",
-              input: { callable_recipe_id: "400" }
-            }
-          ]
-        },
-        {
-          provider: "workato_recipe_function",
-          name: "Call Billing helper",
-          input: { flow_id: "500" }
-        }
-      ]
-    };
-  }
-
-  static recipePayload(id, name, project_id, folder_id, codeObj) {
-    return {
-      id: String(id),
-      name,
-      project_id: String(project_id || "p1"),
-      folder_id: String(folder_id || "f1"),
-      code: JSON.stringify(codeObj)
-    };
-  }
-
-  /**
-   * Graph fixtures for transitive expansion and cycle detection:
-   * 100 -> 200 -> 300 -> 200 (cycle)
-   */
-  static graphRecipes_cycle() {
-    const r100 = Fixtures.recipePayload(
-      "100",
-      "Root",
-      "p1",
-      "f1",
-      { block: [{ provider: "workato_recipe_function", name: "Call 200", input: { flow_id: "200" } }] }
-    );
-
-    const r200 = Fixtures.recipePayload(
-      "200",
-      "Child A",
-      "p1",
-      "f1",
-      { block: [{ provider: "workato_recipe_function", name: "Call 300", input: { flow_id: "300" } }] }
-    );
-
-    const r300 = Fixtures.recipePayload(
-      "300",
-      "Child B",
-      "p1",
-      "f1",
-      { block: [{ provider: "workato_recipe_function", name: "Call 200 again", input: { flow_id: "200" } }] }
-    );
-
-    return { r100, r200, r300 };
-  }
-}
-/** ****************************************************************************************
- * FILE: TEST_Doubles.gs
- * Test doubles (fakes) so we can run tests without touching real Sheets/Drive/Workato.
- ******************************************************************************************/
-
-class FakeWorkatoClient {
-  constructor(recipeById) {
-    this._recipes = recipeById || {};
-  }
-
-  get(endpoint) {
-    const m = String(endpoint).match(/^recipes\/(\d+|[a-zA-Z0-9_-]+)$/);
-    if (m) {
-      const id = String(m[1]);
-      if (!this._recipes[id]) throw new Error(`404 recipe not found: ${id}`);
-      return this._recipes[id];
-    }
-    throw new Error(`FakeWorkatoClient only supports recipes/{id}. Got: ${endpoint}`);
-  }
-
-  fetchPaginated(resourcePath) {
-    throw new Error("FakeWorkatoClient.fetchPaginated not implemented in tests.");
-  }
-}
-
-class FakeSheetService {
-  constructor(requestIds) {
-    this._requestIds = (requestIds || []).map(String);
-    this.writes = {}; // sheetKey -> rows
-    this.appendedDebug = [];
-  }
-
-  readRequests() { return this._requestIds.slice(); }
-
-  write(sheetKey, rows) {
-    this.writes[sheetKey] = rows;
-  }
-
-  appendDebugRows(rows) {
-    this.appendedDebug = this.appendedDebug.concat(rows);
-  }
-}
-
-class FakeDriveService {
-  constructor() {
-    this.saved = []; // {id,name,ext,content}
-    this.nextUrl = "https://drive.fake/file/123";
-  }
-
-  saveText(id, name, ext, content) {
-    this.saved.push({ id: String(id), name, ext, content: String(content || "") });
-    return this.nextUrl;
-  }
-
-  saveLog(id, name, jsonObject) {
-    // Optional: used by runLogicDebug in your app; not needed for these tests.
-    return this.nextUrl;
-  }
-}
-
+// -------------------------------------------------------------------------------------------------------
+// DOMAIN SERVICE CLASSES
+// -------------------------------------------------------------------------------------------------------
 /**
- * Temporarily override AppConfig.get() for tests; always restores afterward.
- * @param {Object} testConfig
- * @param {Function} fn
+ * @class
+ * @classdesc Service responsible for fetching high-level Workato entities.
+ * * Encapsulates logic for Projects, Recipes, Properties, and Folder Recursion.
  */
-function withTestConfig(testConfig, fn) {
-  const original = AppConfig.get;
-  AppConfig.get = function () { return testConfig; };
-  try { return fn(); } finally { AppConfig.get = original; }
-}
+class InventoryService {
+  /**
+   * @param {WorkatoClient} client - An initialized API client instance.
+   */
+  constructor(client) {
+    this.client = client;
+    this.config = AppConfig.get();
+  }
+  /**
+   * Fetches all available projects.
+   * @returns {Array<Object>} List of project objects.
+   */
+  getProjects() { return this.client.fetchPaginated('projects'); }
+  /**
+   * Fetches all recipes.
+   * @returns {Array<Object>} List of recipe objects.
+   */
+  getRecipes() { return this.client.fetchPaginated('recipes'); }
+  /**
+   * Fetches workspace properties.
+   * * Safely handles errors (e.g., 403 Forbidden) if the user lacks permissions.
+   * @returns {Array<Object>} List of property objects, or empty array on error.
+   */
+  getProperties() {
+    try {
+      return this.client.fetchPaginated('properties');
+    } catch (e) {
+      console.warn(`SKIPPING PROPERTIES: The API rejected the request (${e.message}).`);
+      return [];
+    }
+  }
+  /**
+   * Fetches the current authenticated user details.
+   * @returns {Object|null} User profile object or null on failure.
+   */
+  getCurrentUser() {
+    try {
+      return this.client.get('users/me');
+    } catch (e) {
+      return null;
+    }
+  }
+  /**
+   * Recursively fetches all folders using a Hybrid Sync strategy.
+   * 1. Scans Project Roots (folders?project_id=X)
+   * 2. Scans Workspace Root (folders)
+   * 3. Recursively scans children via queue (folders?parent_id=Y)
+   * * @param {Array<Object>} projects - List of projects to seed the search.
+   * @returns {Array<Object>} Comprehensive list of all folder objects.
+   */
+  getFoldersRecursive(projects) {
+    let allFolders = [];
+    let queue = [];
+    let processedIds = new Set();
+    const MAX_CALLS = this.config.API.MAX_CALLS;
 
-/** ****************************************************************************************
- * FILE: TEST_Suite.gs
- * Comprehensive suite focused on the new functionality:
- * - call edges extraction (step path, branch context, id keys)
- * - transitive call graph (depth, cycles, dedupe)
- * - Mermaid rendering (sanitization, truncation, edge labels, dedupe)
- * - mapping rows (DataMapper.mapCallEdgesToRows)
- * - WorkatoSyncApp.runProcessMaps orchestration (writes PROCESS_MAPS)
- ******************************************************************************************/
+    Logger.verbose(`Starting folder sync...`);
 
-function runAllTests() {
-  const runner = new TestRunner();
+    // PHASE 1: Project Roots
+    for (const project of projects) {
+      // Note: We use the raw client.get here because these are single batch checks, not full pagination loops
+      try {
+        const potentialRoots = this._fetchFolderBatch(`folders?project_id=${project.id}`);
+        const rootFolder = potentialRoots.find(f => f.project_id === project.id && f.is_project === true);
 
-  // -----------------------------
-  // Unit: RecipeAnalyzerService internals and outputs
-  // -----------------------------
-  runner.add("cleanDataPill converts label DP to {{Label}}", () => {
-    const client = new FakeWorkatoClient({});
-    const svc = new RecipeAnalyzerService(client);
+        if (rootFolder && !processedIds.has(rootFolder.id)) {
+          allFolders.push(rootFolder);
+          processedIds.add(rootFolder.id);
+          queue.push(rootFolder.id);
+        }
+      } catch (e) {
+        console.warn(`Failed to fetch root for project ${project.id}: ${e.message}`);
+      }
+    }
 
-    const raw = "#{_dp('{\\\"label\\\":\\\"Ticket ID\\\",\\\"path\\\":[\\\"ticket\\\",\\\"id\\\"]}')}";
-    const cleaned = svc._cleanDataPill(raw);
-    Assert.equal(cleaned, "{{Ticket ID}}");
-  });
+    // PHASE 2: Home Folders
+    const globalFolders = this._fetchFolderBatch('folders');
+    globalFolders.forEach(f => {
+      if (!processedIds.has(f.id)) {
+        allFolders.push(f);
+        processedIds.add(f.id);
+        queue.push(f.id);
+      }
+    });
 
-  runner.add("formatConditionSummary returns readable conditions", () => {
-    const client = new FakeWorkatoClient({});
-    const svc = new RecipeAnalyzerService(client);
+    // PHASE 3: Recursion
+    let safetyCounter = 0;
+    while (queue.length > 0 && safetyCounter < MAX_CALLS) {
+      let parentId = queue.shift();
+      let page = 1;
+      let hasMore = true;
 
-    const step = {
-      keyword: "if",
-      input: {
-        operand: "and",
-        conditions: [
-          {
-            lhs: "#{_dp('{\\\"label\\\":\\\"Priority\\\",\\\"path\\\":[\\\"priority\\\"]}')}",
-            operand: "=",
-            rhs: "P1"
+      while (hasMore) {
+        const url = `folders?parent_id=${parentId}&page=${page}&per_page=${this.config.API.PER_PAGE}`;
+        const items = this._fetchFolderBatch(url);
+
+        if (items.length > 0) {
+          const newItems = items.filter(f => !processedIds.has(f.id));
+          if (newItems.length > 0) {
+            allFolders = allFolders.concat(newItems);
+            newItems.forEach(f => {
+              processedIds.add(f.id);
+              queue.push(f.id);
+            });
           }
-        ]
+          
+          if (items.length < this.config.API.PER_PAGE) hasMore = false;
+          else page++;
+        } else {
+          hasMore = false;
+        }
+        safetyCounter++;
+      }
+      
+      if (safetyCounter % 20 === 0) Utilities.sleep(50);
+    }
+
+    console.log(`Sync complete. Found ${allFolders.length} total folders.`);
+    return allFolders;
+  }
+
+  /**
+   * Helper to fetch a single batch of folders and normalize the response.
+   * Accounts for API inconsistencies where folders may return as array or object wrapper.
+   * * @param {string} endpoint - The API endpoint to fetch.
+   * @returns {Array<Object>} Array of folder objects (empty if error).
+   * @private
+   */
+  _fetchFolderBatch(endpoint) {
+    try {
+      const json = this.client.get(endpoint);
+      return Array.isArray(json) ? json : (json.items || json.result || []);
+    } catch (e) {
+      // Original script returned empty array on error for folder batches
+      return [];
+    }
+  }
+}
+/**
+ * @class
+ * @classdesc Service to encapsulate Google Sheets interactions.
+ */
+class SheetService {
+  constructor() {
+    this.config = AppConfig.get();
+  }
+
+  /**
+   * Writes a 2D array of data to a specific Google Sheet.
+   * Clears existing data and applies header formatting.
+   * @param {string} sheetKey - Key corresponding to CONFIG.SHEETS.
+   * @param {Array<Array<any>>} rows - The data to write.
+   */
+  write(sheetKey, rows) {
+    const sheetName = this.config.SHEETS[sheetKey];
+    if (!sheetName) throw new Error(`Sheet key ${sheetKey} not found in config.`);
+
+    Logger.verbose(`Writing ${rows.length} rows to ${sheetName}...`);
+
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    let sheet = ss.getSheetByName(sheetName) || ss.insertSheet(sheetName);
+
+    sheet.clear();
+
+    if (rows.length > 0) {
+      const numRows = rows.length;
+      const numCols = rows[0].length;
+      
+      // Batch write
+      const fullRange = sheet.getRange(1, 1, numRows, numCols);
+      fullRange.setValues(rows).setHorizontalAlignment("left");
+      
+      // Format header
+      sheet.getRange(1, 1, 1, numCols)
+           .setFontWeight("bold")
+           .setBackground(this.config.CONSTANTS.STYLE_HEADER_BG)
+           .setVerticalAlignment("middle");
+      sheet.setFrozenRows(1);
+      // Resize only if fewer than 5 columns 
+      if (numCols > 1 && numCols < 5) { 
+          try { sheet.autoResizeColumns(1, numCols); } catch(e){} 
+      }
+    }
+  }
+  /**
+   * Reads a list of IDs from the request sheet.
+   * @returns {string[]} Array of Recipe IDs found in column A.
+   */
+  readRequests() {
+    const sheetName = this.config.SHEETS.LOGIC_INPUT;
+    const headerText = this.config.HEADERS.LOGIC_INPUT[0];
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    let sheet = ss.getSheetByName(sheetName);
+
+    // If sheet doesn't exist, create it and add headers
+    if (!sheet) {
+      const newSheet = ss.insertSheet(sheetName);
+      newSheet.getRange(1, 1).setValue(headerText).setFontWeight("bold").setBackground("#fff2cc");
+      return [];
+    }
+
+    // Evaluate header integrity
+    const currentHeader = sheet.getRange(1, 1).getValue();
+    if (currentHeader !== headerText) {
+      Logger.notify(`Repairing header in '${sheetName}'...`);
+      sheet.getRange(1, 1).setValue(headerText)
+           .setFontWeight("bold").setBackground("#fff2cc");
+    }
+
+    const lastRow = sheet.getLastRow();
+    if (lastRow < 2) return [];
+
+    const values = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+    return values.flat().filter(id => id).map(String);
+  }
+  /**
+   * Appends rows to the debug sheet.
+   * Assumes rows are already formatted/chunked by DataMapper.
+   * @param {Array<Array<string>>} rows - The ready-to-write data.
+   */
+  appendDebugRows(rows) {
+    if (!this.config.DEBUG.LOG_TO_SHEET || rows.length === 0) return;
+
+    const sheetName = this.config.SHEETS.DEBUG;
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    let sheet = ss.getSheetByName(sheetName);
+
+    // Initialize if absent
+    if (!sheet) {
+      sheet = ss.insertSheet(sheetName);
+      sheet.getRange(1, 1, 1, this.config.HEADERS.DEBUG.length)
+            .setValues([this.config.HEADERS.DEBUG])
+            .setFontWeight("bold")
+            .setBackground("#e6b8af");
+      sheet.setFrozenRows(1);
+    }
+
+    const startRow = sheet.getLastRow() + 1;
+    const numRows = rows.length;
+    const numCols = rows[0].length; 
+    sheet.getRange(startRow, 1, numRows, numCols).setValues(rows);
+  }
+}
+/**
+ * @class
+ * @classdesc Service for handling file I/O with Google Drive.
+ */
+class DriveService{
+  constructor() {
+    this.config = AppConfig.get().DEBUG;
+    this.props = PropertiesService.getScriptProperties();
+  }
+  
+  /**
+   * Saves a JSON payload as a file to the configured debug folder.
+   * @param {string|number} id - Recipe ID.
+   * @param {string} name - Recipe name.
+   * @param {Object} jsonObject - Data to save.
+   * @returns {string} The URL of the created file.
+   */
+  saveLog(id, name, jsonObject) {
+    if (!this.config.LOG_TO_DRIVE) return null;
+
+    try {
+      const folder = this._getVerifiedFolder();
+      const safeName = (name || "Unknown").replace(/[^a-zA-Z0-9-_]/g, '_');
+      const timestamp = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd_HH-mm-ss");
+      const filename = `${timestamp}_ID-${id}_${safeName}.json`;
+
+      let payloadToSave = { ...jsonObject }; // shallow copy
+      if (payloadToSave.code && typeof payloadToSave.code === 'string') {
+        try {
+          payloadToSave.code = JSON.parse(payloadToSave.code);
+        } catch (parseError) {
+          console.warn(`DriveService: Could not parse 'code' string for recipe, ${id}. Saved as raw string.`);
+        }
+      }
+
+      const content = JSON.stringify(payloadToSave, null, 2);
+      const file = folder.createFile(filename, content, MimeType.PLAIN_TEXT);
+
+      return file.getUrl();
+    } catch (e) {
+      console.error(`Drive save error: ${e.message}`);
+      return null;
+    }
+  }
+  /**
+   * Saves arbitrary text conent to the configured debug folder.
+   * @param {string|number} id - Root identifier (recipe ID).
+   * @param {string} name - Human readable recipe name.
+   * @param {string} ext - File extension.
+   * @param {string} content - File contents.
+   * @returns {string|null} The URL of the created file, or null on failure.
+   */
+  saveText(id, name, ext, content) {
+    if (!this.config.LOG_TO_DRIVE) return null;
+    try {
+      const folder = this._getVerifiedFolder();
+      const safeName = (name || "Unknown").replace(/[^a-zA-Z0-9-_]/g, '_');
+      const timestamp = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd_HH-mm-ss");
+      const filename = `${timestamp}_ID-${id}_${safeName}.${ext || "txt"}`;
+      const file = folder.createFile(filename, String(content || ""), MimeType.PLAIN_TEXT);
+      return file.getUrl();
+    } catch(e) {
+      console.error(`Drive saveText error: ${e.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Retrieves folder by cached ID, or creates and updates cache.
+   * @private
+   */
+  _getVerifiedFolder() {
+    const cachedId = this.props.getProperty('DEBUG_FOLDER_ID');
+
+    // 1. Try the cache
+    if (cachedId) {
+      try {
+        return DriveApp.getFolderById(cachedId);
+      } catch (e) {
+        console.warn("Cached folder ID invalid. Rediscovering...");
+      }
+    }
+
+    // 2. Search by name
+    const folders = DriveApp.getFoldersByName(this.config.DRIVE_FOLDER_NAME);
+    let folder;
+    if (folders.hasNext()) {
+      folder = folders.next();
+    } else {
+      // 3. Create
+      folder = DriveApp.createFolder(this.config.DRIVE_FOLDER_NAME);
+    }
+
+    // 4. Update cache
+    this.props.setProperty('DEBUG_FOLDER_ID', folder.getId());
+    return folder;
+  }
+}
+/**
+ * @class
+ * @classdesc Unified service for deep inspection of recipe logic / code.
+ * Merges functionality from historical DependencyService and LogicService.
+ */
+class RecipeAnalyzerService {
+  /**
+   * @param {WorkatoClient} client
+   */
+  constructor(client) {
+    this.client = client;
+    this.constants = AppConfig.get().CONSTANTS;
+    /** @type {Map<string, Object>} */
+    this._recipeDetailCache = new Map();
+  }
+
+  /**
+   * Fetches standard app connections and scans code for recipe calls.
+   * @returns {Array<Object>} List of objects { type, id, name }
+   */
+  getDependencies(recipeId) {
+    let json;
+    try {
+      json = this.client.get(`recipes/${recipeId}`);
+    } catch (e) {
+      console.warn(`Could not fetch details for recipe ${recipeId}`);
+      return [];
+    }
+
+    let dependencies = [];
+
+    // 1. Standard apps
+    if (json.applications && Array.isArray(json.applications)) {
+      json.applications.forEach(app => {
+        if (!this.constants.RECIPE_PROVIDERS.includes(app)) {
+          dependencies.push({ type: 'Connection', id: app, name: app });
+        }
+      });
+    }
+
+    // 2. Recipe calls (deep scan)
+    if (json.code) {
+      try {
+        const codeObj = JSON.parse(json.code);
+        const rootBlock = codeObj.block || codeObj.line || [];
+        this._scanBlockForCalls(rootBlock, dependencies);
+      } catch (e) {
+        console.warn(`Error parsing code for recipe ${recipeId}: ${e.message}`);
+      }
+    }
+    return dependencies;
+  }
+  /**
+   * Fetches recipe details with an in-run cache (reduce API calls).
+   * @param {string|number} recipeId
+   * @returns {Object|null}
+   */
+  getRecipeDetails(recipeId) {
+    const key = String(recipeId);
+    if (this._recipeDetailCache.has(key)) return this._recipeDetailCache.get(key);
+    try {
+      const json = this.client.get(`recipes/${key}`);
+      this._recipeDetailCache.set(key, json);
+      return json;
+    } catch (e) {
+      console.warn(`Could not fetch details for recipe ${key}: ${e.message}`);
+      return null;
+    }
+  }
+  /**
+   * Extracts recipe call edges for a given recipe.
+   * Foundation for transitive call graphs and process maps.
+   * @param {string|number} recipeId
+   * @returns {Array<Object>} edges
+   */
+  getCallEdges(recipeId) {
+    const json = this.getRecipeDetails(recipeId);
+    if (!json || !json.code) return [];
+
+    let edges = [];
+    try {
+      const codeObj = JSON.parse(json.code);
+      const rootBlock = codeObj.block || codeObj.line || [];
+      this._scanBlockForCallEdges(rootBlock, edges, {
+        parentId: String(json.id || recipeId),
+        parentName: json.name || "",
+        stepPathPrefix: "",
+        branchStack: []
+      });
+    } catch (e) {
+      console.warn(`Error parsing call edges for recipe ${recipeId}: ${e.message}`);
+    }
+    return edges;
+  }
+  /**
+   * Builds transitive recipe call graph rooted at rootId up to depthLimit.
+   * Includes cycle detection, deduplication via "best remaining depth expanded".
+   * @param {string|number} rootId
+   * @param {number} depthLimit
+   * @returns {{ nodes: Map<string, {id:string,name:string}>, edges: Array<object, notes: string[] }}
+   */
+  buildTransitiveCallGraph(rootId, depthLimit) {
+    const nodes = new Map();
+    const edges = [];
+    const notes = [];
+
+    /** @type {Map<string, number>} */
+    const expandedAtDepth = new Map(); // id -> max remaining depth expanded
+
+    const expand = (id, remainingDepth, stack) => {
+      const key = String(id);
+      
+      // FIX 1: Ensure stack exists before checking includes (Safety check)
+      const currentStack = stack || [];
+      
+      if (currentStack.includes(key)) {
+        notes.push(`Cycle detected: ${currentStack.join(" -> ")} -> ${key}`);
+        return;
+      }
+
+      const prev = expandedAtDepth.get(key);
+      if (prev !== undefined && prev >= remainingDepth) return;
+      expandedAtDepth.set(key, remainingDepth);
+
+      const recipe = this.getRecipeDetails(key);
+      if (recipe) nodes.set(key, {id: key, name: recipe.name || "" });
+      else nodes.set(key, {id: key, name: ""});
+
+      const localEdges = this.getCallEdges(key);
+      localEdges.forEach(e => edges.push(e));
+
+      if (remainingDepth <= 0) return;
+
+      // FIX 2: Corrected typo 'concaat' to 'concat'
+      const nextStack = currentStack.concat([key]); 
+      
+      for (const e of localEdges) {
+        const child = String(e.child_recipe_id || "");
+        if (!child) continue;
+        // FIX 3: Passed 'nextStack' instead of undefined 'next'
+        expand(child, remainingDepth - 1, nextStack); 
+      }
+    };
+    expand(String(rootId), Math.max(0, Number(depthLimit || 0)), []);
+
+    return { nodes, edges, notes };
+  }
+  /**
+   * Renders a Mermaid flowchart for recipe call graph.
+   * @param {string|number} rootId
+   * @param {{ nodes: Map<string, {id:string,name:string}>, edges: Array<object, notes: string[] }} graph
+   * @returns {string}
+   */
+  renderMermaidCallGraph(rootId, graph) {
+    const normalizeNodeLabel = (s) => this._mNormalizeNodeLabel(s);
+    const normalizeEdgeLabel = (s) => this._mNormalizeEdgeLabel(s);
+
+    const lines = [];
+    lines.push("flowchart TD");
+
+    // Ensure root exists
+    const rootKey = String(rootId);
+    if (!graph.nodes.has(rootKey)) graph.nodes.set(rootKey, {id: rootKey, name: "" });
+
+    // Nodes
+    Array.from(graph.nodes.values()).forEach(n => {
+      const nodeId = `R${String(n.id).replace(/[^0-9a-zA-Z_]/g, "_")}`;
+      const label = normalizeNodeLabel(`${n.name || "Recipe"} (${n.id})`);
+      lines.push(`  ${nodeId}["${label}"]`);
+    });
+
+    const nodeRef = (id) => `R${String(id).replace(/[^0-9a-zA-Z_]/g, "_")}`;
+
+    // Edges (deduplicate)
+    const seen = new Set();
+    graph.edges.forEach(e => {
+      const p = String(e.parent_recipe_id || "");
+      const c = String(e.child_recipe_id || "");
+      if (!p || !c) return;
+
+      const labelBits = [];
+      if (e.branch_context) labelBits.push(normalizeEdgeLabel(e.branch_context));
+      if (e.step_name) labelBits.push(normalizeEdgeLabel(e.step_name));
+      const edgeLabel = labelBits.join(" · "); // "&#183; = mid-dot "·"
+
+      const sig = `${p}->${c}|${edgeLabel}`;
+      if (seen.has(sig)) return;
+      seen.add(sig);
+
+      const left = nodeRef(p);
+      const right = nodeRef(c);
+      if (edgeLabel) lines.push(` ${left} -->|${edgeLabel}| ${right}`);
+      else lines.push(` ${left} --> ${right}`);
+    });
+
+    return lines.join("\n");
+  }
+  /**
+   * Generates a flat list of spreadsheet rows representing the logic flow.
+   * @param {Object} recipe - Full recipe object.
+   */
+  parseLogicRows(recipe) {
+    if (!recipe.code) return [];
+    let rows = [];
+    try {
+      const codeObj = JSON.parse(recipe.code);
+      const rootBlock = codeObj.block || codeObj.line || [];
+      this._scanBlockForLogic(rootBlock, 0, recipe.id, recipe.name, rows);
+    } catch (e) {
+      console.warn(`Error parsing logic for recipe ${recipe.id}: ${e.message}`);
+    }
+    return rows;
+  }
+  /**
+   * Builds a step-level process graph for a single recipe:
+   * - sequential flow
+   * - IF/ELSE branches
+   * - ON_ERROR branches
+   *
+   * @param {string|number} recipeId
+   * @param {{ maxNodes?: number }} [options]
+   * @returns {{ nodes: Map<string, any>, edges: Array<any>, notes: string[], meta: any }}
+   */
+  buildProcessGraph(recipeId, options = {}) {
+    const cfg = AppConfig.get();
+    const maxNodes = Number(options.maxNodes ?? cfg.API.PROCESS_MAP_MAX_NODES ?? 250);
+
+    const recipe = this.getRecipeDetails(recipeId);
+    const notes = [];
+    const nodes = new Map();
+    const edges = [];
+
+    const meta = {
+      recipe_id: String(recipe?.id || recipeId),
+      recipe_name: recipe?.name || ""
+    };
+
+    if (!recipe || !recipe.code) {
+      notes.push("No recipe code available.");
+      return { nodes, edges, notes, meta };
+    }
+
+    let codeObj = null;
+    try {
+      codeObj = (typeof recipe.code === "string") ? JSON.parse(recipe.code) : recipe.code;
+    } catch (e) {
+      notes.push(`Could not parse recipe code JSON: ${e.message}`);
+      return { nodes, edges, notes, meta };
+    }
+
+    const rootBlock = codeObj.block || codeObj.line || [];
+
+    const startId = this._pNodeId(`START_${meta.recipe_id}`);
+    const endId = this._pNodeId(`END_${meta.recipe_id}`);
+
+    this._pAddNode(nodes, startId, {
+      id: startId,
+      kind: "start",
+      provider: "system",
+      step_path: "",
+      label: `Start: ${meta.recipe_name || "Recipe"} (${meta.recipe_id})`,
+      branch_context: ""
+    });
+    this._pAddNode(nodes, endId, {
+      id: endId,
+      kind: "end",
+      provider: "system",
+      step_path: "",
+      label: "End",
+      branch_context: ""
+    });
+
+    const ctx = {
+      recipeId: meta.recipe_id,
+      branchStack: [],
+      stepPathPrefix: "",
+      maxNodes
+    };
+
+    const res = this._scanBlockForProcessGraph(rootBlock, ctx, { nodes, edges, notes }, startId, "");
+    const last = res?.last || startId;
+    this._pAddEdge(edges, last, endId, "", "flow");
+
+    // Cap notice (if we hit max nodes)
+    if (nodes.size >= maxNodes) {
+      notes.push(`Node cap reached (${maxNodes}). Diagram may be truncated.`);
+    }
+
+    return { nodes, edges, notes, meta };
+  }
+  /**
+   * Render a step-level process graph as Mermaid flowchart.
+   * @param {string|number} recipeId
+   * @param {{ nodes: Map<string, any>, edges: Array<any>, notes: string[], meta: any }} graph
+   * @returns {string}
+   */
+  renderMermaidProcessGraph(recipeId, graph) {
+    const lines = [];
+    lines.push("flowchart TD");
+
+    const normalizeNodeLabel = (s) => this._mNormalizeNodeLabel(s);
+    const normalizeEdgeLabel = (s) => this._mNormalizeEdgeLabel(s);
+
+    // Nodes
+    for (const n of Array.from(graph.nodes.values())) {
+      const id = n.id;
+      const label = normalizeNodeLabel(n.label || id);
+      const kind = String(n.kind || "step");
+
+      // Shapes: start/end=stadium, decision=diamond, call=subroutine, merge=circle-ish, default=rect
+      if (kind === "start" || kind === "end") {
+        lines.push(`  ${id}([\"${label}\"])`);
+      } else if (kind === "decision") {
+        lines.push(`  ${id}{\"${label}\"}`);
+      } else if (kind === "call") {
+        lines.push(`  ${id}[[\"${label}\"]]`);
+      } else if (kind === "merge") {
+        lines.push(`  ${id}((\"${label}\"))`);
+      } else {
+        lines.push(`  ${id}[\"${label}\"]`);
+      }
+    }
+
+    // Edges (deduplicate)
+    const seen = new Set();
+    for (const e of (graph.edges || [])) {
+      const from = e.from;
+      const to = e.to;
+      if (!from || !to) continue;
+      const lbl = e.label ? normalizeEdgeLabel(e.label) : "";
+      const sig = `${from}->${to}|${lbl}|${e.kind || ""}`;
+      if (seen.has(sig)) continue;
+      seen.add(sig);
+      if (lbl) lines.push(`  ${from} -->|${lbl}| ${to}`);
+      else lines.push(`  ${from} --> ${to}`);
+    }
+
+    return lines.join("\n");
+  }
+
+  /** @private Helper for getDependencies */
+  _scanBlockForCalls(steps, resultsArray) {
+    if (!Array.isArray(steps)) return;
+
+    steps.forEach(step => {
+      if (this.constants.RECIPE_PROVIDERS.includes(step.provider)) {
+        const input = step.input || {};
+        const idKey = this.constants.FLOW_ID_KEYS.find(key => input[key]);
+
+        if (idKey) {
+          resultsArray.push({
+            type: 'RECIPE CALL',
+            id: input[idKey],
+            name: `Called via step: "${step.name || 'Unknown'}"`
+          });
+        }
+      }
+      // Recurse
+      if (step.block) this._scanBlockForCalls(step.block, resultsArray);
+      if (step.else_block) this._scanBlockForCalls(step.else_block, resultsArray);
+      if (step.error_block) this._scanBlockForCalls(step.error_block, resultsArray);
+    });
+  }
+  /** @private Helper for parseLogicRows */
+  _scanBlockForLogic(steps, indentLevel, recipeId, recipeName, rows) {
+    if (!Array.isArray(steps)) return;
+
+    steps.forEach((step, index) => {
+      const visualIndent = "> ".repeat(indentLevel);
+      
+      let actionName = step.name || step.as || "Unknown Action";
+      if (step.keyword) actionName = `[${step.keyword.toUpperCase()}] ${actionName}`;
+      
+      const description = step.description || step.comment || "";
+      const details = this._extractStepDetails(step);
+
+      rows.push([
+        String(recipeId),
+        recipeName,
+        index + 1,
+        visualIndent,
+        step.provider || "System",
+        actionName,
+        description,
+        details
+      ]);
+
+      if (step.block)       this._scanBlockForLogic(step.block, indentLevel + 1, recipeId, recipeName, rows);
+      if (step.else_block)  this._scanBlockForLogic(step.else_block, indentLevel + 1, recipeId, recipeName, rows);
+      if (step.error_block) this._scanBlockForLogic(step.error_block, indentLevel + 1, recipeId, recipeName, rows);
+    });
+  }
+  /** @private Helper for getCallEdges */
+  _scanBlockForCallEdges(steps, edges, ctx) {
+    if (!Array.isArray(steps)) return;
+
+    steps.forEach((step, index) => {
+      const stepPath = ctx.stepPathPrefix ? `${ctx.stepPathPrefix}/${index}` : `${index}`;
+
+      const input = step?.input || {};
+      const found = this._findIdKeyAndValue(input, this.constants.FLOW_ID_KEYS, 3);
+      const looksLikeRecipeCall = 
+        Boolean(found) || this.constants.RECIPE_PROVIDERS.includes(step?.provider);
+
+      if (looksLikeRecipeCall && found && found.value) {
+        edges.push({
+          parent_recipe_id: ctx.parentId,
+          parent_recipe_name: ctx.parentName,
+          child_recipe_id: String(found.value),
+          id_key: found.key,
+          provider: step.provider || "unknown",
+          step_name: step.name || step.as || "Unknown step",
+          step_path: stepPath,
+          branch_context: (ctx.branchStack || []).join(" / ")
+        });
+      }
+
+      // Hande branch context
+      const keyword = String(step?.keyword || "").toLowerCase();
+      const condSummary = (keyword === "if" || keyword === "elsif")
+        ? this._formatConditionSummary(step)
+        : "";
+
+      // Main
+      if (step.block) {
+        const nextStack = ctx.branchStack.slice();
+        if (keyword === "if" || keyword === "elsif") {
+          nextStack.push(`IF ${condSummary}`.trim());
+        }
+        this._scanBlockForCallEdges(step.block, edges, {
+          ...ctx,
+          stepPathPrefix: stepPath,
+          branchStack: nextStack
+        });
+      }
+
+      // Else block
+      if (step.else_block) {
+        const nextStack = ctx.branchStack.slice();
+        nextStack.push("ELSE");
+        this._scanBlockForCallEdges(step.else_block, edges, {
+          ...ctx,
+          stepPathPrefix: stepPath,
+          branchStack: nextStack
+        });
+      }
+
+      // Error block
+      if (step.error_block) {
+        const nextStack = ctx.branchStack.slice();
+        nextStack.push("ON_ERROR");
+        this._scanBlockForCallEdges(step.error_block, edges, {
+          ...ctx,
+          stepPathPrefix: stepPath,
+          branchStack: nextStack
+        });
+      }
+    });
+  }
+  /**
+   * Depth-limited search for recipe ID key/value inside step.input.
+   * Prioritizes common nests (like params) then falls back to small DFS.
+   * @private
+   */
+  _findIdKeyAndValue(obj, keys, depth) {
+    if (!obj || typeof obj !== "object") return null;
+    if (depth <= 0) return null;
+
+    // Direct keys
+    for (const k of keys) {
+      if (obj[k] !== undefined && obj[k] !== null && obj[k] !== "") {
+        return { key: k, value: obj[k] };
+      }
+    }
+
+    // Common nest, parameters
+    if (obj.parameters && typeof obj.parameters === "object") {
+      for (const k of keys) {
+        const v = obj.parameters[k];
+        if (v !== undefined && v !== null && v !== "") return { key: k, value: v };
+      }
+    }
+
+    // Shallow (bounded) DFS
+    for (const [k, v] of Object.entries(obj)) {
+      if (!v || typeof v !== "object") continue;
+      const hit = this._findIdKeyAndValue(v, keys, depth - 1);
+      if (hit) return hit;
+    }
+    return null;
+  }
+  /** @private Formats IF/ELSIF conditions into short readable str. */
+  _formatConditionSummary(step) {
+    try {
+      const conditions = step?.input?.conditions || [];
+      if (!Array.isArray(conditions) || conditions.length === 0) return "";
+      const parts = conditions.slice(0, 3).map(c => {
+        const lhs = this._cleanDataPill(c.lhs);
+        const rhs = this._cleanDataPill(c.rhs);
+        return `${lhs} ${c.operand} ${rhs}`.trim();
+      });
+      const joiner = (step?.input?.operand || "and").toUpperCase();
+      let summary = parts.join(` ${joiner}`);
+      if (conditions.length > 3) summary += " ...";
+      return summary;
+    } catch (_) {
+      return "";
+    }
+  }
+  /** @private Extracts details like IF conditions or SQL queries */
+  _extractStepDetails(step) {
+    let details = [];
+
+    // Conditionals
+    if (step.keyword === 'if' || step.keyword === 'elsif') {
+      const conditions = step.input?.conditions || [];
+      conditions.forEach(c => {
+        const lhs = this._cleanDataPill(c.lhs);
+        const rhs = this._cleanDataPill(c.rhs);
+        details.push(`Condition: ${lhs} ${c.operand} ${rhs}`);
+      });
+      if (step.input?.type === 'compound') {
+        details.push(`Logic: ${step.input.operand.toUpperCase()}`);
+      }
+    }
+
+    // Standard inputs
+    if (step.input) {
+      if (step.input.flow_id) details.push(`Call Recipe ID: ${step.input.flow_id}`);
+      
+      const keys = ['to', 'subject', 'from', 'table_id', 'sql', 'message'];
+      keys.forEach(key => {
+        if (step.input[key]) details.push(`${key}: ${this._cleanDataPill(step.input[key])}`);
+      });
+
+      if (step.input.parameters) {
+        Object.keys(step.input.parameters).forEach(key => {
+          const val = this._cleanDataPill(step.input.parameters[key]);
+          if(val) details.push(`Set '${key}' = ${val}`);
+        });
+      }
+    }
+    return details.join('\n');
+  }
+  /** @private Cleans Workato Data Pill strings: #{_dp(...)} */
+  _cleanDataPill(rawStr) {
+    if (!rawStr || typeof rawStr !== 'string') return rawStr;
+    const dpRegex = /#\{_dp\('(.*?)'\)\}/g;
+    return rawStr.replace(dpRegex, (match, innerJsonEscaped) => {
+      try {
+        const jsonStr = innerJsonEscaped.replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+        const dpObj = JSON.parse(jsonStr);
+        if (dpObj.label) return `{{${dpObj.label}}}`;
+        if (dpObj.path && Array.isArray(dpObj.path)) {
+           const readablePath = dpObj.path.filter(p => typeof p === 'string' && !p.match(/^[0-9a-f-]{36}$/)).join('.');
+           return `{{${readablePath}}}`;
+        }
+        return "{{Unknown Variable}}";
+      } catch (e) { return "{{Variable}}"; }
+    });
+  }
+
+  // --- MERMAID INTERNALS -------------------------------------------------------------------------------
+  /** @private */
+  _mMaxLabel() {
+    const cfg = AppConfig.get();
+    return Number(cfg.CONSTANTS.MERMAID_LABEL_MAX || 80);
+  }
+  /** @private */
+  _mSafeBase(s) {
+    return String(s || "")
+      .replace(/\r?\n/g, " ")
+      .replace(/[\u0000-\u001F\u007F]/g, " ")
+      .trim();
+  }
+  /** @private Collapse Workato datapill blobs BEFORE truncation */
+  _mCollapseWorkato(s) {
+    return String(s || "").replace(/_dp\([^)]*\)/g, "{{dp}}");
+  }
+  /** @private Entity-style escapes per Mermaid flowchart docs */
+  _mEntityEscape(ch) {
+    const map = {
+      '"': "#quot;",
+      "'": "#39;",
+      "(": "#40;",
+      ")": "#41;",
+      "[": "#91;",
+      "]": "#93;",
+      "{": "#123;",
+      "}": "#125;",
+      "<": "#60;",
+      ">": "#62;",
+      "\\": "#92;",
+      "&": "#38;"
+    };
+    return map[ch] || ch;
+  }
+  /** @private */
+  _mTruncTo(s) {
+    const maxLabel = this._mMaxLabel();
+    const str = String(s || "");
+    return (str.length > maxLabel ? str.slice(0, Math.max(0, maxLabel - 3)) + "..." : str);
+  }
+  /** @private */
+  _mNormalizeNodeLabel(s) {
+    let str = this._mSafeBase(this._mCollapseWorkato(s));
+    str = str.replace(/"/g, "'");
+    str = str.replace(/\s+/g, " ").trim();
+    return this._mTruncTo(str);
+  }
+  /** @private */
+  _mNormalizeEdgeLabel(s) {
+    let str = this._mSafeBase(this._mCollapseWorkato(s));
+    str = str.replace(/\|/g, " / ");
+    str = str.replace(/["'(){}\[\]<>\\&]/g, (ch) => this._mEntityEscape(ch));
+    str = str.replace(/\s+/g, " ").trim();
+    return this._mTruncTo(str);
+  }
+
+  // --- PROCESS-GRAPH INTERNALS -------------------------------------------------------------------------
+  /** @private Ensure Mermaid-safe node ids */
+  _pNodeId(raw) {
+    const safe = String(raw || "")
+      .replace(/[^0-9a-zA-Z_]/g, "_")
+      .replace(/^([0-9])/, "_$1");
+    return `N_${safe}`;
+  }
+  /** @private Add node with cap protection */
+  _pAddNode(nodes, id, node) {
+    if (!nodes.has(id)) nodes.set(id, node);
+  }
+  /** @private Add edge */
+  _pAddEdge(edges, from, to, label = "", kind = "flow") {
+    edges.push({ from, to, label, kind });
+  }
+  /** @private */
+  _pClassifyStep(step) {
+    const keyword = String(step?.keyword || "").toLowerCase();
+    if (keyword === "if" || keyword === "elsif") return "decision";
+
+    const provider = String(step?.provider || "");
+    const input = step?.input || {};
+    const found = this._findIdKeyAndValue(input, this.constants.FLOW_ID_KEYS, 3);
+    const looksLikeRecipeCall = Boolean(found?.value) || this.constants.RECIPE_PROVIDERS.includes(provider);
+    if (looksLikeRecipeCall) return "call";
+
+    return "step";
+  }
+  /** @private */
+  _pStepLabel(step, kind) {
+    const name = step?.name || step?.as || "Unnamed step";
+    const provider = step?.provider || "System";
+    const keyword = step?.keyword ? `[${String(step.keyword).toUpperCase()}] ` : "";
+    if (kind === "call") {
+      const found = this._findIdKeyAndValue(step?.input || {}, this.constants.FLOW_ID_KEYS, 3);
+      const target = found?.value ? ` → ${found.value}` : "";
+      return `${keyword}${name}${target}`;
+    }
+    if (kind === "decision") {
+      const cond = this._formatConditionSummary(step);
+      return cond ? `IF ${cond}` : `${keyword}${name}`;
+    }
+    return `${keyword}${name} (${provider})`;
+  }
+  /**
+   * Walk a block and build control-flow edges.
+   *
+   * @private
+   * @param {Array<any>} steps
+   * @param {{ recipeId: string, branchStack: string[], stepPathPrefix: string, maxNodes: number }} ctx
+   * @param {{ nodes: Map<string, any>, edges: Array<any>, notes: string[] }} graph
+   * @param {string} entryFromNodeId
+   * @param {string} entryEdgeLabel
+   * @returns {{ first: string|null, last: string }}
+   */
+  _scanBlockForProcessGraph(steps, ctx, graph, entryFromNodeId, entryEdgeLabel = "") {
+    if (!Array.isArray(steps) || steps.length === 0) {
+      return { first: null, last: entryFromNodeId };
+    }
+
+    let prev = entryFromNodeId;
+    let first = null;
+
+    for (let index = 0; index < steps.length; index++) {
+      if (graph.nodes.size >= ctx.maxNodes) {
+        graph.notes.push(`Stopped parsing at node cap (${ctx.maxNodes}).`);
+        break;
+      }
+
+      const step = steps[index];
+      const stepPath = ctx.stepPathPrefix ? `${ctx.stepPathPrefix}/${index}` : `${index}`;
+      const kind = this._pClassifyStep(step);
+
+      // Decision handling (IF/ELSIF)
+      if (kind === "decision") {
+        const decisionId = this._pNodeId(`S_${ctx.recipeId}_${stepPath}`);
+        this._pAddNode(graph.nodes, decisionId, {
+          id: decisionId,
+          kind: "decision",
+          provider: step?.provider || "system",
+          step_path: stepPath,
+          label: this._pStepLabel(step, kind),
+          branch_context: (ctx.branchStack || []).join(" / ")
+        });
+
+        // entry edge from prev -> decision
+        const isFirstEdge = (prev === entryFromNodeId && !first);
+        if (isFirstEdge && entryEdgeLabel) this._pAddEdge(graph.edges, prev, decisionId, entryEdgeLabel, "flow");
+        else this._pAddEdge(graph.edges, prev, decisionId, "", "flow");
+        if (!first) first = decisionId;
+
+        // THEN block
+        const thenCtx = {
+          ...ctx,
+          stepPathPrefix: stepPath,
+          branchStack: (ctx.branchStack || []).slice().concat(["IF"])
+        };
+        const thenRes = this._scanBlockForProcessGraph(step.block || [], thenCtx, graph, decisionId, "true");
+
+        // ELSE block
+        const elseCtx = {
+          ...ctx,
+          stepPathPrefix: `${stepPath}/else`,
+          branchStack: (ctx.branchStack || []).slice().concat(["ELSE"])
+        };
+        const elseRes = this._scanBlockForProcessGraph(step.else_block || [], elseCtx, graph, decisionId, "false");
+
+        // Merge
+        const mergeId = this._pNodeId(`M_${ctx.recipeId}_${stepPath}_merge`);
+        this._pAddNode(graph.nodes, mergeId, {
+          id: mergeId,
+          kind: "merge",
+          provider: "system",
+          step_path: `${stepPath}/merge`,
+          label: "Merge",
+          branch_context: (ctx.branchStack || []).join(" / ")
+        });
+
+        // Connect branch ends to merge (if branch empty, connect decision to merge)
+        this._pAddEdge(graph.edges, (thenRes.first ? thenRes.last : decisionId), mergeId, "", "flow");
+        this._pAddEdge(graph.edges, (elseRes.first ? elseRes.last : decisionId), mergeId, "", "flow");
+
+        prev = mergeId;
+        continue;
+      }
+
+      // Normal step node
+      const nodeId = this._pNodeId(`S_${ctx.recipeId}_${stepPath}`);
+      this._pAddNode(graph.nodes, nodeId, {
+        id: nodeId,
+        kind,
+        provider: step?.provider || "system",
+        step_path: stepPath,
+        label: this._pStepLabel(step, kind),
+        branch_context: (ctx.branchStack || []).join(" / ")
+      });
+
+      const isFirstEdge = (prev === entryFromNodeId && !first);
+      if (isFirstEdge && entryEdgeLabel) this._pAddEdge(graph.edges, prev, nodeId, entryEdgeLabel, "flow");
+      else this._pAddEdge(graph.edges, prev, nodeId, "", "flow");
+      if (!first) first = nodeId;
+
+      // Optional nested block (treated as sequential continuation)
+      let mainExit = nodeId;
+      if (Array.isArray(step.block) && step.block.length > 0) {
+        const childCtx = {
+          ...ctx,
+          stepPathPrefix: stepPath,
+          branchStack: (ctx.branchStack || []).slice()
+        };
+        const childRes = this._scanBlockForProcessGraph(step.block, childCtx, graph, nodeId, "");
+        mainExit = childRes.last || nodeId;
+      }
+
+      // Error branch
+      if (Array.isArray(step.error_block) && step.error_block.length > 0) {
+        const mergeId = this._pNodeId(`M_${ctx.recipeId}_${stepPath}_err_merge`);
+        this._pAddNode(graph.nodes, mergeId, {
+          id: mergeId,
+          kind: "merge",
+          provider: "system",
+          step_path: `${stepPath}/err_merge`,
+          label: "Merge",
+          branch_context: (ctx.branchStack || []).join(" / ")
+        });
+
+        // OK path
+        this._pAddEdge(graph.edges, mainExit, mergeId, "ok", "flow");
+
+        // Error path
+        const errCtx = {
+          ...ctx,
+          stepPathPrefix: `${stepPath}/error`,
+          branchStack: (ctx.branchStack || []).slice().concat(["ON_ERROR"])
+        };
+        const errRes = this._scanBlockForProcessGraph(step.error_block, errCtx, graph, nodeId, "error");
+        const errExit = errRes.first ? errRes.last : nodeId;
+        this._pAddEdge(graph.edges, errExit, mergeId, "", "flow");
+
+        prev = mergeId;
+      } else {
+        prev = mainExit;
+      }
+    }
+
+    return { first, last: prev };
+  }
+}
+/**
+ * @class
+ * @classdesc Service for interacting with Google Vertex AI (Gemini).
+ */
+class GeminiService {
+  constructor() {
+    this.config = AppConfig.get().VERTEX;
+
+    this.projectId = this.config.GOOGLE_CLOUD_PROJECT_ID;
+    this.modelId = this.config.MODEL_ID;
+    this.location = this.config.LOCATION;
+    this.generationConfig = this.config.GENERATION_CONFIG;
+
+    if (!this.projectId) {
+      console.warn("GeminiService: 'GOOGLE_CLOUD_PROJECT_ID' is missing in Script Properties.");
+    }
+  }
+  /**
+   * Generates a natural language summary of a Workato recipe.
+   * @param {Object} recipe - The full recipe object.
+   * @returns {string} The AI-generated summary.
+   */
+  explainRecipe(recipe) {
+    if (!this.projectId) throw new Error("Missing GOOGLE_CLOUD_PROJECT_ID in Script Properties");
+
+    const cleanData = this._prepareContext(recipe);
+    const prompt = `
+      You are an expert Workato developer and systems architect.
+      Analyze the following Workato recipe (provided in JSON) and generate a concise technical summary.
+      
+      Structure your response as follows:
+      1. **Objective**: One sentence on what this automation achieves.
+      2. **Trigger**: What event starts this recipe?
+      3. **Key Logic**: Bullet points explaining the main actions, decisions (If/Else), and loops.
+      4. **Dependencies**: List external apps connected (e.g., Salesforce, Jira).
+
+      Recipe JSON:
+      ${JSON.stringify(cleanData)}
+    `;
+
+    return this._callVertexAI(prompt);
+  }
+  /**
+   * Strips raw recipe data down to the essential logic for the LLM.
+   * @private
+   */
+  _prepareContext(recipe) {
+    // If 'code' is still a string (hasn't been parsed by DriveService yet), parse it temporarily
+    let logicBlock = recipe.code;
+    if (typeof logicBlock === 'string') {
+      try { logicBlock = JSON.parse(logicBlock); } catch (e) {}
+    }
+
+    return {
+      name: recipe.name,
+      description: recipe.description, // existing manual description
+      trigger_app: recipe.trigger_application,
+      connected_apps: recipe.action_applications,
+      logic: logicBlock // The nested steps/blocks
+    };
+  }
+  /**
+   * Executes the API call to Vertex AI.
+   * @private
+   */
+  _callVertexAI(textPrompt) {
+    const endpoint = `https://${this.location}-aiplatform.googleapis.com/v1/projects/${this.projectId}/locations/${this.location}/publishers/google/models/${this.modelId}:generateContent`;
+    
+    const payload = {
+      contents: [{
+        role: "user",
+        parts: [{ text: textPrompt }]
+      }],
+      generationConfig: {
+        temperature: this.generationConfig.TEMPERATURE,
+        maxOutputTokens: this.generationConfig.MAX_OUTPUT_TOKENS
       }
     };
 
-    const s = svc._formatConditionSummary(step);
-    Assert.contains(s, "{{Priority}} = P1");
-  });
-
-  runner.add("getCallEdges detects calls across flow_id, recipe_id, callable_recipe_id", () => {
-    const codeObj = Fixtures.recipeCodeBlock_withBranchesAndCalls();
-    const r = Fixtures.recipePayload("100", "Root", "p1", "f1", codeObj);
-
-    const client = new FakeWorkatoClient({ "100": r });
-    const svc = new RecipeAnalyzerService(client);
-
-    const edges = svc.getCallEdges("100");
-    const childIds = edges.map(e => String(e.child_recipe_id)).sort();
-
-    Assert.deepEqual(childIds, ["200", "300", "400", "500"].sort());
-
-    // ensure id_key captured
-    const byChild = Object.fromEntries(edges.map(e => [String(e.child_recipe_id), e]));
-    Assert.equal(byChild["200"].id_key, "flow_id");
-    Assert.equal(byChild["300"].id_key, "recipe_id");
-    Assert.equal(byChild["400"].id_key, "callable_recipe_id");
-  });
-
-  runner.add("getCallEdges records step_path and branch_context for if/else/error", () => {
-    const codeObj = Fixtures.recipeCodeBlock_withBranchesAndCalls();
-    const r = Fixtures.recipePayload("100", "Root", "p1", "f1", codeObj);
-
-    const client = new FakeWorkatoClient({ "100": r });
-    const svc = new RecipeAnalyzerService(client);
-
-    const edges = svc.getCallEdges("100");
-    const e200 = edges.find(e => String(e.child_recipe_id) === "200");
-    const e300 = edges.find(e => String(e.child_recipe_id) === "300");
-    const e400 = edges.find(e => String(e.child_recipe_id) === "400");
-
-    Assert.ok(e200.step_path, "Expected step_path for 200");
-    Assert.ok(e300.step_path, "Expected step_path for 300");
-    Assert.ok(e400.step_path, "Expected step_path for 400");
-
-    Assert.contains(e200.branch_context, "IF");
-    Assert.contains(e300.branch_context, "ELSE");
-    Assert.contains(e400.branch_context, "ON_ERROR");
-  });
-
-  // -----------------------------
-  // Unit: Transitive graph building
-  // -----------------------------
-  runner.add("buildTransitiveCallGraph respects depth 0 (no recursion)", () => {
-    const { r100, r200, r300 } = Fixtures.graphRecipes_cycle();
-    const client = new FakeWorkatoClient({ "100": r100, "200": r200, "300": r300 });
-    const svc = new RecipeAnalyzerService(client);
-
-    const graph = svc.buildTransitiveCallGraph("100", 0);
-    Assert.ok(graph.nodes.has("100"));
-    // still includes edges from root
-    Assert.equal(graph.edges.length, 1);
-    Assert.equal(String(graph.edges[0].child_recipe_id), "200");
-    // but should not expand child nodes at depth 0
-    Assert.ok(!graph.nodes.has("200"));
-  });
-
-  runner.add("buildTransitiveCallGraph expands to depth 2 and detects cycles", () => {
-    const { r100, r200, r300 } = Fixtures.graphRecipes_cycle();
-    const client = new FakeWorkatoClient({ "100": r100, "200": r200, "300": r300 });
-    const svc = new RecipeAnalyzerService(client);
-
-    const graph = svc.buildTransitiveCallGraph("100", 3);
-    Assert.ok(graph.nodes.has("100"));
-    Assert.ok(graph.nodes.has("200"));
-    Assert.ok(graph.nodes.has("300"));
-
-    // edges: 100->200, 200->300, 300->200
-    Assert.equal(graph.edges.length, 3);
-
-    Assert.ok((graph.notes || []).some(n => String(n).includes("Cycle detected")));
-  });
-
-  // -----------------------------
-  // Unit: Mermaid rendering
-  // -----------------------------
-  runner.add("renderMermaidCallGraph emits flowchart TD, nodes, and labeled edges", () => {
-    const codeObj = Fixtures.recipeCodeBlock_withBranchesAndCalls();
-    const r100 = Fixtures.recipePayload("100", 'Root "Recipe"\nName', "p1", "f1", codeObj);
-
-    // provide child stubs so node labels resolve names in cache
-    const r200 = Fixtures.recipePayload("200", "Escalate", "p1", "f1", { block: [] });
-    const r300 = Fixtures.recipePayload("300", "Triage", "p1", "f1", { block: [] });
-    const r400 = Fixtures.recipePayload("400", "Fallback", "p1", "f1", { block: [] });
-    const r500 = Fixtures.recipePayload("500", "Billing", "p1", "f1", { block: [] });
-
-    const client = new FakeWorkatoClient({ "100": r100, "200": r200, "300": r300, "400": r400, "500": r500 });
-    const svc = new RecipeAnalyzerService(client);
-
-    const graph = svc.buildTransitiveCallGraph("100", 1);
-    const mermaid = svc.renderMermaidCallGraph("100", graph);
-
-    Assert.contains(mermaid, "flowchart TD");
-    // root label should be sanitized (no raw double quotes/newlines)
-    Assert.ok(!mermaid.includes('\nName"'), "Expected sanitized label not to preserve raw newline+quote");
-    // edges should include some label content
-    Assert.ok(mermaid.includes("-->|"), "Expected at least one labeled edge");
-  });
-
-  runner.add("renderMermaidCallGraph dedupes identical edges", () => {
-    const r100 = Fixtures.recipePayload("100", "Root", "p1", "f1", {
-      block: [
-        { provider: "workato_recipe_function", name: "Call 200", input: { flow_id: "200" } },
-        { provider: "workato_recipe_function", name: "Call 200", input: { flow_id: "200" } }
-      ]
-    });
-    const r200 = Fixtures.recipePayload("200", "Child", "p1", "f1", { block: [] });
-
-    const client = new FakeWorkatoClient({ "100": r100, "200": r200 });
-    const svc = new RecipeAnalyzerService(client);
-
-    const graph = svc.buildTransitiveCallGraph("100", 0);
-    const mermaid = svc.renderMermaidCallGraph("100", graph);
-
-    // Only one edge should remain after dedupe
-    const edgeCount = mermaid.split("\n").filter(l => l.includes("-->")).length;
-    Assert.equal(edgeCount, 1);
-  });
-
-  // -----------------------------
-  // Unit: DataMapper mapping for call edges
-  // -----------------------------
-  runner.add("mapCallEdgesToRows resolves project/folder and child recipe name", () => {
-    const recipe = { id: "100", name: "Root", project_id: "p1", folder_id: "f1" };
-    const edges = [{
-      parent_recipe_id: "100",
-      parent_recipe_name: "Root",
-      child_recipe_id: "200",
-      id_key: "flow_id",
-      provider: "workato_recipe_function",
-      step_name: "Call 200",
-      step_path: "0",
-      branch_context: "IF x"
-    }];
-
-    const projectMap = { "p1": "Project A" };
-    const folderMap = { "f1": "Folder A" };
-    const recipeNameMap = { "200": "Child Recipe" };
-
-    const rows = DataMapper.mapCallEdgesToRows(recipe, edges, projectMap, folderMap, recipeNameMap);
-    Assert.equal(rows.length, 1);
-    Assert.equal(rows[0][0], "100"); // parent id
-    Assert.equal(rows[0][2], "Project A");
-    Assert.equal(rows[0][3], "Folder A");
-    Assert.equal(rows[0][8], "200"); // child id
-    Assert.equal(rows[0][9], "Child Recipe"); // child name
-    Assert.equal(rows[0][10], "flow_id"); // id key
-  });
-
-  // -----------------------------
-  // Integration-ish: WorkatoSyncApp.runProcessMaps (no real APIs)
-  // -----------------------------
-  runner.add("runProcessMaps writes PROCESS_MAPS with header + rows", () => {
-    const testConfig = {
-      API: {
-        TOKEN: "x",
-        BASE_URL: "https://example/api",
-        PER_PAGE: 100,
-        MAX_CALLS: 500,
-        THROTTLE_MS: 0,
-        RECIPE_LIMIT_DEBUG: 100,
-        PROCESS_MAP_DEPTH: 2,
-        MAX_RETRIES: 1
+    const options = {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify(payload),
+      headers: {
+        // Apps Script automatically handles the OAuth token for Google services
+        Authorization: `Bearer ${ScriptApp.getOAuthToken()}`
       },
-      SHEETS: {
-        PROCESS_MAPS: "process_maps",
-        LOGIC_INPUT: "logic_requests"
-      },
-      HEADERS: {
-        PROCESS_MAPS: ["Root recipe ID", "Root recipe name", "Depth", "Mermaid (flowchart)", "Notes", "Drive link", "Generated at"],
-        LOGIC_INPUT: ["Enter recipe IDs below (one per row)"]
-      },
-      CONSTANTS: { CELL_CHAR_LIMIT: 48000, MERMAID_LABEL_MAX: 80, FLOW_ID_KEYS: ["flow_id", "recipe_id", "callable_recipe_id"], RECIPE_PROVIDERS: ["workato_recipe_function","workato_callable_recipe"] },
-      DEBUG: { LOG_TO_DRIVE: true, LOG_TO_SHEET: false },
-      VERTEX: {},
-      VERBOSE: false
+      muteHttpExceptions: true
     };
 
-    const r100 = Fixtures.recipePayload("100", "Root", "p1", "f1", { block: [{ provider:"workato_recipe_function", name:"Call 200", input:{ flow_id:"200" } }] });
-    const r200 = Fixtures.recipePayload("200", "Child", "p1", "f1", { block: [] });
+    try {
+      const response = UrlFetchApp.fetch(endpoint, options);
+      const json = JSON.parse(response.getContentText());
 
-    const client = new FakeWorkatoClient({ "100": r100, "200": r200 });
+      if (json.error) {
+        throw new Error(`Vertex AI Error: ${json.error.message}`);
+      }
+      
+      // Navigate the Gemini response structure
+      if (json.candidates && json.candidates[0] && json.candidates[0].content) {
+        return json.candidates[0].content.parts[0].text;
+      }
+      return "No content generated.";
 
-    withTestConfig(testConfig, () => {
-      // Build an app instance then replace services with fakes
-      const app = new WorkatoSyncApp();
-      app.analyzerService = new RecipeAnalyzerService(client);
-      app.sheetService = new FakeSheetService(["100"]);
-      app.driveService = new FakeDriveService();
-
-      app.runProcessMaps();
-
-      const written = app.sheetService.writes["PROCESS_MAPS"];
-      Assert.ok(written, "Expected PROCESS_MAPS to be written");
-      Assert.equal(written[0][0], "Root recipe ID"); // header row
-      Assert.equal(written.length, 2); // header + 1 row
-      Assert.equal(written[1][0], "100");
-      Assert.equal(written[1][1], "Root");
-      Assert.contains(written[1][3], "flowchart TD"); // mermaid content
-    });
-  });
-
-  runner.add("runProcessMaps saves to Drive when Mermaid exceeds cell limit", () => {
-    // Force tiny cell limit to trigger truncation + drive save
-    const testConfig = {
-      API: {
-        TOKEN: "x",
-        BASE_URL: "https://example/api",
-        PER_PAGE: 100,
-        MAX_CALLS: 500,
-        THROTTLE_MS: 0,
-        RECIPE_LIMIT_DEBUG: 100,
-        PROCESS_MAP_DEPTH: 1,
-        MAX_RETRIES: 1
-      },
-      SHEETS: {
-        PROCESS_MAPS: "process_maps",
-        LOGIC_INPUT: "logic_requests"
-      },
-      HEADERS: {
-        PROCESS_MAPS: ["Root recipe ID", "Root recipe name", "Depth", "Mermaid (flowchart)", "Notes", "Drive link", "Generated at"],
-        LOGIC_INPUT: ["Enter recipe IDs below (one per row)"]
-      },
-      CONSTANTS: { CELL_CHAR_LIMIT: 200, MERMAID_LABEL_MAX: 80, FLOW_ID_KEYS: ["flow_id", "recipe_id", "callable_recipe_id"], RECIPE_PROVIDERS: ["workato_recipe_function","workato_callable_recipe"] },
-      DEBUG: { LOG_TO_DRIVE: true, LOG_TO_SHEET: false },
-      VERTEX: {},
-      VERBOSE: false
-    };
-
-    // Generate many edges to bloat mermaid text
-    const bigBlock = { block: [] };
-    for (let i = 0; i < 50; i++) {
-      bigBlock.block.push({ provider:"workato_recipe_function", name:`Call ${200+i}`, input:{ flow_id:String(200+i) } });
+    } catch (e) {
+      console.error(e);
+      return `AI Analysis Failed: ${e.message}`;
     }
-    const r100 = Fixtures.recipePayload("100", "Root", "p1", "f1", bigBlock);
+  }
+}
+  
+// -------------------------------------------------------------------------------------------------------
+// DATA MAPPER
+// -------------------------------------------------------------------------------------------------------
+/**
+ * @class
+ * @classdesc Pure utility class for transforming raw API data into 2D arrays for Google Sheets.
+ * Decouples business logic (Controllers) from I/O logic (SheetService).
+ */
+class DataMapper {
+  /**
+   * Transforms Project objects into sheet rows.
+   * @param {Array<Object>} projects - Raw API response.
+   * @returns {Array<Array<string>>}
+   */
+  static mapProjectsToRows(projects) {
+    return projects.map(p => [p.id, p.name, p.description, p.created_at]);
+  }
+  /**
+   * Transforms Folder objects into sheet rows, resolving Parent/Project names.
+   * @param {Array<Object>} folders - Raw API response.
+   * @param {Object} folderMap - Lookup {id: name}.
+   * @param {Object} projectMap - Lookup {id: name}.
+   * @returns {Array<Array<string>>}
+   */
+  static mapFoldersToRows(folders, folderMap, projectMap) {
+    return folders.map(f => {
+      let parentName = "TOP LEVEL";
+      if (f.is_project) parentName = "Workspace Root (Home)";
+      else if (f.parent_id) parentName = DataMapper._safeLookup(folderMap, f.parent_id);
+      
+      const projectName = DataMapper._safeLookup(projectMap, f.project_id);
+      return [f.id, f.name, parentName, projectName];
+    });
+  }
+  /**
+   * Transforms Recipe objects into sheet rows.
+   * @param {Array<Object>} recipes - Raw API response.
+   * @param {Object} projectMap - Lookup {id: name}.
+   * @param {Object} folderMap - Lookup {id: name}.
+   * @returns {Array<Array<string>>}
+   */
+  static mapRecipesToRows(recipes, projectMap, folderMap) {
+    return recipes.map(r => [
+      r.id,
+      r.name,
+      r.running ? "ACTIVE" : "STOPPED",
+      DataMapper._safeLookup(projectMap, r.project_id),
+      DataMapper._safeLookup(folderMap, r.folder_id),
+      r.last_run_at || "NEVER"
+    ]);
+  }
+  /**
+   * Transforms Property objects into sheet rows.
+   * @param {Array<Object>} properties - Raw API response.
+   * @returns {Array<Array<string>>}
+   */
+  static mapPropertiesToRows(properties) {
+    return properties.map(p => [p.id, p.name, p.value, p.created_at, p.updated_at]);
+  }
+  /**
+   * Transforms dependency objects (calculated in Analyzer) into sheet rows.
+   * @param {Object} recipe - The parent recipe object.
+   * @param {Array<Object>} dependencies - List of deps {type, id, name}.
+   * @param {Object} projectMap - Lookup.
+   * @param {Object} folderMap - Lookup.
+   * @returns {Array<Array<string>>}
+   */
+  static mapDependenciesToRows(recipe, dependencies, projectMap, folderMap) {
+    const projectName = DataMapper._safeLookup(projectMap, recipe.project_id);
+    const folderName = DataMapper._safeLookup(folderMap, recipe.folder_id);
 
-    const recipes = { "100": r100 };
-    for (let i = 0; i < 50; i++) {
-      recipes[String(200+i)] = Fixtures.recipePayload(String(200+i), `Child ${200+i}`, "p1", "f1", { block: [] });
+    return dependencies.map(dep => [
+      recipe.id, projectName, folderName, dep.type, dep.id, dep.name
+    ]);
+  }
+  /**
+   * Transforms a batch of debug log entries into rows.
+   * Handles "Chunking" of large JSON strings to fit into cell limits.
+   * * @param {Array<Object>} logEntries - Objects {id, name, json, driveUrl, status}.
+   * @returns {Array<Array<string>>}
+   */
+  static mapDebugLogsToRows(logEntries) {
+    const config = AppConfig.get();
+    const CHAR_LIMIT = config.CONSTANTS.CELL_CHAR_LIMIT || 48000;
+    const LOG_TO_DRIVE = config.DEBUG.LOG_TO_DRIVE;
+
+    return logEntries.map(log => {
+      const timestamp = new Date().toISOString();
+      
+      // Handle Drive status, hyperlink
+      let status = log.status || "OK";
+      let driveLink = "Not saved";
+
+      if (LOG_TO_DRIVE) {
+        if (log.driveUrl) {
+          status = "Saved to Drive";
+          driveLink = `=HYPERLINK("${log.driveUrl}", "View JSON")`;
+        } else if (!log.status) {
+          status = "Drive error";
+        }
+      }
+
+      const row = [timestamp, log.id, log.name, status, driveLink];
+
+      // Handle JSON body
+      if (log.json) {
+        const jsonString = typeof log.json === 'string' ? log.json : JSON.stringify(log.json, null, 2);
+        if (jsonString.length <= CHAR_LIMIT) {
+          row.push(jsonString);
+        } else {
+          let offset = 0;
+          while (offset < jsonString.length) {
+            row.push(jsonString.substring(offset, offset + CHAR_LIMIT));
+            offset += CHAR_LIMIT;
+          }
+        }
+      }
+      return row;
+    });
+  }
+  /**
+   * Transforms recipe call edge objects into sheet rows.
+   * @param {Object} recipe - Parent recipe (from /recipes list).
+   * @param {Array<Object>} edges - Call edge objects from RecipeAnalyzerService.getCallEdges().
+   * @param {Object} projectMap - Lookup.
+   * @param {Object} folderMap - Lookup.
+   * @param {Object} recipeNameMap - Lookup {id: name} for child recipe name resolution.
+   * @returns {Array<Array<string>>}
+   */
+  static mapCallEdgesToRows(recipe, edges, projectMap, folderMap, recipeNameMap) {
+    const projectName = DataMapper._safeLookup(projectMap, recipe.project_id);
+    const folderName = DataMapper._safeLookup(folderMap, recipe.folder_id);
+
+    return (edges || []).map(e => ([
+      String(e.parent_recipe_id || recipe.id || ""),
+      String(e.parent_recipe_name || recipe.name || ""),
+      projectName,
+      folderName,
+      String(e.step_path || ""),
+      String(e.step_name || ""),
+      String(e.branch_context || ""),
+      String(e.provider || ""),
+      String(e.child_recipe_id || ""),
+      DataMapper._safeLookup(recipeNameMap, e.child_recipe_id),
+      String(e.id_key || "")
+    ]));
+  }
+  /**
+   * Transforms a process graph's nodes into sheet rows.
+   * @param {string|number} rootId
+   * @param {string} rootName
+   * @param {{ nodes: Map<string, any> }} graph
+   * @returns {Array<Array<string>>}
+   */
+  static mapProcessNodesToRows(rootId, rootName, graph) {
+    const rows = [];
+    const nodes = graph?.nodes ? Array.from(graph.nodes.values()) : [];
+    nodes.forEach(n => {
+      rows.push([
+        String(rootId || ""),
+        String(rootName || ""),
+        String(n.id || ""),
+        String(n.step_path || ""),
+        String(n.kind || ""),
+        String(n.provider || ""),
+        String(n.label || ""),
+        String(n.branch_context || "")
+      ]);
+    });
+    return rows;
+  }
+  /**
+   * Transforms a process graph's edges into sheet rows.
+   * @param {string|number} rootId
+   * @param {{ edges: Array<any> }} graph
+   * @returns {Array<Array<string>>}
+   */
+  static mapProcessEdgesToRows(rootId, graph) {
+    const rows = [];
+    const edges = Array.isArray(graph?.edges) ? graph.edges : [];
+    edges.forEach(e => {
+      rows.push([
+        String(rootId || ""),
+        String(e.from || ""),
+        String(e.to || ""),
+        String(e.label || ""),
+        String(e.kind || "")
+      ]);
+    });
+    return rows;
+  }
+
+  /**
+   * Safely looks up an ID in a map, returning a fallback if missing.
+   * @private
+   */
+  static _safeLookup(map, id) {
+    if (!id) return "-";
+    const strId = String(id);
+    return map && map[strId] ? map[strId] : `[ID: ${id}]`;
+  }
+}
+
+// -------------------------------------------------------------------------------------------------------
+// ORCHESTRATOR
+// -------------------------------------------------------------------------------------------------------
+/**
+ * @class
+ * @classdesc Main Application Controller.
+ * * Orchestrates the fetching, transformation, and writing of Workato data.
+ */
+class WorkatoSyncApp {
+  constructor() {
+    this.config = AppConfig.get();
+    const client = new WorkatoClient();
+    this.inventoryService = new InventoryService(client);
+    this.analyzerService = new RecipeAnalyzerService(client);
+    this.sheetService = new SheetService();
+    this.driveService = new DriveService();
+  }
+  /**
+   * The main execution method. 
+   * Performs authentication check, fetches all resources, transforms data, 
+   * resolves dependencies, and writes to Sheets.
+   */
+  runInventorySync() {
+    try {
+      Logger.verbose("Starting full workspace sync...");
+
+      // 1. Identify present workspace
+      const currentUser = this.inventoryService.getCurrentUser();
+      if (currentUser) console.log(`Authenticated as ${currentUser.name || "Unknown user"}`);
+
+      // 2. Fetch raw data
+      const projects = this.inventoryService.getProjects();
+      const folders = this.inventoryService.getFoldersRecursive(projects);
+      const recipes = this.inventoryService.getRecipes();
+      const properties = this.inventoryService.getProperties();
+
+      Logger.verbose(`Fetched totals: ${projects.length} projects, ${folders.length} folders, ${recipes.length} recipes, ${properties.length} properties`);
+
+      // 3. Create lookup maps
+      const projectMap = this._createLookupMap(projects);
+      const folderMap = this._createLookupMap(folders);
+      const recipeNameMap = this._createLookupMap(recipes);
+      
+      const projectRows = [this.config.HEADERS.PROJECTS, ...DataMapper.mapProjectsToRows(projects)];
+      const folderRows = [this.config.HEADERS.FOLDERS, ...DataMapper.mapFoldersToRows(folders, folderMap, projectMap)];
+      const recipeRows = [this.config.HEADERS.RECIPES, ...DataMapper.mapRecipesToRows(recipes, projectMap, folderMap)];
+      const propertyRows = [this.config.HEADERS.PROPERTIES, ...DataMapper.mapPropertiesToRows(properties)];
+
+      // 4. Calculate dependencies
+      let dependencyRows = [this.config.HEADERS.DEPENDENCIES];
+      let callEdgeRows = [this.config.HEADERS.CALL_EDGES];
+      const depLimit = this.config.API.RECIPE_LIMIT_DEBUG;
+      
+      recipes.forEach((recipe, index) => {
+        if (index < depLimit) {
+          const rawDeps = this.analyzerService.getDependencies(recipe.id);
+          if (rawDeps.length > 0) {
+            const rows = DataMapper.mapDependenciesToRows(recipe, rawDeps, projectMap, folderMap);
+            dependencyRows = dependencyRows.concat(rows);
+          }
+
+          // Recipe call edges (process-map formation)
+          const callEdges = this.analyzerService.getCallEdges(recipe.id);
+          if (callEdges.length > 0) {
+            callEdgeRows = callEdgeRows.concat(DataMapper.mapCallEdgesToRows(recipe, callEdges, projectMap, folderMap, recipeNameMap));
+          }
+          if (index % 10 === 0) Utilities.sleep(50);
+        }
+      });
+
+      // 5. Write to Sheets
+      Logger.verbose("Writing to Sheets...");
+      this.sheetService.write('PROJECTS', projectRows);
+      this.sheetService.write('FOLDERS', folderRows);
+      this.sheetService.write('RECIPES', recipeRows);
+      this.sheetService.write('PROPERTIES', propertyRows);
+      this.sheetService.write('DEPENDENCIES', dependencyRows);
+      this.sheetService.write('CALL_EDGES', callEdgeRows);
+
+      Logger.notify("Sync complete. Workspace inventory updated...", false);
+
+    } catch (e) {
+      this._handleError(e);
+    }
+  }
+  /**
+   * Reads specific IDs from the input sheet and fetches step-by-step logic.
+   */
+  runLogicDebug() {
+    try {
+      Logger.verbose("Starting recipe logic debugging...");
+      
+      // 1. Read input 
+      const requestedIds = this.sheetService.readRequests();
+      if (requestedIds.length === 0) {
+        Logger.notify("No IDs found in the 'logic_requests' sheet.", true);
+        return;
+      }
+      Logger.notify(`Fetching logic for ${requestedIds.length} recipes...`);
+
+      // 2. Fetch and parse logic
+      const logicRows = [this.config.HEADERS.LOGIC];
+      const debugLogs = [];
+
+      requestedIds.forEach((reqId, index) => {
+        try {
+          const fullRecipe = this.analyzerService.client.get(`recipes/${reqId}`);
+          const recipeName = fullRecipe.name || "Unknown";
+
+          // A. Save to Drive
+          let driveUrl = "";
+          if (this.config.DEBUG.LOG_TO_DRIVE) {
+            driveUrl = this.driveService.saveLog(reqId, fullRecipe.name, fullRecipe);
+          }
+          
+          // B. Emit to Sheet
+          if (this.config.DEBUG.LOG_TO_SHEET) {
+            debugLogs.push({ id: reqId, name: recipeName, driveUrl: driveUrl });
+          }
+
+          // C. Parse using Analyzer Service
+          const parsedRows = this.analyzerService.parseLogicRows(fullRecipe);
+          logicRows.push(...parsedRows);
+
+        } catch (e) {
+          console.warn(`Failed ID ${reqId}: ${e.message}`);
+          logicRows.push([reqId, "ERROR", "-", "-", "-", e.message, "-"]);
+        }
+        
+        // Throttle
+        if (index % 5 === 0) Utilities.sleep(this.config.API.THROTTLE_MS);
+      });
+
+      // 3. Write output
+      Logger.verbose("Writing data to sheets...");
+      this.sheetService.write('LOGIC', logicRows);
+
+      const debugRows = DataMapper.mapDebugLogsToRows(debugLogs);
+      this.sheetService.appendDebugRows(debugRows);
+
+      Logger.notify("Logic debugging complete.");
+
+    } catch (e) {
+      this._handleError(e);
+    }
+  }
+  /**
+   * Reads IDs from 'logic_requests', fetches them, sends to Gemini, and writes output.
+   */
+  runAiAnalysis() {
+    const gemini = new GeminiService();
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(this.config.SHEETS.LOGIC_INPUT);
+    const ids = this.sheetService.readRequests(); // Reusing your existing reader
+
+    if(ids.length === 0) {
+      Logger.notify("No IDs to analyze.");
+      return;
     }
 
-    const client = new FakeWorkatoClient(recipes);
+    // Prepare output sheet
+    let outSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("AI_Analysis");
+    if (!outSheet) {
+      outSheet = SpreadsheetApp.getActiveSpreadsheet().insertSheet("AI_Analysis");
+      outSheet.appendRow(["Recipe ID", "Name", "AI Explanation", "Timestamp"]);
+      outSheet.setFrozenRows(1);
+    }
 
-    withTestConfig(testConfig, () => {
-      const app = new WorkatoSyncApp();
-      app.analyzerService = new RecipeAnalyzerService(client);
-      app.sheetService = new FakeSheetService(["100"]);
-      const fakeDrive = new FakeDriveService();
-      fakeDrive.nextUrl = "https://drive.fake/mermaid.mmd";
-      app.driveService = fakeDrive;
+    ids.forEach(id => {
+      Logger.notify(`Asking Gemini to analyze Recipe ${id}...`);
+      try {
+        // 1. Fetch from Workato
+        const recipe = this.inventoryService.client.get(`recipes/${id}`);
+        
+        // 2. Send to Vertex AI
+        const explanation = gemini.explainRecipe(recipe);
 
-      app.runProcessMaps();
+        // 3. Write to Sheet
+        outSheet.appendRow([recipe.id, recipe.name, explanation, new Date()]);
 
-      const row = app.sheetService.writes["PROCESS_MAPS"][1];
-      const mermaidCell = row[3];
-      const notes = row[4];
-      const link = row[5];
-
-      Assert.contains(mermaidCell, "TRUNCATED");
-      Assert.contains(notes, "truncated");
-      Assert.contains(link, "HYPERLINK");
-      Assert.equal(fakeDrive.saved.length, 1);
-      Assert.equal(fakeDrive.saved[0].ext, "mmd");
-      Assert.contains(fakeDrive.saved[0].content, "flowchart TD");
+      } catch (e) {
+        console.error(e);
+        outSheet.appendRow([id, "Error", e.message]);
+      }
     });
-  });
+  }
+  /**
+   * Reads recipe IDs from 'logic_requests' and generates process maps.
+   * Modes:
+   * - "calls"      : transitive recipe-call graph only
+   * - "full"       : step-level process map only
+   * - "calls+full" : both
+   *
+   * @param {{ mode?: string, callDepth?: number, maxNodes?: number, exportTables?: boolean }} [options]
+   */
+  runProcessMaps(options = {}) {
+    try {
+      Logger.verbose("Starting process map generation...");
 
-  // Run + optionally write results to a sheet
-  runner.run({ writeToSheet: true });
+      const requestedIds = this.sheetService.readRequests();
+      if (requestedIds.length === 0) {
+        Logger.notify("No IDs found in the 'logic_requests' sheet.", true);
+        return;
+      }
+
+      const mode = String(options.mode || this.config.API.PROCESS_MAP_MODE_DEFAULT || "calls+full");
+      const depth = Number(options.callDepth ?? this.config.API.PROCESS_MAP_DEPTH ?? 0);
+      const maxNodes = Number(options.maxNodes ?? this.config.API.PROCESS_MAP_MAX_NODES ?? 250);
+      const exportTables = (options.exportTables !== undefined)
+        ? Boolean(options.exportTables)
+        : Boolean(this.config.API.PROCESS_MAP_EXPORT_TABLES);
+
+      const CHAR_LIMIT = this.config.CONSTANTS.CELL_CHAR_LIMIT || 48000;
+
+      const rows = [this.config.HEADERS.PROCESS_MAPS];
+      const nodeRows = [this.config.HEADERS.PROCESS_NODES];
+      const edgeRows = [this.config.HEADERS.PROCESS_EDGES];
+
+      requestedIds.forEach((rootId, idx) => {
+        const rootRecipe = this.analyzerService.getRecipeDetails(rootId);
+        const rootName = rootRecipe?.name || "";
+
+        let callMermaid = "";
+        let fullMermaid = "";
+        let notes = [];
+        let callDriveLink = "";
+        let fullDriveLink = "";
+
+        // --- Calls graph ---
+        if (mode === "calls" || mode === "calls+full") {
+          const callGraph = this.analyzerService.buildTransitiveCallGraph(rootId, depth);
+          callMermaid = this.analyzerService.renderMermaidCallGraph(rootId, callGraph);
+          notes = notes.concat((callGraph.notes || []).slice(0, 10));
+
+          if (callMermaid.length > CHAR_LIMIT) {
+            const url = this.driveService.saveText(rootId, rootName || `recipe_${rootId}`, "calls.mmd", callMermaid);
+            if (url) {
+              callDriveLink = `=HYPERLINK("${url}", "View calls mermaid")`;
+              callMermaid = callMermaid.substring(0, Math.max(0, CHAR_LIMIT - 200)) + "\n...TRUNCATED IN SHEET (see Drive link).";
+              notes.push("Calls mermaid truncated in cell due to cell limits.");
+            } else {
+              callMermaid = callMermaid.substring(0, Math.max(0, CHAR_LIMIT - 200)) + "\n...TRUNCATED IN SHEET (Drive save failed).";
+              notes.push("Calls mermaid truncated in sheet; Drive save failed.");
+            }
+          }
+        }
+
+        // --- Full process map ---
+        if (mode === "full" || mode === "calls+full") {
+          const procGraph = this.analyzerService.buildProcessGraph(rootId, { maxNodes });
+          fullMermaid = this.analyzerService.renderMermaidProcessGraph(rootId, procGraph);
+          notes = notes.concat((procGraph.notes || []).slice(0, 10));
+
+          if (exportTables) {
+            nodeRows.push(...DataMapper.mapProcessNodesToRows(rootId, rootName, procGraph));
+            edgeRows.push(...DataMapper.mapProcessEdgesToRows(rootId, procGraph));
+          }
+
+          if (fullMermaid.length > CHAR_LIMIT) {
+            const url = this.driveService.saveText(rootId, rootName || `recipe_${rootId}`, "full.mmd", fullMermaid);
+            if (url) {
+              fullDriveLink = `=HYPERLINK("${url}", "View full mermaid")`;
+              fullMermaid = fullMermaid.substring(0, Math.max(0, CHAR_LIMIT - 200)) + "\n...TRUNCATED IN SHEET (see Drive link).";
+              notes.push("Full mermaid truncated in cell due to cell limits.");
+            } else {
+              fullMermaid = fullMermaid.substring(0, Math.max(0, CHAR_LIMIT - 200)) + "\n...TRUNCATED IN SHEET (Drive save failed).";
+              notes.push("Full mermaid truncated in sheet; Drive save failed.");
+            }
+          }
+        }
+
+        const notesCell = notes.filter(Boolean).slice(0, 20).join("\n");
+
+        rows.push([
+          String(rootId),
+          rootName,
+          mode,
+          String(depth),
+          callMermaid,
+          fullMermaid,
+          notesCell,
+          callDriveLink,
+          fullDriveLink,
+          new Date().toISOString()
+        ]);
+
+        if (idx % 2 === 0) Utilities.sleep(this.config.API.THROTTLE_MS);
+      });
+
+      this.sheetService.write('PROCESS_MAPS', rows);
+      if (exportTables) {
+        this.sheetService.write('PROCESS_NODES', nodeRows);
+        this.sheetService.write('PROCESS_EDGES', edgeRows);
+      }
+      Logger.notify("Process maps generated.");
+    } catch (e) {
+      this._handleError(e);
+    }
+  }
+  // --- INTERNAL HELPERS ---
+  /** @private */
+  _createLookupMap(items) {
+    return Object.fromEntries(items.map(i => [String(i.id), i.name]));
+  }
+  /** @private */
+  _handleError(e) {
+    let errorMsg = `Sync failed: ${e.message}`;
+    if (e.message.includes("Unexpected token")) {
+      errorMsg = "Auth Error: Check WORKATO_TOKEN and BASE_URL";
+    }
+    Logger.notify(errorMsg, true);
+    console.error(e.stack);
+  }
+}
+
+// -------------------------------------------------------------------------------------------------------
+// USER INTERFACE
+// -------------------------------------------------------------------------------------------------------
+/**
+ * @class
+ * @classdesc Manages all direct interactions with the user (Menus, Prompts, Alerts).
+ * Encapsulates UI logic to keep the global namespace clean.
+ */
+class UserInterfaceService {
+  constructor() {
+    this.ui = SpreadsheetApp.getUi();
+    this.props = PropertiesService.getScriptProperties();
+  }
+
+  /**
+   * Builds and displays the custom menu.
+   */
+  createMenu() {
+    this.ui.createMenu('Workato Sync')
+      .addSubMenu(this.ui.createMenu('Actions')
+        .addItem('Run workspace inventory sync', 'syncInventory')
+        .addItem('Debug selected logic', 'fetchRecipeLogic')
+        .addItem('Analyze recipe using AI', 'fetchRecipeAnalysis')
+        .addItem('Generate process maps (calls only)', 'generateProcessMapsCalls')
+        .addItem('Generate process maps (full process only)', 'generateProcessMapsFull')
+        .addItem('Generate process maps (calls + full)', 'generateProcessMaps'))
+      .addSeparator()
+      .addItem('Test connectivity', 'testWorkatoConnectivity')
+      .addSeparator()
+      .addSubMenu(this.ui.createMenu('Configuration')
+        .addItem('Set Workato API token', 'promptToken')
+        .addItem('Set base URL', 'promptBaseUrl')
+        .addItem('Set debug folder ID', 'promptFolderId')
+        .addSeparator()
+        .addItem('Show current config', 'showCurrentConfig'))
+      .addToUi();
+  }
+  /**
+   * Prompts the user to update a specific script property.
+   * Handles validation, user cancellation, and masking of secrets.
+   * * @param {string} key - The ScriptProperty key to update.
+   * @param {string} title - The title of the prompt dialog.
+   * @param {boolean} [isSecret=false] - If true, masks the output confirmation.
+   */
+  promptUpdate(key, title, isSecret = false) {
+    const result = this.ui.prompt(title, `Enter new value for ${key}:`, this.ui.ButtonSet.OK_CANCEL);
+
+    if (result.getSelectedButton() === this.ui.Button.OK) {
+      const input = result.getResponseText().trim();
+
+      // Handle Empty Input (Delete vs Cancel)
+      if (input === "") {
+        const confirm = this.ui.alert(
+          'Delete Property?', 
+          `Input was empty. Do you want to DELETE the existing '${key}'?`, 
+          this.ui.ButtonSet.YES_NO
+        );
+        if (confirm === this.ui.Button.YES) {
+          this.props.deleteProperty(key);
+          this.ui.alert('Property deleted. Script will use code-level defaults.');
+        }
+        return;
+      }
+
+      // Save
+      this.props.setProperty(key, input);
+      
+      // Feedback
+      const displayValue = isSecret 
+        ? `${input.substring(0, 4)}...${input.substring(input.length - 4)}` 
+        : input;
+      
+      this.ui.alert(`Saved ${key}: ${displayValue}`);
+    }
+  }
+  /**
+   * Displays the current configuration state in a formatted alert.
+   */
+  showConfiguration() {
+    const storedProps = this.props.getProperties();
+    const defaults = AppConfig.get().API; // Access static defaults
+    
+    // Logic to determine display strings (Set vs Default vs Missing)
+    const tokenStatus = storedProps['WORKATO_TOKEN'] ? "******** (Set)" : "❌ NOT SET";
+    const urlStatus = storedProps['WORKATO_BASE_URL'] || `${defaults.BASE_URL} (Default)`;
+    const folderStatus = storedProps['DEBUG_FOLDER_ID'] || "(Auto-generated)";
+    
+    const msg = [
+      `API Token: ${tokenStatus}`,
+      `Base URL: ${urlStatus}`,
+      `Debug Folder ID: ${folderStatus}`,
+      ``,
+      `To change these, use the 'Configuration' menu.`
+    ].join('\n');
+    
+    this.ui.alert('Current Configuration', msg, this.ui.ButtonSet.OK);
+  }
+  /**
+   * Formats and displays connectivity test results.
+   * @param {Array<string>} results - Array of status messages.
+   */
+  showConnectivityReport(results) {
+    this.ui.alert("Connectivity Test Results", results.join("\n"), this.ui.ButtonSet.OK);
+  }
+}
+
+// -------------------------------------------------------------------------------------------------------
+// HANDLES
+// -------------------------------------------------------------------------------------------------------
+function onOpen() {
+  new UserInterfaceService().createMenu();
+}
+function promptToken() {
+  new UserInterfaceService().promptUpdate('WORKATO_TOKEN', 'Update API Token', true);
+}
+function promptBaseUrl() {
+  new UserInterfaceService().promptUpdate('WORKATO_BASE_URL', 'Update Base URL', false);
+}
+function promptFolderId() {
+  new UserInterfaceService().promptUpdate('DEBUG_FOLDER_ID', 'Update Debug Folder ID', false);
+}
+function showCurrentConfig() {
+  new UserInterfaceService().showConfiguration();
+}
+
+// -------------------------------------------------------------------------------------------------------
+// GLOBAL EXECUTABLES
+// -------------------------------------------------------------------------------------------------------
+/**
+ * Primary entry point for the script. 
+ * Initializes the WorkatoSyncApp controller and runs the sync.
+ */
+function syncInventory() {
+  const app = new WorkatoSyncApp();
+  app.runInventorySync();
+}
+/** Analyze recipe */
+function fetchRecipeLogic() {
+  const app = new WorkatoSyncApp();
+  app.runLogicDebug();
+}
+/** Analyze recipe with AI */
+function fetchRecipeAnalysis() {
+  const app = new WorkatoSyncApp();
+  app.runAiAnalysis();
+}
+/** Generates process maps: calls + full (default). */
+function generateProcessMaps() {
+  const app = new WorkatoSyncApp();
+  app.runProcessMaps({ mode: "calls+full" });
+}
+/** Generates process maps: calls only. */
+function generateProcessMapsCalls() {
+  const app = new WorkatoSyncApp();
+  app.runProcessMaps({ mode: "calls" });
+}
+/** Generates process maps: full process only. */
+function generateProcessMapsFull() {
+  const app = new WorkatoSyncApp();
+  app.runProcessMaps({ mode: "full" });
+}
+/**
+ * Validates the connection to the Workato API across all primary endpoints.
+ * Uses the Class-based WorkatoClient.
+ */
+function testWorkatoConnectivity() {
+  console.log("--- TESTING CONNECTIVITY ---");
+  const client = new WorkatoClient();
+  const endpoints = ['projects', 'folders', 'recipes', 'properties'];
+  const results = [];
+
+  endpoints.forEach(endpoint => {
+    try {
+      const path = `${endpoint}?page=1&per_page=1`;
+      const json = client.get(path);
+      
+      let count = 0;
+      if (Array.isArray(json)) count = json.length;
+      else if (json.items) count = json.items.length;
+      else if (json.result) count = json.result.length;
+      
+      const msg = `[${endpoint.toUpperCase()}] Status: OK (${count}) samples`;
+      console.log(msg);
+      results.push("✅ " + msg);
+    } catch (e) {
+      const msg = `[${endpoint.toUpperCase()}] FAILED: ${e.message}`;
+      console.error(msg);
+      results.push("❌ " + msg);
+    }
+  });
+  try {
+    new UserInterfaceService().showConnectivityReport(results);
+  } catch {
+    console.log(results);
+  }
 }
