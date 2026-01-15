@@ -73,6 +73,7 @@ class AppConfig {
         PROCESS_MAPS: 'process_maps',
         PROCESS_NODES: 'process_nodes',
         PROCESS_EDGES: 'process_edges',
+        AI_ANALYSIS: 'ai_analysis',
         DEBUG: 'debugging_log'
       },
       HEADERS: {
@@ -87,6 +88,7 @@ class AppConfig {
         PROCESS_MAPS: ["Root recipe ID", "Root recipe name", "Mode", "Call depth", "Mermaid (calls)", "Mermaid (full process)", "Notes", "Drive link (calls)", "Drive link (full)", "Generated at"],
         PROCESS_NODES: ["Root recipe ID", "Root recipe name", "Node ID", "Step path", "Kind", "Provider", "Label", "Branch context"],
         PROCESS_EDGES: ["Root recipe ID", "From node", "To node", "Edge label", "Edge kind"],
+        AI_ANALYSIS: ["Recipe ID", "Recipe name", "AI explaination (preview", "Graph metrics (JSON)", "Drive link (AI full)", "Drive link (calls MMD)", "Drive link (full MMD)", "Generated at"],
         DEBUG: ["Timestamp", "Recipe ID", "Recipe name", "Status", "Drive link"]
       },
       CONSTANTS: {
@@ -110,6 +112,10 @@ class AppConfig {
           TEMPERATURE: 0.2,
           MAX_OUTPUT_TOKENS: 10000 // 5000 is too few
         },
+        PROMPT_MAX_CHARS: 60000,
+        MERMAID_PROMPT_MAX_CHARS: 120000,
+        LOGIC_DIGEST_MAX_LINES: 220,
+        MAX_RETRIES: 3
       },
       VERBOSE: true
     };
@@ -387,6 +393,7 @@ class InventoryService {
     return allFolders;
   }
 
+  // --- INTERNALS ---------------------------------------------------------------------------------------
   /**
    * Helper to fetch a single batch of folders and normalize the response.
    * Accounts for API inconsistencies where folders may return as array or object wrapper.
@@ -575,11 +582,8 @@ class DriveService{
       return null;
     }
   }
-
-  /**
-   * Retrieves folder by cached ID, or creates and updates cache.
-   * @private
-   */
+  // --- INTERNALS ---------------------------------------------------------------------------------------
+  /** @private Retrieves folder by cached ID, or creates and updates cache */
   _getVerifiedFolder() {
     const cachedId = this.props.getProperty('DEBUG_FOLDER_ID');
 
@@ -945,6 +949,106 @@ class RecipeAnalyzerService {
     }
 
     return lines.join("\n");
+  }
+  /**
+   * Build a single analysis bundle: summaries + optional Mermaid.
+   * This is the "one thing" both Sheets export and Gemini prompts can consume.
+   *
+   * @param {string|number} rootId
+   * @param {{ callDepth?: number, maxNodes?: number, edgeSampleLimit?: number }} [options]
+   * @returns {{ root_id:string, root_name:string, call:any, process:any }}
+   */
+  buildGraphPack(rootId, options = {}) {
+    const cfg = AppConfig.get();
+    const depth = Number(options.callDepth ?? cfg.API.PROCESS_MAP_DEPTH ?? 0);
+    const maxNodes = Number(options.maxNodes ?? cfg.API.PROCESS_MAP_MAX_NODES ?? 250);
+    const edgeSampleLimit = Number(options.edgeSampleLimit ?? 60);
+
+    const rootRecipe = this.getRecipeDetails(rootId);
+    const rootName = rootRecipe?.name || "";
+
+    const callGraph = this.buildTransitiveCallGraph(rootId, depth);
+    const procGraph = this.buildProcessGraph(rootId, { maxNodes });
+
+    const callMermaid = this.renderMermaidCallGraph(rootId, callGraph);
+    const procMermaid = this.renderMermaidProcessGraph(rootId, procGraph);
+
+    return {
+      root_id: String(rootId),
+      root_name: rootName,
+      call: {
+        depth,
+        node_count: callGraph?.nodes?.size || 0,
+        edge_count: Array.isArray(callGraph?.edges) ? callGraph.edges.length : 0,
+        notes: (callGraph?.notes || []).slice(0, 20),
+        edges_sample: this._summarizeCallEdges(callGraph, edgeSampleLimit),
+        mermaid: callMermaid
+      },
+      process: {
+        maxNodes,
+        node_count: procGraph?.nodes?.size || 0,
+        edge_count: Array.isArray(procGraph?.edges) ? procGraph.edges.length : 0,
+        notes: (procGraph?.notes || []).slice(0, 20),
+        kind_counts: this._summarizeProcessKinds(procGraph),
+        call_targets: this._summarizeProcessCallTargets(procGraph, 12),
+        edges_sample: this._summarizeProcessEdges(procGraph, edgeSampleLimit),
+        mermaid: procMermaid
+      }
+    };
+  }
+
+  /** @private */
+  _summarizeCallEdges(callGraph, limit) {
+    const edges = Array.isArray(callGraph?.edges) ? callGraph.edges : [];
+    const nodes = callGraph?.nodes || new Map();
+    const nameOf = (id) => nodes.get(String(id))?.name || "";
+
+    return edges.slice(0, limit).map(e => {
+      const p = String(e.parent_recipe_id || "");
+      const c = String(e.child_recipe_id || "");
+      const bits = [];
+      if (e.branch_context) bits.push(e.branch_context);
+      if (e.step_name) bits.push(e.step_name);
+      const lbl = bits.filter(Boolean).join(" / ");
+      return `${nameOf(p) || "Recipe"} (${p}) -> ${nameOf(c) || "Recipe"} (${c})${lbl ? `  [${lbl}]` : ""}`;
+    });
+  }
+  /** @private */
+  _summarizeProcessKinds(procGraph) {
+    const out = { start: 0, end: 0, step: 0, decision: 0, loop: 0, call: 0, merge: 0, other: 0 };
+    const nodes = procGraph?.nodes ? Array.from(procGraph.nodes.values()) : [];
+    nodes.forEach(n => {
+      const k = String(n.kind || "other");
+      if (out[k] !== undefined) out[k] += 1;
+      else out.other += 1;
+    });
+    return out;
+  }
+  /** @private */
+  _summarizeProcessCallTargets(procGraph, limit) {
+    const nodes = procGraph?.nodes ? Array.from(procGraph.nodes.values()) : [];
+    const targets = [];
+    const seen = new Set();
+    nodes.forEach(n => {
+      if (String(n.kind) !== "call") return;
+      const m = String(n.label || "").match(/→\s*([0-9]+)/);
+      if (!m) return;
+      const id = m[1];
+      if (!seen.has(id)) {
+        seen.add(id);
+        targets.push(id);
+      }
+    });
+    return targets.slice(0, limit);
+  }
+  /** @private */
+  _summarizeProcessEdges(procGraph, limit) {
+    const edges = Array.isArray(procGraph?.edges) ? procGraph.edges : [];
+    return edges.slice(0, limit).map(e => {
+      const kind = e.kind ? ` (${e.kind})` : "";
+      const lbl = e.label ? ` [${e.label}]` : "";
+      return `${e.from} -> ${e.to}${lbl}${kind}`;
+    });
   }
 
   /** @private Helper for getDependencies */
@@ -1649,31 +1753,21 @@ class GeminiService {
    * @param {Object} recipe - The full recipe object.
    * @returns {string} The AI-generated summary.
    */
-  explainRecipe(recipe) {
+  explainRecipe(recipe, graphPack = null, logicDigest = "") {
     if (!this.projectId) throw new Error("Missing GOOGLE_CLOUD_PROJECT_ID in Script Properties");
 
-    const cleanData = this._prepareContext(recipe);
-    const prompt = `
-      You are an expert Workato developer and systems architect.
-      Analyze the following Workato recipe (provided in JSON) and generate a concise technical summary.
-      
-      Structure your response as follows:
-      1. **Objective**: One sentence on what this automation achieves.
-      2. **Trigger**: What event starts this recipe?
-      3. **Key Logic**: Bullet points explaining the main actions, decisions (If/Else), and loops.
-      4. **Dependencies**: List external apps connected (e.g., Salesforce, Jira).
-
-      Recipe JSON:
-      ${JSON.stringify(cleanData)}
-    `;
+    const ctx = this._prepareContext(recipe, graphPack, logicDigest);
+    const prompt = this._buildPrompt(ctx);
 
     return this._callVertexAI(prompt);
   }
+  
+  // --- INTERNALS ---------------------------------------------------------------------------------------
   /**
    * Strips raw recipe data down to the essential logic for the LLM.
    * @private
    */
-  _prepareContext(recipe) {
+  _prepareContext(recipe, graphPack, logicDigest) {
     // If 'code' is still a string (hasn't been parsed by DriveService yet), parse it temporarily
     let logicBlock = recipe.code;
     if (typeof logicBlock === 'string') {
@@ -1685,8 +1779,73 @@ class GeminiService {
       description: recipe.description, // existing manual description
       trigger_app: recipe.trigger_application,
       connected_apps: recipe.action_applications,
-      logic: logicBlock // The nested steps/blocks
+      logic_digest: String(logicDigest || ""),
+      graphs: graphPack || null
     };
+  }
+  /** @private */
+  _buildPrompt(ctx) {
+    const caps = this.config;
+    const mermaidCap = Number(caps.MERMAID_PROMPT_MAX_CHARS || 12000);
+
+    const graphs = ctx.graphs || {};
+    const call = graphs.call || {};
+    const proc = graphs.process || {};
+
+    const callMermaid = (call.mermaid && String(call.mermaid).length <= mermaidCap) ? call.mermaid : "";
+    const procMermaid = (proc.mermaid && String(proc.mermaid).length <= mermaidCap) ? proc.mermaid : "";
+
+    const graphMetrics = {
+      call: {
+        depth: call.depth,
+        node_count: call.node_count,
+        edge_count: call.edge_count,
+        notes: call.notes
+      },
+      process: {
+        node_count: proc.node_count,
+        edge_count: proc.edge_count,
+        kind_counts: proc.kind_counts,
+        call_targets: proc.call_targets,
+        notes: proc.notes
+      }
+    };
+
+    return `
+      You are an expert Workato developer and systems architect.
+      Only use the provided context. If something isn't present, say "Unknown from provided data."
+
+      Produce:
+      1) Objective (1 sentence)
+      2) Trigger (what starts it)
+      3) High-level flow (5–12 bullets)
+      4) Control-flow hotspots (IF/ELSE chains, loops, ON_ERROR paths)
+      5) Dependencies
+        - External apps
+        - Called recipes (from call graph + step-level call nodes)
+      6) Risks / notes (cycles, large fan-out, truncation, node caps)
+
+      Recipe meta:
+      - Name: ${ctx.name || ""}
+      - Description: ${ctx.description || ""}
+      - Trigger app: ${ctx.trigger_app || ""}
+      - Connected apps: ${JSON.stringify(ctx.connected_apps || [])}
+
+      Flattened steps (may be truncated):
+      ${ctx.logic_digest || "(none)"}
+
+      Graph metrics:
+      ${JSON.stringify(graphMetrics, null, 2)}
+
+      Call graph edges sample:
+      ${(call.edges_sample || []).join("\n")}
+
+      Process graph edges sample:
+      ${(proc.edges_sample || []).join("\n")}
+
+      ${callMermaid ? `Mermaid (call graph):\n${callMermaid}\n` : "Mermaid (call graph): (omitted due to size cap)\n"}
+      ${procMermaid ? `Mermaid (process graph):\n${procMermaid}\n` : "Mermaid (process graph): (omitted due to size cap)\n"}
+      `.trim();
   }
   /**
    * Executes the API call to Vertex AI.
@@ -1717,23 +1876,38 @@ class GeminiService {
       muteHttpExceptions: true
     };
 
-    try {
-      const response = UrlFetchApp.fetch(endpoint, options);
-      const json = JSON.parse(response.getContentText());
+    const maxRetries = Number(this.config.MAX_RETRIES || 3);
+    let attempt = 0;
+    while (attempt <= maxRetries) {
+      try {
+        const response = UrlFetchApp.fetch(endpoint, options);
+        const code = response.getResponseCode();
+        const json = JSON.parse(response.getContentText());
 
-      if (json.error) {
-        throw new Error(`Vertex AI Error: ${json.error.message}`);
-      }
+        if (json.error) {
+          // Retry 429 / 5xx (Gemini throttles happen)
+          if (code === 429 || code >= 500) {
+            if (attempt === maxRetries) throw new Error(`Vertex AI Error: ${json.error.message}`);
+            Utilities.sleep(Math.pow(2, attempt) * 1000);
+            attempt++;
+            continue;
+          }
+          throw new Error(`Vertex AI Error: ${json.error.message}`);
+        }
       
-      // Navigate the Gemini response structure
-      if (json.candidates && json.candidates[0] && json.candidates[0].content) {
-        return json.candidates[0].content.parts[0].text;
-      }
-      return "No content generated.";
+        if (json.candidates && json.candidates[0] && json.candidates[0].content) {
+          return json.candidates[0].content.parts[0].text;
+        }
+        return "No content generated.";
 
-    } catch (e) {
-      console.error(e);
-      return `AI Analysis Failed: ${e.message}`;
+      } catch (e) {
+        if (attempt === maxRetries) {
+          console.error(e);
+          return `AI Analysis Failed: ${e.message}`;
+        }
+        Utilities.sleep(Math.pow(2, attempt) * 1000);
+        attempt++;
+      }
     }
   }
 }
@@ -1930,6 +2104,7 @@ class DataMapper {
     return rows;
   }
 
+  // --- INTERNALS ---------------------------------------------------------------------------------------
   /**
    * Safely looks up an ID in a map, returning a fallback if missing.
    * @private
@@ -2092,39 +2267,86 @@ class WorkatoSyncApp {
    */
   runAiAnalysis() {
     const gemini = new GeminiService();
-    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(this.config.SHEETS.LOGIC_INPUT);
-    const ids = this.sheetService.readRequests(); // Reusing your existing reader
+    const ids = this.sheetService.readRequests();
 
     if(ids.length === 0) {
       Logger.notify("No IDs to analyze.");
       return;
     }
 
-    // Prepare output sheet
-    let outSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("AI_Analysis");
-    if (!outSheet) {
-      outSheet = SpreadsheetApp.getActiveSpreadsheet().insertSheet("AI_Analysis");
-      outSheet.appendRow(["Recipe ID", "Name", "AI Explanation", "Timestamp"]);
-      outSheet.setFrozenRows(1);
-    }
+    const cfg = AppConfig.get();
+    const charLimit = cfg.CONSTANTS.CELL_CHAR_LIMIT || 48000;
+    const maxLines = Number(cfg.VERTEX.LOGIC_DIGEST_MAX_LINES || 220);
+    const depth = Number(cfg.API.PROCESS_MAP_DEPTH ?? 2);
+    const maxNodes = Number(cfg.API.PROCESS_MAP_MAX_NODES ?? 250);
 
-    ids.forEach(id => {
+    const rows = [this.config.HEADERS.AI_ANALYSIS];
+
+    ids.forEach((id, idx) => {
       Logger.notify(`Asking Gemini to analyze Recipe ${id}...`);
       try {
-        // 1. Fetch from Workato
-        const recipe = this.inventoryService.client.get(`recipes/${id}`);
-        
-        // 2. Send to Vertex AI
-        const explanation = gemini.explainRecipe(recipe);
+        const recipe = this.analyzerService.getRecipeDetails(id) || this.inventoryService.client.get(`recipes/${id}`);
+        const name = recipe?.name || "";
 
-        // 3. Write to Sheet
-        outSheet.appendRow([recipe.id, recipe.name, explanation, new Date()]);
+        // 1) Build graphs (same source of truth as your Mermaid exports)
+        const graphPack = this.analyzerService.buildGraphPack(id, { callDepth: depth, maxNodes, edgeSampleLimit: 70 });
+
+        // 2) Build a flattened logic digest (LLM-friendly)
+        const logicRows = this.analyzerService.parseLogicRows(recipe);
+        const digest = this._logicDigestFromRows(logicRows, maxLines);
+
+        // 3) Call Gemini with grounded context
+        const explanation = gemini.explainRecipe(recipe, graphPack, digest);
+
+        // 4) Drive links (full artifacts)
+        const aiUrl = this.driveService.saveText(id, name || `recipe_${id}`, "ai.txt", explanation || "");
+        const callsUrl = this.driveService.saveText(id, name || `recipe_${id}`, "calls.mmd", graphPack?.call?.mermaid || "");
+        const fullUrl  = this.driveService.saveText(id, name || `recipe_${id}`, "full.mmd",  graphPack?.process?.mermaid || "");
+
+        const aiLink    = aiUrl    ? `=HYPERLINK("${aiUrl}", "View AI full")` : "";
+        const callsLink = callsUrl ? `=HYPERLINK("${callsUrl}", "View calls mermaid")` : "";
+        const fullLink  = fullUrl  ? `=HYPERLINK("${fullUrl}", "View full mermaid")` : "";
+
+        const preview = (explanation && explanation.length > 4000)
+          ? explanation.slice(0, 4000) + "\n…(truncated preview; see Drive link)"
+          : (explanation || "");
+
+        const metricsJson = JSON.stringify({
+          call: {
+            depth: graphPack?.call?.depth,
+            node_count: graphPack?.call?.node_count,
+            edge_count: graphPack?.call?.edge_count
+          },
+          process: {
+            node_count: graphPack?.process?.node_count,
+            edge_count: graphPack?.process?.edge_count,
+            kind_counts: graphPack?.process?.kind_counts,
+            call_targets: graphPack?.process?.call_targets
+          }
+        });
+
+        rows.push([
+          String(recipe?.id || id),
+          name,
+          preview,
+          metricsJson.length > charLimit ? metricsJson.slice(0, 2000) + "…(truncated)" : metricsJson,
+          aiLink,
+          callsLink,
+          fullLink,
+          new Date().toISOString()
+        ]);
 
       } catch (e) {
         console.error(e);
-        outSheet.appendRow([id, "Error", e.message]);
+        rows.push([String(id), "Error", String(e.message || e), "", "", "", "", new Date().toISOString()]);
       }
+
+      if (idx % 2 === 0) Utilities.sleep(this.config.API.THROTTLE_MS);
     });
+
+    // Batch write (fast + consistent)
+    this.sheetService.write('AI_ANALYSIS', rows);
+    Logger.notify("AI analysis complete.");
   }
   /**
    * Reads recipe IDs from 'logic_requests' and generates process maps.
@@ -2239,7 +2461,24 @@ class WorkatoSyncApp {
       this._handleError(e);
     }
   }
-  // --- INTERNAL HELPERS ---
+
+  // --- INTERNALS ---------------------------------------------------------------------------------------
+  /** @private */
+  _logicDigestFromRows(logicRows, maxLines) {
+    const lines = [];
+    const slice = Array.isArray(logicRows) ? logicRows.slice(0, maxLines) : [];
+    slice.forEach(r => {
+      // parseLogicRows: [recipeId, recipeName, step#, indent, provider, actionName, description, details]
+      const stepNo = r[2];
+      const indent = r[3] || "";
+      const provider = r[4] || "";
+      const action = r[5] || "";
+      const desc = r[6] ? ` — ${String(r[6]).slice(0, 120)}` : "";
+      lines.push(`${stepNo}. ${indent}${action} (${provider})${desc}`);
+    });
+    if (logicRows.length > maxLines) lines.push(`… (${logicRows.length - maxLines} more steps omitted)`);
+    return lines.join("\n");
+  }
   /** @private */
   _createLookupMap(items) {
     return Object.fromEntries(items.map(i => [String(i.id), i.name]));
