@@ -919,7 +919,7 @@ class RecipeAnalyzerService {
       // Shapes: start/end=stadium, decision=diamond, call=subroutine, merge=circle-ish, default=rect
       if (kind === "start" || kind === "end") {
         lines.push(`  ${id}([\"${label}\"])`);
-      } else if (kind === "decision") {
+      } else if (kind === "decision" || kind === "loop") {
         lines.push(`  ${id}{\"${label}\"}`);
       } else if (kind === "call") {
         lines.push(`  ${id}[[\"${label}\"]]`);
@@ -1227,6 +1227,29 @@ class RecipeAnalyzerService {
   }
 
   // --- PROCESS-GRAPH INTERNALS -------------------------------------------------------------------------
+  /** @private */
+  _pKeyword(step) {
+    return String(step?.keyword || "").toLowerCase();
+  }
+  /** @private */
+  _pIsIf(step) {
+    return this._pKeyword(step) === "if";
+  }
+  /** @private */
+  _pIsElsif(step) {
+    return this._pKeyword(step) === "elsif";
+  }
+  /** @private */
+  _pDecisionHeader(step) {
+    const kw = this._pKeyword(step);
+    return (kw === "elsif") ? "ELSIF" : "IF";
+  }
+  /** @private */
+  _pDecisionBranchLabel(step) {
+    const head = this._pDecisionHeader(step);
+    const cond = this._formatConditionSummary(step);
+    return cond ? `${head} ${cond}` : head;
+  }
   /** @private Ensure Mermaid-safe node ids */
   _pNodeId(raw) {
     const safe = String(raw || "")
@@ -1244,7 +1267,8 @@ class RecipeAnalyzerService {
   }
   /** @private */
   _pClassifyStep(step) {
-    const keyword = String(step?.keyword || "").toLowerCase();
+    const keyword = this._pKeyword(step);
+    if (this._pIsLoopStep(step)) return "loop";
     if (keyword === "if" || keyword === "elsif") return "decision";
 
     const provider = String(step?.provider || "");
@@ -1254,6 +1278,27 @@ class RecipeAnalyzerService {
     if (looksLikeRecipeCall) return "call";
 
     return "step";
+  }
+  /** @private Heuristic loop detection */
+  _pIsLoopStep(step) {
+    const kw = this._pKeyword(step);
+    const name = String(step?.name || step?.as || "").toLowerCase();
+    // Keywords are not guaranteed, so we also look at common UI names.
+    const kwHit = ["repeat", "repeat_while", "repeat_each", "repeat_for_each", "for_each", "while", "until"].includes(kw);
+    const nameHit = name.includes("repeat") || name.includes("for each") || name.includes("foreach");
+    return kwHit || nameHit;
+  }
+  /** @private */
+  _pLoopLabel(step) {
+    const kw = this._pKeyword(step);
+    const name = step?.name || step?.as || "Loop";
+    const cond = this._formatConditionSummary(step);
+    // If it's a "repeat while"-style loop, condition summary is valuable.
+    if (kw.includes("while") || name.toLowerCase().includes("while")) {
+      return cond ? `REPEAT WHILE ${cond}` : "REPEAT WHILE";
+    }
+    // Otherwise, keep it simple and readable.
+    return String(name).toUpperCase();
   }
   /** @private */
   _pStepLabel(step, kind) {
@@ -1266,8 +1311,12 @@ class RecipeAnalyzerService {
       return `${keyword}${name}${target}`;
     }
     if (kind === "decision") {
+      const head = this._pDecisionHeader(step);
       const cond = this._formatConditionSummary(step);
-      return cond ? `IF ${cond}` : `${keyword}${name}`;
+      return cond ? `${head} ${cond}` : `${head}`;
+    }
+    if (kind === "loop") {
+      return this._pLoopLabel(step);
     }
     return `${keyword}${name} (${provider})`;
   }
@@ -1299,8 +1348,171 @@ class RecipeAnalyzerService {
       const step = steps[index];
       const stepPath = ctx.stepPathPrefix ? `${ctx.stepPathPrefix}/${index}` : `${index}`;
       const kind = this._pClassifyStep(step);
+      const kw = this._pKeyword(step);
 
-      // Decision handling (IF/ELSIF)
+      // Loop handling (Repeat while / Repeat for each / etc)
+      if (kind === "loop") {
+        const loopId = this._pNodeId(`S_${ctx.recipeId}_${stepPath}`);
+        this._pAddNode(graph.nodes, loopId, {
+          id: loopId,
+          kind: "loop",
+          provider: step?.provider || "system",
+          step_path: stepPath,
+          label: this._pStepLabel(step, "loop"),
+          branch_context: (ctx.branchStack || []).join(" / ")
+        });
+
+        // Connect prev -> loop
+        const isFirstEdge = (prev === entryFromNodeId && !first);
+        if (isFirstEdge && entryEdgeLabel) this._pAddEdge(graph.edges, prev, loopId, entryEdgeLabel, "flow");
+        else this._pAddEdge(graph.edges, prev, loopId, "", "flow");
+        if (!first) first = loopId;
+
+        // Loop body (iterate)
+        const loopCtx = {
+          ...ctx,
+          stepPathPrefix: stepPath,
+          branchStack: (ctx.branchStack || []).slice().concat([`LOOP ${this._pLoopLabel(step)}`])
+        };
+        const bodyRes = this._scanBlockForProcessGraph(step.block || [], loopCtx, graph, loopId, "iterate");
+
+        // Back-edge to represent repetition
+        if (bodyRes.first) {
+          this._pAddEdge(graph.edges, bodyRes.last, loopId, "repeat", "loop");
+        } else {
+          graph.notes.push(`Loop body empty at step_path=${stepPath}`);
+        }
+
+        // Exit/merge after loop
+        const afterLoopId = this._pNodeId(`M_${ctx.recipeId}_${stepPath}_after_loop`);
+        this._pAddNode(graph.nodes, afterLoopId, {
+          id: afterLoopId,
+          kind: "merge",
+          provider: "system",
+          step_path: `${stepPath}/after_loop`,
+          label: "After loop",
+          branch_context: (ctx.branchStack || []).join(" / ")
+        });
+
+        // "done" edge (conceptual exit)
+        this._pAddEdge(graph.edges, loopId, afterLoopId, "done", "flow");
+
+        // Optional else_block (often conceptually "empty list" / "no more")
+        if (Array.isArray(step.else_block) && step.else_block.length > 0) {
+          const elseCtx = {
+            ...ctx,
+            stepPathPrefix: `${stepPath}/else`,
+            branchStack: (ctx.branchStack || []).slice().concat(["LOOP_ELSE"])
+          };
+          const elseRes = this._scanBlockForProcessGraph(step.else_block, elseCtx, graph, loopId, "empty");
+          const elseExit = elseRes.first ? elseRes.last : loopId;
+          this._pAddEdge(graph.edges, elseExit, afterLoopId, "", "flow");
+        }
+
+        prev = afterLoopId;
+        continue;
+      }
+
+      // Decision handling (IF/ELSIF w/chain grouping)
+      // If we see an IF followed by one or more sibling ELSIF steps, treat them as one chain.
+      if (kind === "decision" && kw === "if") {
+        const chain = [{ step, stepPath }];
+        let j = index + 1;
+        while (j < steps.length && this._pIsElsif(steps[j])) {
+          const p = ctx.stepPathPrefix ? `${ctx.stepPathPrefix}/${j}` : `${j}`;
+          chain.push({ step: steps[j], stepPath: p });
+          j++;
+        }
+
+        // Only treat as a chain if we actually found ELSIF siblings
+        if (chain.length > 1) {
+          // Create decision nodes for IF and each ELSIF, wiring false-path to the next condition.
+          let lastDecisionId = null;
+          const thenExits = [];
+
+          for (let ci = 0; ci < chain.length; ci++) {
+            const c = chain[ci];
+            const decisionId = this._pNodeId(`S_${ctx.recipeId}_${c.stepPath}`);
+            this._pAddNode(graph.nodes, decisionId, {
+              id: decisionId,
+              kind: "decision",
+              provider: c.step?.provider || "system",
+              step_path: c.stepPath,
+              label: this._pStepLabel(c.step, "decision"),
+              branch_context: (ctx.branchStack || []).join(" / ")
+            });
+
+            // Connect into the first decision from prev, and subsequent decisions from prior false-path.
+            if (ci === 0) {
+              const isFirstEdge = (prev === entryFromNodeId && !first);
+              if (isFirstEdge && entryEdgeLabel) this._pAddEdge(graph.edges, prev, decisionId, entryEdgeLabel, "flow");
+              else this._pAddEdge(graph.edges, prev, decisionId, "", "flow");
+              if (!first) first = decisionId;
+            } else {
+              // prior decision false -> next decision
+              this._pAddEdge(graph.edges, lastDecisionId, decisionId, "false", "flow");
+            }
+
+            // THEN branch for this condition
+            const thenCtx = {
+              ...ctx,
+              stepPathPrefix: c.stepPath,
+              branchStack: (ctx.branchStack || []).slice().concat([this._pDecisionBranchLabel(c.step)])
+            };
+            const thenRes = this._scanBlockForProcessGraph(c.step.block || [], thenCtx, graph, decisionId, "true");
+            thenExits.push(thenRes.first ? thenRes.last : decisionId);
+
+            lastDecisionId = decisionId;
+          }
+
+          // ELSE (final false) comes from the last decision's else_block (if any).
+          // Prefer the IF's else_block; if absent, take first else_block found in chain.
+          let elseBlock = chain[0].step?.else_block;
+          if (!Array.isArray(elseBlock) || elseBlock.length === 0) {
+            for (const c of chain) {
+              if (Array.isArray(c.step?.else_block) && c.step.else_block.length > 0) {
+                elseBlock = c.step.else_block;
+                break;
+              }
+            }
+          }
+
+          // Merge node for the entire chain
+          const chainMergeId = this._pNodeId(`M_${ctx.recipeId}_${chain[0].stepPath}_chain_merge`);
+          this._pAddNode(graph.nodes, chainMergeId, {
+            id: chainMergeId,
+            kind: "merge",
+            provider: "system",
+            step_path: `${chain[0].stepPath}/chain_merge`,
+            label: "Merge",
+            branch_context: (ctx.branchStack || []).join(" / ")
+          });
+
+          // Connect all THEN exits into the chain merge
+          thenExits.forEach(exitId => this._pAddEdge(graph.edges, exitId, chainMergeId, "", "flow"));
+
+          // ELSE path: either a real else_block or direct false->merge
+          if (Array.isArray(elseBlock) && elseBlock.length > 0) {
+            const elseCtx = {
+              ...ctx,
+              stepPathPrefix: `${chain[0].stepPath}/else`,
+              branchStack: (ctx.branchStack || []).slice().concat(["ELSE"])
+            };
+            const elseRes = this._scanBlockForProcessGraph(elseBlock, elseCtx, graph, lastDecisionId, "false");
+            const elseExit = elseRes.first ? elseRes.last : lastDecisionId;
+            this._pAddEdge(graph.edges, elseExit, chainMergeId, "", "flow");
+          } else {
+            this._pAddEdge(graph.edges, lastDecisionId, chainMergeId, "false", "flow");
+          }
+
+          prev = chainMergeId;
+          // Skip over the ELSIF siblings we've consumed
+          index = j - 1;
+          continue;
+        }
+      }
+
+      // Single decision (standalone IF or standalone ELSIF)
       if (kind === "decision") {
         const decisionId = this._pNodeId(`S_${ctx.recipeId}_${stepPath}`);
         this._pAddNode(graph.nodes, decisionId, {
@@ -1322,7 +1534,7 @@ class RecipeAnalyzerService {
         const thenCtx = {
           ...ctx,
           stepPathPrefix: stepPath,
-          branchStack: (ctx.branchStack || []).slice().concat(["IF"])
+          branchStack: (ctx.branchStack || []).slice().concat([this._pDecisionBranchLabel(step)])
         };
         const thenRes = this._scanBlockForProcessGraph(step.block || [], thenCtx, graph, decisionId, "true");
 
