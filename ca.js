@@ -88,7 +88,23 @@ class AppConfig {
         PROCESS_MAPS: ["Root recipe ID", "Root recipe name", "Mode", "Call depth", "Mermaid (calls)", "Mermaid (full process)", "Notes", "Drive link (calls)", "Drive link (full)", "Generated at"],
         PROCESS_NODES: ["Root recipe ID", "Root recipe name", "Node ID", "Step path", "Kind", "Provider", "Label", "Branch context"],
         PROCESS_EDGES: ["Root recipe ID", "From node", "To node", "Edge label", "Edge kind"],
-        AI_ANALYSIS: ["Recipe ID", "Recipe name", "AI explaination (preview", "Graph metrics (JSON)", "Drive link (AI full)", "Drive link (calls MMD)", "Drive link (full MMD)", "Generated at"],
+        AI_ANALYSIS: [
+          "Recipe ID",
+          "Recipe name",
+          "Objective",
+          "Trigger",
+          "High-level flow",
+          "Control-flow hotspots",
+          "External apps",
+          "Called recipes",
+          "Risks / notes",
+          "Raw (preview)",
+          "Graph metrics (JSON)",
+          "Drive link (AI full)",
+          "Drive link (calls mermaid)",
+          "Drive link (full mermaid)",
+          "Generated at"
+        ],
         DEBUG: ["Timestamp", "Recipe ID", "Recipe name", "Status", "Drive link"]
       },
       CONSTANTS: {
@@ -1761,6 +1777,25 @@ class GeminiService {
 
     return this._callVertexAI(prompt);
   }
+  /**
+   * Returns a structured analysis object (JSON) so we can split into columns.
+   * @returns {{objective:string,trigger:string,high_level_flow:string[],hotspots:string[],external_apps:string[],called_recipes:string[],risks_notes:string[]}}
+   */
+  explainRecipeStructured(recipe, graphPack = null, logicDigest = "") {
+    const ctx = this._prepareContext(recipe, graphPack, logicDigest);
+    const prompt = this._buildStructuredPrompt(ctx);
+    const raw = this._callVertexAI(prompt);
+    const obj = this._extractJsonObject(raw);
+    return obj || {
+      objective: "",
+      trigger: "",
+      high_level_flow: [],
+      hotspots: [],
+      external_apps: [],
+      called_recipes: [],
+      risks_notes: []
+    };
+  }
   
   // --- INTERNALS ---------------------------------------------------------------------------------------
   /**
@@ -1846,6 +1881,84 @@ class GeminiService {
       ${callMermaid ? `Mermaid (call graph):\n${callMermaid}\n` : "Mermaid (call graph): (omitted due to size cap)\n"}
       ${procMermaid ? `Mermaid (process graph):\n${procMermaid}\n` : "Mermaid (process graph): (omitted due to size cap)\n"}
       `.trim();
+  }
+  /** @private */
+  _buildStructuredPrompt(ctx) {
+    const graphs = ctx.graphs || {};
+    const call = graphs.call || {};
+    const proc = graphs.process || {};
+
+    // Keep the prompt compact; send summaries + samples, not full Mermaid.
+    const graphMetrics = {
+      call: {
+        depth: call.depth,
+        node_count: call.node_count,
+        edge_count: call.edge_count,
+        notes: call.notes
+      },
+      process: {
+        node_count: proc.node_count,
+        edge_count: proc.edge_count,
+        kind_counts: proc.kind_counts,
+        call_targets: proc.call_targets,
+        notes: proc.notes
+      }
+    };
+
+    return `
+      Return ONLY valid JSON (no markdown, no code fences).
+      Schema:
+      {
+        "objective": "string",
+        "trigger": "string",
+        "high_level_flow": ["string", ...],
+        "hotspots": ["string", ...],
+        "external_apps": ["string", ...],
+        "called_recipes": ["string", ...],
+        "risks_notes": ["string", ...]
+      }
+
+      Use ONLY the provided context. If unknown, use "" or [].
+
+      Recipe meta:
+      - Name: ${ctx.name || ""}
+      - Description: ${ctx.description || ""}
+      - Trigger app: ${ctx.trigger_app || ""}
+      - Connected apps: ${JSON.stringify(ctx.connected_apps || [])}
+
+      Flattened steps (may be truncated):
+      ${ctx.logic_digest || "(none)"}
+
+      Graph metrics:
+      ${JSON.stringify(graphMetrics)}
+
+      Call graph edges sample:
+      ${(call.edges_sample || []).join("\n")}
+
+      Process graph edges sample:
+      ${(proc.edges_sample || []).join("\n")}
+      `.trim();
+  }
+  /** @private Extract a JSON object from model output (handles occasional wrapping). */
+  _extractJsonObject(text) {
+    if (!text) return null;
+    let t = String(text).trim();
+
+    // Strip ```json fences if the model "cheats"
+    t = t.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```$/i, "").trim();
+
+    // If there's extra text, take the first {...} block.
+    const first = t.indexOf("{");
+    const last = t.lastIndexOf("}");
+    if (first === -1 || last === -1 || last <= first) return null;
+
+    const candidate = t.slice(first, last + 1);
+    try {
+      const obj = JSON.parse(candidate);
+      return obj && typeof obj === "object" ? obj : null;
+    } catch (_) {
+      return null;
+    }
   }
   /**
    * Executes the API call to Vertex AI.
@@ -2296,10 +2409,20 @@ class WorkatoSyncApp {
         const digest = this._logicDigestFromRows(logicRows, maxLines);
 
         // 3) Call Gemini with grounded context
-        const explanation = gemini.explainRecipe(recipe, graphPack, digest);
+        const structured = gemini.explainRecipeStructured(recipe, graphPack, digest);
+
+        const objective = String(structured.objective || "");
+        const trigger = String(structured.trigger || "");
+        const flow = Array.isArray(structured.high_level_flow) ? structured.high_level_flow.join("\n") : String(structured.high_level_flow || "");
+        const hotspots = Array.isArray(structured.hotspots) ? structured.hotspots.join("\n") : String(structured.hotspots || "");
+        const externalApps = Array.isArray(structured.external_apps) ? structured.external_apps.join("\n") : String(structured.external_apps || "");
+        const calledRecipes = Array.isArray(structured.called_recipes) ? structured.called_recipes.join("\n") : String(structured.called_recipes || "");
+        const risks = Array.isArray(structured.risks_notes) ? structured.risks_notes.join("\n") : String(structured.risks_notes || "");
+
+        const rawPreview = JSON.stringify(structured, null, 2).slice(0, 4000);
 
         // 4) Drive links (full artifacts)
-        const aiUrl = this.driveService.saveText(id, name || `recipe_${id}`, "ai.txt", explanation || "");
+        const aiUrl = this.driveService.saveText(id, name || `recipe_${id}`, "ai.json", JSON.stringify(structured, null, 2));
         const callsUrl = this.driveService.saveText(id, name || `recipe_${id}`, "calls.mmd", graphPack?.call?.mermaid || "");
         const fullUrl  = this.driveService.saveText(id, name || `recipe_${id}`, "full.mmd",  graphPack?.process?.mermaid || "");
 
@@ -2307,9 +2430,9 @@ class WorkatoSyncApp {
         const callsLink = callsUrl ? `=HYPERLINK("${callsUrl}", "View calls mermaid")` : "";
         const fullLink  = fullUrl  ? `=HYPERLINK("${fullUrl}", "View full mermaid")` : "";
 
-        const preview = (explanation && explanation.length > 4000)
-          ? explanation.slice(0, 4000) + "\n…(truncated preview; see Drive link)"
-          : (explanation || "");
+        const preview = rawPreview.length >= 4000
+          ? rawPreview + "\n…(truncated preview; see Drive link)"
+          : rawPreview;
 
         const metricsJson = JSON.stringify({
           call: {
@@ -2328,6 +2451,13 @@ class WorkatoSyncApp {
         rows.push([
           String(recipe?.id || id),
           name,
+          objective,
+          trigger,
+          flow,
+          hotspots,
+          externalApps,
+          calledRecipes,
+          risks,
           preview,
           metricsJson.length > charLimit ? metricsJson.slice(0, 2000) + "…(truncated)" : metricsJson,
           aiLink,
