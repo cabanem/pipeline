@@ -41,12 +41,16 @@ class AppConfig {
    * @returns {AppConfigObject} The full application configuration.
    */
   static get() {
-    const props = PropertiesService.getScriptProperties();
+    const scriptProps = PropertiesService.getScriptProperties();
 
     return {
       API: {
-        TOKEN: props.getProperty('WORKATO_TOKEN'),
-        BASE_URL: (props.getProperty('WORKATO_BASE_URL') || 'https://app.eu.workato.com/api').replace(/\/$/, '') ,
+        // User-specific overrides first, then script defaults
+        TOKEN: ConfigStore.get('WORKATO_TOKEN', { preferUser: true, defaultValue: "" }),
+        BASE_URL: (ConfigStore.get('WORKATO_BASE_URL', {
+          preferUser: true,
+          defaultValue: 'https://app.eu.workato.com/api'
+        }) || 'https://app.eu.workato.com/api').replace(/\/$/, ''),
         PER_PAGE: 100,
         MAX_CALLS: 500,
         THROTTLE_MS: 100,       
@@ -122,6 +126,7 @@ class AppConfig {
       },
       VERTEX: {
         GOOGLE_CLOUD_PROJECT_ID: props.getProperty('GOOGLE_CLOUD_PROJECT_ID'),
+        //GOOGLE_CLOUD_PROJECT_ID: scriptProps.getProperty('GOOGLE_CLOUD_PROJECT_ID'),
         MODEL_ID: 'gemini-2.5-pro',
         LOCATION: 'us-central1',
         GENERATION_CONFIG: {
@@ -135,6 +140,40 @@ class AppConfig {
       },
       VERBOSE: true
     };
+  }
+}
+
+// -------------------------------------------------------------------------------------------------------
+// CONFIG STORE (UserProperties > ScriptProperties > default)
+// -------------------------------------------------------------------------------------------------------
+class ConfigStore {
+  static userProps() { return PropertiesService.getUserProperties(); }
+  static scriptProps() { return PropertiesService.getScriptProperties(); }
+
+  /**
+   * Get a property with precedence control.
+   * @param {string} key
+   * @param {{ preferUser?: boolean, defaultValue?: any }} [opts]
+   */
+  static get(key, opts = {}) {
+    const preferUser = (opts.preferUser !== undefined) ? Boolean(opts.preferUser) : true;
+    const u = this.userProps().getProperty(key);
+    const s = this.scriptProps().getProperty(key);
+    const def = (opts.defaultValue !== undefined) ? opts.defaultValue : null;
+    return preferUser ? (u ?? s ?? def) : (s ?? u ?? def);
+  }
+
+  static setUser(key, value) {
+    this.userProps().setProperty(key, String(value ?? ""));
+  }
+  static setScript(key, value) {
+    this.scriptProps().setProperty(key, String(value ?? ""));
+  }
+  static deleteUser(key) {
+    this.userProps().deleteProperty(key);
+  }
+  static deleteScript(key) {
+    this.scriptProps().deleteProperty(key);
   }
 }
 
@@ -183,7 +222,8 @@ class WorkatoClient {
     /** @type {APIConfig} */
     this.config = AppConfig.get().API;
     if (!this.config.TOKEN) {
-      throw new Error("Missing 'WORKATO_TOKEN' in Script Properties.");
+      //throw new Error("Missing 'WORKATO_TOKEN' in Script Properties.");
+      throw new Error("Missing WORKATO_TOKEN. Set it via Workato Sync → Configuration → Set Workato API token (saved per-user).");r54
     }
   }
 
@@ -601,7 +641,8 @@ class DriveService{
   // --- INTERNALS ---------------------------------------------------------------------------------------
   /** @private Retrieves folder by cached ID, or creates and updates cache */
   _getVerifiedFolder() {
-    const cachedId = this.props.getProperty('DEBUG_FOLDER_ID');
+    //const cachedId = this.props.getProperty('DEBUG_FOLDER_ID');
+    const cachedId = ConfigStore.get('DEBUG_FOLDER_ID', { preferUser: true, defaultValue: "" });
 
     // 1. Try the cache
     if (cachedId) {
@@ -623,7 +664,8 @@ class DriveService{
     }
 
     // 4. Update cache
-    this.props.setProperty('DEBUG_FOLDER_ID', folder.getId());
+    //this.props.setProperty('DEBUG_FOLDER_ID', folder.getId()); // if storing in scriptProps
+    ConfigStore.setUser('DEBUG_FOLDER_ID', folder.getId()); // storing in userProps
     return folder;
   }
 }
@@ -2635,7 +2677,9 @@ class WorkatoSyncApp {
 class UserInterfaceService {
   constructor() {
     this.ui = SpreadsheetApp.getUi();
-    this.props = PropertiesService.getScriptProperties();
+    // this.props = PropertiesService.getScriptProperties(); // scriptProps
+    this.scriptProps = PropertiesService.getScriptProperties();
+    this.userProps = PropertiesService.getUserProperties();
   }
 
   /**
@@ -2664,11 +2708,13 @@ class UserInterfaceService {
   /**
    * Prompts the user to update a specific script property.
    * Handles validation, user cancellation, and masking of secrets.
-   * * @param {string} key - The ScriptProperty key to update.
+   * @param {string} key - The ScriptProperty key to update.
    * @param {string} title - The title of the prompt dialog.
-   * @param {boolean} [isSecret=false] - If true, masks the output confirmation.
+   * @param {{ isSecret?: boolean, scope?: "user"|"script" }} [opts]
    */
-  promptUpdate(key, title, isSecret = false) {
+  promptUpdate(key, title, opts = {}) {
+    const isSecret = Boolean(opts.isSecret);
+    const scope = (opts.scope === "script") ? "script" : "user";
     const result = this.ui.prompt(title, `Enter new value for ${key}:`, this.ui.ButtonSet.OK_CANCEL);
 
     if (result.getSelectedButton() === this.ui.Button.OK) {
@@ -2682,41 +2728,55 @@ class UserInterfaceService {
           this.ui.ButtonSet.YES_NO
         );
         if (confirm === this.ui.Button.YES) {
-          this.props.deleteProperty(key);
+          if (scope === "script") this.scriptProps.deleteProperty(key);
+          else this.userProps.deleteProperty(key);
           this.ui.alert('Property deleted. Script will use code-level defaults.');
         }
         return;
       }
 
       // Save
-      this.props.setProperty(key, input);
+      if (scope === "script") this.scriptProps.setProperty(key, input);
+      else this.userProps.setProperty(key, input);
       
       // Feedback
       const displayValue = isSecret 
         ? `${input.substring(0, 4)}...${input.substring(input.length - 4)}` 
         : input;
       
-      this.ui.alert(`Saved ${key}: ${displayValue}`);
+      this.ui.alert(`Saved ${key} (${scope}): ${displayValue}`);
     }
   }
   /**
    * Displays the current configuration state in a formatted alert.
    */
   showConfiguration() {
-    const storedProps = this.props.getProperties();
-    const defaults = AppConfig.get().API; // Access static defaults
+    const user = this.userProps.getProperties();
+    const script = this.scriptProps.getProperties();
+    const defaults = AppConfig.get().API;
     
     // Logic to determine display strings (Set vs Default vs Missing)
-    const tokenStatus = storedProps['WORKATO_TOKEN'] ? "******** (Set)" : "❌ NOT SET";
-    const urlStatus = storedProps['WORKATO_BASE_URL'] || `${defaults.BASE_URL} (Default)`;
-    const folderStatus = storedProps['DEBUG_FOLDER_ID'] || "(Auto-generated)";
+    const tokenStatus =
+      user['WORKATO_TOKEN'] ? "******** (User)" :
+      script['WORKATO_TOKEN'] ? "******** (Script)" :
+      "❌ NOT SET";
+
+    const urlStatus =
+      user['WORKATO_BASE_URL'] ? `${user['WORKATO_BASE_URL']} (User)` :
+      script['WORKATO_BASE_URL'] ? `${script['WORKATO_BASE_URL']} (Script)` :
+      `${defaults.BASE_URL} (Default)`;
+
+    const folderStatus =
+      user['DEBUG_FOLDER_ID'] ? `${user['DEBUG_FOLDER_ID']} (User)` :
+      script['DEBUG_FOLDER_ID'] ? `${script['DEBUG_FOLDER_ID']} (Script)` :
+      "(Auto-generated)";
     
     const msg = [
       `API Token: ${tokenStatus}`,
       `Base URL: ${urlStatus}`,
       `Debug Folder ID: ${folderStatus}`,
       ``,
-      `To change these, use the 'Configuration' menu.`
+      `Precedence: User settings override Script settings.`
     ].join('\n');
     
     this.ui.alert('Current Configuration', msg, this.ui.ButtonSet.OK);
@@ -2737,13 +2797,14 @@ function onOpen() {
   new UserInterfaceService().createMenu();
 }
 function promptToken() {
-  new UserInterfaceService().promptUpdate('WORKATO_TOKEN', 'Update API Token', true);
+  new UserInterfaceService().promptUpdate('WORKATO_TOKEN', 'Update API Token', { isSecret: true, scope: "user" });
 }
 function promptBaseUrl() {
-  new UserInterfaceService().promptUpdate('WORKATO_BASE_URL', 'Update Base URL', false);
+  // Base URL can be user-specific or shared; defaulting to user avoids surprises across environments.
+  new UserInterfaceService().promptUpdate('WORKATO_BASE_URL', 'Update Base URL', { isSecret: false, scope: "user" });
 }
 function promptFolderId() {
-  new UserInterfaceService().promptUpdate('DEBUG_FOLDER_ID', 'Update Debug Folder ID', false);
+  new UserInterfaceService().promptUpdate('DEBUG_FOLDER_ID', 'Update Debug Folder ID', { isSecret: false, scope: "user" });
 }
 function showCurrentConfig() {
   new UserInterfaceService().showConfiguration();
@@ -2784,6 +2845,19 @@ function generateProcessMapsCalls() {
 function generateProcessMapsFull() {
   const app = new WorkatoSyncApp();
   app.runProcessMaps({ mode: "full" });
+}
+/**
+ * Migrate from scriptProperties to userProperties
+ */
+function migrateMyScriptPropsToUserProps() {
+  const keys = ["WORKATO_TOKEN", "WORKATO_BASE_URL", "DEBUG_FOLDER_ID"];
+  const s = PropertiesService.getScriptProperties();
+  const u = PropertiesService.getUserProperties();
+  keys.forEach(k => {
+    const v = s.getProperty(k);
+    if (v && !u.getProperty(k)) u.setProperty(k, v);
+  });
+  SpreadsheetApp.getUi().alert("Migrated script props to your user props (only for missing values).");
 }
 /**
  * Validates the connection to the Workato API across all primary endpoints.
