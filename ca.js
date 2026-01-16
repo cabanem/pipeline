@@ -125,8 +125,8 @@ class AppConfig {
         DRIVE_FOLDER_NAME: "workato_workspace_debug_logs"
       },
       VERTEX: {
-        GOOGLE_CLOUD_PROJECT_ID: props.getProperty('GOOGLE_CLOUD_PROJECT_ID'),
         //GOOGLE_CLOUD_PROJECT_ID: scriptProps.getProperty('GOOGLE_CLOUD_PROJECT_ID'),
+        GOOGLE_CLOUD_PROJECT_ID: ConfigStore.get('GOOGLE_CLOUD_PROJECT_ID', { preferUser: false, defaultValue: "" }),
         MODEL_ID: 'gemini-2.5-pro',
         LOCATION: 'us-central1',
         GENERATION_CONFIG: {
@@ -143,9 +143,10 @@ class AppConfig {
   }
 }
 
-// -------------------------------------------------------------------------------------------------------
-// CONFIG STORE (UserProperties > ScriptProperties > default)
-// -------------------------------------------------------------------------------------------------------
+/**
+ * @class
+ * @classdesc Configuration store
+ */
 class ConfigStore {
   static userProps() { return PropertiesService.getUserProperties(); }
   static scriptProps() { return PropertiesService.getScriptProperties(); }
@@ -222,8 +223,7 @@ class WorkatoClient {
     /** @type {APIConfig} */
     this.config = AppConfig.get().API;
     if (!this.config.TOKEN) {
-      //throw new Error("Missing 'WORKATO_TOKEN' in Script Properties.");
-      throw new Error("Missing WORKATO_TOKEN. Set it via Workato Sync → Configuration → Set Workato API token (saved per-user).");r54
+      throw new Error("Missing WORKATO_TOKEN. Set it via Workato Sync → Configuration → Set Workato API token (saved per-user).");
     }
   }
 
@@ -579,7 +579,6 @@ class SheetService {
 class DriveService{
   constructor() {
     this.config = AppConfig.get().DEBUG;
-    this.props = PropertiesService.getScriptProperties();
   }
   
   /**
@@ -2893,4 +2892,11 @@ function testWorkatoConnectivity() {
   } catch {
     console.log(results);
   }
+}
+function debugPropertyReport() {
+  const u = PropertiesService.getUserProperties().getProperties();
+  const s = PropertiesService.getScriptProperties().getProperties();
+  console.log("USER PROPS:", JSON.stringify(u, null, 2));
+  console.log("SCRIPT PROPS:", JSON.stringify(s, null, 2));
+  SpreadsheetApp.getUi().alert("Logged user/script properties to execution logs.");
 }
