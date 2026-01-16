@@ -2363,9 +2363,11 @@ class WorkatoSyncApp {
       Logger.verbose("Starting recipe logic debugging...");
       
       // 1. Read input 
-      const requestedIds = this.sheetService.readRequests();
+      const requestedIds = (Array.isArray(idsOverride) && idsOverride.length > 0)
+        ? idsOverride : this.sheetService.readRequests();
+
       if (requestedIds.length === 0) {
-        Logger.notify("No IDs found in the 'logic_requests' sheet.", true);
+        Logger.notify("No recipe IDs found (select rows with IDs, or use 'logic_requests').", true);
         return;
       }
       Logger.notify(`Fetching logic for ${requestedIds.length} recipes...`);
@@ -2421,10 +2423,11 @@ class WorkatoSyncApp {
    */
   runAiAnalysis() {
     const gemini = new GeminiService();
-    const ids = this.sheetService.readRequests();
+    const ids = (Array.isArray(idsOverride) && idsOverride.length > 0)
+      ? idsOverride : this.sheetService.readRequests();
 
-    if(ids.length === 0) {
-      Logger.notify("No IDs to analyze.");
+    if (ids.length === 0) {
+      Logger.notify("No recipe IDs found (select rows with IDs, or use 'logic_requests').");
       return;
     }
 
@@ -2532,9 +2535,12 @@ class WorkatoSyncApp {
     try {
       Logger.verbose("Starting process map generation...");
 
-      const requestedIds = this.sheetService.readRequests();
+      const requestedIds = (Array.isArray(idsOverride) && idsOverride.length > 0)
+        ? idsOverride
+        : this.sheetService.readRequests();
+
       if (requestedIds.length === 0) {
-        Logger.notify("No IDs found in the 'logic_requests' sheet.", true);
+        Logger.notify("No recipe IDs found (select rows with IDs, or use 'logic_requests').", true);
         return;
       }
 
@@ -2687,6 +2693,12 @@ class UserInterfaceService {
   createMenu() {
     this.ui.createMenu('Workato Sync')
       .addSubMenu(this.ui.createMenu('Actions')
+        .addSubMenu(this.ui.createMenu('Selection driven actions')
+          .addItem('Debug logic for selected rows', 'fetchRecipeLogicSelected')
+          .addItem('Analyze selected rows using AI', 'fetchRecipeAnalysisSelected')
+          .addItem('Generate process maps for selection (calls only)', 'generateProcessMapsSelectedCalls')
+          .addItem('Generate process maps for selection (full only)', 'generateProcessMapsSelectedFull')
+          .addItem('Generate process maps for selection (calls + full)', 'generateProcessMapsSelected'))
         .addItem('Run workspace inventory sync', 'syncInventory')
         .addItem('Debug selected logic', 'fetchRecipeLogic')
         .addItem('Analyze recipe using AI', 'fetchRecipeAnalysis')
@@ -2790,6 +2802,85 @@ class UserInterfaceService {
 }
 
 // -------------------------------------------------------------------------------------------------------
+// SELECTION UTILS
+// -------------------------------------------------------------------------------------------------------
+class SelectionUtils {
+  /**
+   * Extract recipe IDs from the user's current selection.
+   * Works if the active sheet has a recognizable ID header (e.g. "ID", "Recipe ID", "Root recipe ID").
+   * Fallback: if the user selects a column of IDs directly, we’ll try to parse numeric-ish values.
+   *
+   * @param {{ headerCandidates?: string[] }} [opts]
+   * @returns {string[]} unique recipe IDs
+   */
+  static getSelectedRecipeIds(opts = {}) {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getActiveSheet();
+    const range = sheet.getActiveRange();
+    if (!range) return [];
+
+    const headerCandidates = (opts.headerCandidates && opts.headerCandidates.length)
+      ? opts.headerCandidates
+      : ["ID", "Recipe ID", "Root recipe ID", "Parent recipe ID", "Child recipe ID"];
+
+    const lastCol = sheet.getLastColumn();
+    if (lastCol < 1) return [];
+
+    const headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(v => String(v || "").trim());
+    const idCol = this._findHeaderColumn_(headers, headerCandidates); // 1-based col index or 0
+
+    // Prefer: use the ID column for the selected rows (even if selection isn't in that column)
+    if (idCol > 0) {
+      const selStartRow = range.getRow();
+      const selEndRow = selStartRow + range.getNumRows() - 1;
+
+      const startRow = Math.max(2, selStartRow); // skip header row
+      const endRow = Math.max(startRow, selEndRow);
+      const numRows = Math.max(0, endRow - startRow + 1);
+      if (numRows <= 0) return [];
+
+      const values = sheet.getRange(startRow, idCol, numRows, 1).getValues().flat();
+      return this._normalizeIds_(values);
+    }
+
+    // Fallback: user selected ID cells directly (try to parse numeric-ish values)
+    const raw = range.getValues().flat();
+    return this._normalizeIds_(raw);
+  }
+
+  // --- INTERNALS ---------------------------------------------------------------------------------------
+  static _findHeaderColumn_(headers, candidates) {
+    const norm = (s) => String(s || "").trim().toLowerCase();
+    const candSet = new Set(candidates.map(norm));
+
+    for (let i = 0; i < headers.length; i++) {
+      if (candSet.has(norm(headers[i]))) return i + 1; // 1-based
+    }
+    return 0;
+  }
+  static _normalizeIds_(values) {
+    const out = [];
+    const seen = new Set();
+
+    values.forEach(v => {
+      if (v === null || v === undefined || v === "") return;
+
+      // Accept numbers or digit-strings; ignore other noise
+      const s = String(v).trim();
+      const isNumeric = (typeof v === "number") || /^[0-9]+$/.test(s);
+      if (!isNumeric) return;
+
+      const id = String(parseInt(s, 10));
+      if (!id || seen.has(id)) return;
+      seen.add(id);
+      out.push(id);
+    });
+
+    return out;
+  }
+}
+
+// -------------------------------------------------------------------------------------------------------
 // HANDLES
 // -------------------------------------------------------------------------------------------------------
 function onOpen() {
@@ -2845,6 +2936,48 @@ function generateProcessMapsFull() {
   const app = new WorkatoSyncApp();
   app.runProcessMaps({ mode: "full" });
 }
+// --- Selection-driven actions -------------------------------------------------------------------------
+function fetchRecipeLogicSelected() {
+  const ids = SelectionUtils.getSelectedRecipeIds();
+  if (!ids.length) {
+    Logger.notify("Select rows (or ID cells) in a sheet with recipe IDs first.", true);
+    return;
+  }
+  new WorkatoSyncApp().runLogicDebug(ids);
+}
+function fetchRecipeAnalysisSelected() {
+  const ids = SelectionUtils.getSelectedRecipeIds();
+  if (!ids.length) {
+    Logger.notify("Select rows (or ID cells) in a sheet with recipe IDs first.", true);
+    return;
+  }
+  new WorkatoSyncApp().runAiAnalysis(ids);
+}
+function generateProcessMapsSelected() {
+  const ids = SelectionUtils.getSelectedRecipeIds();
+  if (!ids.length) {
+    Logger.notify("Select rows (or ID cells) in a sheet with recipe IDs first.", true);
+    return;
+  }
+  new WorkatoSyncApp().runProcessMaps({ mode: "calls+full" }, ids);
+}
+function generateProcessMapsSelectedCalls() {
+  const ids = SelectionUtils.getSelectedRecipeIds();
+  if (!ids.length) {
+    Logger.notify("Select rows (or ID cells) in a sheet with recipe IDs first.", true);
+    return;
+  }
+  new WorkatoSyncApp().runProcessMaps({ mode: "calls" }, ids);
+}
+function generateProcessMapsSelectedFull() {
+  const ids = SelectionUtils.getSelectedRecipeIds();
+  if (!ids.length) {
+    Logger.notify("Select rows (or ID cells) in a sheet with recipe IDs first.", true);
+    return;
+  }
+  new WorkatoSyncApp().runProcessMaps({ mode: "full" }, ids);
+}
+
 /**
  * Migrate from scriptProperties to userProperties
  */
