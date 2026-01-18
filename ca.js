@@ -6,6 +6,10 @@
  * @see - README ("https://docs.google.com/document/d/18mk8sphXwC7bTRrDj09rnL4FNVuiBNS1oVeM3zuyUcg/edit?tab=t.0")
  * @see - Diagrams ("https://lucid.app/lucidchart/8af28952-b1ae-4eb2-a486-343a0162a587/edit?viewport_loc=-2621%2C-29%2C4037%2C1896%2C-4lm-29-aRvB&invitationId=inv_66f2e22a-b1f9-49b6-b036-ed97b5af2d39")
  * @see - Documentation for the Workato developer API: "https://docs.workato.com/en/workato-api.html"
+ * 
+ * * WorkatoSyncApp ID: 1sl2ZfkgwX57EIygRwEP7nkXTK8BEXaB60cnFKsqhg2DWic3V0SVAzrYS
+ * * RecipeAnalyzer: 1zQz8lK_00xJiyVweBiNUfhr54HqAGY0isdck0lQCYyr134Xmm7fx_ahW
+ * * GeminiService: 1mc_Jm9FmSo2yMzjAaVdtD7Ww95Fa2RPLQ1-4Kb5kTtEwkuSfrOBCIzKZ
  */
 
 // -------------------------------------------------------------------------------------------------------
@@ -544,7 +548,7 @@ class DriveService{
  * @class
  * @classdesc Unified service for deep inspection of recipe logic / code.
  * Merges functionality from historical DependencyService and LogicService.
- * 1zQz8lK_00xJiyVweBiNUfhr54HqAGY0isdck0lQCYyr134Xmm7fx_ahW
+ * RecipeAnalyzer: 1zQz8lK_00xJiyVweBiNUfhr54HqAGY0isdck0lQCYyr134Xmm7fx_ahW
  */
 class RecipeAnalyzerService {
   /**
@@ -577,7 +581,7 @@ class RecipeAnalyzerService {
 /**
  * @class
  * @classdesc Service for interacting with Google Vertex AI via the GeminiClient library.
- * 1mc_Jm9FmSo2yMzjAaVdtD7Ww95Fa2RPLQ1-4Kb5kTtEwkuSfrOBCIzKZ
+ * GeminiService ID: 1mc_Jm9FmSo2yMzjAaVdtD7Ww95Fa2RPLQ1-4Kb5kTtEwkuSfrOBCIzKZ
  */
 class GeminiService {
   constructor() {
@@ -986,7 +990,7 @@ class DataMapper {
  * @class
  * @classdesc Main Application Controller.
  * * Orchestrates the fetching, transformation, and writing of Workato data.
- * * 1sl2ZfkgwX57EIygRwEP7nkXTK8BEXaB60cnFKsqhg2DWic3V0SVAzrYS
+ * * WorkatoSyncApp ID: 1sl2ZfkgwX57EIygRwEP7nkXTK8BEXaB60cnFKsqhg2DWic3V0SVAzrYS
  */
 class WorkatoSyncApp {
   constructor() {
