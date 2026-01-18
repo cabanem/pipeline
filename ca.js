@@ -65,59 +65,9 @@ class AppConfig {
 
         MAX_RETRIES: 3
       },
-      SHEETS: {
-        RECIPES: 'recipes',
-        FOLDERS: 'folders',
-        PROJECTS: 'projects',
-        PROPERTIES: 'properties',
-        DEPENDENCIES: 'recipe_dependencies',
-        LOGIC: 'recipe_logic',
-        LOGIC_INPUT: 'logic_requests',
-        CALL_EDGES: 'recipe_call_edges',
-        PROCESS_MAPS: 'process_maps',
-        PROCESS_NODES: 'process_nodes',
-        PROCESS_EDGES: 'process_edges',
-        AI_ANALYSIS: 'ai_analysis',
-        DEBUG: 'debugging_log'
-      },
-      HEADERS: {
-        PROJECTS: ["ID", "Name", "Description", "Created at"],
-        FOLDERS: ["ID", "Name", "Parent folder", "Project name"],
-        RECIPES: ["ID", "Name", "Status", "Project", "Folder", "Last run"],
-        DEPENDENCIES: ["Parent recipe ID", "Project", "Folder", "Dependency type", "Dependency ID", "Dependency name"],
-        PROPERTIES: ["ID", "Name", "Value", "Created at", "Updated at"],
-        LOGIC: ["Recipe ID", "Recipe name", "Step number", "Indent", "Provider", "Action/Name", "Description", "Input / Details"],
-        LOGIC_INPUT: ["Enter recipe IDs below (one per row)"],
-        CALL_EDGES: ["Parent recipe ID", "Parent recipe name", "Project", "Folder", "Step path", "Step name", "Branch context", "Provider", "Child recipe ID", "Child recipe name", "ID key"],
-        PROCESS_MAPS: ["Root recipe ID", "Root recipe name", "Mode", "Call depth", "Mermaid (calls)", "Mermaid (full process)", "Notes", "Drive link (calls)", "Drive link (full)", "Generated at"],
-        PROCESS_NODES: ["Root recipe ID", "Root recipe name", "Node ID", "Step path", "Kind", "Provider", "Label", "Branch context"],
-        PROCESS_EDGES: ["Root recipe ID", "From node", "To node", "Edge label", "Edge kind"],
-        AI_ANALYSIS: [
-          "Recipe ID",
-          "Recipe name",
-          "Objective",
-          "Trigger",
-          "High-level flow",
-          "Control-flow hotspots",
-          "External apps",
-          "Called recipes",
-          "Risks / notes",
-          "Raw (preview)",
-          "Graph metrics (JSON)",
-          "Drive link (AI full)",
-          "Drive link (calls mermaid)",
-          "Drive link (full mermaid)",
-          "Generated at"
-        ],
-        DEBUG: ["Timestamp", "Recipe ID", "Recipe name", "Status", "Drive link"]
-      },
-      CONSTANTS: {
-        RECIPE_PROVIDERS: ['workato_recipe_function', 'workato_callable_recipe'],
-        FLOW_ID_KEYS: ['flow_id', 'recipe_id', 'callable_recipe_id'],
-        STYLE_HEADER_BG: "#efefef",
-        CELL_CHAR_LIMIT: 48000,
-        MERMAID_LABEL_MAX: 80
-      },
+      SHEETS: SchemaDef.SHEETS,
+      HEADERS: SchemaDef.HEADERS,
+      CONSTANTS: SchemaDef.CONSTANTS,
       DEBUG: {
         ENABLE_LOGGING: true,
         LOG_TO_SHEET: true,
@@ -215,108 +165,30 @@ class Logger {
 // -------------------------------------------------------------------------------------------------------
 /**
  * @class
- * @classdesc Low-level HTTP wrapper for the Workato API.
- * * Handles Authentication, Base URL construction, and Pagination loops.
  */
 class WorkatoClient {
   constructor() {
-    /** @type {APIConfig} */
-    this.config = AppConfig.get().API;
-    if (!this.config.TOKEN) {
-      throw new Error("Missing WORKATO_TOKEN. Set it via Workato Sync → Configuration → Set Workato API token (saved per-user).");
-    }
+    const apiConfig = AppConfig.get().API;
+    const verbose = AppConfig.get().VERBOSE;
+
+    // Initialize external library dependency
+    this.client = WorkatoLib.newClient(
+      apiConfig.TOKEN,
+      apiConfig.BASE_URL,
+      {
+        verbose: verbose,
+        maxRetries: apiConfig.MAX_RETRIES,
+        dryRun: false,
+        perPage: apiConfig.PER_PAGE
+      }
+    );
   }
 
-  /**
-   * Executes a single GET request to the Workato API.
-   * @param {string} endpoint - The relative API path (e.g., 'recipes' or '/users/me').
-   * @returns {Object|Array} The parsed JSON response.
-   * @throws {Error} If the API returns a non-200 status code.
-   */
   get(endpoint) {
-    const cleanPath = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
-    const url = `${this.config.BASE_URL}${cleanPath}`;
-    
-    const options = {
-      method: 'get',
-      headers: {
-        'Authorization': `Bearer ${this.config.TOKEN}`,
-        'Content-Type': 'application/json'
-      },
-      muteHttpExceptions: true
-    };
-
-    let attempts = 0;
-    const maxRetries = this.config.MAX_RETRIES || 3;
-
-    while (attempts <= maxRetries) {
-      try {
-        const response = UrlFetchApp.fetch(url, options);
-        const code = response.getResponseCode(); 
-
-        if (code === 200) {
-          return JSON.parse(response.getContentText());
-        }
-
-        // Handle rate limits or server errors
-        if (code === 429 || code >= 500) {
-          if (attempts === maxRetries) {
-            throw new Error(`API Failed after ${attempts} retries: ${code} - ${response.getContentText()}`);
-          }
-          Logger.verbose(`API ${code} on ${endpoint}. Retrying in ${Math.pow(2, attempts)}s...`);
-          Utilities.sleep(Math.pow(2, attempts) * 1000); // Exponential backoff: 1s, 2s, 4s
-          attempts++;
-          continue;
-        }
-
-        // Fatal Client Errors (400, 401, 403, 404) - Do not retry
-        throw new Error(`API Error [${code}]: ${response.getContentText()}`);
-
-      } catch (e) {
-        if (attempts === maxRetries) throw e;
-        Logger.verbose(`Network/Fetch Error: ${e.message}. Retrying...`);
-        Utilities.sleep(1000);
-        attempts++;
-      }
-    }
+    return this.client.get(endpoint);
   }
-  /**
-   * Fetches all records from a resource by automatically following pagination.
-   * @param {string} resourcePath - The resource endpoint (e.g., 'recipes').
-   * @returns {Array<Object>} An aggregated array of all items across all pages.
-   */
   fetchPaginated(resourcePath) {
-    let results = [];
-    let page = 1;
-    let hasMore = true;
-
-    while (hasMore) {
-      const separator = resourcePath.includes('?') ? '&' : '?';
-      const pathWithParams = `${resourcePath}${separator}page=${page}&per_page=${this.config.PER_PAGE}`;
-      
-      const json = this.get(pathWithParams);
-      let records = Array.isArray(json) ? json : (json.items || json.result || []);
-
-      if (records.length > 0) {
-        results = results.concat(records);
-        if (records.length < this.config.PER_PAGE) {
-          hasMore = false;
-        } else {
-          page++;
-        }
-      } else {
-        hasMore = false;
-      }
-
-      if (page % 5 === 0) Logger.verbose(`...fetched ${page} pages of ${resourcePath}`);
-      if (page > 500) {
-        Logger.notify(`Pagination limit reached for ${resourcePath}. Stopping at 50,000 records.`, true);
-        break; 
-      }
-    }
-    
-    console.log(`Fetched ${results.length} records for ${resourcePath}`);
-    return results;
+    return this.client.fetchPaginated(resourcePath);
   }
 }
 
@@ -672,1138 +544,53 @@ class DriveService{
  * @class
  * @classdesc Unified service for deep inspection of recipe logic / code.
  * Merges functionality from historical DependencyService and LogicService.
+ * 1zQz8lK_00xJiyVweBiNUfhr54HqAGY0isdck0lQCYyr134Xmm7fx_ahW
  */
 class RecipeAnalyzerService {
   /**
-   * @param {WorkatoClient} client
+   * @param {WorkatoClient} workatoClient
    */
   constructor(client) {
-    this.client = client;
-    this.constants = AppConfig.get().CONSTANTS;
-    /** @type {Map<string, Object>} */
-    this._recipeDetailCache = new Map();
+    // 1. Dependency injection (pass client to new lib)
+    this.engine = WorkatoGraphLib.newAnalyzer(workatoClient, {
+      MERMAID_LABEL_MAX: AppConfig.get().CONSTANTS.MERMAID_LABEL_MAX
+    });
   }
 
-  /**
-   * Fetches standard app connections and scans code for recipe calls.
-   * @returns {Array<Object>} List of objects { type, id, name }
-   */
+  // ----- Delegate methods -------------------------------------------------
   getDependencies(recipeId) {
-    let json;
-    try {
-      json = this.client.get(`recipes/${recipeId}`);
-    } catch (e) {
-      console.warn(`Could not fetch details for recipe ${recipeId}`);
-      return [];
-    }
-
-    let dependencies = [];
-
-    // 1. Standard apps
-    if (json.applications && Array.isArray(json.applications)) {
-      json.applications.forEach(app => {
-        if (!this.constants.RECIPE_PROVIDERS.includes(app)) {
-          dependencies.push({ type: 'Connection', id: app, name: app });
-        }
-      });
-    }
-
-    // 2. Recipe calls (deep scan)
-    if (json.code) {
-      try {
-        const codeObj = JSON.parse(json.code);
-        const rootBlock = codeObj.block || codeObj.line || [];
-        this._scanBlockForCalls(rootBlock, dependencies);
-      } catch (e) {
-        console.warn(`Error parsing code for recipe ${recipeId}: ${e.message}`);
-      }
-    }
-    return dependencies;
+    return this.engine.getDependencies(recipeId);
   }
-  /**
-   * Fetches recipe details with an in-run cache (reduce API calls).
-   * @param {string|number} recipeId
-   * @returns {Object|null}
-   */
-  getRecipeDetails(recipeId) {
-    const key = String(recipeId);
-    if (this._recipeDetailCache.has(key)) return this._recipeDetailCache.get(key);
-    try {
-      const json = this.client.get(`recipes/${key}`);
-      this._recipeDetailCache.set(key, json);
-      return json;
-    } catch (e) {
-      console.warn(`Could not fetch details for recipe ${key}: ${e.message}`);
-      return null;
-    }
-  }
-  /**
-   * Extracts recipe call edges for a given recipe.
-   * Foundation for transitive call graphs and process maps.
-   * @param {string|number} recipeId
-   * @returns {Array<Object>} edges
-   */
   getCallEdges(recipeId) {
-    const json = this.getRecipeDetails(recipeId);
-    if (!json || !json.code) return [];
-
-    let edges = [];
-    try {
-      const codeObj = JSON.parse(json.code);
-      const rootBlock = codeObj.block || codeObj.line || [];
-      this._scanBlockForCallEdges(rootBlock, edges, {
-        parentId: String(json.id || recipeId),
-        parentName: json.name || "",
-        stepPathPrefix: "",
-        branchStack: []
-      });
-    } catch (e) {
-      console.warn(`Error parsing call edges for recipe ${recipeId}: ${e.message}`);
-    }
-    return edges;
+    return this.engine.getCallEdges(recipeId);
   }
-  /**
-   * Builds transitive recipe call graph rooted at rootId up to depthLimit.
-   * Includes cycle detection, deduplication via "best remaining depth expanded".
-   * @param {string|number} rootId
-   * @param {number} depthLimit
-   * @returns {{ nodes: Map<string, {id:string,name:string}>, edges: Array<object, notes: string[] }}
-   */
-  buildTransitiveCallGraph(rootId, depthLimit) {
-    const nodes = new Map();
-    const edges = [];
-    const notes = [];
-
-    /** @type {Map<string, number>} */
-    const expandedAtDepth = new Map(); // id -> max remaining depth expanded
-
-    const expand = (id, remainingDepth, stack) => {
-      const key = String(id);
-      
-      // FIX 1: Ensure stack exists before checking includes (Safety check)
-      const currentStack = stack || [];
-      
-      if (currentStack.includes(key)) {
-        notes.push(`Cycle detected: ${currentStack.join(" -> ")} -> ${key}`);
-        return;
-      }
-
-      const prev = expandedAtDepth.get(key);
-      if (prev !== undefined && prev >= remainingDepth) return;
-      expandedAtDepth.set(key, remainingDepth);
-
-      const recipe = this.getRecipeDetails(key);
-      if (recipe) nodes.set(key, {id: key, name: recipe.name || "" });
-      else nodes.set(key, {id: key, name: ""});
-
-      const localEdges = this.getCallEdges(key);
-      localEdges.forEach(e => edges.push(e));
-
-      if (remainingDepth <= 0) return;
-
-      // FIX 2: Corrected typo 'concaat' to 'concat'
-      const nextStack = currentStack.concat([key]); 
-      
-      for (const e of localEdges) {
-        const child = String(e.child_recipe_id || "");
-        if (!child) continue;
-        // FIX 3: Passed 'nextStack' instead of undefined 'next'
-        expand(child, remainingDepth - 1, nextStack); 
-      }
-    };
-    expand(String(rootId), Math.max(0, Number(depthLimit || 0)), []);
-
-    return { nodes, edges, notes };
-  }
-  /**
-   * Renders a Mermaid flowchart for recipe call graph.
-   * @param {string|number} rootId
-   * @param {{ nodes: Map<string, {id:string,name:string}>, edges: Array<object, notes: string[] }} graph
-   * @returns {string}
-   */
-  renderMermaidCallGraph(rootId, graph) {
-    const normalizeNodeLabel = (s) => this._mNormalizeNodeLabel(s);
-    const normalizeEdgeLabel = (s) => this._mNormalizeEdgeLabel(s);
-
-    const lines = [];
-    lines.push("flowchart TD");
-
-    // Ensure root exists
-    const rootKey = String(rootId);
-    if (!graph.nodes.has(rootKey)) graph.nodes.set(rootKey, {id: rootKey, name: "" });
-
-    // Nodes
-    Array.from(graph.nodes.values()).forEach(n => {
-      const nodeId = `R${String(n.id).replace(/[^0-9a-zA-Z_]/g, "_")}`;
-      const label = normalizeNodeLabel(`${n.name || "Recipe"} (${n.id})`);
-      lines.push(`  ${nodeId}["${label}"]`);
-    });
-
-    const nodeRef = (id) => `R${String(id).replace(/[^0-9a-zA-Z_]/g, "_")}`;
-
-    // Edges (deduplicate)
-    const seen = new Set();
-    graph.edges.forEach(e => {
-      const p = String(e.parent_recipe_id || "");
-      const c = String(e.child_recipe_id || "");
-      if (!p || !c) return;
-
-      const labelBits = [];
-      if (e.branch_context) labelBits.push(normalizeEdgeLabel(e.branch_context));
-      if (e.step_name) labelBits.push(normalizeEdgeLabel(e.step_name));
-      const edgeLabel = labelBits.join(" · "); // "&#183; = mid-dot "·"
-
-      const sig = `${p}->${c}|${edgeLabel}`;
-      if (seen.has(sig)) return;
-      seen.add(sig);
-
-      const left = nodeRef(p);
-      const right = nodeRef(c);
-      if (edgeLabel) lines.push(` ${left} -->|${edgeLabel}| ${right}`);
-      else lines.push(` ${left} --> ${right}`);
-    });
-
-    return lines.join("\n");
-  }
-  /**
-   * Generates a flat list of spreadsheet rows representing the logic flow.
-   * @param {Object} recipe - Full recipe object.
-   */
   parseLogicRows(recipe) {
-    if (!recipe.code) return [];
-    let rows = [];
-    try {
-      const codeObj = JSON.parse(recipe.code);
-      const rootBlock = codeObj.block || codeObj.line || [];
-      this._scanBlockForLogic(rootBlock, 0, recipe.id, recipe.name, rows);
-    } catch (e) {
-      console.warn(`Error parsing logic for recipe ${recipe.id}: ${e.message}`);
-    }
-    return rows;
+    return this.engine.parseLogicRows(recipe);
   }
-  /**
-   * Builds a step-level process graph for a single recipe:
-   * - sequential flow
-   * - IF/ELSE branches
-   * - ON_ERROR branches
-   *
-   * @param {string|number} recipeId
-   * @param {{ maxNodes?: number }} [options]
-   * @returns {{ nodes: Map<string, any>, edges: Array<any>, notes: string[], meta: any }}
-   */
-  buildProcessGraph(recipeId, options = {}) {
-    const cfg = AppConfig.get();
-    const maxNodes = Number(options.maxNodes ?? cfg.API.PROCESS_MAP_MAX_NODES ?? 250);
-
-    const recipe = this.getRecipeDetails(recipeId);
-    const notes = [];
-    const nodes = new Map();
-    const edges = [];
-
-    const meta = {
-      recipe_id: String(recipe?.id || recipeId),
-      recipe_name: recipe?.name || ""
-    };
-
-    if (!recipe || !recipe.code) {
-      notes.push("No recipe code available.");
-      return { nodes, edges, notes, meta };
-    }
-
-    let codeObj = null;
-    try {
-      codeObj = (typeof recipe.code === "string") ? JSON.parse(recipe.code) : recipe.code;
-    } catch (e) {
-      notes.push(`Could not parse recipe code JSON: ${e.message}`);
-      return { nodes, edges, notes, meta };
-    }
-
-    const rootBlock = codeObj.block || codeObj.line || [];
-
-    const startId = this._pNodeId(`START_${meta.recipe_id}`);
-    const endId = this._pNodeId(`END_${meta.recipe_id}`);
-
-    this._pAddNode(nodes, startId, {
-      id: startId,
-      kind: "start",
-      provider: "system",
-      step_path: "",
-      label: `Start: ${meta.recipe_name || "Recipe"} (${meta.recipe_id})`,
-      branch_context: ""
-    });
-    this._pAddNode(nodes, endId, {
-      id: endId,
-      kind: "end",
-      provider: "system",
-      step_path: "",
-      label: "End",
-      branch_context: ""
-    });
-
-    const ctx = {
-      recipeId: meta.recipe_id,
-      branchStack: [],
-      stepPathPrefix: "",
-      maxNodes
-    };
-
-    const res = this._scanBlockForProcessGraph(rootBlock, ctx, { nodes, edges, notes }, startId, "");
-    const last = res?.last || startId;
-    this._pAddEdge(edges, last, endId, "", "flow");
-
-    // Cap notice (if we hit max nodes)
-    if (nodes.size >= maxNodes) {
-      notes.push(`Node cap reached (${maxNodes}). Diagram may be truncated.`);
-    }
-
-    return { nodes, edges, notes, meta };
+  getRecipeDetails(recipeId) {
+    return this.engine.getRecipeDetails(recipeId);
   }
-  /**
-   * Render a step-level process graph as Mermaid flowchart.
-   * @param {string|number} recipeId
-   * @param {{ nodes: Map<string, any>, edges: Array<any>, notes: string[], meta: any }} graph
-   * @returns {string}
-   */
-  renderMermaidProcessGraph(recipeId, graph) {
-    const lines = [];
-    lines.push("flowchart TD");
-
-    const normalizeNodeLabel = (s) => this._mNormalizeNodeLabel(s);
-    const normalizeEdgeLabel = (s) => this._mNormalizeEdgeLabel(s);
-
-    // Nodes
-    for (const n of Array.from(graph.nodes.values())) {
-      const id = n.id;
-      const label = normalizeNodeLabel(n.label || id);
-      const kind = String(n.kind || "step");
-
-      // Shapes: start/end=stadium, decision=diamond, call=subroutine, merge=circle-ish, default=rect
-      if (kind === "start" || kind === "end") {
-        lines.push(`  ${id}([\"${label}\"])`);
-      } else if (kind === "decision" || kind === "loop") {
-        lines.push(`  ${id}{\"${label}\"}`);
-      } else if (kind === "call") {
-        lines.push(`  ${id}[[\"${label}\"]]`);
-      } else if (kind === "merge") {
-        lines.push(`  ${id}((\"${label}\"))`);
-      } else {
-        lines.push(`  ${id}[\"${label}\"]`);
-      }
-    }
-
-    // Edges (deduplicate)
-    const seen = new Set();
-    for (const e of (graph.edges || [])) {
-      const from = e.from;
-      const to = e.to;
-      if (!from || !to) continue;
-      const lbl = e.label ? normalizeEdgeLabel(e.label) : "";
-      const sig = `${from}->${to}|${lbl}|${e.kind || ""}`;
-      if (seen.has(sig)) continue;
-      seen.add(sig);
-      if (lbl) lines.push(`  ${from} -->|${lbl}| ${to}`);
-      else lines.push(`  ${from} --> ${to}`);
-    }
-
-    return lines.join("\n");
-  }
-  /**
-   * Build a single analysis bundle: summaries + optional Mermaid.
-   * This is the "one thing" both Sheets export and Gemini prompts can consume.
-   *
-   * @param {string|number} rootId
-   * @param {{ callDepth?: number, maxNodes?: number, edgeSampleLimit?: number }} [options]
-   * @returns {{ root_id:string, root_name:string, call:any, process:any }}
-   */
-  buildGraphPack(rootId, options = {}) {
-    const cfg = AppConfig.get();
-    const depth = Number(options.callDepth ?? cfg.API.PROCESS_MAP_DEPTH ?? 0);
-    const maxNodes = Number(options.maxNodes ?? cfg.API.PROCESS_MAP_MAX_NODES ?? 250);
-    const edgeSampleLimit = Number(options.edgeSampleLimit ?? 60);
-
-    const rootRecipe = this.getRecipeDetails(rootId);
-    const rootName = rootRecipe?.name || "";
-
-    const callGraph = this.buildTransitiveCallGraph(rootId, depth);
-    const procGraph = this.buildProcessGraph(rootId, { maxNodes });
-
-    const callMermaid = this.renderMermaidCallGraph(rootId, callGraph);
-    const procMermaid = this.renderMermaidProcessGraph(rootId, procGraph);
-
-    return {
-      root_id: String(rootId),
-      root_name: rootName,
-      call: {
-        depth,
-        node_count: callGraph?.nodes?.size || 0,
-        edge_count: Array.isArray(callGraph?.edges) ? callGraph.edges.length : 0,
-        notes: (callGraph?.notes || []).slice(0, 20),
-        edges_sample: this._summarizeCallEdges(callGraph, edgeSampleLimit),
-        mermaid: callMermaid
-      },
-      process: {
-        maxNodes,
-        node_count: procGraph?.nodes?.size || 0,
-        edge_count: Array.isArray(procGraph?.edges) ? procGraph.edges.length : 0,
-        notes: (procGraph?.notes || []).slice(0, 20),
-        kind_counts: this._summarizeProcessKinds(procGraph),
-        call_targets: this._summarizeProcessCallTargets(procGraph, 12),
-        edges_sample: this._summarizeProcessEdges(procGraph, edgeSampleLimit),
-        mermaid: procMermaid
-      }
-    };
-  }
-
-  /** @private */
-  _summarizeCallEdges(callGraph, limit) {
-    const edges = Array.isArray(callGraph?.edges) ? callGraph.edges : [];
-    const nodes = callGraph?.nodes || new Map();
-    const nameOf = (id) => nodes.get(String(id))?.name || "";
-
-    return edges.slice(0, limit).map(e => {
-      const p = String(e.parent_recipe_id || "");
-      const c = String(e.child_recipe_id || "");
-      const bits = [];
-      if (e.branch_context) bits.push(e.branch_context);
-      if (e.step_name) bits.push(e.step_name);
-      const lbl = bits.filter(Boolean).join(" / ");
-      return `${nameOf(p) || "Recipe"} (${p}) -> ${nameOf(c) || "Recipe"} (${c})${lbl ? `  [${lbl}]` : ""}`;
-    });
-  }
-  /** @private */
-  _summarizeProcessKinds(procGraph) {
-    const out = { start: 0, end: 0, step: 0, decision: 0, loop: 0, call: 0, merge: 0, other: 0 };
-    const nodes = procGraph?.nodes ? Array.from(procGraph.nodes.values()) : [];
-    nodes.forEach(n => {
-      const k = String(n.kind || "other");
-      if (out[k] !== undefined) out[k] += 1;
-      else out.other += 1;
-    });
-    return out;
-  }
-  /** @private */
-  _summarizeProcessCallTargets(procGraph, limit) {
-    const nodes = procGraph?.nodes ? Array.from(procGraph.nodes.values()) : [];
-    const targets = [];
-    const seen = new Set();
-    nodes.forEach(n => {
-      if (String(n.kind) !== "call") return;
-      const m = String(n.label || "").match(/→\s*([0-9]+)/);
-      if (!m) return;
-      const id = m[1];
-      if (!seen.has(id)) {
-        seen.add(id);
-        targets.push(id);
-      }
-    });
-    return targets.slice(0, limit);
-  }
-  /** @private */
-  _summarizeProcessEdges(procGraph, limit) {
-    const edges = Array.isArray(procGraph?.edges) ? procGraph.edges : [];
-    return edges.slice(0, limit).map(e => {
-      const kind = e.kind ? ` (${e.kind})` : "";
-      const lbl = e.label ? ` [${e.label}]` : "";
-      return `${e.from} -> ${e.to}${lbl}${kind}`;
-    });
-  }
-
-  /** @private Helper for getDependencies */
-  _scanBlockForCalls(steps, resultsArray) {
-    if (!Array.isArray(steps)) return;
-
-    steps.forEach(step => {
-      if (this.constants.RECIPE_PROVIDERS.includes(step.provider)) {
-        const input = step.input || {};
-        const idKey = this.constants.FLOW_ID_KEYS.find(key => input[key]);
-
-        if (idKey) {
-          resultsArray.push({
-            type: 'RECIPE CALL',
-            id: input[idKey],
-            name: `Called via step: "${step.name || 'Unknown'}"`
-          });
-        }
-      }
-      // Recurse
-      if (step.block) this._scanBlockForCalls(step.block, resultsArray);
-      if (step.else_block) this._scanBlockForCalls(step.else_block, resultsArray);
-      if (step.error_block) this._scanBlockForCalls(step.error_block, resultsArray);
-    });
-  }
-  /** @private Helper for parseLogicRows */
-  _scanBlockForLogic(steps, indentLevel, recipeId, recipeName, rows) {
-    if (!Array.isArray(steps)) return;
-
-    steps.forEach((step, index) => {
-      const visualIndent = "> ".repeat(indentLevel);
-      
-      let actionName = step.name || step.as || "Unknown Action";
-      if (step.keyword) actionName = `[${step.keyword.toUpperCase()}] ${actionName}`;
-      
-      const description = step.description || step.comment || "";
-      const details = this._extractStepDetails(step);
-
-      rows.push([
-        String(recipeId),
-        recipeName,
-        index + 1,
-        visualIndent,
-        step.provider || "System",
-        actionName,
-        description,
-        details
-      ]);
-
-      if (step.block)       this._scanBlockForLogic(step.block, indentLevel + 1, recipeId, recipeName, rows);
-      if (step.else_block)  this._scanBlockForLogic(step.else_block, indentLevel + 1, recipeId, recipeName, rows);
-      if (step.error_block) this._scanBlockForLogic(step.error_block, indentLevel + 1, recipeId, recipeName, rows);
-    });
-  }
-  /** @private Helper for getCallEdges */
-  _scanBlockForCallEdges(steps, edges, ctx) {
-    if (!Array.isArray(steps)) return;
-
-    steps.forEach((step, index) => {
-      const stepPath = ctx.stepPathPrefix ? `${ctx.stepPathPrefix}/${index}` : `${index}`;
-
-      const input = step?.input || {};
-      const found = this._findIdKeyAndValue(input, this.constants.FLOW_ID_KEYS, 3);
-      const looksLikeRecipeCall = 
-        Boolean(found) || this.constants.RECIPE_PROVIDERS.includes(step?.provider);
-
-      if (looksLikeRecipeCall && found && found.value) {
-        edges.push({
-          parent_recipe_id: ctx.parentId,
-          parent_recipe_name: ctx.parentName,
-          child_recipe_id: String(found.value),
-          id_key: found.key,
-          provider: step.provider || "unknown",
-          step_name: step.name || step.as || "Unknown step",
-          step_path: stepPath,
-          branch_context: (ctx.branchStack || []).join(" / ")
-        });
-      }
-
-      // Hande branch context
-      const keyword = String(step?.keyword || "").toLowerCase();
-      const condSummary = (keyword === "if" || keyword === "elsif")
-        ? this._formatConditionSummary(step)
-        : "";
-
-      // Main
-      if (step.block) {
-        const nextStack = ctx.branchStack.slice();
-        if (keyword === "if" || keyword === "elsif") {
-          nextStack.push(`IF ${condSummary}`.trim());
-        }
-        this._scanBlockForCallEdges(step.block, edges, {
-          ...ctx,
-          stepPathPrefix: stepPath,
-          branchStack: nextStack
-        });
-      }
-
-      // Else block
-      if (step.else_block) {
-        const nextStack = ctx.branchStack.slice();
-        nextStack.push("ELSE");
-        this._scanBlockForCallEdges(step.else_block, edges, {
-          ...ctx,
-          stepPathPrefix: stepPath,
-          branchStack: nextStack
-        });
-      }
-
-      // Error block
-      if (step.error_block) {
-        const nextStack = ctx.branchStack.slice();
-        nextStack.push("ON_ERROR");
-        this._scanBlockForCallEdges(step.error_block, edges, {
-          ...ctx,
-          stepPathPrefix: stepPath,
-          branchStack: nextStack
-        });
-      }
-    });
-  }
-  /**
-   * Depth-limited search for recipe ID key/value inside step.input.
-   * Prioritizes common nests (like params) then falls back to small DFS.
-   * @private
-   */
-  _findIdKeyAndValue(obj, keys, depth) {
-    if (!obj || typeof obj !== "object") return null;
-    if (depth <= 0) return null;
-
-    // Direct keys
-    for (const k of keys) {
-      if (obj[k] !== undefined && obj[k] !== null && obj[k] !== "") {
-        return { key: k, value: obj[k] };
-      }
-    }
-
-    // Common nest, parameters
-    if (obj.parameters && typeof obj.parameters === "object") {
-      for (const k of keys) {
-        const v = obj.parameters[k];
-        if (v !== undefined && v !== null && v !== "") return { key: k, value: v };
-      }
-    }
-
-    // Shallow (bounded) DFS
-    for (const [k, v] of Object.entries(obj)) {
-      if (!v || typeof v !== "object") continue;
-      const hit = this._findIdKeyAndValue(v, keys, depth - 1);
-      if (hit) return hit;
-    }
-    return null;
-  }
-  /** @private Formats IF/ELSIF conditions into short readable str. */
-  _formatConditionSummary(step) {
-    try {
-      const conditions = step?.input?.conditions || [];
-      if (!Array.isArray(conditions) || conditions.length === 0) return "";
-      const parts = conditions.slice(0, 3).map(c => {
-        const lhs = this._cleanDataPill(c.lhs);
-        const rhs = this._cleanDataPill(c.rhs);
-        return `${lhs} ${c.operand} ${rhs}`.trim();
-      });
-      const joiner = (step?.input?.operand || "and").toUpperCase();
-      let summary = parts.join(` ${joiner}`);
-      if (conditions.length > 3) summary += " ...";
-      return summary;
-    } catch (_) {
-      return "";
-    }
-  }
-  /** @private Extracts details like IF conditions or SQL queries */
-  _extractStepDetails(step) {
-    let details = [];
-
-    // Conditionals
-    if (step.keyword === 'if' || step.keyword === 'elsif') {
-      const conditions = step.input?.conditions || [];
-      conditions.forEach(c => {
-        const lhs = this._cleanDataPill(c.lhs);
-        const rhs = this._cleanDataPill(c.rhs);
-        details.push(`Condition: ${lhs} ${c.operand} ${rhs}`);
-      });
-      if (step.input?.type === 'compound') {
-        details.push(`Logic: ${step.input.operand.toUpperCase()}`);
-      }
-    }
-
-    // Standard inputs
-    if (step.input) {
-      if (step.input.flow_id) details.push(`Call Recipe ID: ${step.input.flow_id}`);
-      
-      const keys = ['to', 'subject', 'from', 'table_id', 'sql', 'message'];
-      keys.forEach(key => {
-        if (step.input[key]) details.push(`${key}: ${this._cleanDataPill(step.input[key])}`);
-      });
-
-      if (step.input.parameters) {
-        Object.keys(step.input.parameters).forEach(key => {
-          const val = this._cleanDataPill(step.input.parameters[key]);
-          if(val) details.push(`Set '${key}' = ${val}`);
-        });
-      }
-    }
-    return details.join('\n');
-  }
-  /** @private Cleans Workato Data Pill strings: #{_dp(...)} */
-  _cleanDataPill(rawStr) {
-    if (!rawStr || typeof rawStr !== 'string') return rawStr;
-    const dpRegex = /#\{_dp\('(.*?)'\)\}/g;
-    return rawStr.replace(dpRegex, (match, innerJsonEscaped) => {
-      try {
-        const jsonStr = innerJsonEscaped.replace(/\\"/g, '"').replace(/\\\\/g, '\\');
-        const dpObj = JSON.parse(jsonStr);
-        if (dpObj.label) return `{{${dpObj.label}}}`;
-        if (dpObj.path && Array.isArray(dpObj.path)) {
-           const readablePath = dpObj.path.filter(p => typeof p === 'string' && !p.match(/^[0-9a-f-]{36}$/)).join('.');
-           return `{{${readablePath}}}`;
-        }
-        return "{{Unknown Variable}}";
-      } catch (e) { return "{{Variable}}"; }
-    });
-  }
-
-  // --- MERMAID INTERNALS -------------------------------------------------------------------------------
-  /** @private */
-  _mMaxLabel() {
-    const cfg = AppConfig.get();
-    return Number(cfg.CONSTANTS.MERMAID_LABEL_MAX || 80);
-  }
-  /** @private */
-  _mSafeBase(s) {
-    return String(s || "")
-      .replace(/\r?\n/g, " ")
-      .replace(/[\u0000-\u001F\u007F]/g, " ")
-      .trim();
-  }
-  /** @private Collapse Workato datapill blobs BEFORE truncation */
-  _mCollapseWorkato(s) {
-    return String(s || "").replace(/_dp\([^)]*\)/g, "{{dp}}");
-  }
-  /** @private Entity-style escapes per Mermaid flowchart docs */
-  _mEntityEscape(ch) {
-    const map = {
-      '"': "#quot;",
-      "'": "#39;",
-      "(": "#40;",
-      ")": "#41;",
-      "[": "#91;",
-      "]": "#93;",
-      "{": "#123;",
-      "}": "#125;",
-      "<": "#60;",
-      ">": "#62;",
-      "\\": "#92;",
-      "&": "#38;"
-    };
-    return map[ch] || ch;
-  }
-  /** @private */
-  _mTruncTo(s) {
-    const maxLabel = this._mMaxLabel();
-    const str = String(s || "");
-    return (str.length > maxLabel ? str.slice(0, Math.max(0, maxLabel - 3)) + "..." : str);
-  }
-  /** @private */
-  _mNormalizeNodeLabel(s) {
-    let str = this._mSafeBase(this._mCollapseWorkato(s));
-    str = str.replace(/"/g, "'");
-    str = str.replace(/\s+/g, " ").trim();
-    return this._mTruncTo(str);
-  }
-  /** @private */
-  _mNormalizeEdgeLabel(s) {
-    let str = this._mSafeBase(this._mCollapseWorkato(s));
-    str = str.replace(/\|/g, " / ");
-    str = str.replace(/["'(){}\[\]<>\\&]/g, (ch) => this._mEntityEscape(ch));
-    str = str.replace(/\s+/g, " ").trim();
-    return this._mTruncTo(str);
-  }
-
-  // --- PROCESS-GRAPH INTERNALS -------------------------------------------------------------------------
-  /** @private */
-  _pKeyword(step) {
-    return String(step?.keyword || "").toLowerCase();
-  }
-  /** @private */
-  _pIsIf(step) {
-    return this._pKeyword(step) === "if";
-  }
-  /** @private */
-  _pIsElsif(step) {
-    return this._pKeyword(step) === "elsif";
-  }
-  /** @private */
-  _pDecisionHeader(step) {
-    const kw = this._pKeyword(step);
-    return (kw === "elsif") ? "ELSIF" : "IF";
-  }
-  /** @private */
-  _pDecisionBranchLabel(step) {
-    const head = this._pDecisionHeader(step);
-    const cond = this._formatConditionSummary(step);
-    return cond ? `${head} ${cond}` : head;
-  }
-  /** @private Ensure Mermaid-safe node ids */
-  _pNodeId(raw) {
-    const safe = String(raw || "")
-      .replace(/[^0-9a-zA-Z_]/g, "_")
-      .replace(/^([0-9])/, "_$1");
-    return `N_${safe}`;
-  }
-  /** @private Add node with cap protection */
-  _pAddNode(nodes, id, node) {
-    if (!nodes.has(id)) nodes.set(id, node);
-  }
-  /** @private Add edge */
-  _pAddEdge(edges, from, to, label = "", kind = "flow") {
-    edges.push({ from, to, label, kind });
-  }
-  /** @private */
-  _pClassifyStep(step) {
-    const keyword = this._pKeyword(step);
-    if (this._pIsLoopStep(step)) return "loop";
-    if (keyword === "if" || keyword === "elsif") return "decision";
-
-    const provider = String(step?.provider || "");
-    const input = step?.input || {};
-    const found = this._findIdKeyAndValue(input, this.constants.FLOW_ID_KEYS, 3);
-    const looksLikeRecipeCall = Boolean(found?.value) || this.constants.RECIPE_PROVIDERS.includes(provider);
-    if (looksLikeRecipeCall) return "call";
-
-    return "step";
-  }
-  /** @private Heuristic loop detection */
-  _pIsLoopStep(step) {
-    const kw = this._pKeyword(step);
-    const name = String(step?.name || step?.as || "").toLowerCase();
-    // Keywords are not guaranteed, so we also look at common UI names.
-    const kwHit = ["repeat", "repeat_while", "repeat_each", "repeat_for_each", "for_each", "while", "until"].includes(kw);
-    const nameHit = name.includes("repeat") || name.includes("for each") || name.includes("foreach");
-    return kwHit || nameHit;
-  }
-  /** @private */
-  _pLoopLabel(step) {
-    const kw = this._pKeyword(step);
-    const name = step?.name || step?.as || "Loop";
-    const cond = this._formatConditionSummary(step);
-    // If it's a "repeat while"-style loop, condition summary is valuable.
-    if (kw.includes("while") || name.toLowerCase().includes("while")) {
-      return cond ? `REPEAT WHILE ${cond}` : "REPEAT WHILE";
-    }
-    // Otherwise, keep it simple and readable.
-    return String(name).toUpperCase();
-  }
-  /** @private */
-  _pStepLabel(step, kind) {
-    const name = step?.name || step?.as || "Unnamed step";
-    const provider = step?.provider || "System";
-    const keyword = step?.keyword ? `[${String(step.keyword).toUpperCase()}] ` : "";
-    if (kind === "call") {
-      const found = this._findIdKeyAndValue(step?.input || {}, this.constants.FLOW_ID_KEYS, 3);
-      const target = found?.value ? ` → ${found.value}` : "";
-      return `${keyword}${name}${target}`;
-    }
-    if (kind === "decision") {
-      const head = this._pDecisionHeader(step);
-      const cond = this._formatConditionSummary(step);
-      return cond ? `${head} ${cond}` : `${head}`;
-    }
-    if (kind === "loop") {
-      return this._pLoopLabel(step);
-    }
-    return `${keyword}${name} (${provider})`;
-  }
-  /**
-   * Walk a block and build control-flow edges.
-   *
-   * @private
-   * @param {Array<any>} steps
-   * @param {{ recipeId: string, branchStack: string[], stepPathPrefix: string, maxNodes: number }} ctx
-   * @param {{ nodes: Map<string, any>, edges: Array<any>, notes: string[] }} graph
-   * @param {string} entryFromNodeId
-   * @param {string} entryEdgeLabel
-   * @returns {{ first: string|null, last: string }}
-   */
-  _scanBlockForProcessGraph(steps, ctx, graph, entryFromNodeId, entryEdgeLabel = "") {
-    if (!Array.isArray(steps) || steps.length === 0) {
-      return { first: null, last: entryFromNodeId };
-    }
-
-    let prev = entryFromNodeId;
-    let first = null;
-
-    for (let index = 0; index < steps.length; index++) {
-      if (graph.nodes.size >= ctx.maxNodes) {
-        graph.notes.push(`Stopped parsing at node cap (${ctx.maxNodes}).`);
-        break;
-      }
-
-      const step = steps[index];
-      const stepPath = ctx.stepPathPrefix ? `${ctx.stepPathPrefix}/${index}` : `${index}`;
-      const kind = this._pClassifyStep(step);
-      const kw = this._pKeyword(step);
-
-      // Loop handling (Repeat while / Repeat for each / etc)
-      if (kind === "loop") {
-        const loopId = this._pNodeId(`S_${ctx.recipeId}_${stepPath}`);
-        this._pAddNode(graph.nodes, loopId, {
-          id: loopId,
-          kind: "loop",
-          provider: step?.provider || "system",
-          step_path: stepPath,
-          label: this._pStepLabel(step, "loop"),
-          branch_context: (ctx.branchStack || []).join(" / ")
-        });
-
-        // Connect prev -> loop
-        const isFirstEdge = (prev === entryFromNodeId && !first);
-        if (isFirstEdge && entryEdgeLabel) this._pAddEdge(graph.edges, prev, loopId, entryEdgeLabel, "flow");
-        else this._pAddEdge(graph.edges, prev, loopId, "", "flow");
-        if (!first) first = loopId;
-
-        // Loop body (iterate)
-        const loopCtx = {
-          ...ctx,
-          stepPathPrefix: stepPath,
-          branchStack: (ctx.branchStack || []).slice().concat([`LOOP ${this._pLoopLabel(step)}`])
-        };
-        const bodyRes = this._scanBlockForProcessGraph(step.block || [], loopCtx, graph, loopId, "iterate");
-
-        // Back-edge to represent repetition
-        if (bodyRes.first) {
-          this._pAddEdge(graph.edges, bodyRes.last, loopId, "repeat", "loop");
-        } else {
-          graph.notes.push(`Loop body empty at step_path=${stepPath}`);
-        }
-
-        // Exit/merge after loop
-        const afterLoopId = this._pNodeId(`M_${ctx.recipeId}_${stepPath}_after_loop`);
-        this._pAddNode(graph.nodes, afterLoopId, {
-          id: afterLoopId,
-          kind: "merge",
-          provider: "system",
-          step_path: `${stepPath}/after_loop`,
-          label: "After loop",
-          branch_context: (ctx.branchStack || []).join(" / ")
-        });
-
-        // "done" edge (conceptual exit)
-        this._pAddEdge(graph.edges, loopId, afterLoopId, "done", "flow");
-
-        // Optional else_block (often conceptually "empty list" / "no more")
-        if (Array.isArray(step.else_block) && step.else_block.length > 0) {
-          const elseCtx = {
-            ...ctx,
-            stepPathPrefix: `${stepPath}/else`,
-            branchStack: (ctx.branchStack || []).slice().concat(["LOOP_ELSE"])
-          };
-          const elseRes = this._scanBlockForProcessGraph(step.else_block, elseCtx, graph, loopId, "empty");
-          const elseExit = elseRes.first ? elseRes.last : loopId;
-          this._pAddEdge(graph.edges, elseExit, afterLoopId, "", "flow");
-        }
-
-        prev = afterLoopId;
-        continue;
-      }
-
-      // Decision handling (IF/ELSIF w/chain grouping)
-      // If we see an IF followed by one or more sibling ELSIF steps, treat them as one chain.
-      if (kind === "decision" && kw === "if") {
-        const chain = [{ step, stepPath }];
-        let j = index + 1;
-        while (j < steps.length && this._pIsElsif(steps[j])) {
-          const p = ctx.stepPathPrefix ? `${ctx.stepPathPrefix}/${j}` : `${j}`;
-          chain.push({ step: steps[j], stepPath: p });
-          j++;
-        }
-
-        // Only treat as a chain if we actually found ELSIF siblings
-        if (chain.length > 1) {
-          // Create decision nodes for IF and each ELSIF, wiring false-path to the next condition.
-          let lastDecisionId = null;
-          const thenExits = [];
-
-          for (let ci = 0; ci < chain.length; ci++) {
-            const c = chain[ci];
-            const decisionId = this._pNodeId(`S_${ctx.recipeId}_${c.stepPath}`);
-            this._pAddNode(graph.nodes, decisionId, {
-              id: decisionId,
-              kind: "decision",
-              provider: c.step?.provider || "system",
-              step_path: c.stepPath,
-              label: this._pStepLabel(c.step, "decision"),
-              branch_context: (ctx.branchStack || []).join(" / ")
-            });
-
-            // Connect into the first decision from prev, and subsequent decisions from prior false-path.
-            if (ci === 0) {
-              const isFirstEdge = (prev === entryFromNodeId && !first);
-              if (isFirstEdge && entryEdgeLabel) this._pAddEdge(graph.edges, prev, decisionId, entryEdgeLabel, "flow");
-              else this._pAddEdge(graph.edges, prev, decisionId, "", "flow");
-              if (!first) first = decisionId;
-            } else {
-              // prior decision false -> next decision
-              this._pAddEdge(graph.edges, lastDecisionId, decisionId, "false", "flow");
-            }
-
-            // THEN branch for this condition
-            const thenCtx = {
-              ...ctx,
-              stepPathPrefix: c.stepPath,
-              branchStack: (ctx.branchStack || []).slice().concat([this._pDecisionBranchLabel(c.step)])
-            };
-            const thenRes = this._scanBlockForProcessGraph(c.step.block || [], thenCtx, graph, decisionId, "true");
-            thenExits.push(thenRes.first ? thenRes.last : decisionId);
-
-            lastDecisionId = decisionId;
-          }
-
-          // ELSE (final false) comes from the last decision's else_block (if any).
-          // Prefer the IF's else_block; if absent, take first else_block found in chain.
-          let elseBlock = chain[0].step?.else_block;
-          if (!Array.isArray(elseBlock) || elseBlock.length === 0) {
-            for (const c of chain) {
-              if (Array.isArray(c.step?.else_block) && c.step.else_block.length > 0) {
-                elseBlock = c.step.else_block;
-                break;
-              }
-            }
-          }
-
-          // Merge node for the entire chain
-          const chainMergeId = this._pNodeId(`M_${ctx.recipeId}_${chain[0].stepPath}_chain_merge`);
-          this._pAddNode(graph.nodes, chainMergeId, {
-            id: chainMergeId,
-            kind: "merge",
-            provider: "system",
-            step_path: `${chain[0].stepPath}/chain_merge`,
-            label: "Merge",
-            branch_context: (ctx.branchStack || []).join(" / ")
-          });
-
-          // Connect all THEN exits into the chain merge
-          thenExits.forEach(exitId => this._pAddEdge(graph.edges, exitId, chainMergeId, "", "flow"));
-
-          // ELSE path: either a real else_block or direct false->merge
-          if (Array.isArray(elseBlock) && elseBlock.length > 0) {
-            const elseCtx = {
-              ...ctx,
-              stepPathPrefix: `${chain[0].stepPath}/else`,
-              branchStack: (ctx.branchStack || []).slice().concat(["ELSE"])
-            };
-            const elseRes = this._scanBlockForProcessGraph(elseBlock, elseCtx, graph, lastDecisionId, "false");
-            const elseExit = elseRes.first ? elseRes.last : lastDecisionId;
-            this._pAddEdge(graph.edges, elseExit, chainMergeId, "", "flow");
-          } else {
-            this._pAddEdge(graph.edges, lastDecisionId, chainMergeId, "false", "flow");
-          }
-
-          prev = chainMergeId;
-          // Skip over the ELSIF siblings we've consumed
-          index = j - 1;
-          continue;
-        }
-      }
-
-      // Single decision (standalone IF or standalone ELSIF)
-      if (kind === "decision") {
-        const decisionId = this._pNodeId(`S_${ctx.recipeId}_${stepPath}`);
-        this._pAddNode(graph.nodes, decisionId, {
-          id: decisionId,
-          kind: "decision",
-          provider: step?.provider || "system",
-          step_path: stepPath,
-          label: this._pStepLabel(step, kind),
-          branch_context: (ctx.branchStack || []).join(" / ")
-        });
-
-        // entry edge from prev -> decision
-        const isFirstEdge = (prev === entryFromNodeId && !first);
-        if (isFirstEdge && entryEdgeLabel) this._pAddEdge(graph.edges, prev, decisionId, entryEdgeLabel, "flow");
-        else this._pAddEdge(graph.edges, prev, decisionId, "", "flow");
-        if (!first) first = decisionId;
-
-        // THEN block
-        const thenCtx = {
-          ...ctx,
-          stepPathPrefix: stepPath,
-          branchStack: (ctx.branchStack || []).slice().concat([this._pDecisionBranchLabel(step)])
-        };
-        const thenRes = this._scanBlockForProcessGraph(step.block || [], thenCtx, graph, decisionId, "true");
-
-        // ELSE block
-        const elseCtx = {
-          ...ctx,
-          stepPathPrefix: `${stepPath}/else`,
-          branchStack: (ctx.branchStack || []).slice().concat(["ELSE"])
-        };
-        const elseRes = this._scanBlockForProcessGraph(step.else_block || [], elseCtx, graph, decisionId, "false");
-
-        // Merge
-        const mergeId = this._pNodeId(`M_${ctx.recipeId}_${stepPath}_merge`);
-        this._pAddNode(graph.nodes, mergeId, {
-          id: mergeId,
-          kind: "merge",
-          provider: "system",
-          step_path: `${stepPath}/merge`,
-          label: "Merge",
-          branch_context: (ctx.branchStack || []).join(" / ")
-        });
-
-        // Connect branch ends to merge (if branch empty, connect decision to merge)
-        this._pAddEdge(graph.edges, (thenRes.first ? thenRes.last : decisionId), mergeId, "", "flow");
-        this._pAddEdge(graph.edges, (elseRes.first ? elseRes.last : decisionId), mergeId, "", "flow");
-
-        prev = mergeId;
-        continue;
-      }
-
-      // Normal step node
-      const nodeId = this._pNodeId(`S_${ctx.recipeId}_${stepPath}`);
-      this._pAddNode(graph.nodes, nodeId, {
-        id: nodeId,
-        kind,
-        provider: step?.provider || "system",
-        step_path: stepPath,
-        label: this._pStepLabel(step, kind),
-        branch_context: (ctx.branchStack || []).join(" / ")
-      });
-
-      const isFirstEdge = (prev === entryFromNodeId && !first);
-      if (isFirstEdge && entryEdgeLabel) this._pAddEdge(graph.edges, prev, nodeId, entryEdgeLabel, "flow");
-      else this._pAddEdge(graph.edges, prev, nodeId, "", "flow");
-      if (!first) first = nodeId;
-
-      // Optional nested block (treated as sequential continuation)
-      let mainExit = nodeId;
-      if (Array.isArray(step.block) && step.block.length > 0) {
-        const childCtx = {
-          ...ctx,
-          stepPathPrefix: stepPath,
-          branchStack: (ctx.branchStack || []).slice()
-        };
-        const childRes = this._scanBlockForProcessGraph(step.block, childCtx, graph, nodeId, "");
-        mainExit = childRes.last || nodeId;
-      }
-
-      // Error branch
-      if (Array.isArray(step.error_block) && step.error_block.length > 0) {
-        const mergeId = this._pNodeId(`M_${ctx.recipeId}_${stepPath}_err_merge`);
-        this._pAddNode(graph.nodes, mergeId, {
-          id: mergeId,
-          kind: "merge",
-          provider: "system",
-          step_path: `${stepPath}/err_merge`,
-          label: "Merge",
-          branch_context: (ctx.branchStack || []).join(" / ")
-        });
-
-        // OK path
-        this._pAddEdge(graph.edges, mainExit, mergeId, "ok", "flow");
-
-        // Error path
-        const errCtx = {
-          ...ctx,
-          stepPathPrefix: `${stepPath}/error`,
-          branchStack: (ctx.branchStack || []).slice().concat(["ON_ERROR"])
-        };
-        const errRes = this._scanBlockForProcessGraph(step.error_block, errCtx, graph, nodeId, "error");
-        const errExit = errRes.first ? errRes.last : nodeId;
-        this._pAddEdge(graph.edges, errExit, mergeId, "", "flow");
-
-        prev = mergeId;
-      } else {
-        prev = mainExit;
-      }
-    }
-
-    return { first, last: prev };
+  buildGraphPack(rootId, options) {
+    return this.engine.buildGraphPack(rootId, options);
   }
 }
 /**
  * @class
- * @classdesc Service for interacting with Google Vertex AI (Gemini).
+ * @classdesc Service for interacting with Google Vertex AI via the GeminiClient library.
+ * 1mc_Jm9FmSo2yMzjAaVdtD7Ww95Fa2RPLQ1-4Kb5kTtEwkuSfrOBCIzKZ
  */
 class GeminiService {
   constructor() {
-    this.config = AppConfig.get().VERTEX;
+    const config = AppConfig.get().VERTEX;
+    this.config = config;
 
-    this.projectId = this.config.GOOGLE_CLOUD_PROJECT_ID;
-    this.modelId = this.config.MODEL_ID;
-    this.location = this.config.LOCATION;
-    this.generationConfig = this.config.GENERATION_CONFIG;
+    this.client = GeminiLib.newClient(
+      config.GOOGLE_CLOUD_PROJECT_ID,
+      config.LOCATION,
+      config.MODEL_ID
+    );
 
-    if (!this.projectId) {
-      console.warn("GeminiService: 'GOOGLE_CLOUD_PROJECT_ID' is missing in Script Properties.");
-    }
+    this.genConfig = config.GENERATION_CONFIG;
   }
   /**
    * Generates a natural language summary of a Workato recipe.
@@ -1811,12 +598,13 @@ class GeminiService {
    * @returns {string} The AI-generated summary.
    */
   explainRecipe(recipe, graphPack = null, logicDigest = "") {
-    if (!this.projectId) throw new Error("Missing GOOGLE_CLOUD_PROJECT_ID in Script Properties");
-
     const ctx = this._prepareContext(recipe, graphPack, logicDigest);
     const prompt = this._buildPrompt(ctx);
-
-    return this._callVertexAI(prompt);
+    
+    // Delegate to library
+    return this.client.generateContent(prompt, {
+      generationConfig: this.genConfig
+    });
   }
   /**
    * Returns a structured analysis object (JSON) so we can split into columns.
@@ -1825,16 +613,21 @@ class GeminiService {
   explainRecipeStructured(recipe, graphPack = null, logicDigest = "") {
     const ctx = this._prepareContext(recipe, graphPack, logicDigest);
     const prompt = this._buildStructuredPrompt(ctx);
-    const raw = this._callVertexAI(prompt);
-    const obj = this._extractJsonObject(raw);
-    return obj || {
-      objective: "",
-      trigger: "",
+
+    // Delegate to Library (using the structured helper)
+    const result = this.client.generateStructured(prompt, {
+      generationConfig: this.genConfig
+    });
+
+    // Fallback if AI fails to return valid JSON
+    return result || {
+      objective: "Analysis failed",
+      trigger: "Unknown",
       high_level_flow: [],
       hotspots: [],
       external_apps: [],
       called_recipes: [],
-      risks_notes: []
+      risks_notes: ["AI output could not be parsed."]
     };
   }
   
@@ -1979,90 +772,6 @@ class GeminiService {
       Process graph edges sample:
       ${(proc.edges_sample || []).join("\n")}
       `.trim();
-  }
-  /** @private Extract a JSON object from model output (handles occasional wrapping). */
-  _extractJsonObject(text) {
-    if (!text) return null;
-    let t = String(text).trim();
-
-    // Strip ```json fences if the model "cheats"
-    t = t.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```$/i, "").trim();
-
-    // If there's extra text, take the first {...} block.
-    const first = t.indexOf("{");
-    const last = t.lastIndexOf("}");
-    if (first === -1 || last === -1 || last <= first) return null;
-
-    const candidate = t.slice(first, last + 1);
-    try {
-      const obj = JSON.parse(candidate);
-      return obj && typeof obj === "object" ? obj : null;
-    } catch (_) {
-      return null;
-    }
-  }
-  /**
-   * Executes the API call to Vertex AI.
-   * @private
-   */
-  _callVertexAI(textPrompt) {
-    const endpoint = `https://${this.location}-aiplatform.googleapis.com/v1/projects/${this.projectId}/locations/${this.location}/publishers/google/models/${this.modelId}:generateContent`;
-    
-    const payload = {
-      contents: [{
-        role: "user",
-        parts: [{ text: textPrompt }]
-      }],
-      generationConfig: {
-        temperature: this.generationConfig.TEMPERATURE,
-        maxOutputTokens: this.generationConfig.MAX_OUTPUT_TOKENS
-      }
-    };
-
-    const options = {
-      method: 'post',
-      contentType: 'application/json',
-      payload: JSON.stringify(payload),
-      headers: {
-        // Apps Script automatically handles the OAuth token for Google services
-        Authorization: `Bearer ${ScriptApp.getOAuthToken()}`
-      },
-      muteHttpExceptions: true
-    };
-
-    const maxRetries = Number(this.config.MAX_RETRIES || 3);
-    let attempt = 0;
-    while (attempt <= maxRetries) {
-      try {
-        const response = UrlFetchApp.fetch(endpoint, options);
-        const code = response.getResponseCode();
-        const json = JSON.parse(response.getContentText());
-
-        if (json.error) {
-          // Retry 429 / 5xx (Gemini throttles happen)
-          if (code === 429 || code >= 500) {
-            if (attempt === maxRetries) throw new Error(`Vertex AI Error: ${json.error.message}`);
-            Utilities.sleep(Math.pow(2, attempt) * 1000);
-            attempt++;
-            continue;
-          }
-          throw new Error(`Vertex AI Error: ${json.error.message}`);
-        }
-      
-        if (json.candidates && json.candidates[0] && json.candidates[0].content) {
-          return json.candidates[0].content.parts[0].text;
-        }
-        return "No content generated.";
-
-      } catch (e) {
-        if (attempt === maxRetries) {
-          console.error(e);
-          return `AI Analysis Failed: ${e.message}`;
-        }
-        Utilities.sleep(Math.pow(2, attempt) * 1000);
-        attempt++;
-      }
-    }
   }
 }
   
@@ -2277,6 +986,7 @@ class DataMapper {
  * @class
  * @classdesc Main Application Controller.
  * * Orchestrates the fetching, transformation, and writing of Workato data.
+ * * 1sl2ZfkgwX57EIygRwEP7nkXTK8BEXaB60cnFKsqhg2DWic3V0SVAzrYS
  */
 class WorkatoSyncApp {
   constructor() {
@@ -2523,17 +1233,12 @@ class WorkatoSyncApp {
     Logger.notify("AI analysis complete.");
   }
   /**
-   * Reads recipe IDs from 'logic_requests' and generates process maps.
-   * Modes:
-   * - "calls"      : transitive recipe-call graph only
-   * - "full"       : step-level process map only
-   * - "calls+full" : both
-   *
-   * @param {{ mode?: string, callDepth?: number, maxNodes?: number, exportTables?: boolean }} [options]
+   * Reads recipe IDs from 'logic_requests' and generates process maps using the Library.
+   * @param {{ mode?: string, callDepth?: number, maxNodes?: number }} [options]
    */
   runProcessMaps(options = {}) {
     try {
-      Logger.verbose("Starting process map generation...");
+      Logger.verbose("Starting process map generation (v2 - Library)...");
 
       const requestedIds = (Array.isArray(idsOverride) && idsOverride.length > 0)
         ? idsOverride
@@ -2547,71 +1252,51 @@ class WorkatoSyncApp {
       const mode = String(options.mode || this.config.API.PROCESS_MAP_MODE_DEFAULT || "calls+full");
       const depth = Number(options.callDepth ?? this.config.API.PROCESS_MAP_DEPTH ?? 0);
       const maxNodes = Number(options.maxNodes ?? this.config.API.PROCESS_MAP_MAX_NODES ?? 250);
-      const exportTables = (options.exportTables !== undefined)
-        ? Boolean(options.exportTables)
-        : Boolean(this.config.API.PROCESS_MAP_EXPORT_TABLES);
-
       const CHAR_LIMIT = this.config.CONSTANTS.CELL_CHAR_LIMIT || 48000;
 
       const rows = [this.config.HEADERS.PROCESS_MAPS];
-      const nodeRows = [this.config.HEADERS.PROCESS_NODES];
-      const edgeRows = [this.config.HEADERS.PROCESS_EDGES];
 
       requestedIds.forEach((rootId, idx) => {
-        const rootRecipe = this.analyzerService.getRecipeDetails(rootId);
-        const rootName = rootRecipe?.name || "";
+        // 1. Generate via Library (Fetch once, build both)
+        const pack = this.analyzerService.buildGraphPack(rootId, { 
+          callDepth: depth, 
+          maxNodes: maxNodes 
+        });
 
+        const rootName = pack.root_name || "";
         let callMermaid = "";
         let fullMermaid = "";
         let notes = [];
         let callDriveLink = "";
         let fullDriveLink = "";
 
-        // --- Calls graph ---
-        if (mode === "calls" || mode === "calls+full") {
-          const callGraph = this.analyzerService.buildTransitiveCallGraph(rootId, depth);
-          callMermaid = this.analyzerService.renderMermaidCallGraph(rootId, callGraph);
-          notes = notes.concat((callGraph.notes || []).slice(0, 10));
+        // 2. Extract Call Graph Mermaid
+        if (mode.includes("calls")) {
+          callMermaid = pack.call.mermaid || "";
+          notes = notes.concat(pack.call.notes || []);
 
           if (callMermaid.length > CHAR_LIMIT) {
-            const url = this.driveService.saveText(rootId, rootName || `recipe_${rootId}`, "calls.mmd", callMermaid);
-            if (url) {
-              callDriveLink = `=HYPERLINK("${url}", "View calls mermaid")`;
-              callMermaid = callMermaid.substring(0, Math.max(0, CHAR_LIMIT - 200)) + "\n...TRUNCATED IN SHEET (see Drive link).";
-              notes.push("Calls mermaid truncated in cell due to cell limits.");
-            } else {
-              callMermaid = callMermaid.substring(0, Math.max(0, CHAR_LIMIT - 200)) + "\n...TRUNCATED IN SHEET (Drive save failed).";
-              notes.push("Calls mermaid truncated in sheet; Drive save failed.");
-            }
+            const url = this.driveService.saveText(rootId, rootName, "calls.mmd", callMermaid);
+            callDriveLink = url ? `=HYPERLINK("${url}", "View calls mermaid")` : "Save failed";
+            callMermaid = callMermaid.substring(0, CHAR_LIMIT - 200) + "\n...(TRUNCATED)";
+            notes.push("Calls mermaid truncated.");
           }
         }
 
-        // --- Full process map ---
-        if (mode === "full" || mode === "calls+full") {
-          const procGraph = this.analyzerService.buildProcessGraph(rootId, { maxNodes });
-          fullMermaid = this.analyzerService.renderMermaidProcessGraph(rootId, procGraph);
-          notes = notes.concat((procGraph.notes || []).slice(0, 10));
-
-          if (exportTables) {
-            nodeRows.push(...DataMapper.mapProcessNodesToRows(rootId, rootName, procGraph));
-            edgeRows.push(...DataMapper.mapProcessEdgesToRows(rootId, procGraph));
-          }
+        // 3. Extract Process Graph Mermaid
+        if (mode.includes("full")) {
+          fullMermaid = pack.process.mermaid || "";
+          notes = notes.concat(pack.process.notes || []);
 
           if (fullMermaid.length > CHAR_LIMIT) {
-            const url = this.driveService.saveText(rootId, rootName || `recipe_${rootId}`, "full.mmd", fullMermaid);
-            if (url) {
-              fullDriveLink = `=HYPERLINK("${url}", "View full mermaid")`;
-              fullMermaid = fullMermaid.substring(0, Math.max(0, CHAR_LIMIT - 200)) + "\n...TRUNCATED IN SHEET (see Drive link).";
-              notes.push("Full mermaid truncated in cell due to cell limits.");
-            } else {
-              fullMermaid = fullMermaid.substring(0, Math.max(0, CHAR_LIMIT - 200)) + "\n...TRUNCATED IN SHEET (Drive save failed).";
-              notes.push("Full mermaid truncated in sheet; Drive save failed.");
-            }
+            const url = this.driveService.saveText(rootId, rootName, "full.mmd", fullMermaid);
+            fullDriveLink = url ? `=HYPERLINK("${url}", "View full mermaid")` : "Save failed";
+            fullMermaid = fullMermaid.substring(0, CHAR_LIMIT - 200) + "\n...(TRUNCATED)";
+            notes.push("Full mermaid truncated.");
           }
         }
 
-        const notesCell = notes.filter(Boolean).slice(0, 20).join("\n");
-
+        // 4. Aggregate Row
         rows.push([
           String(rootId),
           rootName,
@@ -2619,7 +1304,7 @@ class WorkatoSyncApp {
           String(depth),
           callMermaid,
           fullMermaid,
-          notesCell,
+          notes.slice(0, 20).join("\n"),
           callDriveLink,
           fullDriveLink,
           new Date().toISOString()
@@ -2629,11 +1314,8 @@ class WorkatoSyncApp {
       });
 
       this.sheetService.write('PROCESS_MAPS', rows);
-      if (exportTables) {
-        this.sheetService.write('PROCESS_NODES', nodeRows);
-        this.sheetService.write('PROCESS_EDGES', edgeRows);
-      }
       Logger.notify("Process maps generated.");
+
     } catch (e) {
       this._handleError(e);
     }
