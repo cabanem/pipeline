@@ -1302,7 +1302,7 @@ class WorkatoSyncApp {
 
         } catch (e) {
           console.warn(`Failed ID ${reqId}: ${e.message}`);
-          logicRows.push([reqId, "ERROR", "-", "-", "-", e.message, "-"]);
+          logicRows.push([reqId, "ERROR", "-", "-", "-", "-", String(e.message || e), "-"]);
         }
         
         // Throttle
@@ -1419,7 +1419,12 @@ class WorkatoSyncApp {
 
       } catch (e) {
         console.error(e);
-        rows.push([String(id), "Error", String(e.message || e), "", "", "", "", new Date().toISOString()]);
+        const errRow = Array(this.config.HEADERS.AI_ANALYSIS.length).fill("");
+        errRow[0] = String(id);
+        errRow[1] = "Error";
+        errRow[2] = String(e.message || e);
+        errRow[14] = new Date().toISOString(); // Timestamp column
+        rows.push(errRow);
       }
 
       if (idx % 2 === 0) Utilities.sleep(this.config.API.THROTTLE_MS);
