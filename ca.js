@@ -257,6 +257,7 @@ class InventoryService {
   getFoldersRecursive(projects) {
     let allFolders = [];
     let queue = [];
+    let qIndex = 0; // FIFO without O(n) shift()
     let processedIds = new Set();
     const MAX_CALLS = this.config.API.MAX_CALLS;
 
@@ -280,7 +281,13 @@ class InventoryService {
     }
 
     // PHASE 2: Home Folders
-    const globalFolders = this._fetchFolderBatch('folders');
+    let globalFolders = [];
+    try {
+      // Prefer complete root set; fall back to legacy single-batch on error
+      globalFolders = this.client.fetchPaginated('folders');
+    } catch (e) {
+      globalFolders = this._fetchFolderBatch('folders');
+    }
     globalFolders.forEach(f => {
       if (!processedIds.has(f.id)) {
         allFolders.push(f);
@@ -291,8 +298,8 @@ class InventoryService {
 
     // PHASE 3: Recursion
     let safetyCounter = 0;
-    while (queue.length > 0 && safetyCounter < MAX_CALLS) {
-      let parentId = queue.shift();
+    while (qIndex < queue.length && safetyCounter < MAX_CALLS) {
+      let parentId = queue[qIndex++];
       let page = 1;
       let hasMore = true;
 
@@ -444,8 +451,13 @@ class SheetService {
 
     const startRow = sheet.getLastRow() + 1;
     const numRows = rows.length;
-    const numCols = rows[0].length; 
-    sheet.getRange(startRow, 1, numRows, numCols).setValues(rows);
+    const maxCols = rows.reduce((m, r) => Math.max(m, (r ? r.length : 0)), 0);
+    const normalized = rows.map(r => {
+      const row = Array.isArray(r) ? r.slice() : [];
+      while (row.length < maxCols) row.push("");
+      return row;
+    });
+    sheet.getRange(startRow, 1, numRows, maxCols).setValues(normalized);
   }
 }
 /**
@@ -552,11 +564,11 @@ class DriveService{
  */
 class RecipeAnalyzerService {
   /**
-   * @param {WorkatoClient} workatoClient
+   * @param {WorkatoClient} client
    */
   constructor(client) {
     // 1. Dependency injection (pass client to new lib)
-    this.engine = WorkatoGraphLib.newAnalyzer(workatoClient, {
+    this.engine = WorkatoGraphLib.newAnalyzer(client, {
       MERMAID_LABEL_MAX: AppConfig.get().CONSTANTS.MERMAID_LABEL_MAX
     });
   }
@@ -996,6 +1008,7 @@ class WorkatoSyncApp {
   constructor() {
     this.config = AppConfig.get();
     const client = new WorkatoClient();
+    this.client = client; // keep a stable direct fetch handle
     this.inventoryService = new InventoryService(client);
     this.analyzerService = new RecipeAnalyzerService(client);
     this.sheetService = new SheetService();
@@ -1072,13 +1085,14 @@ class WorkatoSyncApp {
   /**
    * Reads specific IDs from the input sheet and fetches step-by-step logic.
    */
-  runLogicDebug() {
+  runLogicDebug(idsOverride = null) {
     try {
       Logger.verbose("Starting recipe logic debugging...");
       
       // 1. Read input 
       const requestedIds = (Array.isArray(idsOverride) && idsOverride.length > 0)
-        ? idsOverride : this.sheetService.readRequests();
+        ? idsOverride
+        : this.sheetService.readRequests();
 
       if (requestedIds.length === 0) {
         Logger.notify("No recipe IDs found (select rows with IDs, or use 'logic_requests').", true);
@@ -1092,7 +1106,9 @@ class WorkatoSyncApp {
 
       requestedIds.forEach((reqId, index) => {
         try {
-          const fullRecipe = this.analyzerService.client.get(`recipes/${reqId}`);
+          const fullRecipe =
+            this.analyzerService.getRecipeDetails(reqId) ||
+            this.client.get(`recipes/${reqId}`);
           const recipeName = fullRecipe.name || "Unknown";
 
           // A. Save to Drive
@@ -1135,10 +1151,11 @@ class WorkatoSyncApp {
   /**
    * Reads IDs from 'logic_requests', fetches them, sends to Gemini, and writes output.
    */
-  runAiAnalysis() {
+  runAiAnalysis(idsOverride = null) {
     const gemini = new GeminiService();
     const ids = (Array.isArray(idsOverride) && idsOverride.length > 0)
-      ? idsOverride : this.sheetService.readRequests();
+      ? idsOverride
+      : this.sheetService.readRequests();
 
     if (ids.length === 0) {
       Logger.notify("No recipe IDs found (select rows with IDs, or use 'logic_requests').");
@@ -1156,7 +1173,9 @@ class WorkatoSyncApp {
     ids.forEach((id, idx) => {
       Logger.notify(`Asking Gemini to analyze Recipe ${id}...`);
       try {
-        const recipe = this.analyzerService.getRecipeDetails(id) || this.inventoryService.client.get(`recipes/${id}`);
+        const recipe =
+          this.analyzerService.getRecipeDetails(id) ||
+          this.client.get(`recipes/${id}`);
         const name = recipe?.name || "";
 
         // 1) Build graphs (same source of truth as your Mermaid exports)
@@ -1240,7 +1259,7 @@ class WorkatoSyncApp {
    * Reads recipe IDs from 'logic_requests' and generates process maps using the Library.
    * @param {{ mode?: string, callDepth?: number, maxNodes?: number }} [options]
    */
-  runProcessMaps(options = {}) {
+  runProcessMaps(options = {}, idsOverride = null) {
     try {
       Logger.verbose("Starting process map generation (v2 - Library)...");
 
