@@ -33,7 +33,181 @@
  * @property {Object} CONSTANTS - Internal constants for parsing logic and styling.
  * @property {boolean} VERBOSE - Toggle for detailed logging.
  */
+/**
+ * @class
+ * @classdesc Centralized definitions for Sheet names, Column Headers, and application constants.
+ * This class serves as the single source of truth for the AppConfig class.
+ */
 
+/**
+ * @class
+ * @classdesc Static container for application schema definitions.
+ */
+class SchemaDef {
+  /**
+   * Defines the user-facing names of the Google Sheets tabs.
+   * Keys correspond to internal reference IDs used in AppConfig.
+   */
+  static get SHEETS() {
+    return {
+      PROJECTS: "Inventory_Projects",
+      FOLDERS: "Inventory_Folders",
+      RECIPES: "Inventory_Recipes",
+      PROPERTIES: "Inventory_Properties",
+      DEPENDENCIES: "Analysis_Dependencies",
+      CALL_EDGES: "Analysis_Call_Edges",
+      LOGIC: "Debug_Recipe_Logic",
+      DEBUG: "System_Logs",
+      LOGIC_INPUT: "Input_Requests",
+      AI_ANALYSIS: "Output_AI_Analysis",
+      PROCESS_MAPS: "Output_Process_Maps"
+    };
+  }
+  /**
+   * Defines the column headers for every sheet type.
+   * ORDER MATTERS: These must match the order of elements produced in DataMapper.
+   */
+  static get HEADERS() {
+    return {
+      // InventoryService -> DataMapper.mapProjectsToRows
+      PROJECTS: [
+        "Project ID", 
+        "Name", 
+        "Description", 
+        "Created At"
+      ],
+
+      // InventoryService -> DataMapper.mapFoldersToRows
+      FOLDERS: [
+        "Folder ID", 
+        "Name", 
+        "Parent Folder", 
+        "Project"
+      ],
+
+      // InventoryService -> DataMapper.mapRecipesToRows
+      RECIPES: [
+        "Recipe ID", 
+        "Name", 
+        "Status", 
+        "Project", 
+        "Folder", 
+        "Last Run At"
+      ],
+
+      // InventoryService -> DataMapper.mapPropertiesToRows
+      PROPERTIES: [
+        "Property ID", 
+        "Name", 
+        "Value", 
+        "Created At", 
+        "Updated At"
+      ],
+
+      // AnalyzerService -> DataMapper.mapDependenciesToRows
+      DEPENDENCIES: [
+        "Parent Recipe ID", 
+        "Project", 
+        "Folder", 
+        "Dependency Type", 
+        "Dependency ID", 
+        "Dependency Name"
+      ],
+
+      // AnalyzerService -> DataMapper.mapCallEdgesToRows
+      CALL_EDGES: [
+        "Parent Recipe ID",
+        "Parent Recipe Name",
+        "Project",
+        "Folder",
+        "Step Path",
+        "Step Name",
+        "Branch Context",
+        "Provider",
+        "Child Recipe ID",
+        "Child Recipe Name",
+        "ID Key"
+      ],
+
+      // AnalyzerService -> DataMapper via parseLogicRows
+      // [recipeId, recipeName, step#, indent, provider, actionName, description, details]
+      LOGIC: [
+        "Recipe ID",
+        "Recipe Name",
+        "Step #",
+        "Indentation",
+        "Provider",
+        "Action",
+        "Description",
+        "Details/Code"
+      ],
+
+      // SheetService.readRequests uses index 0 of this array for validation
+      LOGIC_INPUT: [
+        "Recipe ID (Input List)"
+      ],
+
+      // SheetService.appendDebugRows -> DataMapper.mapDebugLogsToRows
+      DEBUG: [
+        "Timestamp",
+        "Recipe ID",
+        "Recipe Name",
+        "Status",
+        "Drive Link",
+        "JSON Payload"
+      ],
+
+      // GeminiService -> WorkatoSyncApp.runAiAnalysis
+      AI_ANALYSIS: [
+        "Recipe ID",
+        "Recipe Name",
+        "Objective",
+        "Trigger",
+        "High Level Flow",
+        "Hotspots",
+        "External Apps",
+        "Called Recipes",
+        "Risks & Notes",
+        "Structured Preview",
+        "Graph Metrics",
+        "Link: AI Analysis",
+        "Link: Call Graph",
+        "Link: Full Graph",
+        "Timestamp"
+      ],
+
+      // WorkatoSyncApp.runProcessMaps
+      PROCESS_MAPS: [
+        "Root Recipe ID",
+        "Root Name",
+        "Mode",
+        "Depth",
+        "Call Graph (Mermaid)",
+        "Process Graph (Mermaid)",
+        "Generation Notes",
+        "Link: Call Graph",
+        "Link: Full Graph",
+        "Timestamp"
+      ]
+    };
+  }
+  /**
+   * System-wide constants used for styling, limits, and parsing configuration.
+   */
+  static get CONSTANTS() {
+    return {
+      // Formatting
+      STYLE_HEADER_BG: "#d9d9d9", // Standard Light Grey
+      
+      // Parsing & Generation
+      MERMAID_LABEL_MAX: 60,      // Max chars for a node label in Mermaid diagrams
+      
+      // Google Sheets Limits
+      // Sheets has a cell limit of 50,000 characters. We set safety buffer.
+      CELL_CHAR_LIMIT: 48000      
+    };
+  }
+}
 /**
  * @class
  * @classdesc Static configuration container.
