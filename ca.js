@@ -54,6 +54,8 @@ class SchemaDef {
       FOLDERS: "Inventory_Folders",
       RECIPES: "Inventory_Recipes",
       PROPERTIES: "Inventory_Properties",
+      TABLES: "Inventory_Data_Tables",
+      LOOKUP: "Inventory_Lookup_Tables",
       DEPENDENCIES: "Analysis_Dependencies",
       CALL_EDGES: "Analysis_Call_Edges",
       LOGIC: "Debug_Recipe_Logic",
@@ -70,49 +72,21 @@ class SchemaDef {
   static get HEADERS() {
     return {
       // InventoryService -> DataMapper.mapProjectsToRows
-      PROJECTS: [
-        "Project ID", 
-        "Name", 
-        "Description", 
-        "Created At"
-      ],
+      PROJECTS: [ "Project ID", "Name", "Description", "Created At" ],
 
       // InventoryService -> DataMapper.mapFoldersToRows
-      FOLDERS: [
-        "Folder ID", 
-        "Name", 
-        "Parent Folder", 
-        "Project"
-      ],
+      FOLDERS: [ "Folder ID", "Name", "Parent Folder", "Project" ],
 
       // InventoryService -> DataMapper.mapRecipesToRows
-      RECIPES: [
-        "Recipe ID", 
-        "Name", 
-        "Status", 
-        "Project", 
-        "Folder", 
-        "Last Run At"
-      ],
+      RECIPES: [ "Recipe ID", "Name", "Status", "Project", "Folder", "Last Run At" ],
 
       // InventoryService -> DataMapper.mapPropertiesToRows
-      PROPERTIES: [
-        "Property ID", 
-        "Name", 
-        "Value", 
-        "Created At", 
-        "Updated At"
-      ],
+      PROPERTIES: [ "Property ID", "Name", "Value", "Created At", "Updated At" ],
 
       // AnalyzerService -> DataMapper.mapDependenciesToRows
-      DEPENDENCIES: [
-        "Parent Recipe ID", 
-        "Project", 
-        "Folder", 
-        "Dependency Type", 
-        "Dependency ID", 
-        "Dependency Name"
-      ],
+      DEPENDENCIES: [ "Parent Recipe ID", "Project", "Folder", "Dependency Type", "Dependency ID", "Dependency Name" ],
+      TABLES: [ "Table ID", "Name", "Description", "Columns", "Record count", "Updated at" ],
+      LOOKUP_TABLES: [ "Table ID", "Name", "Description", "Columns", "Record count", "Updated at" ],
 
       // AnalyzerService -> DataMapper.mapCallEdgesToRows
       CALL_EDGES: [
@@ -143,19 +117,10 @@ class SchemaDef {
       ],
 
       // SheetService.readRequests uses index 0 of this array for validation
-      LOGIC_INPUT: [
-        "Recipe ID (Input List)"
-      ],
+      LOGIC_INPUT: [ "Recipe ID (Input List)"  ],
 
       // SheetService.appendDebugRows -> DataMapper.mapDebugLogsToRows
-      DEBUG: [
-        "Timestamp",
-        "Recipe ID",
-        "Recipe Name",
-        "Status",
-        "Drive Link",
-        "JSON Payload"
-      ],
+      DEBUG: [ "Timestamp", "Recipe ID", "Recipe Name", "Status", "Drive Link", "JSON Payload" ],
 
       // GeminiService -> WorkatoSyncApp.runAiAnalysis
       AI_ANALYSIS: [
@@ -410,6 +375,20 @@ class InventoryService {
     }
   }
   /**
+   * Fetches all lookup tables.
+   * @returns {Array<object>} List of table objects.
+   */
+  getLookupTables() {
+    return this._fetchPaginatedNormalized_('lookup_tables');
+  }
+  /**
+   * Fetches all data tables.
+   * @returns {Array<object>} List of table objects.
+   */
+  getDataTables() {
+    return this._fetchPaginatedNormalized_('data_tables');
+  }
+  /**
    * Fetches the current authenticated user details.
    * @returns {Object|null} User profile object or null on failure.
    */
@@ -522,6 +501,50 @@ class InventoryService {
       // Original script returned empty array on error for folder batches
       return [];
     }
+  }
+  _fetchPaginatedNormalized_(resourcePath) {
+    // 1) Prefer library pagination if it works
+    try {
+      const res = this.client.fetchPaginated(resourcePath);
+      const arr = this._normalizeListResponse_(res);
+      if (Array.isArray(arr)) return arr;
+    } catch (e) {
+      // fall through to manual paging
+    }
+
+    // 2) Manual paging (handles endpoints that wrap results under "data")
+    const out = [];
+    const perPage = Number(this.config.API.PER_PAGE || 100);
+    const maxCalls = Number(this.config.API.MAX_CALLS || 500);
+
+    let page = 1;
+    let safety = 0;
+    while (safety < maxCalls) {
+      try {
+        const endpoint = `${resourcePath}?page=${page}&per_page=${perPage}`;
+        const json = this.client.get(endpoint);
+        const items = this._normalizeListResponse_(json);
+        if (!items || items.length === 0) break;
+        out.push(...items);
+        if (items.length < perPage) break;
+        page++;
+        safety++;
+        if (safety % 10 === 0) Utilities.sleep(50);
+      } catch (e) {
+        console.warn(`SKIPPING ${resourcePath.toUpperCase()}: ${e.message}`);
+        break;
+      }
+    }
+    return out;
+  }
+  _normalizeListResponse_(json) {
+    if (Array.isArray(json)) return json;
+    if (!json || typeof json !== 'object') return [];
+    // data tables list uses { data: [...] } :contentReference[oaicite:3]{index=3}
+    if (Array.isArray(json.data)) return json.data;
+    if (Array.isArray(json.items)) return json.items;
+    if (Array.isArray(json.result)) return json.result;
+    return [];
   }
 }
 /**
@@ -1024,6 +1047,42 @@ class DataMapper {
   static mapPropertiesToRows(properties) {
     return properties.map(p => [p.id, p.name, p.value, p.created_at, p.updated_at]);
   }
+  // Data tables: schema is an array :contentReference[oaicite:6]{index=6}
+  static mapDataTablesToRows(dataTables, folderMap = null) {
+    return (dataTables || []).map(t => {
+      const cols = DataMapper._columnsFromAnySchema_(t.schema);
+      const folderNote = t.folder_id
+        ? `Folder: ${DataMapper._safeLookup(folderMap, t.folder_id)}`
+        : "";
+      const desc = [String(t.description || ""), folderNote].filter(Boolean).join(" | ");
+      return [
+        String(t.id || ""),
+        String(t.name || ""),
+        desc,
+        cols,
+        "", // record count not provided by list endpoint
+        String(t.updated_at || "")
+      ];
+    });
+  }
+  // Lookup tables: schema is a JSON string :contentReference[oaicite:7]{index=7}
+  static mapLookupTablesToRows(lookupTables, projectMap = null) {
+    return (lookupTables || []).map(t => {
+      const cols = DataMapper._columnsFromAnySchema_(t.schema);
+      const scopeNote = t.project_id
+        ? `Project: ${DataMapper._safeLookup(projectMap, t.project_id)}`
+        : "Scope: Global";
+      const desc = [String(t.description || ""), scopeNote].filter(Boolean).join(" | ");
+      return [
+        String(t.id || ""),
+        String(t.name || ""),
+        desc,
+        cols,
+        "", // record count not provided by list endpoint
+        String(t.updated_at || "")
+      ];
+    });
+  }
   /**
    * Transforms dependency objects (calculated in Analyzer) into sheet rows.
    * @param {Object} recipe - The parent recipe object.
@@ -1032,12 +1091,13 @@ class DataMapper {
    * @param {Object} folderMap - Lookup.
    * @returns {Array<Array<string>>}
    */
-  static mapDependenciesToRows(recipe, dependencies, projectMap, folderMap) {
+  static mapDependenciesToRows(recipe, dependencies, projectMap, folderMap, tableNameMap = null) {
     const projectName = DataMapper._safeLookup(projectMap, recipe.project_id);
     const folderName = DataMapper._safeLookup(folderMap, recipe.folder_id);
 
     return dependencies.map(dep => [
-      recipe.id, projectName, folderName, dep.type, dep.id, dep.name
+      recipe.id, projectName, folderName, dep.type, dep.id, dep.name,
+      String(dep.name || (tableNameMap && /table/i.test(String(dep.type || "")) ? (tableNameMap[String(dep.id)] || "") : ""))
     ]);
   }
   /**
@@ -1158,6 +1218,29 @@ class DataMapper {
   }
 
   // --- INTERNALS ---------------------------------------------------------------------------------------
+  static _columnsFromAnySchema_(schema) {
+    // Lookup tables: schema is a stringified JSON array :contentReference[oaicite:8]{index=8}
+    if (typeof schema === "string") {
+      try {
+        const arr = JSON.parse(schema);
+        if (Array.isArray(arr)) {
+          return arr.map(c => c.label || c.name).filter(Boolean).join(", ");
+        }
+      } catch (e) {
+        return "";
+      }
+      return "";
+    }
+    // Data tables: schema is an array of objects :contentReference[oaicite:9]{index=9}
+    if (Array.isArray(schema)) {
+      return schema.map(c => c.name).filter(Boolean).join(", ");
+    }
+    // Some APIs might return columns: [...]
+    if (schema && Array.isArray(schema.columns)) {
+      return schema.columns.map(c => c.name).filter(Boolean).join(", ");
+    }
+    return "";
+  }
   /**
    * Safely looks up an ID in a map, returning a fallback if missing.
    * @private
@@ -1206,18 +1289,25 @@ class WorkatoSyncApp {
       const folders = this.inventoryService.getFoldersRecursive(projects);
       const recipes = this.inventoryService.getRecipes();
       const properties = this.inventoryService.getProperties();
+      const dataTables = this.inventoryService.getDataTables();       // GET /api/data_tables
+      const lookupTables = this.inventoryService.getLookupTables();   // GET /api/lookup_tables
 
-      Logger.verbose(`Fetched totals: ${projects.length} projects, ${folders.length} folders, ${recipes.length} recipes, ${properties.length} properties`);
+      Logger.verbose(`Fetched totals: ${projects.length} projects, ${folders.length} folders, ${recipes.length} recipes, ${properties.length} properties, ${dataTables.length} data tables, ${lookupTables.length} lookup tables`);
 
       // 3. Create lookup maps
       const projectMap = this._createLookupMap(projects);
       const folderMap = this._createLookupMap(folders);
       const recipeNameMap = this._createLookupMap(recipes);
+      const dataTableMap = this._createLookupMap(dataTables);
+      const lookupTableMap = this._createLookupMap(lookupTables);
+      const tableNameMap = { ...dataTableMap, ...lookupTableMap };
       
       const projectRows = [this.config.HEADERS.PROJECTS, ...DataMapper.mapProjectsToRows(projects)];
       const folderRows = [this.config.HEADERS.FOLDERS, ...DataMapper.mapFoldersToRows(folders, folderMap, projectMap)];
       const recipeRows = [this.config.HEADERS.RECIPES, ...DataMapper.mapRecipesToRows(recipes, projectMap, folderMap)];
       const propertyRows = [this.config.HEADERS.PROPERTIES, ...DataMapper.mapPropertiesToRows(properties)];
+      const dataTableRows = [this.config.HEADERS.TABLES, ...DataMapper.mapDataTablesToRows(dataTables, folderMap)];
+      const lookupTableRows = [this.config.HEADERS.LOOKUP_TABLES, ...DataMapper.mapLookupTablesToRows(lookupTables, projectMap)];
 
       // 4. Calculate dependencies
       let dependencyRows = [this.config.HEADERS.DEPENDENCIES];
@@ -1228,7 +1318,7 @@ class WorkatoSyncApp {
         if (index < depLimit) {
           const rawDeps = this.analyzerService.getDependencies(recipe.id);
           if (rawDeps.length > 0) {
-            const rows = DataMapper.mapDependenciesToRows(recipe, rawDeps, projectMap, folderMap);
+            const rows = DataMapper.mapDependenciesToRows(recipe, rawDeps, projectMap, folderMap, tableNameMap);
             dependencyRows = dependencyRows.concat(rows);
           }
 
@@ -1247,6 +1337,8 @@ class WorkatoSyncApp {
       this.sheetService.write('FOLDERS', folderRows);
       this.sheetService.write('RECIPES', recipeRows);
       this.sheetService.write('PROPERTIES', propertyRows);
+      this.sheetService.write('TABLES', dataTableRows);
+      this.sheetService.write('LOOKUP_TABLES', lookupTableRows);
       this.sheetService.write('DEPENDENCIES', dependencyRows);
       this.sheetService.write('CALL_EDGES', callEdgeRows);
 
@@ -1882,7 +1974,7 @@ function migrateMyScriptPropsToUserProps() {
 function testWorkatoConnectivity() {
   console.log("--- TESTING CONNECTIVITY ---");
   const client = new WorkatoClient();
-  const endpoints = ['projects', 'folders', 'recipes', 'properties'];
+  const endpoints = ['projects', 'folders', 'recipes', 'properties', 'lookup_tables', 'data_tables'];
   const results = [];
 
   endpoints.forEach(endpoint => {
