@@ -1262,14 +1262,16 @@ class DataMapper {
  * * WorkatoSyncApp ID: 1sl2ZfkgwX57EIygRwEP7nkXTK8BEXaB60cnFKsqhg2DWic3V0SVAzrYS
  */
 class WorkatoSyncApp {
-  constructor() {
-    this.config = AppConfig.get();
-    const client = new WorkatoClient();
-    this.client = client; // keep a stable direct fetch handle
-    this.inventoryService = new InventoryService(client);
-    this.analyzerService = new RecipeAnalyzerService(client);
-    this.sheetService = new SheetService();
-    this.driveService = new DriveService();
+  constructor(ctx = null) {
+    // Backwards compatible: if no ctx provided, behave exactly as before.
+    const context = ctx || new AppContext();
+
+    this.config = context.config;
+    this.client = context.client; // stable direct fetch handle
+    this.inventoryService = context.inventoryService;
+    this.analyzerService = context.analyzerService;
+    this.sheetService = context.sheetService;
+    this.driveService = context.driveService;
   }
   /**
    * The main execution method. 
@@ -1884,33 +1886,27 @@ function showCurrentConfig() {
  * Initializes the WorkatoSyncApp controller and runs the sync.
  */
 function syncInventory() {
-  const app = new WorkatoSyncApp();
-  app.runInventorySync();
+  Commands.run("inventory.sync");
 }
 /** Analyze recipe */
 function fetchRecipeLogic() {
-  const app = new WorkatoSyncApp();
-  app.runLogicDebug();
+  Commands.run("logic.debug");
 }
 /** Analyze recipe with AI */
 function fetchRecipeAnalysis() {
-  const app = new WorkatoSyncApp();
-  app.runAiAnalysis();
+  Commands.run("ai.analyze");
 }
 /** Generates process maps: calls + full (default). */
 function generateProcessMaps() {
-  const app = new WorkatoSyncApp();
-  app.runProcessMaps({ mode: "calls+full" });
+  Commands.run("process.maps", { options: { mode: "calls+full" } });
 }
 /** Generates process maps: calls only. */
 function generateProcessMapsCalls() {
-  const app = new WorkatoSyncApp();
-  app.runProcessMaps({ mode: "calls" });
+  Commands.run("process.maps", { options: { mode: "calls" } });
 }
 /** Generates process maps: full process only. */
 function generateProcessMapsFull() {
-  const app = new WorkatoSyncApp();
-  app.runProcessMaps({ mode: "full" });
+  Commands.run("process.maps", { options: { mode: "full" } });
 }
 // --- Selection-driven actions -------------------------------------------------------------------------
 function fetchRecipeLogicSelected() {
@@ -1919,7 +1915,7 @@ function fetchRecipeLogicSelected() {
     Logger.notify("Select rows (or ID cells) in a sheet with recipe IDs first.", true);
     return;
   }
-  new WorkatoSyncApp().runLogicDebug(ids);
+  Commands.run("logic.debug", { ids });
 }
 function fetchRecipeAnalysisSelected() {
   const ids = SelectionUtils.getSelectedRecipeIds();
@@ -1927,7 +1923,7 @@ function fetchRecipeAnalysisSelected() {
     Logger.notify("Select rows (or ID cells) in a sheet with recipe IDs first.", true);
     return;
   }
-  new WorkatoSyncApp().runAiAnalysis(ids);
+  Commands.run("ai.analyze", { ids });
 }
 function generateProcessMapsSelected() {
   const ids = SelectionUtils.getSelectedRecipeIds();
@@ -1935,7 +1931,7 @@ function generateProcessMapsSelected() {
     Logger.notify("Select rows (or ID cells) in a sheet with recipe IDs first.", true);
     return;
   }
-  new WorkatoSyncApp().runProcessMaps({ mode: "calls+full" }, ids);
+  Commands.run("process.maps", { options: { mode: "calls+full" }, ids });
 }
 function generateProcessMapsSelectedCalls() {
   const ids = SelectionUtils.getSelectedRecipeIds();
@@ -1943,7 +1939,7 @@ function generateProcessMapsSelectedCalls() {
     Logger.notify("Select rows (or ID cells) in a sheet with recipe IDs first.", true);
     return;
   }
-  new WorkatoSyncApp().runProcessMaps({ mode: "calls" }, ids);
+  Commands.run("process.maps", { options: { mode: "calls" }, ids });
 }
 function generateProcessMapsSelectedFull() {
   const ids = SelectionUtils.getSelectedRecipeIds();
@@ -1951,7 +1947,7 @@ function generateProcessMapsSelectedFull() {
     Logger.notify("Select rows (or ID cells) in a sheet with recipe IDs first.", true);
     return;
   }
-  new WorkatoSyncApp().runProcessMaps({ mode: "full" }, ids);
+  Commands.run("process.maps", { options: { mode: "full" }, ids });
 }
 
 /**
