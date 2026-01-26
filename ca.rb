@@ -4,22 +4,20 @@ require 'json'
 require 'date'
 
 {
-  title: 'Core Utilities: Entry Serialization + URL Builder',
+  title: 'URL builder and entry serialization',
   subtitle: 'Generic data shaping + parameterized URL payloads',
   description: 'Utility connector for serializing repeated entry forms, deserializing JSON arrays, and generating parameterized URLs with encoded JSON payloads.',
   help: -> { 'Generic utilities: serialize/deserialize entries with a field spec, and build parameterized URLs with encoded JSON payloads.' },
-
+  
   connection: {
     fields: [],
     authorization: { type: 'none' }
   },
-
   test: ->(_connection) { { success: true, message: 'Connected successfully.' } },
 
   pick_lists: {
     num_opts_thru_10: -> { (1..10).map { |i| [i, i] } },
     num_opts_thru_31: -> { (1..31).map { |i| [i, i] } },
-
     output_format_options: -> {
       [
         ['Nested Array', 'nested_array'],
@@ -28,7 +26,6 @@ require 'date'
         ['Both Nested + Lists + Flat', 'both']
       ]
     },
-
     field_type_options: -> {
       [
         ['String', 'string'],
@@ -38,7 +35,6 @@ require 'date'
         ['Boolean', 'boolean']
       ]
     },
-
     coerce_options: -> {
       [
         ['None', 'none'],
@@ -49,14 +45,12 @@ require 'date'
         ['Boolean', 'bool']
       ]
     },
-
     payload_encoding_options: -> {
       [
         ['URL-encoded JSON (pretty)', 'urlencoded_json_pretty'],
         ['URL-encoded JSON (compact)', 'urlencoded_json_compact']
       ]
     },
-
     payload_style_options: -> {
       [
         ['Value wrapper (key => {value, disabled})', 'value_wrapper'],
@@ -76,33 +70,12 @@ require 'date'
       },
 
       config_fields: [
-        {
-          name: 'num_entries',
-          type: :integer,
-          label: 'Number of Entries',
-          control_type: 'select',
-          pick_list: 'num_opts_thru_31',
-          optional: false,
-          default: 5,
-          hint: 'Maximum number of repeated entry forms to show (entry_1..entry_N).'
-        },
-        {
-          name: 'entry_prefix',
-          type: :string,
-          label: 'Entry Prefix',
-          control_type: 'text',
-          optional: false,
-          default: 'entry_',
-          hint: 'Prefix for repeated entry field groups (e.g., entry_1, entry_2, ...).'
-        },
-        {
-          name: 'field_specs',
-          type: :array,
-          of: :object,
-          label: 'Field Specs',
-          optional: false,
-          hint: 'Defines the shape of each entry. Keys must be unique.',
-          initially_expanded: true,
+        { name: 'num_entries', type: :integer, label: 'Number of Entries', control_type: 'select', pick_list: 'num_opts_thru_31',
+          optional: false, default: 5, hint: 'Maximum number of repeated entry forms to show (entry_1..entry_N).' },
+        { name: 'entry_prefix', type: :string, label: 'Entry Prefix', control_type: 'text', optional: false,
+          default: 'entry_', hint: 'Prefix for repeated entry field groups (e.g., entry_1, entry_2, ...).' },
+        { name: 'field_specs', type: :array, of: :object, label: 'Field Specs', optional: false,
+          hint: 'Defines the shape of each entry. Keys must be unique.', initially_expanded: true,
           properties: [
             { name: 'key', type: :string, label: 'Key', control_type: 'text', optional: false, sticky: true, hint: 'Example: date, units, note' },
             { name: 'label', type: :string, label: 'Label', control_type: 'text', optional: true, sticky: true },
@@ -111,72 +84,22 @@ require 'date'
             { name: 'optional', type: :boolean, label: 'Optional?', control_type: 'checkbox', optional: true, default: true },
             { name: 'include_in_lists', type: :boolean, label: 'Include in lists?', control_type: 'checkbox', optional: true, default: true },
             { name: 'include_in_flat', type: :boolean, label: 'Include in flat fields?', control_type: 'checkbox', optional: true, default: true }
-          ]
-        },
-        {
-          name: 'required_keys',
-          type: :string,
-          label: 'Required Keys',
-          control_type: 'text',
-          optional: true,
-          hint: 'Comma-separated keys required for an entry to be considered valid. Example: date, units'
-        },
-        {
-          name: 'strict',
-          type: :boolean,
-          label: 'Strict mode?',
-          control_type: 'checkbox',
-          optional: true,
-          default: false,
-          hint: 'If true, any invalid entry causes an error. If false, invalid entries can be dropped and errors returned.'
-        },
-        {
-          name: 'drop_invalid_entries',
-          type: :boolean,
-          label: 'Drop invalid entries?',
-          control_type: 'checkbox',
-          optional: true,
-          default: true,
-          hint: 'If strict=false, invalid entries can be skipped.'
-        },
-        {
-          name: 'output_format',
-          label: 'Output Format',
-          type: :string,
-          control_type: 'select',
-          pick_list: 'output_format_options',
-          optional: false,
-          default: 'both'
-        },
-        {
-          name: 'max_flat_entries',
-          label: 'Maximum Flat Entries',
-          type: :integer,
-          control_type: 'select',
-          pick_list: 'num_opts_thru_31',
-          optional: true,
-          default: 10,
-          hint: 'How many entries to expose as individual flat fields.'
-        },
-        {
-          name: 'sum_field_key',
-          label: 'Sum Field Key',
-          type: :string,
-          control_type: 'text',
-          optional: true,
-          hint: "If provided, computes a sum across entries for this field (numeric). Example: units"
-        },
-        {
-          name: 'sum_output_name',
-          label: 'Sum Output Field Name',
-          type: :string,
-          control_type: 'text',
-          optional: true,
-          default: 'total_sum',
-          hint: 'Output field name for the computed sum.'
-        }
+          ] },
+        { name: 'required_keys', type: :string, label: 'Required Keys', control_type: 'text', optional: true,
+          hint: 'Comma-separated keys required for an entry to be considered valid. Example: date, units' },
+        { name: 'strict', type: :boolean, label: 'Strict mode?', control_type: 'checkbox', optional: true, default: false,
+          hint: 'If true, any invalid entry causes an error. If false, invalid entries can be dropped and errors returned.'},
+        { name: 'drop_invalid_entries', type: :boolean, label: 'Drop invalid entries?', control_type: 'checkbox',
+          optional: true, default: true, hint: 'If strict=false, invalid entries can be skipped.' },
+        { name: 'output_format', label: 'Output Format', type: :string, control_type: 'select',
+          pick_list: 'output_format_options', optional: false, default: 'both' },
+        { name: 'max_flat_entries', label: 'Maximum Flat Entries', type: :integer, control_type: 'select', pick_list: 'num_opts_thru_31',
+          optional: true, default: 10, hint: 'How many entries to expose as individual flat fields.' },
+        { name: 'sum_field_key', label: 'Sum Field Key', type: :string, control_type: 'text', optional: true,
+          hint: "If provided, computes a sum across entries for this field (numeric). Example: units" },
+        { name: 'sum_output_name', label: 'Sum Output Field Name', type: :string, control_type: 'text',
+          optional: true, default: 'total_sum', hint: 'Output field name for the computed sum.' }
       ],
-
       input_fields: lambda do |_object_definitions, _connection, config_fields|
         num_entries  = (config_fields['num_entries'] || 1).to_i
         entry_prefix = (config_fields['entry_prefix'] || 'entry_').to_s
@@ -197,7 +120,6 @@ require 'date'
           }
         end
       end,
-
       output_fields: lambda do |_object_definitions, _connection, config_fields|
         format    = (config_fields['output_format'] || 'both').to_s
         max_flat  = (config_fields['max_flat_entries'] || 10).to_i
@@ -250,7 +172,6 @@ require 'date'
 
         fields
       end,
-
       execute: lambda do |_connection, input|
         num_entries  = (input['num_entries'] || 0).to_i
         entry_prefix = (input['entry_prefix'] || 'entry_').to_s
@@ -259,7 +180,11 @@ require 'date'
         format       = (input['output_format'] || 'both').to_s
         max_flat     = (input['max_flat_entries'] || 10).to_i
 
-        specs = call(:normalize_field_specs, input['field_specs'])
+        raw_specs = input['field_specs']
+        unless raw_specs.is_a?(Array) && raw_specs.any?
+          raise 'field_specs must be a non-empty array'
+        end
+        specs = call(:normalize_field_specs, raw_specs)
         required = call(:parse_csv_keys, input['required_keys'])
         sum_key  = input['sum_field_key']&.to_s
         sum_name = (input['sum_output_name'] || 'total_sum').to_s
@@ -331,30 +256,67 @@ require 'date'
         end
 
         output
-      end
-    },
+      end,
+      sample_output: ->(_connection, input) {
+        format    = (input['output_format'] || 'both').to_s
+        max_flat  = (input['max_flat_entries'] || 10).to_i
+        sum_key   = input['sum_field_key']&.to_s
+        sum_name  = (input['sum_output_name'] || 'total_sum').to_s
 
+        specs = call(:normalize_field_specs, input['field_specs'])
+
+        entries = (1..2).map do |i|
+          specs.each_with_object({}) do |s, h|
+            h[s['key']] = call(:sample_value_for_spec, s, i)
+          end
+        end
+
+        out = {
+          'serialized_json' => entries.to_json,
+          'errors' => nil
+        }
+
+        if format == 'nested_array' || format == 'both'
+          out['entries'] = entries
+        end
+
+        if format == 'lists' || format == 'both'
+          specs.each do |s|
+            next unless s['include_in_lists']
+            k = s['key']
+            out["#{k}_list"] = entries.map { |e| e[k] }
+          end
+        end
+
+        if format == 'flat_fields' || format == 'both'
+          entries.each_with_index do |entry, idx|
+            break if idx >= max_flat
+            i = idx + 1
+            specs.each do |s|
+              next unless s['include_in_flat']
+              k = s['key']
+              out["entry_#{i}_#{k}"] = entry[k]
+            end
+          end
+        end
+
+        if call(:present?, sum_key)
+          sum = entries.sum { |e| e[sum_key].is_a?(Numeric) ? e[sum_key] : 0.0 }
+          out[sum_name] = sum
+        end
+
+        out
+      }
+    },
     deserialize_entries_json: {
       title: 'Deserialize JSON to Entries',
       subtitle: 'Parse JSON into entries + lists + flat fields, with coercion + validation',
       display_priority: 9,
 
       config_fields: [
-        {
-          name: 'entries_path',
-          type: :string,
-          label: 'Entries Path (optional)',
-          control_type: 'text',
-          optional: true,
-          hint: 'Dot path to the array inside JSON. Example: data.entries'
-        },
-        {
-          name: 'field_specs',
-          type: :array,
-          of: :object,
-          label: 'Field Specs',
-          optional: false,
-          initially_expanded: true,
+        { name: 'entries_path', type: :string, label: 'Entries Path (optional)', control_type: 'text',
+          optional: true, hint: 'Dot path to the array inside JSON. Example: data.entries' },
+        { name: 'field_specs', type: :array, of: :object, label: 'Field Specs', optional: false, initially_expanded: true,
           properties: [
             { name: 'key', type: :string, label: 'Key', control_type: 'text', optional: false, sticky: true },
             { name: 'label', type: :string, label: 'Label', control_type: 'text', optional: true, sticky: true },
@@ -363,58 +325,21 @@ require 'date'
             { name: 'optional', type: :boolean, label: 'Optional?', control_type: 'checkbox', optional: true, default: true },
             { name: 'include_in_lists', type: :boolean, label: 'Include in lists?', control_type: 'checkbox', optional: true, default: true },
             { name: 'include_in_flat', type: :boolean, label: 'Include in flat fields?', control_type: 'checkbox', optional: true, default: true }
-          ]
-        },
-        {
-          name: 'required_keys',
-          type: :string,
-          label: 'Required Keys',
-          control_type: 'text',
-          optional: true,
-          hint: 'Comma-separated keys required for each entry. Example: date, units'
-        },
-        {
-          name: 'strict',
-          type: :boolean,
-          label: 'Strict mode?',
-          control_type: 'checkbox',
-          optional: true,
-          default: true,
-          hint: 'If true, any invalid entry causes an error. If false, invalid entries are skipped and errors returned.'
-        },
-        {
-          name: 'output_format',
-          label: 'Output Format',
-          type: :string,
-          control_type: 'select',
-          pick_list: 'output_format_options',
-          optional: false,
-          default: 'both'
-        },
-        {
-          name: 'max_flat_entries',
-          label: 'Maximum Flat Entries',
-          type: :integer,
-          control_type: 'select',
-          pick_list: 'num_opts_thru_31',
-          optional: true,
-          default: 10
-        }
+          ] },
+        { name: 'required_keys', type: :string, label: 'Required Keys', control_type: 'text',
+          optional: true, hint: 'Comma-separated keys required for each entry. Example: date, units' },
+        { name: 'strict', type: :boolean, label: 'Strict mode?', control_type: 'checkbox', optional: true, default: true,
+          hint: 'If true, any invalid entry causes an error. If false, invalid entries are skipped and errors returned.'},
+        { name: 'output_format', label: 'Output Format', type: :string,  control_type: 'select',  
+          pick_list: 'output_format_options', optional: false,  default: 'both'  },
+        { name: 'max_flat_entries', label: 'Maximum Flat Entries', type: :integer, control_type: 'select',
+          pick_list: 'num_opts_thru_31', optional: true, default: 10 }
       ],
-
       input_fields: lambda do |_object_definitions, _connection, _config_fields|
-        [
-          {
-            name: 'serialized_json',
-            label: 'Serialized JSON',
-            type: :string,
-            control_type: 'text',
-            optional: false,
+        [ { name: 'serialized_json', label: 'Serialized JSON', type: :string, control_type: 'text', optional: false,
             hint: 'JSON string representing an array of entries (or an object containing the array if entries_path is set).'
-          }
-        ]
+          } ]
       end,
-
       output_fields: lambda do |_object_definitions, _connection, config_fields|
         format   = (config_fields['output_format'] || 'both').to_s
         max_flat = (config_fields['max_flat_entries'] || 10).to_i
@@ -459,14 +384,17 @@ require 'date'
 
         fields
       end,
-
       execute: lambda do |_connection, input|
         strict   = input.key?('strict') ? !!input['strict'] : true
         format   = (input['output_format'] || 'both').to_s
         max_flat = (input['max_flat_entries'] || 10).to_i
         path     = input['entries_path']&.to_s
 
-        specs    = call(:normalize_field_specs, input['field_specs'])
+        raw_specs = input['field_specs']
+        unless raw_specs.is_a?(Array) && raw_specs.any?
+          raise 'field_specs must be a non-empty array'
+        end
+        specs = call(:normalize_field_specs, raw_specs)
         required = call(:parse_csv_keys, input['required_keys'])
 
         raw = input['serialized_json']
@@ -534,62 +462,67 @@ require 'date'
         end
 
         output
-      end
-    },
+      end,
+      sample_output: ->(_connection, input) {
+        format   = (input['output_format'] || 'both').to_s
+        max_flat = (input['max_flat_entries'] || 10).to_i
 
+        specs = call(:normalize_field_specs, input['field_specs'])
+
+        entries = (1..2).map do |i|
+          specs.each_with_object({}) do |s, h|
+            h[s['key']] = call(:sample_value_for_spec, s, i)
+          end
+        end
+
+        out = { 'errors' => nil }
+
+        if format == 'nested_array' || format == 'both'
+          out['entries'] = entries
+        end
+
+        if format == 'lists' || format == 'both'
+          specs.each do |s|
+            next unless s['include_in_lists']
+            k = s['key']
+            out["#{k}_list"] = entries.map { |e| e[k] }
+          end
+        end
+
+        if format == 'flat_fields' || format == 'both'
+          entries.each_with_index do |entry, idx|
+            break if idx >= max_flat
+            i = idx + 1
+            specs.each do |s|
+              next unless s['include_in_flat']
+              k = s['key']
+              out["entry_#{i}_#{k}"] = entry[k]
+            end
+          end
+        end
+
+        out
+      }
+    },
     build_parameterized_url: {
       title: 'Build Parameterized URL',
       subtitle: 'Encode a JSON payload into a URL query parameter (supports static fields, mappings, and indexed entry expansion)',
       display_priority: 6,
 
       config_fields: [
-        {
-          name: 'param_name',
-          type: :string,
-          label: 'Query Parameter Name',
-          control_type: 'text',
-          optional: false,
-          default: 'prefilled_values',
-          hint: 'The query parameter that will receive the encoded payload.'
-        },
-        {
-          name: 'payload_encoding',
-          type: :string,
-          label: 'Payload Encoding',
-          control_type: 'select',
-          pick_list: 'payload_encoding_options',
-          optional: false,
-          default: 'urlencoded_json_pretty'
-        },
-        {
-          name: 'payload_style',
-          type: :string,
-          label: 'Payload Style',
-          control_type: 'select',
-          pick_list: 'payload_style_options',
-          optional: false,
-          default: 'value_wrapper',
-          hint: 'Some forms expect {value, disabled}. Others want raw key/value pairs.'
-        },
-        {
-          name: 'static_fields',
-          type: :array,
-          of: :object,
-          label: 'Static Fields',
-          optional: true,
-          hint: 'Always included in payload.',
+        { name: 'param_name', type: :string, label: 'Query Parameter Name', control_type: 'text', optional: false,
+          default: 'prefilled_values', hint: 'The query parameter that will receive the encoded payload.' },
+        { name: 'payload_encoding', type: :string, label: 'Payload Encoding', control_type: 'select',
+          pick_list: 'payload_encoding_options', optional: false, default: 'urlencoded_json_pretty' },
+        { name: 'payload_style', type: :string,  label: 'Payload Style', control_type: 'select', pick_list: 'payload_style_options',
+          optional: false, default: 'value_wrapper', hint: 'Some forms expect {value, disabled}. Others want raw key/value pairs.' },
+        { name: 'static_fields', type: :array, of: :object, label: 'Static Fields', optional: true, hint: 'Always included in payload.',
           properties: [
             { name: 'key', type: :string, label: 'Key', control_type: 'text', optional: false, sticky: true },
             { name: 'value', type: :string, label: 'Value', control_type: 'text', optional: true, sticky: true },
             { name: 'disabled', type: :boolean, label: 'Disabled?', control_type: 'checkbox', optional: true, default: false }
-          ]
-        },
-        {
-          name: 'mappings',
-          type: :array,
-          of: :object,
-          label: 'Mappings',
-          optional: true,
+          ] },
+        { name: 'mappings', type: :array, of: :object, label: 'Mappings', optional: true,
           hint: 'Map source_fields into payload keys, with casts/required/disabled.',
           properties: [
             { name: 'input_key', type: :string, label: 'Source key', control_type: 'text', optional: false, sticky: true },
@@ -597,42 +530,20 @@ require 'date'
             { name: 'cast', type: :string, label: 'Cast', control_type: 'select', pick_list: 'coerce_options', optional: true, default: 'none' },
             { name: 'required', type: :boolean, label: 'Required?', control_type: 'checkbox', optional: true, default: false },
             { name: 'disabled', type: :boolean, label: 'Disabled?', control_type: 'checkbox', optional: true, default: false }
-          ]
-        },
-        {
-          name: 'indexed_entry_mappings',
-          type: :array,
-          of: :object,
-          label: 'Indexed Entry Mappings',
-          optional: true,
-          hint: 'Expand entries[] into payload keys using key templates like date{{i}}, units{{i}}.',
+          ] },
+        { name: 'indexed_entry_mappings', type: :array, of: :object, label: 'Indexed Entry Mappings',
+          optional: true, hint: 'Expand entries[] into payload keys using key templates like date{{i}}, units{{i}}.',
           properties: [
             { name: 'field_key', type: :string, label: 'Entry field key', control_type: 'text', optional: false, sticky: true, hint: 'Key within each entries[] object' },
             { name: 'key_template', type: :string, label: 'Payload key template', control_type: 'text', optional: false, sticky: true, hint: 'Use {{i}} for 1-based index, e.g. date{{i}}' },
             { name: 'cast', type: :string, label: 'Cast', control_type: 'select', pick_list: 'coerce_options', optional: true, default: 'none' },
             { name: 'disabled', type: :boolean, label: 'Disabled?', control_type: 'checkbox', optional: true, default: false }
-          ]
-        },
-        {
-          name: 'index_start',
-          type: :integer,
-          label: 'Index Start',
-          control_type: 'number',
-          optional: true,
-          default: 1,
-          hint: 'Starting index for {{i}} substitution (usually 1).'
-        },
-        {
-          name: 'include_blank_values',
-          type: :boolean,
-          label: 'Include blank values?',
-          control_type: 'checkbox',
-          optional: true,
-          default: false,
-          hint: 'If false, blank/empty values are omitted from the payload.'
-        }
+          ] },
+        { name: 'index_start', type: :integer, label: 'Index Start', control_type: 'number',
+          optional: true, default: 1,  hint: 'Starting index for {{i}} substitution (usually 1).' },
+        { name: 'include_blank_values', type: :boolean, label: 'Include blank values?', control_type: 'checkbox',
+          optional: true, default: false, hint: 'If false, blank/empty values are omitted from the payload.' }
       ],
-
       input_fields: lambda do |_object_definitions, _connection, _config_fields|
         [
           { name: 'base_url', type: :string, label: 'Base URL', control_type: 'text', optional: false, hint: 'Target URL (query param appended).' },
@@ -677,7 +588,6 @@ require 'date'
           }
         ]
       end,
-
       output_fields: lambda do |_object_definitions, _connection, _config_fields|
         [
           { name: 'url', type: :string, label: 'Parameterized URL' },
@@ -685,7 +595,6 @@ require 'date'
           { name: 'payload_encoded', type: :string, label: 'Encoded Payload' }
         ]
       end,
-
       execute: lambda do |_connection, input|
         base_url     = input['base_url'].to_s
         param_name   = (input['param_name'] || 'prefilled_values').to_s
@@ -771,7 +680,24 @@ require 'date'
         url = "#{base_url}#{delimiter}#{param_name}=#{encoded}"
 
         { url: url, payload_json: json, payload_encoded: encoded }
-      end
+      end,
+      sample_output: ->(_connection, input) {
+        param_name = (input['param_name'] || 'prefilled_values').to_s
+        encoding   = (input['payload_encoding'] || 'urlencoded_json_pretty').to_s
+        style      = (input['payload_style'] || 'value_wrapper').to_s
+
+        payload = {
+          'example' => call(:wrap_payload_value, 'value', false, style),
+          'flag'    => call(:wrap_payload_value, true,  false, style)
+        }
+
+        json = call(:payload_json, payload, style, encoding)
+        encoded = URI.encode_www_form_component(json)
+        base_url = 'https://example.com/form'
+        url = "#{base_url}?#{param_name}=#{encoded}"
+
+        { url: url, payload_json: json, payload_encoded: encoded }
+      }
     }
   },
 
@@ -779,15 +705,28 @@ require 'date'
     present?: ->(value) {
       !value.nil? && (value.respond_to?(:empty?) ? !value.empty? : true)
     },
-
+    default_field_specs: -> {
+      [
+        {
+          'key' => 'value',
+          'label' => 'Value',
+          'type' => 'string',
+          'coerce' => 'none',
+          'optional' => true,
+          'include_in_lists' => true,
+          'include_in_flat' => true
+        }
+      ]
+    },
     parse_csv_keys: ->(csv) {
       return [] unless call(:present?, csv)
       csv.to_s.split(',').map(&:strip).reject(&:empty?)
     },
-
     normalize_field_specs: ->(specs) {
       arr = specs.is_a?(Array) ? specs : []
-      raise 'field_specs must be a non-empty array' if arr.empty?
+      # IMPORTANT: do not raise here. Workato calls input_fields/output_fields while config is incomplete.
+      # Provide a placeholder spec so the UI can render.
+      return call(:default_field_specs) if arr.empty?
 
       normalized = arr.map do |s|
         raise 'field_spec must be an object' unless s.is_a?(Hash)
@@ -811,7 +750,6 @@ require 'date'
 
       normalized
     },
-
     workato_type_for: ->(t) {
       case t.to_s
       when 'string' then :string
@@ -822,7 +760,6 @@ require 'date'
       else :string
       end
     },
-
     build_properties_from_specs: ->(specs) {
       specs.map do |s|
         {
@@ -835,7 +772,6 @@ require 'date'
         }
       end
     },
-
     present_entry_any_field?: ->(raw, specs) {
       return false unless raw.is_a?(Hash)
       specs.any? do |s|
@@ -843,7 +779,6 @@ require 'date'
         call(:present?, v)
       end
     },
-
     coerce_value: ->(value, cast) {
       return nil if value.nil?
       c = cast.to_s
@@ -890,7 +825,6 @@ require 'date'
         value
       end
     },
-
     coerce_entry: ->(raw, specs) {
       raise 'Entry must be an object' unless raw.is_a?(Hash)
 
@@ -906,13 +840,11 @@ require 'date'
       end
       out
     },
-
     validate_required_keys!: ->(entry, required_keys, idx) {
       missing = required_keys.reject { |k| call(:present?, entry[k]) }
       raise "Missing required keys: #{missing.join(', ')}" if missing.any?
       true
     },
-
     parse_json_any: ->(raw) {
       return raw if raw.is_a?(Hash) || raw.is_a?(Array)
 
@@ -926,7 +858,6 @@ require 'date'
         raise "Invalid JSON: #{e.message}"
       end
     },
-
     dig_by_path: ->(obj, path) {
       parts = path.to_s.split('.').map(&:strip).reject(&:empty?)
       cur = obj
@@ -941,13 +872,11 @@ require 'date'
       end
       cur
     },
-
     lookup_kv: ->(kvs, key) {
       return nil unless kvs.is_a?(Array) && call(:present?, key)
       found = kvs.find { |h| h.is_a?(Hash) && (h['key'].to_s == key.to_s) }
       found ? found['value'] : nil
     },
-
     wrap_payload_value: ->(value, disabled, style) {
       if style.to_s == 'raw'
         value
@@ -957,7 +886,6 @@ require 'date'
         out
       end
     },
-
     payload_json: ->(payload, style, encoding) {
       # payload is already correctly shaped for either style. Only control pretty vs compact.
       if encoding.to_s == 'urlencoded_json_compact'
@@ -965,6 +893,26 @@ require 'date'
       else
         JSON.pretty_generate(payload)
       end
+    },
+    sample_value_for_spec: ->(spec, idx = 1) {
+      key  = spec['key'].to_s
+      type = spec['type'].to_s
+
+      case type
+      when 'string'
+        "#{key}_#{idx}"
+      when 'number'
+        (idx * 1.25)
+      when 'integer'
+        idx
+      when 'date'
+        Date.today - (idx - 1)
+      when 'boolean'
+        idx.odd?
+      else
+        "#{key}_#{idx}"
+      end
     }
+
   }
 }
