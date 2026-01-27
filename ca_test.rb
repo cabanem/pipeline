@@ -99,99 +99,142 @@ require 'base64'
         ]
       }
     },
+    prefill_pairs_fields: {
+        fields: ->(_connection, _config_fields) {
+        (1..10).flat_map do |i|
+            [
+            {
+                name: "title_#{i}",
+                type: :string,
+                label: "Title #{i}",
+                control_type: 'text',
+                optional: true,
+                sticky: true,
+                hint: 'Component Title (builder-visible). Leave blank to skip.'
+            },
+            {
+                name: "value_#{i}",
+                type: :string,
+                label: "Value #{i}",
+                control_type: 'text',
+                optional: true,
+                sticky: true,
+                hint: 'Map a pill here (string). Will be coerced if enabled.'
+            },
+            {
+                name: "disabled_#{i}",
+                type: :boolean,
+                label: "Disabled #{i}?",
+                control_type: 'checkbox',
+                optional: true,
+                sticky: true,
+                hint: 'Optional. If omitted, Default editable? controls whether disabled:false is injected.'
+            }
+            ]
+        end
+        }
+    },
 
     # ---- Action input schema ----
     wfa_url_input: {
       fields: ->(object_definitions, _connection, _config_fields) {
         [
-          {
-            name: 'request_url',
-            type: :string,
-            label: 'Request URL',
-            control_type: 'text',
-            optional: false,
-            sticky: true,
-            hint: 'Workflow Apps "New request" URL (must start with http:// or https://).'
-          },
-
-          {
-            name: 'input_mode',
-            type: :string,
-            label: 'Input mode',
-            control_type: 'select',
-            pick_list: 'prefill_input_mode_options',
-            optional: true,
-            default: 'entries',
-            sticky: true,
-            hint: 'Recommended: Entries (nested list). Advanced: Object or JSON.'
-          },
-
-          {
-            control_type: 'nested_fields',
-            type: 'array',
-            of: 'object',
-            name: 'prefill_entries',
-            label: 'Prefill Entries (recommended)',
-            optional: true,
-            sticky: true,
-            hint: 'Add rows: Title + Value (pill-friendly). Use Value mode for table dropdown or JSON.',
-            properties: object_definitions['prefill_entry_fields']
-          },
-
-          # Advanced option: strict object (supports pills, but requires strict shape)
-          {
-            name: 'prefilled_values',
+            {
+                name: 'request_url',
+                type: :string,
+                label: 'Request URL',
+                control_type: 'text',
+                optional: false,
+                sticky: true,
+                hint: 'Workflow Apps "New request" URL (must start with http:// or https://).'
+            },
+            {
+                name: 'input_mode',
+                type: :string,
+                label: 'Input mode',
+                control_type: 'select',
+                pick_list: 'prefill_input_mode_options',
+                optional: true,
+                default: 'entries',
+                sticky: true,
+                hint: 'Recommended: Entries (nested list). Advanced: Object or JSON.'
+            },
+            {
+            name: 'prefill_pairs',
             type: :object,
-            label: 'Prefilled values (object) — advanced',
+            control_type: 'form',
+            label: 'Quick prefill pairs',
             optional: true,
             sticky: true,
-            hint: 'Strict shape: { "Title": { "value": <...>, "disabled": <bool optional> } }.'
-          },
+            hint: 'Fill Title/Value pairs (1–10). Great for mapping individual pills without building a list.',
+            properties: object_definitions['prefill_pairs_fields']
+            },
+            {
+                control_type: 'nested_fields',
+                type: 'array',
+                of: 'object',
+                name: 'prefill_entries',
+                label: 'Prefill Entries (recommended)',
+                optional: true,
+                sticky: true,
+                hint: 'Add rows: Title + Value (pill-friendly). Use Value mode for table dropdown or JSON.',
+                properties: object_definitions['prefill_entry_fields']
+            },
 
-          # Advanced option: JSON string (static / copy-paste)
-          {
-            name: 'prefilled_values_json',
-            type: :string,
-            label: 'Prefilled values JSON — advanced',
-            control_type: 'text-area',
-            optional: true,
-            sticky: true,
-            hint: 'Raw JSON object: {"Title":{"value":"x","disabled":false}}. No pills here.'
-          },
+            # Advanced option: strict object (supports pills, but requires strict shape)
+            {
+                name: 'prefilled_values',
+                type: :object,
+                label: 'Prefilled values (object) — advanced',
+                optional: true,
+                sticky: true,
+                hint: 'Strict shape: { "Title": { "value": <...>, "disabled": <bool optional> } }.'
+            },
 
-          {
-            name: 'default_editable',
-            type: :boolean,
-            label: 'Default editable?',
-            optional: true,
-            default: false,
-            sticky: true,
-            hint: 'If true, injects disabled:false when missing. If false, omit disabled (read-only default).'
-          },
+            # Advanced option: JSON string (static / copy-paste)
+            {
+                name: 'prefilled_values_json',
+                type: :string,
+                label: 'Prefilled values JSON — advanced',
+                control_type: 'text-area',
+                optional: true,
+                sticky: true,
+                hint: 'Raw JSON object: {"Title":{"value":"x","disabled":false}}. No pills here.'
+            },
 
-          {
-            name: 'value_coercion',
-            type: :string,
-            label: 'Coerce value types',
-            control_type: 'select',
-            pick_list: 'value_coercion_options',
-            optional: true,
-            default: 'preserve',
-            sticky: true,
-            hint: 'If your pills arrive as strings, you can infer int/float/bool/null from common patterns.'
-          },
+            {
+                name: 'default_editable',
+                type: :boolean,
+                label: 'Default editable?',
+                optional: true,
+                default: false,
+                sticky: true,
+                hint: 'If true, injects disabled:false when missing. If false, omit disabled (read-only default).'
+            },
 
-          {
-            name: 'on_url_limit',
-            type: :string,
-            label: 'On URL limit exceeded',
-            control_type: :select,
-            pick_list: 'on_url_limit_options',
-            optional: true,
-            default: 'error',
-            sticky: true,
-            hint: 'If final URL exceeds ~8000 chars, either raise an error or return within_limit=false.'
-          }
+            {
+                name: 'value_coercion',
+                type: :string,
+                label: 'Coerce value types',
+                control_type: 'select',
+                pick_list: 'value_coercion_options',
+                optional: true,
+                default: 'preserve',
+                sticky: true,
+                hint: 'If your pills arrive as strings, you can infer int/float/bool/null from common patterns.'
+            },
+
+            {
+                name: 'on_url_limit',
+                type: :string,
+                label: 'On URL limit exceeded',
+                control_type: :select,
+                pick_list: 'on_url_limit_options',
+                optional: true,
+                default: 'error',
+                sticky: true,
+                hint: 'If final URL exceeds ~8000 chars, either raise an error or return within_limit=false.'
+            }
         ]
       }
     }
@@ -206,11 +249,12 @@ require 'base64'
     },
 
     prefill_input_mode_options: ->(_connection) {
-      [
-        ['Entries (recommended)', 'entries'],
+        [
+        ['Quick pairs (Title/Value fields)', 'pairs'],
+        ['Entries (nested list)', 'entries'],
         ['Object (advanced)', 'object'],
         ['JSON (advanced)', 'json']
-      ]
+        ]
     },
 
     prefill_value_mode_options: ->(_connection) {
@@ -255,16 +299,18 @@ require 'base64'
         coercion = 'preserve' if coercion.strip.empty?
 
         payload =
-          case mode
-          when 'entries'
+        case mode
+        when 'pairs'
+            call('payload_from_pairs', input['prefill_pairs'])
+        when 'entries'
             call('payload_from_entries', input['prefill_entries'])
-          when 'object'
+        when 'object'
             call('payload_from_object', input['prefilled_values'])
-          when 'json'
+        when 'json'
             call('payload_from_json_string', input['prefilled_values_json'])
-          else
-            error("Invalid input_mode: #{mode.inspect}. Use entries/object/json.")
-          end
+        else
+            error("Invalid input_mode: #{mode.inspect}. Use pairs/entries/object/json.")
+        end
 
         normalized = call('normalize_wfa_payload', payload, default_editable, coercion)
 
@@ -466,6 +512,36 @@ require 'base64'
       parsed
     },
 
+    payload_from_pairs: ->(pairs_form) {
+    form = pairs_form.is_a?(Hash) ? pairs_form : {}
+
+    out = {}
+    (1..10).each do |i|
+        title = form["title_#{i}"].to_s.strip
+        next if title.empty?
+
+        # value is a string field (pills map here)
+        value_raw = form["value_#{i}"]
+        value_str = value_raw.nil? ? '' : value_raw.to_s
+
+        # Skip if value is blank (prevents accidental empty fields)
+        next if value_str.strip.empty?
+
+        entry = { 'value' => value_str }
+
+        # Preserve disabled if explicitly present (including false)
+        key = "disabled_#{i}"
+        if form.key?(key)
+        entry['disabled'] = form[key]
+        end
+
+        out[title] = entry
+    end
+
+    error('Provide at least one Title/Value pair in Quick prefill pairs.') if out.empty?
+    out
+    },
+
     resolve_entry_value: ->(entry, idx) {
       mode = (entry['value_mode'] || entry[:value_mode] || 'auto').to_s
 
@@ -625,6 +701,6 @@ require 'base64'
       else
         v
       end
-    end
+    }
   }
 }
