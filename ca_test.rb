@@ -46,14 +46,59 @@ require 'base64'
             label: 'Request URL',
             hint: 'The Workflow Apps "New request" page URL (must start with http:// or https://).'
           },
+
+          # OPTION A: easiest for data pills (recommended)
+          {
+            name: 'prefilled_value_entries',
+            type: :array,
+            of: :object,
+            optional: true,
+            label: 'Prefill entries (recommended)',
+            hint: 'Use this to build prefilled values with data pills. Each row: Title + Value + optional Disabled.',
+            properties: [
+              {
+                name: 'title',
+                type: :string,
+                optional: false,
+                label: 'Component Title',
+                hint: 'Must match the Workflow Apps component Title exactly (builder-visible).'
+              },
+              {
+                name: 'value',
+                type: :object,
+                optional: false,
+                label: 'Value',
+                hint: 'Any primitive or object. For table dropdowns, pass { "record_id": "...", "value": "..." }.'
+              },
+              {
+                name: 'disabled',
+                type: :boolean,
+                optional: true,
+                label: 'Disabled?',
+                hint: 'If omitted, behavior is controlled by Default editable?.'
+              }
+            ]
+          },
+
+          # OPTION B: advanced users can pass the strict object shape directly (also supports pills)
+          {
+            name: 'prefilled_values',
+            type: :object,
+            optional: true,
+            label: 'Prefilled values (object)',
+            hint: 'Strict shape: { "Title": { "value": <...>, "disabled": <bool optional> } }. Supports data pills.'
+          },
+
+          # OPTION C: static JSON (no pills)
           {
             name: 'prefilled_values_json',
             type: :string,
             control_type: :text_area,
-            optional: false,
-            label: 'Prefilled values JSON',
-            hint: 'Raw JSON object. Keys = Component Titles. Values must be objects containing "value". Example: {"Employee Name":{"value":"Ada"}}'
+            optional: true,
+            label: 'Prefilled values JSON (static)',
+            hint: 'Raw JSON object. Keys = Titles. Values must be objects containing "value". Example: {"Employee Name":{"value":"Ada"}}'
           },
+
           {
             name: 'default_editable',
             type: :boolean,
@@ -81,8 +126,12 @@ require 'base64'
           error('Request URL must be a valid http/https URL.')
         end
 
-        raw_json = input['prefilled_values_json']
-        payload = parse_prefilled_values_json(raw_json)
+        # Resolve payload source (entries > object > json string)
+        payload = resolve_prefilled_values_input(
+          input['prefilled_value_entries'],
+          input['prefilled_values'],
+          input['prefilled_values_json']
+        )
 
         default_editable = strict_bool(input['default_editable'])
         normalized_payload = normalize_wfa_payload(payload, default_editable)
@@ -102,9 +151,8 @@ require 'base64'
             error(msg)
           end
 
-          # return_error_object mode: keep the URL for debugging (do not nil it out)
           return {
-            'prefilled_url' => final_url,
+            'prefilled_url' => final_url,              # keep for debugging
             'prefilled_values_json' => json_string,
             'prefilled_values_encoded' => encoded_values,
             'url_length' => url_len,
@@ -178,13 +226,11 @@ require 'base64'
             error("JSON must parse to an Object or Array, got #{data.class}.")
           end
 
-        # Flatten each row; non-hash rows become {_value: <row>}
         flat_rows = rows.map do |r|
           r = { '_value' => r } unless r.is_a?(Hash)
           flatten_value(r)
         end
 
-        # Stable header order (first-seen)
         headers = []
         flat_rows.each { |row| headers |= row.keys }
 
@@ -228,18 +274,62 @@ require 'base64'
   },
 
   methods: {
-    # Strict-ish boolean: only true boolean or string "true" (case-insensitive) counts as true.
     strict_bool: lambda do |v|
       v == true || v.to_s.strip.downcase == 'true'
     end,
 
-    # Parse and validate prefilled_values_json: must be valid JSON object/hash.
-    parse_prefilled_values_json: lambda do |raw_json|
-      s = raw_json.to_s
-      if s.strip.empty?
-        error("Missing required 'prefilled_values_json'.")
+    # Selects a payload source in priority order:
+    # 1) prefilled_value_entries (best for pills)
+    # 2) prefilled_values object (strict shape, supports pills)
+    # 3) prefilled_values_json (static)
+    resolve_prefilled_values_input: lambda do |entries, obj, json|
+      if entries.is_a?(Array) && !entries.empty?
+        out = {}
+
+        entries.each_with_index do |e, idx|
+          unless e.is_a?(Hash)
+            error("Prefill entries[#{idx}] must be an object with title/value/disabled.")
+          end
+
+          title = (e['title'] || e[:title]).to_s.strip
+          if title.empty?
+            error("Prefill entries[#{idx}] is missing required 'title' (component Title).")
+          end
+
+          has_value = e.key?('value') || e.key?(:value)
+          unless has_value
+            error("Prefill entries[#{idx}] (title '#{title}') is missing required 'value'.")
+          end
+          value = e.key?('value') ? e['value'] : e[:value]
+
+          entry = { 'value' => value }
+
+          has_disabled = e.key?('disabled') || e.key?(:disabled)
+          if has_disabled
+            disabled_val = e.key?('disabled') ? e['disabled'] : e[:disabled] # preserves false
+            entry['disabled'] = disabled_val
+          end
+
+          out[title] = entry
+        end
+
+        return out
       end
 
+      if obj.is_a?(Hash) && !obj.empty?
+        return obj
+      end
+
+      s = json.to_s
+      if !s.strip.empty?
+        return parse_prefilled_values_json(s)
+      end
+
+      error("Provide one of: Prefill entries, Prefilled values (object), or Prefilled values JSON.")
+    end,
+
+    parse_prefilled_values_json: lambda do |raw_json|
+      s = raw_json.to_s
       begin
         parsed = JSON.parse(s)
       rescue JSON::ParserError => e
@@ -253,11 +343,6 @@ require 'base64'
       parsed
     end,
 
-    # Normalize WFA payload:
-    # - Keys are treated as component Titles (stringified)
-    # - Each entry must be an object containing 'value' (presence required, value may be nil/false/0)
-    # - Preserve 'disabled' when present (including false)
-    # - If missing and default_editable true -> set disabled:false; otherwise omit disabled
     normalize_wfa_payload: lambda do |payload, default_editable|
       out = {}
 
@@ -276,7 +361,7 @@ require 'base64'
 
         has_disabled = entry.key?('disabled') || entry.key?(:disabled)
         if has_disabled
-          disabled_val = entry.key?('disabled') ? entry['disabled'] : entry[:disabled]
+          disabled_val = entry.key?('disabled') ? entry['disabled'] : entry[:disabled] # preserves false
           normalized['disabled'] = disabled_val
         elsif default_editable
           normalized['disabled'] = false
@@ -288,10 +373,8 @@ require 'base64'
       out
     end,
 
-    # Upsert a query param safely, preserving existing query params and fragments.
-    # IMPORTANT: pass raw (unencoded) value_string; this method encodes all query params.
-    # - Replaces existing key occurrences
-    # - Ensures query appears before fragment
+    # Upsert query param safely (preserves existing params + fragments; replaces existing key).
+    # Pass raw (unencoded) value; this encodes consistently.
     upsert_query_param: lambda do |url_string, key, value_string|
       uri = URI.parse(url_string)
 
@@ -299,15 +382,13 @@ require 'base64'
       pairs.reject! { |(k, _v)| k == key }
       pairs << [key, value_string.to_s]
 
-      new_query = pairs.map do |k, v|
+      uri.query = pairs.map { |k, v|
         "#{URI.encode_www_form_component(k)}=#{URI.encode_www_form_component(v.to_s)}"
-      end.join('&')
+      }.join('&')
 
-      uri.query = new_query
       uri.to_s
     end,
 
-    # Flatten hashes + arrays into a flat hash with dotted keys and indexed array keys.
     flatten_value: lambda do |value, parent_key = nil, out = {}|
       case value
       when Hash
@@ -326,7 +407,6 @@ require 'base64'
       out
     end,
 
-    # Normalize cell for CSV output.
     normalize_cell: lambda do |v|
       case v
       when NilClass
@@ -341,18 +421,9 @@ require 'base64'
 }
 
 # ---------------------------------------------------------------------------
-# Examples (for testing)
+# Recipe-builder usage tip (data pills):
+# - Use "Prefill entries (recommended)" and add rows like:
+#   title: "Employee name"   value: (Employee name pill)
+#   title: "Start date"      value: (date pill)
+#   title: "Manager"         value: { "record_id": "...", "value": "Grace Hopper" }  (table dropdown)
 # ---------------------------------------------------------------------------
-# 1) Prefill payload example (manual dropdown, editable by default):
-# {
-#   "Employee name": { "value": "Ada Lovelace" },
-#   "Department":    { "value": "Engineering", "disabled": false }
-# }
-#
-# 2) Prefill payload example (table dropdown):
-# {
-#   "Manager": { "value": { "record_id": "abcd-1234", "value": "Grace Hopper" } }
-# }
-#
-# 3) JSON→CSV input example:
-# [{"a":1,"b":{"c":2},"items":[{"id":9},{"id":10}]}]
