@@ -1,5 +1,5 @@
 {
-  title: 'Utilities (Build URLs, Generate .CSV',
+  title: 'URL Builder',
   
   description: 'Build parameterized URLs for Workflow Apps and convert JSON to CSV',
 
@@ -357,14 +357,18 @@
       end
     end,
 
-    # Convert JSON to CSV with full flattening
+    # Convert JSON to CSV with full flattening (from string input)
     json_to_csv_convert: lambda do |json_string|
       # Parse the JSON
       parse_result = call(:safe_json_parse, json_string)
       return parse_result if parse_result[:error]
       
-      data = parse_result[:data]
-      
+      call(:json_data_to_csv, parse_result[:data])
+    end,
+
+    # Convert parsed JSON data (Hash or Array) to CSV with full flattening
+    # This is the core conversion logic, separated from parsing
+    json_data_to_csv: lambda do |data|
       # Normalize to array of objects
       rows = if data.is_a?(Array)
         data
@@ -381,7 +385,7 @@
         end
       end
       
-      return { csv_string: '', row_count: 0, column_count: 0 } if rows.empty?
+      return { csv_string: '', row_count: 0, column_count: 0, headers: [] } if rows.empty?
       
       # Flatten each row
       flattened_rows = rows.map { |row| call(:flatten_object, row) }
@@ -1005,7 +1009,11 @@
         body: <<~HELP
           Converts JSON data to CSV format with intelligent flattening of nested structures.
 
-          **Input**: Raw JSON text containing either:
+          **Input Options** (use one):
+          - **JSON String**: Raw JSON text or a string datapill
+          - **JSON Object**: Direct object/array datapill (no parsing needed)
+
+          **Accepted Data**:
           - An array of objects: `[{"name": "John"}, {"name": "Jane"}]`
           - A single object (treated as one-row array): `{"name": "John"}`
 
@@ -1047,9 +1055,17 @@
             name: 'json_string',
             label: 'JSON String',
             type: 'string',
-            control_type: 'text_area',
-            optional: false,
-            hint: 'Raw JSON text to convert. Must be an object or array of objects.'
+            control_type: 'text',
+            optional: true,
+            sticky: true,
+            hint: 'Raw JSON text to convert (accepts string datapills). Use this OR JSON Object below.'
+          },
+          {
+            name: 'json_object',
+            label: 'JSON Object',
+            type: 'object',
+            optional: true,
+            hint: 'Direct object/array datapill input (no parsing needed). Use this OR JSON String above.'
           },
           {
             name: 'include_headers',
@@ -1075,14 +1091,25 @@
       # EXECUTE
       # ─────────────────────────────────────────────────────────────────────────
       execute: lambda do |_connection, input, _eis, _eos, _continue|
-        # Validate input
-        json_string = input['json_string']
-        unless call(:present?, json_string)
-          error('JSON string is required')
+        # Determine input source: prefer json_object if present, else parse json_string
+        data = nil
+        
+        if call(:present?, input['json_object'])
+          # Direct object input - already parsed
+          data = input['json_object']
+        elsif call(:present?, input['json_string'])
+          # String input - needs parsing
+          parse_result = call(:safe_json_parse, input['json_string'])
+          if parse_result[:error]
+            error(parse_result[:error])
+          end
+          data = parse_result[:data]
+        else
+          error('Either JSON String or JSON Object is required')
         end
 
-        # Convert JSON to CSV
-        result = call(:json_to_csv_convert, json_string)
+        # Convert to CSV using the parsed/provided data
+        result = call(:json_data_to_csv, data)
 
         if result[:error]
           error(result[:error])
