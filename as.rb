@@ -651,7 +651,7 @@ require 'date'
         param_name    = (input['param_name'] || 'prefilled_values').to_s
         encoding      = (input['payload_encoding'] || 'urlencoded_json_pretty').to_s
 
-        # IMPORTANT: align fallback with your config default (you set default: 'raw')
+        # Align fallback with config default (default: 'raw')
         style         = (input['payload_style'] || 'raw').to_s
 
         index_start   = (input['index_start'] || 1).to_i
@@ -661,10 +661,10 @@ require 'date'
         raise 'Missing base_url' unless call(:present?, base_url)
         raise 'param_name must be non-empty' unless call(:present?, param_name)
 
-        static_fields  = input['static_fields'].is_a?(Array) ? input['static_fields'] : []
-        mappings       = input['mappings'].is_a?(Array) ? input['mappings'] : []
-        idx_maps       = input['indexed_entry_mappings'].is_a?(Array) ? input['indexed_entry_mappings'] : []
-        source_fields  = input['source_fields'].is_a?(Array) ? input['source_fields'] : []
+        static_fields = input['static_fields'].is_a?(Array) ? input['static_fields'] : []
+        mappings      = input['mappings'].is_a?(Array) ? input['mappings'] : []
+        idx_maps      = input['indexed_entry_mappings'].is_a?(Array) ? input['indexed_entry_mappings'] : []
+        source_fields = input['source_fields'].is_a?(Array) ? input['source_fields'] : []
 
         # key_value sometimes comes through as Hash (key=>value) depending on UI/runtime.
         prefill_raw = input['prefill_fields']
@@ -681,9 +681,10 @@ require 'date'
 
         payload = {}
 
-        # 1) Static fields (skip blank rows; error on partially-filled rows)
+        # 1) Static fields
         static_fields.each do |f|
-          next if call(:row_blank?, f, 'key', :key, 'value', :value, 'disabled', :disabled)
+          # Only use key/value to determine "blank row" (disabled defaults to false and will otherwise trip you)
+          next if call(:row_blank?, f, 'key', :key, 'value', :value)
 
           key = f['key'].to_s
           raise 'Static field missing key' unless call(:present?, key)
@@ -696,7 +697,7 @@ require 'date'
 
         # 2) Mappings (from source_fields)
         mappings.each do |m|
-          # Ignore fully blank mapping rows
+          # Only input_key/output_key decide blankness (cast defaults to 'none')
           next if call(:row_blank?, m, 'input_key', :input_key, 'output_key', :output_key)
 
           in_key  = m['input_key'].to_s
@@ -715,7 +716,6 @@ require 'date'
 
         # 3) Prefill fields (from key_value UI)
         prefill_fields.each do |f|
-          # Ignore fully blank prefill rows (common from UI)
           next if call(:row_blank?, f, 'key', :key, 'value', :value)
 
           key = f['key'].to_s
@@ -730,8 +730,8 @@ require 'date'
 
         # 4) Indexed entry expansion
         idx_maps_norm = idx_maps.each_with_object([]) do |r, acc|
-          # Ignore blank mapping rows
-          next if call(:row_blank?, r, 'field_key', :field_key, 'key_template', :key_template, 'cast', :cast, 'disabled', :disabled)
+          # Only field_key/key_template decide blankness (cast defaults to 'none')
+          next if call(:row_blank?, r, 'field_key', :field_key, 'key_template', :key_template)
 
           field_key = r['field_key'].to_s
           tpl       = r['key_template'].to_s
