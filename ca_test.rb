@@ -1,7 +1,7 @@
 {
-  title: 'URL Builder',
+  title: 'Utilities (Build URLs, Generate .CSV',
   
-  description: 'Build parameterized URLs with prefilled form values for Workflow Apps',
+  description: 'Build parameterized URLs for Workflow Apps and convert JSON to CSV',
 
   # ═══════════════════════════════════════════════════════════════════════════
   # HELPER METHODS
@@ -230,6 +230,174 @@
     url_encode: lambda do |str|
       return '' if str.nil?
       ERB::Util.url_encode(str.to_s)
+    end,
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # JSON TO CSV HELPER METHODS
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    # Recursively flatten a value, accumulating into result hash
+    # Hashes → dotted keys: a.b.c
+    # Arrays → indexed keys: items[0].id
+    flatten_value: lambda do |value, prefix, result|
+      case value
+      when Hash
+        if value.empty?
+          # Empty hash becomes empty string at this key
+          result[prefix] = ''
+        else
+          value.each do |k, v|
+            new_prefix = prefix.empty? ? k.to_s : "#{prefix}.#{k}"
+            call(:flatten_value, v, new_prefix, result)
+          end
+        end
+      when Array
+        if value.empty?
+          # Empty array becomes empty string at this key
+          result[prefix] = ''
+        else
+          value.each_with_index do |item, idx|
+            new_prefix = prefix.empty? ? "[#{idx}]" : "#{prefix}[#{idx}]"
+            call(:flatten_value, item, new_prefix, result)
+          end
+        end
+      else
+        # Primitive value - store directly
+        result[prefix] = value
+      end
+      result
+    end,
+
+    # Flatten an entire object to a single-level hash with dotted/indexed keys
+    flatten_object: lambda do |obj|
+      return {} unless obj.is_a?(Hash)
+      call(:flatten_value, obj, '', {})
+    end,
+
+    # Collect all unique headers across multiple rows, preserving first-seen order
+    collect_headers: lambda do |rows|
+      headers = []
+      seen = {}
+      
+      rows.each do |row|
+        next unless row.is_a?(Hash)
+        row.keys.each do |key|
+          key_str = key.to_s
+          unless seen[key_str]
+            seen[key_str] = true
+            headers << key_str
+          end
+        end
+      end
+      
+      headers
+    end,
+
+    # Escape a value for CSV output (RFC 4180 compliant)
+    # - Wrap in quotes if contains comma, quote, or newline
+    # - Double any internal quotes
+    # - JSON-stringify remaining Hash/Array values
+    escape_csv_field: lambda do |value|
+      return '' if value.nil?
+      
+      # JSON-stringify any remaining complex types
+      str = if value.is_a?(Hash) || value.is_a?(Array)
+        value.to_json
+      else
+        value.to_s
+      end
+      
+      # Check if quoting is needed
+      needs_quoting = str.include?(',') || str.include?('"') || str.include?("\n") || str.include?("\r")
+      
+      if needs_quoting
+        # Escape internal quotes by doubling them
+        escaped = str.gsub('"', '""')
+        "\"#{escaped}\""
+      else
+        str
+      end
+    end,
+
+    # Build CSV string from array of flattened row hashes
+    build_csv: lambda do |rows, headers|
+      return '' if rows.empty? || headers.empty?
+      
+      lines = []
+      
+      # Header row
+      header_line = headers.map { |h| call(:escape_csv_field, h) }.join(',')
+      lines << header_line
+      
+      # Data rows
+      rows.each do |row|
+        row_values = headers.map do |header|
+          call(:escape_csv_field, row[header])
+        end
+        lines << row_values.join(',')
+      end
+      
+      lines.join("\n")
+    end,
+
+    # Parse JSON string to object/array, with helpful error messages
+    safe_json_parse: lambda do |json_string|
+      return { error: 'JSON string is required' } unless call(:present?, json_string)
+      
+      begin
+        parsed = JSON.parse(json_string.to_s.strip)
+        { data: parsed }
+      rescue JSON::ParserError => e
+        # Try to give a helpful error message
+        position_match = e.message.match(/at line (\d+)/)
+        position_info = position_match ? " at line #{position_match[1]}" : ''
+        { error: "Invalid JSON#{position_info}: #{e.message.split(':').last&.strip || 'parse error'}" }
+      rescue => e
+        { error: "Failed to parse JSON: #{e.message}" }
+      end
+    end,
+
+    # Convert JSON to CSV with full flattening
+    json_to_csv_convert: lambda do |json_string|
+      # Parse the JSON
+      parse_result = call(:safe_json_parse, json_string)
+      return parse_result if parse_result[:error]
+      
+      data = parse_result[:data]
+      
+      # Normalize to array of objects
+      rows = if data.is_a?(Array)
+        data
+      elsif data.is_a?(Hash)
+        [data]
+      else
+        return { error: "JSON must be an object or array of objects, got: #{data.class}" }
+      end
+      
+      # Validate all elements are objects
+      rows.each_with_index do |row, idx|
+        unless row.is_a?(Hash)
+          return { error: "Array element at index #{idx} is not an object (got: #{row.class})" }
+        end
+      end
+      
+      return { csv_string: '', row_count: 0, column_count: 0 } if rows.empty?
+      
+      # Flatten each row
+      flattened_rows = rows.map { |row| call(:flatten_object, row) }
+      
+      # Collect headers in stable first-seen order
+      headers = call(:collect_headers, flattened_rows)
+      
+      # Build CSV
+      csv_string = call(:build_csv, flattened_rows, headers)
+      
+      {
+        csv_string: csv_string,
+        row_count: rows.size,
+        column_count: headers.size,
+        headers: headers
+      }
     end,
 
     # Build the final URL with encoded payload parameter
@@ -820,6 +988,230 @@
           base_url: 'https://app.workato.com/request_pages/abc123',
           param_name: 'prefill',
           encoding_used: 'url'
+        }
+      end
+    },
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # JSON TO CSV ACTION
+    # ═══════════════════════════════════════════════════════════════════════════
+    json_to_csv: {
+      title: 'JSON to CSV',
+      subtitle: 'Convert JSON to CSV format',
+      description: "Convert a <span class='provider'>JSON</span> object or array to " \
+                   "<span class='provider'>CSV</span> format with automatic flattening",
+
+      help: {
+        body: <<~HELP
+          Converts JSON data to CSV format with intelligent flattening of nested structures.
+
+          **Input**: Raw JSON text containing either:
+          - An array of objects: `[{"name": "John"}, {"name": "Jane"}]`
+          - A single object (treated as one-row array): `{"name": "John"}`
+
+          **Flattening Rules**:
+          - Nested objects use dot notation: `address.city`
+          - Arrays use bracket notation: `items[0].id`
+          - Empty objects/arrays become empty strings
+          - Any remaining complex values are JSON-stringified
+
+          **Header Order**: Columns appear in first-seen order across all rows, ensuring stable output.
+
+          **Outputs**:
+          - `csv_string`: The raw CSV text
+          - `csv_binary`: Base64-encoded CSV (for file downloads)
+          - `csv_file`: File object with content, MIME type, and filename
+        HELP
+      },
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # CONFIG FIELDS
+      # ─────────────────────────────────────────────────────────────────────────
+      config_fields: [
+        {
+          name: 'filename_prefix',
+          label: 'Filename Prefix',
+          type: 'string',
+          optional: true,
+          default: 'export',
+          hint: 'Prefix for the generated filename (will append timestamp)'
+        }
+      ],
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # INPUT FIELDS
+      # ─────────────────────────────────────────────────────────────────────────
+      input_fields: lambda do |_object_definitions, _connection, _config_fields|
+        [
+          {
+            name: 'json_string',
+            label: 'JSON String',
+            type: 'string',
+            control_type: 'text_area',
+            optional: false,
+            hint: 'Raw JSON text to convert. Must be an object or array of objects.'
+          },
+          {
+            name: 'include_headers',
+            label: 'Include Headers',
+            type: 'string',
+            control_type: 'select',
+            pick_list: 'boolean_options',
+            optional: true,
+            default: 'true',
+            hint: 'Include column headers as the first row'
+          },
+          {
+            name: 'filename',
+            label: 'Output Filename',
+            type: 'string',
+            optional: true,
+            hint: 'Custom filename for csv_file output (without .csv extension). Defaults to prefix + timestamp.'
+          }
+        ]
+      end,
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # EXECUTE
+      # ─────────────────────────────────────────────────────────────────────────
+      execute: lambda do |_connection, input, _eis, _eos, _continue|
+        # Validate input
+        json_string = input['json_string']
+        unless call(:present?, json_string)
+          error('JSON string is required')
+        end
+
+        # Convert JSON to CSV
+        result = call(:json_to_csv_convert, json_string)
+
+        if result[:error]
+          error(result[:error])
+        end
+
+        csv_string = result[:csv_string]
+
+        # Handle include_headers option (remove first line if false)
+        if input['include_headers'] == 'false' && call(:present?, csv_string)
+          lines = csv_string.split("\n")
+          csv_string = lines.drop(1).join("\n") if lines.size > 1
+        end
+
+        # Generate filename
+        config = input['filename_prefix'] || 'export'
+        timestamp = Time.now.strftime('%Y%m%d_%H%M%S')
+        filename = if call(:present?, input['filename'])
+          "#{input['filename']}.csv"
+        else
+          "#{config}_#{timestamp}.csv"
+        end
+
+        # Base64 encode for binary output
+        csv_binary = Base64.strict_encode64(csv_string)
+
+        # Build file object
+        csv_file = {
+          'content' => csv_binary,
+          'content_type' => 'text/csv',
+          'original_filename' => filename
+        }
+
+        {
+          csv_string: csv_string,
+          csv_binary: csv_binary,
+          csv_file: csv_file,
+          row_count: result[:row_count],
+          column_count: result[:column_count],
+          headers: result[:headers]&.join(', ') || '',
+          filename: filename
+        }
+      end,
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # OUTPUT FIELDS
+      # ─────────────────────────────────────────────────────────────────────────
+      output_fields: lambda do |_object_definitions, _connection, _config_fields|
+        [
+          {
+            name: 'csv_string',
+            label: 'CSV String',
+            type: 'string',
+            hint: 'The raw CSV text output'
+          },
+          {
+            name: 'csv_binary',
+            label: 'CSV Binary (Base64)',
+            type: 'string',
+            hint: 'Base64-encoded CSV content for file operations'
+          },
+          {
+            name: 'csv_file',
+            label: 'CSV File',
+            type: 'object',
+            hint: 'File object ready for file upload actions',
+            properties: [
+              {
+                name: 'content',
+                label: 'Content (Base64)',
+                type: 'string',
+                hint: 'Base64-encoded file content'
+              },
+              {
+                name: 'content_type',
+                label: 'Content Type',
+                type: 'string',
+                hint: 'MIME type (text/csv)'
+              },
+              {
+                name: 'original_filename',
+                label: 'Filename',
+                type: 'string',
+                hint: 'Generated filename with .csv extension'
+              }
+            ]
+          },
+          {
+            name: 'row_count',
+            label: 'Row Count',
+            type: 'integer',
+            hint: 'Number of data rows (excluding header)'
+          },
+          {
+            name: 'column_count',
+            label: 'Column Count',
+            type: 'integer',
+            hint: 'Number of columns in the CSV'
+          },
+          {
+            name: 'headers',
+            label: 'Headers',
+            type: 'string',
+            hint: 'Comma-separated list of column headers'
+          },
+          {
+            name: 'filename',
+            label: 'Generated Filename',
+            type: 'string',
+            hint: 'The filename used for the csv_file output'
+          }
+        ]
+      end,
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # SAMPLE OUTPUT
+      # ─────────────────────────────────────────────────────────────────────────
+      sample_output: lambda do |_connection, _input|
+        {
+          csv_string: "name,email,address.city,address.zip\nJohn Doe,john@example.com,New York,10001\nJane Smith,jane@example.com,Boston,02101",
+          csv_binary: 'bmFtZSxlbWFpbCxhZGRyZXNzLmNpdHksYWRkcmVzcy56aXAKSm9obiBEb2Usam9obkBleGFtcGxlLmNvbSxOZXcgWW9yaywxMDAwMQpKYW5lIFNtaXRoLGphbmVAZXhhbXBsZS5jb20sQm9zdG9uLDAyMTAx',
+          csv_file: {
+            content: 'bmFtZSxlbWFpbCxhZGRyZXNzLmNpdHksYWRkcmVzcy56aXAKSm9obiBEb2Usam9obkBleGFtcGxlLmNvbSxOZXcgWW9yaywxMDAwMQpKYW5lIFNtaXRoLGphbmVAZXhhbXBsZS5jb20sQm9zdG9uLDAyMTAx',
+            content_type: 'text/csv',
+            original_filename: 'export_20250127_120000.csv'
+          },
+          row_count: 2,
+          column_count: 4,
+          headers: 'name, email, address.city, address.zip',
+          filename: 'export_20250127_120000.csv'
         }
       end
     }
