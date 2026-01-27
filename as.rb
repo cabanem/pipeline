@@ -537,7 +537,7 @@ require 'date'
         { name: 'static_fields', type: :array, of: :object, label: 'Static Fields', optional: true,
           ngIf: 'input.ui_mode == "advanced" && input.use_static_fields == true',
           properties: [
-            { name: 'key', type: :string, label: 'Key', control_type: 'text', optional: false, sticky: true },
+            { name: 'key', type: :string, label: 'Key', control_type: 'text', optional: true, sticky: true },
             { name: 'value', type: :string, label: 'Value', control_type: 'text', optional: true, sticky: true },
             { name: 'disabled', type: :boolean, label: 'Disabled?', control_type: 'checkbox', optional: true, default: false }
           ] },
@@ -547,8 +547,8 @@ require 'date'
         { name: 'mappings', type: :array, of: :object, label: 'Mappings', optional: true,
           ngIf: 'input.ui_mode == "advanced" && input.use_mappings == true',
           properties: [
-            { name: 'input_key', type: :string, label: 'Source key', control_type: 'text', optional: false, sticky: true },
-            { name: 'output_key', type: :string, label: 'Payload key', control_type: 'text', optional: false, sticky: true },
+            { name: 'input_key', type: :string, label: 'Source key', control_type: 'text', optional: true, sticky: true },
+            { name: 'output_key', type: :string, label: 'Payload key', control_type: 'text', optional: true, sticky: true },
             { name: 'cast', type: :string, label: 'Cast', control_type: 'select', pick_list: 'coerce_options', optional: true, default: 'none' },
             { name: 'required', type: :boolean, label: 'Required?', control_type: 'checkbox', optional: true, default: false },
             { name: 'disabled', type: :boolean, label: 'Disabled?', control_type: 'checkbox', optional: true, default: false }
@@ -559,8 +559,8 @@ require 'date'
         { name: 'indexed_entry_mappings', type: :array, of: :object, label: 'Indexed Entry Mappings', optional: true,
           ngIf: 'input.ui_mode == "advanced" && input.use_indexed_entries == true',
           properties: [
-            { name: 'field_key', type: :string, label: 'Entry field key', control_type: 'text', optional: false, sticky: true, hint: 'Key within each entries[] object' },
-            { name: 'key_template', type: :string, label: 'Payload key template', control_type: 'text', optional: false, sticky: true, hint: 'Use {{i}} e.g. date{{i}}' },
+            { name: 'field_key', type: :string, label: 'Entry field key', control_type: 'text', optional: true, sticky: true, hint: 'Key within each entries[] object' },
+            { name: 'key_template', type: :string, label: 'Payload key template', control_type: 'text', optional: true, sticky: true, hint: 'Use {{i}} e.g. date{{i}}' },
             { name: 'cast', type: :string, label: 'Cast', control_type: 'select', pick_list: 'coerce_options', optional: true, default: 'none' },
             { name: 'disabled', type: :boolean, label: 'Disabled?', control_type: 'checkbox', optional: true, default: false }
           ] },
@@ -600,7 +600,7 @@ require 'date'
 
             # Keep properties canonical for key_value
             properties: [
-              { name: 'key', type: 'string', optional: false },
+              { name: 'key', type: 'string', optional: true },
               { name: 'value', type: 'string', optional: true }
             ]
           }
@@ -650,7 +650,10 @@ require 'date'
         base_url      = input['base_url'].to_s
         param_name    = (input['param_name'] || 'prefilled_values').to_s
         encoding      = (input['payload_encoding'] || 'urlencoded_json_pretty').to_s
-        style         = (input['payload_style'] || 'value_wrapper').to_s
+
+        # IMPORTANT: align fallback with your config default (you set default: 'raw')
+        style         = (input['payload_style'] || 'raw').to_s
+
         index_start   = (input['index_start'] || 1).to_i
         include_blank = !!input['include_blank_values']
         prefill_disabled_default = !!input['prefill_disabled_default']
@@ -662,22 +665,40 @@ require 'date'
         mappings       = input['mappings'].is_a?(Array) ? input['mappings'] : []
         idx_maps       = input['indexed_entry_mappings'].is_a?(Array) ? input['indexed_entry_mappings'] : []
         source_fields  = input['source_fields'].is_a?(Array) ? input['source_fields'] : []
-        prefill_fields = input['prefill_fields'].is_a?(Array) ? input['prefill_fields'] : []
-        entries        = input['entries'].is_a?(Array) ? input['entries'] : []
+
+        # key_value sometimes comes through as Hash (key=>value) depending on UI/runtime.
+        prefill_raw = input['prefill_fields']
+        prefill_fields =
+          if prefill_raw.is_a?(Array)
+            prefill_raw
+          elsif prefill_raw.is_a?(Hash)
+            prefill_raw.map { |k, v| { 'key' => k, 'value' => v } }
+          else
+            []
+          end
+
+        entries = input['entries'].is_a?(Array) ? input['entries'] : []
 
         payload = {}
 
-        # 1) Static fields
+        # 1) Static fields (skip blank rows; error on partially-filled rows)
         static_fields.each do |f|
+          next if call(:row_blank?, f, 'key', :key, 'value', :value, 'disabled', :disabled)
+
           key = f['key'].to_s
-          next unless call(:present?, key)
+          raise 'Static field missing key' unless call(:present?, key)
+
           val = f['value']
           next if !include_blank && !call(:present?, val)
+
           payload[key] = call(:wrap_payload_value, val, f['disabled'], style)
         end
 
         # 2) Mappings (from source_fields)
         mappings.each do |m|
+          # Ignore fully blank mapping rows
+          next if call(:row_blank?, m, 'input_key', :input_key, 'output_key', :output_key)
+
           in_key  = m['input_key'].to_s
           out_key = m['output_key'].to_s
           raise 'Mapping missing input_key' unless call(:present?, in_key)
@@ -687,15 +708,19 @@ require 'date'
           raise "Missing required mapped field: #{in_key}" if !!m['required'] && !call(:present?, val)
           next if !include_blank && !call(:present?, val)
 
-          cast = (m['cast'] || 'none').to_s
+          cast    = (m['cast'] || 'none').to_s
           coerced = call(:coerce_value, val, cast)
           payload[out_key] = call(:wrap_payload_value, coerced, m['disabled'], style)
         end
 
         # 3) Prefill fields (from key_value UI)
         prefill_fields.each do |f|
+          # Ignore fully blank prefill rows (common from UI)
+          next if call(:row_blank?, f, 'key', :key, 'value', :value)
+
           key = f['key'].to_s
-          next unless call(:present?, key)
+          raise 'Prefill field missing key' unless call(:present?, key)
+
           val = f['value']
           next if !include_blank && !call(:present?, val)
 
@@ -704,30 +729,44 @@ require 'date'
         end
 
         # 4) Indexed entry expansion
-        entries.each_with_index do |entry, idx|
-          i = index_start + idx
-          idx_maps.each do |r|
-            field_key = r['field_key'].to_s
-            tpl       = r['key_template'].to_s
-            raise 'indexed_entry_mappings.field_key missing' unless call(:present?, field_key)
-            raise 'indexed_entry_mappings.key_template missing' unless call(:present?, tpl)
+        idx_maps_norm = idx_maps.each_with_object([]) do |r, acc|
+          # Ignore blank mapping rows
+          next if call(:row_blank?, r, 'field_key', :field_key, 'key_template', :key_template, 'cast', :cast, 'disabled', :disabled)
 
-            k = tpl.gsub('{{i}}', i.to_s)
-            next unless call(:present?, k)
+          field_key = r['field_key'].to_s
+          tpl       = r['key_template'].to_s
+          raise 'indexed_entry_mappings.field_key missing' unless call(:present?, field_key)
+          raise 'indexed_entry_mappings.key_template missing' unless call(:present?, tpl)
 
-            raw_val = entry.is_a?(Hash) ? entry[field_key] || entry[field_key.to_sym] : nil
-            next if !include_blank && !call(:present?, raw_val)
+          acc << r
+        end
 
-            cast = (r['cast'] || 'none').to_s
-            coerced = call(:coerce_value, raw_val, cast)
-            payload[k] = call(:wrap_payload_value, coerced, r['disabled'], style)
+        if idx_maps_norm.any? && entries.any?
+          entries.each_with_index do |entry, idx|
+            next unless entry.is_a?(Hash)
+
+            i = index_start + idx
+            idx_maps_norm.each do |r|
+              field_key = r['field_key'].to_s
+              tpl       = r['key_template'].to_s
+
+              k = tpl.gsub('{{i}}', i.to_s)
+              next unless call(:present?, k)
+
+              raw_val = entry[field_key] || entry[field_key.to_sym]
+              next if !include_blank && !call(:present?, raw_val)
+
+              cast    = (r['cast'] || 'none').to_s
+              coerced = call(:coerce_value, raw_val, cast)
+              payload[k] = call(:wrap_payload_value, coerced, r['disabled'], style)
+            end
           end
         end
 
-        json = call(:payload_json, payload, style, encoding)
-        encoded = URI.encode_www_form_component(json)
+        json      = call(:payload_json, payload, style, encoding)
+        encoded   = URI.encode_www_form_component(json)
         delimiter = base_url.include?('?') ? '&' : '?'
-        url = "#{base_url}#{delimiter}#{param_name}=#{encoded}"
+        url       = "#{base_url}#{delimiter}#{param_name}=#{encoded}"
 
         { url: url, payload_json: json, payload_encoded: encoded }
       end,
@@ -755,6 +794,13 @@ require 'date'
   methods: {
     present?: ->(value) {
       !value.nil? && (value.respond_to?(:empty?) ? !value.empty? : true)
+    },
+    row_blank?: ->(h, *keys) {
+      return true unless h.is_a?(Hash)
+      keys.all? do |k|
+        v = h[k] || h[k.to_s] || h[k.to_sym]
+        !call(:present?, v)
+      end
     },
     default_field_specs: -> {
       [
