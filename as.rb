@@ -568,35 +568,73 @@ require 'date'
           ngIf: 'input.ui_mode == "advanced" && input.use_indexed_entries == true', hint: 'Starting index for {{i}} substitution (usually 1).' }
       ],
       input_fields: lambda do |_object_definitions, _connection, config_fields|
-        mode         = (config_fields['ui_mode'] || 'simple').to_s
-        use_mappings = config_fields['use_mappings'] == true
-        use_indexed  = config_fields['use_indexed_entries'] == true
+        cfg = config_fields.is_a?(Hash) ? config_fields : {}
+
+        mode        = (cfg['ui_mode'] || 'simple').to_s
+        use_mappings = cfg['use_mappings'] == true
+        use_indexed  = cfg['use_indexed_entries'] == true
 
         fields = [
-          { name: 'base_url', type: :string, label: 'Base URL', control_type: 'text', optional: false, sticky: true, hint: 'Target URL (query param appended).' },
+          {
+            name: 'base_url',
+            type: 'string',
+            label: 'Base URL',
+            control_type: 'url',
+            optional: false,
+            sticky: true,
+            hint: 'Target URL (query param appended).'
+          },
+          {
+            name: 'prefill_fields',
+            control_type: 'key_value',
+            label: 'Prefill fields',
+            type: 'array',
+            of: 'object',
+            optional: true,
+            sticky: true,
 
-          # key/value editor (nicer UX than an array-of-objects table)
-          { name: 'prefill_fields', control_type: 'key_value', label: 'Prefill fields', type: 'array', of: 'object', optional: true, sticky: true,
-            empty_list_title: 'Add prefill fields', empty_list_text: 'Add keys and values to include in payload.',
-            item_label: 'Field', add_field_label: 'Add field',
+            # Use schema-supported empty message knobs (and avoid relying on older keys)
+            item_label: 'Field',
+            add_field_label: 'Add field',
+            empty_schema_message: 'Add keys and values to include in payload.',
+
+            # Keep properties canonical for key_value
             properties: [
-              { name: 'key', type: :string, label: 'Key', control_type: 'text', optional: false, sticky: true },
-              { name: 'value', type: :string, label: 'Value', control_type: 'text', optional: true, sticky: true }
-            ] }
+              { name: 'key', type: 'string', optional: false },
+              { name: 'value', type: 'string', optional: true }
+            ]
+          }
         ]
 
         if mode == 'advanced' && use_mappings
-          fields << { name: 'source_fields', type: :array, of: :object, label: 'Source Fields', optional: true, hint: 'Key/value inputs used by mappings.',
+          fields << {
+            name: 'source_fields',
+            type: 'array',
+            of: 'object',
+            label: 'Source Fields',
+            optional: true,
+            hint: 'Key/value inputs used by mappings.',
             properties: [
-              { name: 'key', type: :string, label: 'Key', control_type: 'text', optional: false, sticky: true },
-              { name: 'value', type: :string, label: 'Value', control_type: 'text', optional: true, sticky: true }
-            ] }
+              { name: 'key', type: 'string', optional: false },
+              { name: 'value', type: 'string', optional: true }
+            ]
+          }
         end
 
         if mode == 'advanced' && use_indexed
-          fields << { name: 'entries', type: :array, of: :object, label: 'Entries', optional: true, list_mode: 'dynamic', list_mode_toggle: true,
+          fields << {
+            name: 'entries',
+            type: 'array',
+            of: 'object',
+            label: 'Entries',
+            optional: true,
+            list_mode: 'dynamic',
+            list_mode_toggle: true,
             hint: 'Array of objects used by indexed_entry_mappings (usually mapped from an upstream datapill).',
-            properties: [ { name: 'placeholder', type: :string, label: '(map datapill)', optional: true } ] }
+            properties: [
+              { name: 'placeholder', type: 'string', label: '(map datapill)', optional: true }
+            ]
+          }
         end
 
         fields
